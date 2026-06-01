@@ -73,16 +73,20 @@ jobs:
         working-directory: fresh-port/20-touchHLE-src/touchHLE
         run: 7z -ovendor x "cmake-3.31.6-windows-x86_64.zip" && ren vendor\cmake-3.31.6-windows-x86_64 cmake
 
+      # CARGO_TARGET_DIR 设到极短路径 C:\t:否则 sdl2-sys 的 CMake TryCompile 在
+      # 我们的深层子目录 + 长仓库名下会超过 Windows 260 字符路径上限,导致
+      # FileTracker FTK1011 / “compiler is broken”。短 target dir 是标准修法。
       - name: Build (release)
         working-directory: fresh-port/20-touchHLE-src/touchHLE
         run: cargo build --release
         env:
           CMAKE: ${{ github.workspace }}\fresh-port\20-touchHLE-src\touchHLE\vendor\cmake\bin\cmake.exe
+          CARGO_TARGET_DIR: C:\t
 
       - name: Create bundle
         shell: bash
         working-directory: fresh-port/20-touchHLE-src/touchHLE
-        run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+        run: cd dev-scripts && ./make-windows-bundle.sh C:/t/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
