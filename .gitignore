@@ -1,0 +1,29 @@
+# ── 构建产物 ──────────────────────────────────────────────
+# touchHLE 的 Rust 构建目录（1.1GB），以及任何 target/
+**/target/
+
+# ── 系统/编辑器垃圾 ───────────────────────────────────────
+.DS_Store
+**/.DS_Store
+**/__MACOSX/
+
+# ── 运行期日志 / 调试残留 ─────────────────────────────────
+LOG
+**/touchHLE_log.txt
+**/*.decoded.plist
+**/hs_err_pid*.log
+/tmp/
+
+# ── 冗余的解包副本（~275MB）───────────────────────────────
+# 旧版 IPA 解包出来的 Payload 只是 `unzip` 产物，IPA 本体已通过 LFS 收录。
+# 逆向研究报告在 fresh-port/30-oldver/reports/（保留）。
+fresh-port/30-oldver/v1.1.5/
+fresh-port/30-oldver/v2.4.3/
+fresh-port/30-oldver/v5.4.0/
+
+# 注：touchHLE 子树内的 /target、/vendor/boost 等由 touchHLE 自带的
+# .gitignore 处理（git 会尊重子目录 .gitignore）。
+
+# ── 临时移开的嵌套 .git（push 后会恢复为 .git，永不收录）──
+# 不带尾斜杠 → 同时匹配目录(touchHLE/.git)和指针文件(vendor 子模块的 .git)
+**/.git__MOVED__

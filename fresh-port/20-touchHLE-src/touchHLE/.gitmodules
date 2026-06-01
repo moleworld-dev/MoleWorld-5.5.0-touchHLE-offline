@@ -1,0 +1,14 @@
+[submodule "stb"]
+	path = vendor/stb
+	url = https://github.com/nothings/stb.git
+	branch = dev
+[submodule "dynarmic"]
+	path = vendor/dynarmic
+	url = https://github.com/touchHLE/dynarmic.git
+[submodule "openal-soft"]
+	path = vendor/openal-soft
+	url = https://github.com/kcat/openal-soft
+[submodule "vendor/SDL"]
+	path = vendor/SDL
+	url = https://github.com/libsdl-org/SDL.git
+	branch = 07d0f51fa292895443f563f0cbde4cb3802d87fa
