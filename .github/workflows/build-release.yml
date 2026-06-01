@@ -1,0 +1,284 @@
+name: Build Release (Windows / Linux / Android)
+
+# 推送 v* tag(如 v5.5.0)触发,把各平台 touchHLE 构建产物上传到该 tag 的 Release。
+# 也支持手动触发(workflow_dispatch)做构建测试(手动触发不上传 Release,只留 artifact)。
+#
+# 说明:macOS 版是“双击即跑、内置摩尔庄园”的特制 .app,在本地打包后手动传 Release,
+#       不在此 CI 内(CI 的 mac 只会产出不含游戏的通用 touchHLE)。本 CI 专做
+#       用户要“尝试打包”的 Windows / Linux / Android 三个平台(通用 touchHLE 二进制,
+#       配合仓库内的游戏包使用)。
+#
+# 仓库结构提示:touchHLE 源码在子目录 fresh-port/20-touchHLE-src/touchHLE/;
+#   vendor 依赖已摊平为普通文件(无需 submodule);boost 未入库,CI 自行下载。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (no LFS, no submodules)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fresh-port/20-touchHLE-src/touchHLE
+
+      # boost 被 .gitignore 忽略,dynarmic_wrapper 在 Windows 下强制要求 vendor/boost
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/vendor/boost
+          key: boost_1_81_0_windows
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost
+
+      - name: Try to get cached copy of cmake
+        id: cache-cmake
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/vendor/cmake
+          key: cmake_3_31_6_windows
+      - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+        name: Download Cmake
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip"
+      - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+        name: Extract Cmake
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: 7z -ovendor x "cmake-3.31.6-windows-x86_64.zip" && ren vendor\cmake-3.31.6-windows-x86_64 cmake
+
+      - name: Build (release)
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: cargo build --release
+        env:
+          CMAKE: ${{ github.workspace }}\fresh-port\20-touchHLE-src\touchHLE\vendor\cmake\bin\cmake.exe
+
+      - name: Create bundle
+        shell: bash
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: touchHLE_Windows_x86_64
+          path: fresh-port/20-touchHLE-src/touchHLE/touchHLE_windows_bundle/
+
+      - name: Zip bundle for release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: 7z a touchHLE_Windows_x86_64.zip ./touchHLE_windows_bundle/*
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Windows_x86_64.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no LFS, no submodules)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fresh-port/20-touchHLE-src/touchHLE
+
+      # touchHLE 在 Linux 的系统依赖:
+      #   cmake/clang 驱动 dynarmic/openal/sdl2-sys 的 C/C++ 构建;
+      #   libboost-dev 供 dynarmic 头文件;libsndio-dev 供 openal 链接;
+      #   SDL2 静态构建仍需系统图形/音频/输入开发库。
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang build-essential pkg-config \
+            libboost-dev libsndio-dev \
+            libasound2-dev libpulse-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxss-dev libxinerama-dev \
+            libwayland-dev libxkbcommon-dev libudev-dev libdbus-1-dev
+
+      - name: Build (release)
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: cargo build --release
+        env:
+          CMAKE: /usr/bin/cmake
+
+      - name: Package tar.gz
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: |
+          rm -rf touchHLE_linux_bundle
+          mkdir touchHLE_linux_bundle
+          cp target/release/touchHLE touchHLE_linux_bundle/
+          cp -r touchHLE_dylibs touchHLE_linux_bundle/
+          cp -r touchHLE_fonts touchHLE_linux_bundle/
+          cp touchHLE_default_options.txt touchHLE_linux_bundle/
+          tar czvf touchHLE_Linux_x86_64.tar.gz -C touchHLE_linux_bundle .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: touchHLE_Linux_x86_64
+          path: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Linux_x86_64.tar.gz
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Linux_x86_64.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          fetch-depth: 0
+          submodules: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install AArch64 Android Rust toolchain
+        working-directory: .
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk
+        working-directory: .
+        run: cargo install cargo-ndk@3.5.4
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/vendor/boost
+          key: boost_1_81_0
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: 7z -ovendor x boost_1_81_0.7z && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Try to get cached copy of cmake
+        id: cache-cmake
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/vendor/cmake
+          key: cmake_3_31_6_linux
+      - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+        name: Download Cmake
+        run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz"
+      - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+        name: Extract Cmake
+        run: tar xzvf "cmake-3.31.6-linux-x86_64.tar.gz" -C vendor && mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake
+
+      - name: Try to get a cached copy of Gradle
+        id: cache-gradle
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/gradle
+          key: gradle-8.11.1
+      - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+        name: Download Gradle
+        run: curl -L -o gradle-8.11.1-bin.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
+      - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+        name: Extract Gradle
+        run: 7z -ogradle x gradle-8.11.1-bin.zip
+
+      - name: Try to get a cached copy of Android NDK
+        id: cache-android-ndk
+        uses: actions/cache@v4
+        with:
+          path: fresh-port/20-touchHLE-src/touchHLE/android-ndk
+          key: android-ndk-r25c
+      - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+        name: Download Android NDK
+        run: curl -L -o android-ndk-r25c-linux.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+      - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+        name: Extract Android NDK
+        run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip
+      - name: Link Android NDK
+        run: ln -s "$PWD/android-ndk/android-ndk-r25c" "$ANDROID_SDK_ROOT/ndk/25.2.9519653"
+
+      - name: Generate local.properties file
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      - name: Ensure debug keystore exists
+        working-directory: .
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -dname "CN=Android Debug,O=Android,C=US" \
+              -alias androiddebugkey -keypass android -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keyalg RSA -keysize 2048 -validity 10000
+          fi
+
+      - name: Build for Android (assembleRelease)
+        working-directory: fresh-port/20-touchHLE-src/touchHLE/android
+        run: ../gradle/gradle-8.11.1/bin/gradle assembleRelease
+        env:
+          ANDROID_NDK_ROOT: "/usr/local/lib/android/sdk/ndk/25.2.9519653"
+          ANDROID_NDK: "/usr/local/lib/android/sdk/ndk/25.2.9519653"
+          ANDROID_NDK_HOME: "/usr/local/lib/android/sdk/ndk/25.2.9519653"
+          CMAKE: "${{ github.workspace }}/fresh-port/20-touchHLE-src/touchHLE/vendor/cmake/bin/cmake"
+
+      - name: Rename APK
+        working-directory: fresh-port/20-touchHLE-src/touchHLE/android
+        run: cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/touchHLE.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: touchHLE_Android_AArch64
+          path: touchHLE.apk
+
+      - name: Attach APK to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: touchHLE.apk
