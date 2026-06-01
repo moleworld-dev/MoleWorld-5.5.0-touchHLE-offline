@@ -83,27 +83,35 @@ jobs:
           CMAKE: ${{ github.workspace }}\fresh-port\20-touchHLE-src\touchHLE\vendor\cmake\bin\cmake.exe
           CARGO_TARGET_DIR: C:\t
 
-      - name: Create bundle
+      # 打包:touchHLE 资源 + 内置游戏(MoleWorld.app)+ 双击启动器。
+      # 之前只打了通用 touchHLE(无游戏)→ 双击没游戏可跑=用户看到的“闪退”,
+      # 且比 mac 版小约 100MB(就是缺这个游戏)。现在做成开箱即玩。
+      - name: Create bundle (含内置游戏 + 启动器)
         shell: bash
         working-directory: fresh-port/20-touchHLE-src/touchHLE
-        run: cd dev-scripts && ./make-windows-bundle.sh C:/t/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+        run: |
+          cd dev-scripts && ./make-windows-bundle.sh C:/t/release/touchHLE.exe && mv touchHLE_windows_bundle/ .. && cd ..
+          cp -r ../../01-cracked/Payload/MoleWorld.app touchHLE_windows_bundle/MoleWorld.app
+          find touchHLE_windows_bundle/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
+          # 双击运行的 .bat:cd 到自身目录,带正确参数加载游戏;末尾 pause 便于看到报错
+          printf '@echo off\r\ncd /d "%%~dp0"\r\ntouchHLE.exe "MoleWorld.app" --landscape-right --device-family=ipad\r\npause\r\n' > "touchHLE_windows_bundle/Run-MoleWorld.bat"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: touchHLE_Windows_x86_64
+          name: MoleWorld_Windows_x86_64
           path: fresh-port/20-touchHLE-src/touchHLE/touchHLE_windows_bundle/
 
       - name: Zip bundle for release asset
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         working-directory: fresh-port/20-touchHLE-src/touchHLE
-        run: 7z a touchHLE_Windows_x86_64.zip ./touchHLE_windows_bundle/*
+        run: 7z a MoleWorld-5.5.0-Windows-x64.zip ./touchHLE_windows_bundle/*
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Windows_x86_64.zip
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Windows-x64.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -145,28 +153,32 @@ jobs:
         env:
           CMAKE: /usr/bin/cmake
 
-      - name: Package tar.gz
+      # 打包:touchHLE 二进制 + 资源 + 内置游戏 + 启动脚本(开箱即玩,与 Win/mac 一致)
+      - name: Package tar.gz (含内置游戏 + 启动器)
         working-directory: fresh-port/20-touchHLE-src/touchHLE
         run: |
           rm -rf touchHLE_linux_bundle
           mkdir touchHLE_linux_bundle
           cp target/release/touchHLE touchHLE_linux_bundle/
-          cp -r touchHLE_dylibs touchHLE_linux_bundle/
-          cp -r touchHLE_fonts touchHLE_linux_bundle/
+          cp -r touchHLE_dylibs touchHLE_fonts touchHLE_linux_bundle/
           cp touchHLE_default_options.txt touchHLE_linux_bundle/
-          tar czvf touchHLE_Linux_x86_64.tar.gz -C touchHLE_linux_bundle .
+          cp -r ../../01-cracked/Payload/MoleWorld.app touchHLE_linux_bundle/MoleWorld.app
+          find touchHLE_linux_bundle/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
+          printf '#!/bin/sh\ncd "$(dirname "$0")"\n./touchHLE "MoleWorld.app" --landscape-right --device-family=ipad\n' > touchHLE_linux_bundle/run-moleworld.sh
+          chmod +x touchHLE_linux_bundle/run-moleworld.sh touchHLE_linux_bundle/touchHLE
+          tar czf MoleWorld-5.5.0-Linux-x64.tar.gz -C touchHLE_linux_bundle .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: touchHLE_Linux_x86_64
-          path: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Linux_x86_64.tar.gz
+          name: MoleWorld_Linux_x86_64
+          path: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Linux-x64.tar.gz
 
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/touchHLE_Linux_x86_64.tar.gz
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Linux-x64.tar.gz
 
   build-android:
     runs-on: ubuntu-latest
