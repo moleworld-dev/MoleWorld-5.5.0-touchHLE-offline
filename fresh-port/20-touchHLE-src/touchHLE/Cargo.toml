@@ -1,0 +1,106 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+[workspace]
+
+# Optimize the release build for the hot HLE interpreter glue (objc_msgSend_inner
+# -> call_from_guest -> run_call -> run_or_step) which by default is split across
+# 16 codegen units with no cross-unit inlining. Fat LTO + single codegen unit lets
+# these inline together. (panic stays unwind — environment.rs uses catch_unwind.)
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[workspace.package]
+version = "0.2.3"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["touchHLE project contributors"]
+homepage = "https://touchhle.org/"
+
+[package]
+name = "touchHLE"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+homepage = { workspace = true }
+
+[lib]
+# https://users.rust-lang.org/t/making-both-binary-and-cdylib-from-one-package/29105
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "touchHLE"
+path = "src/bin.rs"
+
+[features]
+default = ["static"]
+static = ["sdl2/bundled", "sdl2/static-link", "touchHLE_openal_soft_wrapper/static"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace.dependencies]
+cc = "1.0.83"
+cmake = "0.1.49"
+gl_generator = "0.14.0"
+
+[dependencies]
+hound = "3.5.0"
+mach_object = "0.1.17"
+plist = "1.8.0"
+zip = { version = "0.6.4", default-features = false, features = ["deflate"] }
+# zlib (inflate) for implementing libz's uncompress(), used by cocos2d-iphone's
+# ZipUtils to decode .pvr.ccz texture atlases. Pure-Rust miniz_oxide backend
+# (no system zlib dep). Already in the lock tree via zip, so no new transitive
+# deps are pulled in.
+flate2 = { version = "1.0.25", default-features = false, features = ["rust_backend"] }
+rusttype = "0.9.3"
+# Needed so we can access underlying OwnedFace from rusttype
+# (bump version if rusttype is updated!)
+owned_ttf_parser = "0.15.2"
+# While most Symphonia codecs are (likely) unpatented/have freely licenseable 
+# patents as of 2024, all of the AAC profiles except AAC-LC (likely) have 
+# active patent claims. The "aac" feature only enables AAC-LC, so it's should 
+# be ok.
+# (The above statements should not understood as legal claims/advice.)
+symphonia = { version = "0.6.0-alpha.1", default-features = false, features = [
+    # formats
+    "caf", "isomp4", "wav",
+    # codecs
+    "aac", "adpcm", "alac", "mp3", "pcm"
+] }
+quick-xml = "0.38.4"
+digest = "0.10.7"
+md-5 = "0.10.6"
+sha1 = "0.10.6"
+encoding_rs = "0.8.35"
+# We currently use a fork of rust-sdl2 because we need a fix for Android builds
+# that's not upstream yet.
+# The HIDAPI feature is enabled because rust-sdl2 hides the SDL2 sensor features
+# behind this, but the actual HIDAPI is not used by touchHLE (see window.rs).
+# Note that the submodule in vendor/SDL2/ must use exactly the same revision of
+# SDL2 that rust-sdl2 uses, so that the Android JNI interface matches.
+sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"] }
+sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3" }
+touchHLE_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
+touchHLE_gl_bindings = { path = "src/gles/gl_bindings" }
+touchHLE_openal_soft_wrapper = { path = "src/audio/openal_soft_wrapper" }
+touchHLE_pvrt_decompress_wrapper = { path = "src/image/pvrt_decompress_wrapper" }
+touchHLE_stb_image_wrapper = { path = "src/image/stb_image_wrapper" }
+touchHLE_version = { path = "src/version" }
+windows-sys = { version = "0.61.0", features = ["Win32_System_Memory"] }
+nibarchive = "0.1.0"
+libc = "0.2.180"
+# AES (CommonCrypto CCCrypt) for game resource decryption.
+# Verified offline-buildable: aes 0.9.1 + cbc 0.2.1 in ~/.cargo cache.
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+corosensei = "0.3.2"
+uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
+
+[build-dependencies]
+cargo-license = "0.5.1"
+cc = { workspace = true }
+cmake = { workspace = true }
+gl_generator = { workspace = true }

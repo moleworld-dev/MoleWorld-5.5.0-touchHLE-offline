@@ -1,0 +1,139 @@
+<?xml version='1.0' encoding='utf-8' standalone='no'?>
+<flashbitmap>
+  <layers name="river"/>
+  <layer name="anim" swf_name="river" width="113" height="97" frames="85" offset_x="614" offset_y="185" images_count="1">
+    <bitmap_index>
+      <key width="61" height="96"/>
+      <key width="63" height="96"/>
+      <key width="64" height="97"/>
+      <key width="65" height="97"/>
+      <key width="65" height="97"/>
+      <key width="66" height="97"/>
+      <key width="60" height="97"/>
+      <key width="112" height="71"/>
+      <key width="112" height="71"/>
+      <key width="112" height="71"/>
+      <key width="112" height="72"/>
+      <key width="112" height="72"/>
+      <key width="113" height="72"/>
+      <key width="113" height="72"/>
+      <key width="111" height="72"/>
+      <key width="111" height="72"/>
+      <key width="111" height="73"/>
+      <key width="111" height="73"/>
+      <key width="111" height="72"/>
+      <key width="111" height="72"/>
+      <key width="63" height="77"/>
+      <key width="64" height="76"/>
+      <key width="64" height="76"/>
+      <key width="65" height="77"/>
+      <key width="61" height="76"/>
+      <key width="62" height="77"/>
+      <key width="63" height="77"/>
+      <key width="42" height="69"/>
+      <key width="42" height="69"/>
+      <key width="42" height="69"/>
+      <key width="42" height="70"/>
+      <key width="41" height="70"/>
+      <key width="41" height="70"/>
+      <key width="42" height="70"/>
+    </bitmap_index>
+    <action_label list="001,002,003,004"/>
+    <action_keyframe list="1,22,43,65"/>
+    <movie>
+      <action name="001">
+        <key index="0" x="-127" y="-67"/>
+        <key index="0" x="-127" y="-67"/>
+        <key index="0" x="-127" y="-67"/>
+        <key index="1" x="-128" y="-67"/>
+        <key index="1" x="-128" y="-67"/>
+        <key index="1" x="-128" y="-67"/>
+        <key index="2" x="-129" y="-67"/>
+        <key index="2" x="-129" y="-67"/>
+        <key index="2" x="-129" y="-67"/>
+        <key index="3" x="-130" y="-67"/>
+        <key index="3" x="-130" y="-67"/>
+        <key index="3" x="-130" y="-67"/>
+        <key index="4" x="-131" y="-67"/>
+        <key index="4" x="-131" y="-67"/>
+        <key index="4" x="-131" y="-67"/>
+        <key index="5" x="-132" y="-67"/>
+        <key index="5" x="-132" y="-67"/>
+        <key index="5" x="-132" y="-67"/>
+        <key index="6" x="-125" y="-67"/>
+        <key index="6" x="-125" y="-67"/>
+        <key index="6" x="-125" y="-67"/>
+      </action>
+      <action name="004">
+        <key index="27" x="76" y="52"/>
+        <key index="27" x="76" y="52"/>
+        <key index="27" x="76" y="52"/>
+        <key index="28" x="76" y="52"/>
+        <key index="28" x="76" y="52"/>
+        <key index="28" x="76" y="52"/>
+        <key index="29" x="76" y="52"/>
+        <key index="29" x="76" y="52"/>
+        <key index="29" x="76" y="52"/>
+        <key index="30" x="76" y="52"/>
+        <key index="30" x="76" y="52"/>
+        <key index="30" x="76" y="52"/>
+        <key index="31" x="76" y="52"/>
+        <key index="31" x="76" y="52"/>
+        <key index="31" x="76" y="52"/>
+        <key index="32" x="76" y="52"/>
+        <key index="32" x="76" y="52"/>
+        <key index="32" x="76" y="52"/>
+        <key index="33" x="76" y="52"/>
+        <key index="33" x="76" y="52"/>
+        <key index="33" x="76" y="52"/>
+      </action>
+      <action name="002">
+        <key index="7" x="41" y="-37"/>
+        <key index="7" x="41" y="-37"/>
+        <key index="7" x="41" y="-37"/>
+        <key index="8" x="41" y="-37"/>
+        <key index="8" x="41" y="-37"/>
+        <key index="9" x="41" y="-37"/>
+        <key index="10" x="41" y="-37"/>
+        <key index="10" x="41" y="-37"/>
+        <key index="11" x="41" y="-37"/>
+        <key index="12" x="41" y="-37"/>
+        <key index="12" x="41" y="-37"/>
+        <key index="13" x="41" y="-37"/>
+        <key index="14" x="41" y="-37"/>
+        <key index="14" x="41" y="-37"/>
+        <key index="15" x="41" y="-37"/>
+        <key index="16" x="42" y="-37"/>
+        <key index="16" x="42" y="-37"/>
+        <key index="17" x="42" y="-37"/>
+        <key index="18" x="42" y="-37"/>
+        <key index="19" x="42" y="-37"/>
+        <key index="19" x="42" y="-37"/>
+      </action>
+      <action name="003">
+        <key index="20" x="65" y="48"/>
+        <key index="20" x="65" y="48"/>
+        <key index="20" x="65" y="48"/>
+        <key index="21" x="65" y="48"/>
+        <key index="21" x="65" y="48"/>
+        <key index="21" x="65" y="48"/>
+        <key index="22" x="65" y="48"/>
+        <key index="22" x="65" y="48"/>
+        <key index="22" x="65" y="48"/>
+        <key index="23" x="64" y="48"/>
+        <key index="23" x="64" y="48"/>
+        <key index="23" x="64" y="48"/>
+        <key index="24" x="67" y="48"/>
+        <key index="24" x="67" y="48"/>
+        <key index="24" x="67" y="48"/>
+        <key index="25" x="66" y="48"/>
+        <key index="25" x="66" y="48"/>
+        <key index="25" x="66" y="48"/>
+        <key index="26" x="66" y="48"/>
+        <key index="26" x="66" y="48"/>
+        <key index="26" x="66" y="48"/>
+        <key index="20" x="65" y="48"/>
+      </action>
+    </movie>
+  </layer>
+</flashbitmap>

@@ -1,0 +1,2 @@
+# 大文件走 Git LFS（IPA 单个可达 100MB+，超 GitHub 普通文件硬上限）
+*.ipa filter=lfs diff=lfs merge=lfs -text
