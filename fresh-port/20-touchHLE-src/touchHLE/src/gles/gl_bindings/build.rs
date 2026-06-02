@@ -15,7 +15,11 @@ fn main() {
         Api::Gl,
         (2, 1),
         Profile::Compatibility,
-        Fallbacks::None,
+        // [MoleWorld/Windows fix] Fallbacks::All:新 NVIDIA 驱动可能不再导出 *EXT 版
+        // 入口(如 glGenFramebuffersEXT),回退到核心同名函数(glGenFramebuffers),
+        // 避免函数指针为 NULL 时被调用导致硬崩溃。mac(Apple GL 2.1,EXT 入口齐全)
+        // 不触发回退,行为不变。
+        Fallbacks::All,
         [
             "GL_EXT_framebuffer_object",
             "GL_EXT_texture_filter_anisotropic",

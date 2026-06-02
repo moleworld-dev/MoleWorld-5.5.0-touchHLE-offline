@@ -1230,6 +1230,7 @@ impl Window {
                 );
 
             use crate::gles::gles11_raw as gles11; // constants only
+            log!("[splash] GL context current (default VAO ensured); uploading splash texture");
 
             let mut texture = 0;
             gl_ctx.GenTextures(1, &mut texture);
@@ -1257,17 +1258,20 @@ impl Window {
                 gles11::LINEAR as _,
             );
 
+            log!("[splash] texture ready; calling present_frame (first GL draw / DrawArrays)");
             present_frame(
                 gl_ctx.as_mut(),
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
             );
+            log!("[splash] present_frame returned OK");
 
             gl_ctx.DeleteTextures(1, &texture);
         };
 
         self.window.gl_swap_window();
+        log!("[splash] gl_swap_window done — splash displayed");
 
         // hold onto GL context so the image doesn't disappear, and hold
         // onto image so we can rotate later if necessary
