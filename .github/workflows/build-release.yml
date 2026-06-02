@@ -93,11 +93,8 @@ jobs:
           cd dev-scripts && ./make-windows-bundle.sh C:/t/release/touchHLE.exe && mv touchHLE_windows_bundle/ .. && cd ..
           cp -r ../../01-cracked/Payload/MoleWorld.app touchHLE_windows_bundle/MoleWorld.app
           find touchHLE_windows_bundle/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
-          # 双击运行的 .bat:cd 到自身目录,带正确参数加载游戏;末尾 pause 便于看到报错。
-          # [音频诊断] 在启动 exe 前设 ALSOFT_LOGLEVEL=3 + ALSOFT_LOGFILE,让 openal-soft
-          # 把后端选择/设备打开的详细日志写到 exe 旁的 alsoft_log.txt(必须在进程启动前设,
-          # openal-soft 读的是早期环境快照,代码里 set_var 太晚无效)。用于定位 Windows 无声。
-          printf '@echo off\r\ncd /d "%%~dp0"\r\nset ALSOFT_LOGLEVEL=3\r\nset ALSOFT_LOGFILE=alsoft_log.txt\r\ntouchHLE.exe "MoleWorld.app" --landscape-right --device-family=ipad\r\npause\r\n' > "touchHLE_windows_bundle/Run-MoleWorld.bat"
+          # 双击运行的 .bat:cd 到自身目录,带正确参数加载游戏;末尾 pause 便于看到报错
+          printf '@echo off\r\ncd /d "%%~dp0"\r\ntouchHLE.exe "MoleWorld.app" --landscape-right --device-family=ipad\r\npause\r\n' > "touchHLE_windows_bundle/Run-MoleWorld.bat"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
