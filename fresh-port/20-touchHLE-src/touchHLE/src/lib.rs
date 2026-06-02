@@ -48,6 +48,7 @@ mod mem;
 mod mole_cheats;
 mod mole_diag;
 mod mole_menu;
+mod mole_sysinfo;
 mod objc;
 mod save_reset;
 mod options;
