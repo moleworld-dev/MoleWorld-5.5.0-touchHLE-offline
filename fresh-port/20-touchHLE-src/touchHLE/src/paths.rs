@@ -40,14 +40,26 @@ pub const DEFAULT_OPTIONS_FILE: &str = "touchHLE_default_options.txt";
 /// [None].
 #[allow(dead_code)]
 fn get_macos_bundled_resources_path() -> Option<PathBuf> {
-    if std::env::consts::OS != "macos" {
-        return None;
+    // [MoleWorld iOS] iOS 的 .app bundle 是扁平结构:SDL 的 base_path() 就是 bundle
+    // 根目录,touchHLE 的资源(字体等)和内置游戏都直接放在那里(不像 macOS 的
+    // Contents/Resources)。把它当资源根返回 → ResourceFile 从 bundle 读资源,且
+    // user_data_base_path 因这里 is_some() 会改用可写的 pref_path 存档(iOS 沙盒里
+    // bundle 只读,存档必须落到 Documents/Library)。
+    #[cfg(target_os = "ios")]
+    {
+        return sdl2::filesystem::base_path().ok().map(PathBuf::from);
     }
-    let base_path = PathBuf::from(sdl2::filesystem::base_path().ok()?);
-    if base_path.file_name().is_some_and(|p| p == "Resources") {
-        Some(base_path)
-    } else {
-        None
+    #[cfg(not(target_os = "ios"))]
+    {
+        if std::env::consts::OS != "macos" {
+            return None;
+        }
+        let base_path = PathBuf::from(sdl2::filesystem::base_path().ok()?);
+        if base_path.file_name().is_some_and(|p| p == "Resources") {
+            Some(base_path)
+        } else {
+            None
+        }
     }
 }
 

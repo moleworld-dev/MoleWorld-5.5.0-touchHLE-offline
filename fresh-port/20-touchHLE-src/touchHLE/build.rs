@@ -106,4 +106,33 @@ pub fn main() {
         // but sdl2 still depends on it
         println!("cargo::rustc-link-lib=advapi32")
     }
+
+    // [MoleWorld iOS] 静态链接的 SDL2 与 openal-soft 在 iOS 上依赖一组系统框架,
+    // 这些不会随静态库自动带入,必须由最终二进制显式链接。缺 CoreBluetooth 会出现
+    // HIDBLEDevice/HIDBLEManager 未定义符号(SDL2 的蓝牙手柄支持);音频走
+    // CoreAudio/AudioToolbox/AVFoundation;画面走 OpenGLES(iOS 原生 GLES1.1)+
+    // UIKit/QuartzCore;其余是 SDL2 iOS 后端引用到的(GameController/CoreMotion/
+    // CoreHaptics/Metal 等)。一次性补齐,避免缺一个补一个。
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "ios" {
+        for framework in [
+            "UIKit",
+            "Foundation",
+            "CoreFoundation",
+            "QuartzCore",
+            "CoreGraphics",
+            "OpenGLES",
+            "CoreAudio",
+            "AudioToolbox",
+            "AVFoundation",
+            "CoreBluetooth",
+            "CoreMotion",
+            "CoreHaptics",
+            "GameController",
+            "Metal",
+            "CoreVideo",
+            "ImageIO",
+        ] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
 }

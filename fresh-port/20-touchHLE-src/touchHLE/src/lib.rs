@@ -152,6 +152,50 @@ fn ensure_bundled_moleworld() -> Option<String> {
     Some(target.to_string_lossy().into_owned())
 }
 
+/// This is the true entry point on iOS (SDL's UIKit `SDL_UIKitRunApp` shim calls
+/// it after UIApplication setup), analogous to the Android entry above. The game
+/// (MoleWorld.ipa) is bundled inside the .app, so we load it directly from the
+/// read-only bundle and skip the app picker → tap the icon to play. Saves go to
+/// the writable pref_path (see paths.rs get_macos_bundled_resources_path iOS arm).
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub extern "C" fn SDL_main(
+    _argc: std::ffi::c_int,
+    _argv: *const *const std::ffi::c_char,
+) -> std::ffi::c_int {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s
+        } else {
+            "(non-string payload)"
+        };
+        if let Some(location) = info.location() {
+            echo!("Panic at {}: {}", location, payload);
+        } else {
+            echo!("Panic: {}", payload);
+        }
+    }));
+
+    // SDL's base path on iOS is the .app bundle root; the bundled game sits at
+    // <bundle>/MoleWorld.ipa. BundleData reads the .ipa (zip) directly from the
+    // read-only bundle (no copy needed). Skip the picker by passing the path.
+    let base = sdl2::filesystem::base_path().unwrap_or_else(|_| String::from("./"));
+    let game = std::path::Path::new(&base).join("MoleWorld.ipa");
+    let args = vec![
+        String::from("touchHLE"), // argv[0], skipped by main()
+        game.to_string_lossy().into_owned(),
+        String::from("--landscape-right"),
+        String::from("--device-family=ipad"),
+    ];
+    match main(args.into_iter()) {
+        Ok(_) => echo!("touchHLE finished"),
+        Err(e) => echo!("touchHLE errored: {e:?}"),
+    }
+    0
+}
+
 const USAGE: &str = "\
 Usage:
     touchHLE [PATH] [OPTIONS]
