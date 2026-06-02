@@ -43,16 +43,26 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    androidResources {
+        // 内置的 MoleWorld.ipa 已是 store 模式(里面全是 mp3/png/ccz 等已压缩资源),
+        // 让 AGP 不要再压缩这个 ~110MB 的 asset:① 避免超大压缩 asset 在设备上读取/解压
+        // 的内存与兼容问题;② 加快构建;③ 首启复制是一次顺序大读取。
+        noCompress += "ipa"
+    }
     defaultConfig {
         val branding = getTouchHLEBranding()
         applicationId = "org.touchhle.android"
         if (!branding.isEmpty()) {
             applicationIdSuffix = branding.lowercase()
         }
-        resValue("string", "app_name", join("touchHLE", " ", branding))
-        buildConfigField("String", "APP_NAME", "\"${join("touchHLE", " ", branding)}\"")
-        manifestPlaceholders["icon"] = join("@drawable/icon", "_", branding.lowercase())
-        buildConfigField("int", "APP_ICON", join("R.drawable.icon", "_", branding.lowercase()))
+        // [MoleWorld] 固定 launcher 名称为"摩尔庄园HD"、图标固定用游戏高清图标
+        // (@drawable/icon = res/drawable-nodpi/icon.png,已替换成游戏 iTunesArtwork)。
+        // 不再随 touchHLE branding 变化(原本带 branding 时会解析成 icon_unofficial,
+        // 且名字会带"touchHLE UNOFFICIAL …")。
+        resValue("string", "app_name", "摩尔庄园HD")
+        buildConfigField("String", "APP_NAME", "\"摩尔庄园HD\"")
+        manifestPlaceholders["icon"] = "@drawable/icon"
+        buildConfigField("int", "APP_ICON", "R.drawable.icon")
         versionName = join(getTouchHLEVersionName(), " ", branding)
 
         minSdk = 21 // first version with AArch64

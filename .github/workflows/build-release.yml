@@ -267,6 +267,20 @@ jobs:
       - name: Generate local.properties file
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
 
+      - name: 内置 MoleWorld 游戏到 assets(store 模式 IPA,供"点击即玩"首启复制)
+        run: |
+          # 把 01-cracked 的 MoleWorld.app 打成 Payload/MoleWorld.app 结构的 .ipa(zip),
+          # 放进 android assets。touchHLE 的 BundleData 只能读真实文件,读不了 APK asset,
+          # 故首启时由 SDL_main 复制到外部存储再加载(见 src/lib.rs ensure_bundled_moleworld)。
+          rm -rf _ipa_stage && mkdir -p _ipa_stage/Payload
+          cp -r ../../01-cracked/Payload/MoleWorld.app _ipa_stage/Payload/MoleWorld.app
+          find _ipa_stage/Payload/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
+          mkdir -p android/app/src/main/assets
+          rm -f android/app/src/main/assets/MoleWorld.ipa
+          # -0 = store(不压缩):里面全是 mp3/png/ccz 已压缩资源,且配合 noCompress 让首启复制更快
+          ( cd _ipa_stage && zip -r -X -0 -q "$GITHUB_WORKSPACE/fresh-port/20-touchHLE-src/touchHLE/android/app/src/main/assets/MoleWorld.ipa" Payload )
+          ls -la android/app/src/main/assets/MoleWorld.ipa
+
       - name: Ensure debug keystore exists
         working-directory: .
         run: |

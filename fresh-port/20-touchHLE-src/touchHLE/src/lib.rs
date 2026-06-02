@@ -91,12 +91,65 @@ pub extern "C" fn SDL_main(
         }
     }));
 
-    // Empty args: brings up app picker.
-    match main([String::new()].into_iter()) {
+    // [MoleWorld 点击即玩] touchHLE 默认传空参数 → 弹出 app 选择器。这里改为:把内置在
+    // APK assets 里的 MoleWorld.ipa 复制到外部存储的 touchHLE_apps/(touchHLE 的
+    // BundleData 只能从真实文件路径加载,读不了 APK asset),再用该路径直接启动 → 跳过
+    // 选择器 = 双击图标即玩。仅首次复制;若复制失败则退回选择器(至少不崩)。
+    let args: Vec<String> = match ensure_bundled_moleworld() {
+        Some(ipa_path) => vec![
+            String::from("touchHLE"), // argv[0],main() 会跳过
+            ipa_path,
+            String::from("--landscape-right"),
+            String::from("--device-family=ipad"),
+        ],
+        None => vec![String::new()],
+    };
+    match main(args.into_iter()) {
         Ok(_) => echo!("touchHLE finished"),
         Err(e) => echo!("touchHLE errored: {e:?}"),
     }
     0
+}
+
+/// [MoleWorld 点击即玩] 确保内置游戏已落到外部存储,返回其 .ipa 路径(失败返回 None)。
+/// 游戏以单个 MoleWorld.ipa 内置于 APK assets(见 CI 的"内置 MoleWorld 到 assets"步骤),
+/// 首次启动时复制到 touchHLE_apps/MoleWorld.ipa,之后复用。
+#[cfg(target_os = "android")]
+fn ensure_bundled_moleworld() -> Option<String> {
+    use std::io::Read;
+    let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
+    let target = apps_dir.join("MoleWorld.ipa");
+    if target.is_file() {
+        return Some(target.to_string_lossy().into_owned());
+    }
+    if let Err(e) = std::fs::create_dir_all(&apps_dir) {
+        echo!("[MoleWorld] 创建目录 {:?} 失败: {:?}", apps_dir, e);
+        return None;
+    }
+    // 从 APK assets 读取内置的 MoleWorld.ipa(经 SDL2 的 Android assets 封装)。
+    let mut data = Vec::new();
+    match paths::ResourceFile::open("MoleWorld.ipa") {
+        Ok(mut rf) => {
+            if let Err(e) = rf.get().read_to_end(&mut data) {
+                echo!("[MoleWorld] 读取内置 MoleWorld.ipa 失败: {:?}", e);
+                return None;
+            }
+        }
+        Err(e) => {
+            echo!("[MoleWorld] 打开内置 MoleWorld.ipa(APK asset)失败: {}", e);
+            return None;
+        }
+    }
+    if let Err(e) = std::fs::write(&target, &data) {
+        echo!("[MoleWorld] 写入 {:?} 失败: {:?}", target, e);
+        return None;
+    }
+    echo!(
+        "[MoleWorld] 已复制内置游戏到 {:?}({} 字节)",
+        target,
+        data.len()
+    );
+    Some(target.to_string_lossy().into_owned())
 }
 
 const USAGE: &str = "\
