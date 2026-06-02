@@ -1176,7 +1176,31 @@ impl Window {
     pub fn gl_get_proc_address(&self, procname: &str) -> *const std::ffi::c_void {
         // For some reason, rust-sdl2 uses *const (), but () is not meant to be
         // used for void pointees (just void results), so let's fix that.
-        self.video_ctx.gl_get_proc_address(procname) as *const _
+        Self::gl_proc_ios_fallback(
+            self.video_ctx.gl_get_proc_address(procname) as *const _,
+            procname,
+        )
+    }
+
+    /// [MoleWorld iOS] iOS 的 OpenGLES.framework 函数(glGetString 等)是直接链接进
+    /// 进程的符号,SDL_GL_GetProcAddress 对它们返回 NULL → gles11/gl21::load_with 拿到
+    /// 空指针、调用即段错误(实测在 PlayCover 上崩于 Window::new 的
+    /// driver_description → glGetString)。回退用 dlsym(RTLD_DEFAULT) 从进程已链接符号
+    /// 解析。桌面/Android 上 SDL 正常返回(addr 非空),此回退不触发,故无副作用。
+    fn gl_proc_ios_fallback(
+        addr: *const std::ffi::c_void,
+        procname: &str,
+    ) -> *const std::ffi::c_void {
+        #[cfg(unix)]
+        if addr.is_null() {
+            if let Ok(cname) = std::ffi::CString::new(procname) {
+                let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+                if !sym.is_null() {
+                    return sym as *const std::ffi::c_void;
+                }
+            }
+        }
+        addr
     }
 
     pub fn set_share_with_current_context(&self, value: bool) {
@@ -1202,7 +1226,12 @@ impl Window {
                 .unwrap()
                 .make_current_unchecked_for_window(
                     &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
-                    &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
+                    &mut |s| {
+                        Self::gl_proc_ios_fallback(
+                            self.video_ctx.gl_get_proc_address(s) as *const _,
+                            s,
+                        )
+                    },
                 )
         };
         gl_ins
@@ -1226,7 +1255,12 @@ impl Window {
                 .unwrap()
                 .make_current_unchecked_for_window(
                     &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
-                    &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
+                    &mut |s| {
+                        Self::gl_proc_ios_fallback(
+                            self.video_ctx.gl_get_proc_address(s) as *const _,
+                            s,
+                        )
+                    },
                 );
 
             use crate::gles::gles11_raw as gles11; // constants only

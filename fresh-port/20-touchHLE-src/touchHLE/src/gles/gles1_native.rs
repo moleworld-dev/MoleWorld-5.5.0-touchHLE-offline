@@ -83,17 +83,28 @@ pub struct GLES1Native<'gl_ctx> {
 
 impl GLES for GLES1Native<'_> {
     unsafe fn driver_description(&self) -> String {
-        let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
-        let vendor = CStr::from_ptr(gles11::GetString(gles11::VENDOR) as *const _);
-        let renderer = CStr::from_ptr(gles11::GetString(gles11::RENDERER) as *const _);
-        // OpenGL ES requires the version to be prefixed "OpenGL ES", so we
-        // don't need to contextualize it.
-        format!(
-            "{} / {} / {}",
-            version.to_string_lossy(),
-            vendor.to_string_lossy(),
-            renderer.to_string_lossy()
-        )
+        // [MoleWorld iOS] 在 iOS 上跳过 glGetString:实测在 PlayCover(iOS-on-Mac)下,
+        // 即便 SDL_GL_MakeCurrent 成功返回,glGetString 仍因没有真正 current 的 GL 上下文
+        // 段错误(EXC_BAD_ACCESS @0x3b0)。driver_description 仅用于打印一行 Driver info,
+        // 不值得为它让整个 app 崩;略过它,让启动继续到真正的渲染调用。
+        #[cfg(target_os = "ios")]
+        {
+            return String::from("Native OpenGL ES 1.1 (iOS)");
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let version = CStr::from_ptr(gles11::GetString(gles11::VERSION) as *const _);
+            let vendor = CStr::from_ptr(gles11::GetString(gles11::VENDOR) as *const _);
+            let renderer = CStr::from_ptr(gles11::GetString(gles11::RENDERER) as *const _);
+            // OpenGL ES requires the version to be prefixed "OpenGL ES", so we
+            // don't need to contextualize it.
+            format!(
+                "{} / {} / {}",
+                version.to_string_lossy(),
+                vendor.to_string_lossy(),
+                renderer.to_string_lossy()
+            )
+        }
     }
 
     // Generic state manipulation
