@@ -82,6 +82,9 @@ macro_rules! echo {
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(formatted_str.as_bytes());
             let _ = log_file.write_all(b"\n");
+            // 每行强制落盘(Windows 上即 FlushFileBuffers):即便随后硬崩溃,
+            // 也能保住崩溃前最后一行日志,而不是被缓冲丢掉。
+            let _ = log_file.sync_data();
         }
     };
     () => {
@@ -94,7 +97,9 @@ macro_rules! echo {
             eprintln!("");
 
             use std::io::Write;
-            let _ = $crate::log::get_log_file().write_all(b"\n");
+            let mut log_file = $crate::log::get_log_file();
+            let _ = log_file.write_all(b"\n");
+            let _ = log_file.sync_data();
         }
     }
 }

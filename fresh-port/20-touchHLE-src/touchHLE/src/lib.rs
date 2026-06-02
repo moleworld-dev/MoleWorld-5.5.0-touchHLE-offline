@@ -118,7 +118,83 @@ Special options:
         Print basic information about the app bundle without running the app.
 ";
 
+/// [crash logging] Windows 顶层异常过滤器:GL 调用等触发的 native 访问违例是 SEH
+/// 异常、不是 Rust panic,现有 panic 钩子收不到 → 没有它日志会在崩溃处干净截断。
+/// 这里在进程被系统终结前往 touchHLE_log.txt 追加一行错误,然后返回
+/// EXCEPTION_CONTINUE_SEARCH(放行默认处理,进程照常崩溃退出,行为不变)。
+/// 全程裸指针判空、不上 logging 锁、不 unwrap;writeln! 直写文件不经 String。
+#[cfg(windows)]
+unsafe extern "system" fn native_exception_filter(
+    info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use std::io::Write;
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    let (code, addr): (u32, usize) = if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+        let rec = &*(*info).ExceptionRecord;
+        (rec.ExceptionCode as u32, rec.ExceptionAddress as usize)
+    } else {
+        (0, 0)
+    };
+    let kind = match code {
+        0xC0000005 => "access violation (segfault)",
+        0xC000001D => "illegal instruction",
+        0xC00000FD => "stack overflow",
+        0xC0000094 => "integer divide by zero",
+        _ => "native exception",
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
+    {
+        let _ = writeln!(
+            f,
+            "FATAL native exception 0x{:08X} ({}) at 0x{:016X} — 崩溃点见上方最后一条 [marker]/[splash]/[appframe] 日志",
+            code, kind, addr
+        );
+        let _ = f.flush();
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// [crash logging] 注册上面的顶层异常过滤器(仅 Windows)。
+#[cfg(windows)]
+fn install_native_crash_handler() {
+    use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+    // SAFETY: 仅传入一个有效的 extern "system" fn 指针。
+    unsafe {
+        SetUnhandledExceptionFilter(Some(native_exception_filter));
+    }
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+    // [crash logging] 强制开启 backtrace(若未设),让 panic 钩子能拿到符号栈。
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+    // [crash logging] Windows 原生崩溃(访问违例/segfault,如 GL 调用)是 SEH 异常、
+    // 不是 Rust panic,panic 钩子抓不到。装一个顶层异常过滤器,在进程死前往日志
+    // 写一行 "FATAL native exception ...",避免日志干净截断。仅 Windows。
+    #[cfg(windows)]
+    install_native_crash_handler();
+    // [crash logging] 全平台 panic 钩子:把 Rust panic 的消息 + 位置(file:line)+
+    // 栈回溯写进 touchHLE_log.txt(echo! 已每行落盘),这样硬崩溃也能留下完整错误。
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "(non-string payload)"
+        };
+        if let Some(location) = info.location() {
+            echo!("Rust panic 于 {}: {}", location, payload);
+        } else {
+            echo!("Rust panic: {}", payload);
+        }
+        echo!("栈回溯:\n{}", std::backtrace::Backtrace::force_capture());
+    }));
+
     echo!(
         "touchHLE {}{}{} — https://touchhle.org/",
         branding(),
