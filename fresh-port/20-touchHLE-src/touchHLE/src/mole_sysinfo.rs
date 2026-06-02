@@ -30,13 +30,63 @@ pub fn set_gpu_desc(desc: String) {
     }
 }
 
+/// 启动时缓存的「游戏本体」标识(显示名 + 版本 + bundle id)。由 `lib.rs` 在打印
+/// App bundle info 后写入,供诊断块 / panic 日志使用(那时还没有 `Environment`)。
+static GAME_VERSION: Mutex<Option<String>> = Mutex::new(None);
+
+/// 由 `lib.rs` 在拿到 bundle 信息后调用,缓存「游戏本体」标识。
+pub fn set_game_version(v: String) {
+    if let Ok(mut g) = GAME_VERSION.lock() {
+        *g = Some(v);
+    }
+}
+
+fn game_version() -> String {
+    GAME_VERSION
+        .try_lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "MoleWorld 5.5.0 (com.taomee.MoleWorld)".to_string())
+}
+
+/// [crash log] 运行「足迹」环形缓冲:在关键生命周期节点记一条,崩溃时(panic 钩子)
+/// 回放最近若干条,快速看出「崩溃前都干了什么」。用 `Vec`(`Vec::new()` 是 const)而非
+/// `VecDeque`(其 const new 较新),容量到顶就丢最旧一条。
+static CRUMBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const CRUMB_CAP: usize = 32;
+
+/// 记录一个运行里程碑(面包屑)。① 存入有界缓冲供 panic 回放;② 立即 `echo!` 落盘,
+/// 这样即使是原生崩溃(Windows SEH,不便在崩溃处读锁),`[足迹]` 行也已在日志里、
+/// 可肉眼回溯到最后一步。里程碑应是低频事件(生命周期节点),不要放进每帧热路径。
+pub fn milestone(msg: &str) {
+    let (date, _) = local_time_and_tz();
+    // date = "YYYY-MM-DD HH:MM:SS";取后段 "HH:MM:SS"(ASCII,按字节切安全)。
+    let hms = if date.len() >= 19 { &date[11..19] } else { date.as_str() };
+    if let Ok(mut q) = CRUMBS.lock() {
+        if q.len() >= CRUMB_CAP {
+            q.remove(0);
+        }
+        q.push(format!("{hms}  {msg}"));
+    }
+    echo!("[足迹] {}", msg);
+}
+
+/// 回放最近的足迹(供 panic 钩子)。用 `try_lock` 避免万一在持锁时 panic 造成死锁。
+pub fn breadcrumbs_dump() -> String {
+    match CRUMBS.try_lock() {
+        Ok(q) if !q.is_empty() => q.join("\n"),
+        Ok(_) => "(无足迹记录)".to_string(),
+        Err(_) => "(足迹缓冲忙)".to_string(),
+    }
+}
+
 /// 从驱动描述里取出 GPU(renderer)那一段。`driver_description` 用 " / " 连接
 /// VERSION / VENDOR / RENDERER,所以取最后一段即 renderer(GPU 名)。
 /// 注意按 " / "(带空格)切分:renderer 自身可能含无空格的 '/'(如
 /// "NVIDIA GeForce RTX 3080/PCIe/SSE2")。
 fn gpu_name() -> String {
     let desc = GPU_DESC
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|g| g.clone())
         .unwrap_or_default();
@@ -116,6 +166,122 @@ fn sysctl_string(name: &str) -> Option<String> {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         Some(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
+}
+
+/// 宿主操作系统名称 + 版本(尽力而为)。用于诊断块,方便定位「哪类系统出问题」。
+#[cfg(target_os = "macos")]
+fn os_name_version() -> String {
+    let arch = std::env::consts::ARCH;
+    let ver = sysctl_string("kern.osproductversion").unwrap_or_default();
+    let build = sysctl_string("kern.osversion").unwrap_or_default();
+    match (ver.is_empty(), build.is_empty()) {
+        (false, false) => format!("macOS {ver} ({build}, {arch})"),
+        (false, true) => format!("macOS {ver} ({arch})"),
+        _ => format!("macOS ({arch})"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn os_name_version() -> String {
+    let arch = std::env::consts::ARCH;
+    if let Ok(txt) = std::fs::read_to_string("/etc/os-release") {
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("PRETTY_NAME=") {
+                let v = v.trim().trim_matches('"');
+                if !v.is_empty() {
+                    return format!("{v} ({arch})");
+                }
+            }
+        }
+    }
+    // 回退:uname。Android 没有 /etc/os-release 时也能给出内核串。
+    unsafe {
+        let mut u: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut u) == 0 {
+            let sys = cstr_to_string(u.sysname.as_ptr());
+            let rel = cstr_to_string(u.release.as_ptr());
+            if !sys.is_empty() {
+                return format!("{sys} {rel} ({arch})");
+            }
+        }
+    }
+    format!("Linux ({arch})")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn cstr_to_string(p: *const libc::c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+}
+
+/// Windows:从已加载的 ntdll 动态解析 `RtlGetVersion`(`GetVersionExW` 在无 manifest 时
+/// 会被系统「撒谎」封顶到 6.2,`RtlGetVersion` 给真实版本/构建号)。只读现成模块句柄,
+/// 不新增加载;任何一步失败都回退到通用串。
+#[cfg(target_os = "windows")]
+fn os_name_version() -> String {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    #[repr(C)]
+    #[allow(dead_code)] // 部分字段仅为匹配 OSVERSIONINFOW 的内存布局/大小。
+    struct OsVersionInfoW {
+        dw_os_version_info_size: u32,
+        dw_major_version: u32,
+        dw_minor_version: u32,
+        dw_build_number: u32,
+        dw_platform_id: u32,
+        sz_csd_version: [u16; 128],
+    }
+    let arch = std::env::consts::ARCH;
+    let fallback = || format!("Windows ({arch})");
+    unsafe {
+        // "ntdll.dll\0" 的 UTF-16。ntdll 始终已加载,GetModuleHandleW 拿现成句柄。
+        let name: Vec<u16> = "ntdll.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let h = GetModuleHandleW(name.as_ptr());
+        if h.is_null() {
+            return fallback();
+        }
+        // PCSTR = *const u8;字节串带结尾 NUL。
+        let Some(proc) = GetProcAddress(h, b"RtlGetVersion\0".as_ptr()) else {
+            return fallback();
+        };
+        let rtl_get_version: unsafe extern "system" fn(*mut OsVersionInfoW) -> i32 =
+            std::mem::transmute(proc);
+        let mut info: OsVersionInfoW = std::mem::zeroed();
+        info.dw_os_version_info_size = std::mem::size_of::<OsVersionInfoW>() as u32;
+        if rtl_get_version(&mut info) != 0 {
+            return fallback();
+        }
+        let (major, minor, build) = (
+            info.dw_major_version,
+            info.dw_minor_version,
+            info.dw_build_number,
+        );
+        let name = if major == 10 && build >= 22000 {
+            "Windows 11"
+        } else if major == 10 {
+            "Windows 10"
+        } else if major == 6 && minor == 3 {
+            "Windows 8.1"
+        } else if major == 6 && minor == 2 {
+            "Windows 8"
+        } else if major == 6 && minor == 1 {
+            "Windows 7"
+        } else {
+            "Windows"
+        };
+        format!("{name} {major}.{minor} (build {build}, {arch})")
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows"
+)))]
+fn os_name_version() -> String {
+    format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// 本地日期时间 + 时区。unix(macOS / Linux / Android)用 libc(含 `tm_gmtoff`,
@@ -207,5 +373,30 @@ Made with love by @Shad0w2333 aka 小丑猫 · 2026.6.1
 
 版权所有 上海淘米公司,如有侵权,尽请谅解!
 Copyright © 2012 Shanghai Shengran Information Technology Co., Ltd. All Rights Reserved"
+    )
+}
+
+/// [crash log] 启动 / 崩溃诊断块:把「移植版本 / 游戏本体 / 操作系统 / CPU / GPU /
+/// 系统时间时区」汇成一个方便用户复制粘贴的可读方框。`window.rs` 在 GL 初始化后输出一次;
+/// panic 钩子也会输出一次(确保崩溃日志自带机器信息)。
+pub fn diag_block() -> String {
+    let ver = crate::GITHUB_REF_NAME
+        .filter(|s| s.starts_with('v'))
+        .unwrap_or("v0.0.1 beta");
+    let game = game_version();
+    let os = os_name_version();
+    let cpu = cpu_model();
+    let gpu = gpu_name();
+    let (time, tz) = local_time_and_tz();
+    format!(
+        "\
+┌──────────── 摩尔庄园HD · 离线移植运行诊断(touchHLE)────────────
+│ 移植版本 : {ver}
+│ 游戏本体 : {game}
+│ 操作系统 : {os}
+│ CPU      : {cpu}
+│ GPU      : {gpu}
+│ 系统时间 : {time} ({tz})
+└─────────────────────────────────────────────────────────────────"
     )
 }
