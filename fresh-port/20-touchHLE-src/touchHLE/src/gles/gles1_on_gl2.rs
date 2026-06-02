@@ -397,46 +397,6 @@ pub struct GLES1OnGL2Context {
     gl_ctx: GLContext,
     state: GLES1OnGL2State,
     is_loaded: bool,
-    default_vao_bound: bool,
-}
-impl GLES1OnGL2Context {
-    /// [MoleWorld/Windows fix] NVIDIA(及其它新驱动)对 "2.1 Compatibility" 的请求
-    /// 实际给的是 4.6 兼容上下文,其中“未绑定 VAO + 客户端顶点数组”的 glDrawArrays
-    /// 会直接 native segfault(无 Rust panic)——这正是本游戏在 Windows/NVIDIA 上
-    /// GL 初始化后(首帧 splash 渲染)闪退的根因。macOS 的真 legacy 2.1 上下文有
-    /// 默认 VAO(对象 0),不需要这一步。这里统一生成并绑定一个非 0 默认 VAO,
-    /// 两端都安全:取不到入口点(如 Apple 2.1 没有 glGenVertexArrays)就跳过,
-    /// 完全不改变 mac 现有行为。每个上下文只做一次。
-    unsafe fn ensure_default_vao(
-        &mut self,
-        loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) {
-        if self.default_vao_bound {
-            return;
-        }
-        self.default_vao_bound = true;
-        // macOS 的 legacy GL 2.1 上下文本就有可用的默认 VAO(对象 0);而且它的
-        // glGenVertexArrays 入口在 2.1 上下文里是非法的——调用会置 GL_INVALID_OPERATION
-        // (1282),该错误潜伏到下游 composition.rs 的 assert_eq!(GetError(),0) 处爆掉
-        // (实测会让 mac 崩)。只有非 macOS(Windows/Linux:驱动可能把 "2.1 兼容" 兑现成
-        // 4.x 兼容上下文、没有可用的默认 VAO 0)才需要显式绑定一个默认 VAO。
-        if cfg!(target_os = "macos") {
-            return;
-        }
-        let gen_ptr = loader_fn("glGenVertexArrays");
-        let bind_ptr = loader_fn("glBindVertexArray");
-        if gen_ptr.is_null() || bind_ptr.is_null() {
-            log!("[GLFIX] glGenVertexArrays/glBindVertexArray absent — skipping default VAO (legacy 2.1, has default VAO 0)");
-            return;
-        }
-        // x64 Windows 单一调用约定下 extern "C" == stdcall,安全。
-        let gen_vaos: extern "C" fn(GLsizei, *mut GLuint) = std::mem::transmute(gen_ptr);
-        let bind_vao: extern "C" fn(GLuint) = std::mem::transmute(bind_ptr);
-        let mut vao: GLuint = 0;
-        gen_vaos(1, &mut vao);
-        bind_vao(vao);
-        log!("[GLFIX] bound default VAO {} (NVIDIA/new-driver compat-profile fix)", vao);
-    }
 }
 impl GLESContext for GLES1OnGL2Context {
     fn description() -> &'static str {
@@ -452,7 +412,6 @@ impl GLESContext for GLES1OnGL2Context {
                 fixed_point_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             },
             is_loaded: false,
-            default_vao_bound: false,
         })
     }
 
@@ -471,9 +430,13 @@ impl GLESContext for GLES1OnGL2Context {
         }
         gl21::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
-        unsafe {
-            self.ensure_default_vao(&mut |s| window.gl_get_proc_address(s));
-        }
+        // 【不要绑定非 0 VAO】我们请求 2.1 Compatibility 上下文;NVIDIA/AMD/Intel
+        // 会把它兑现成 4.x 兼容上下文,而兼容上下文本就有默认 VAO 0,且默认 VAO 0
+        // 完整支持 client-side 顶点数组(present.rs 的 splash 四边形与整个游戏渲染
+        // 都用 client 数组)。若用 glGenVertexArrays 生成一个非默认 VAO 并绑定,
+        // NVIDIA 驱动会把 client 指针误当成 VBO 偏移 → 取顶点时 0xC0000005 原生
+        // segfault(实测 RTX 5090 / 596.36:首帧 splash DrawArrays 必崩)。保持默认
+        // VAO 0,mac/Windows/Linux 三端都安全。
 
         Box::new(GLES1OnGL2 {
             state: &mut self.state,
@@ -494,7 +457,8 @@ impl GLESContext for GLES1OnGL2Context {
         make_current_fn(&self.gl_ctx);
         gl21::load_with(&mut *loader_fn);
         self.is_loaded = true;
-        self.ensure_default_vao(loader_fn);
+        // 见上方 make_current 的说明:不绑定非 0 VAO,依赖兼容上下文的默认 VAO 0
+        // (NVIDIA 上 client-array + 非默认 VAO 会原生 segfault)。
 
         Box::new(GLES1OnGL2 {
             state: &mut self.state,
