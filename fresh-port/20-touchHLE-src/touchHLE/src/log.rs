@@ -118,4 +118,12 @@ macro_rules! echo_no_panic {
 
 /// Put modules to enable [log_dbg] for here, e.g. "touchHLE::mem" to see when
 /// memory is allocated and freed.
-pub const ENABLED_MODULES: &[&str] = &[];
+pub const ENABLED_MODULES: &[&str] = &[
+    // [MoleWorld 音频诊断] 临时点亮音频子系统的 log_dbg,定位 Windows 无声根因。
+    "touchHLE::audio",
+    "touchHLE::audio::openal",
+    "touchHLE::frameworks::openal",
+    "touchHLE::frameworks::audio_toolbox",
+    "touchHLE::frameworks::audio_toolbox::audio_queue",
+    "touchHLE::frameworks::avfoundation::av_audio_player",
+];
