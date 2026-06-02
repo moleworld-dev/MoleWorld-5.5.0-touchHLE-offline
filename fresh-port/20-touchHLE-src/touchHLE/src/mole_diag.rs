@@ -26,7 +26,7 @@
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 const DIAG_PATH: &str = "/tmp/mole_diag.log";
@@ -36,6 +36,26 @@ static TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// De-dup set for `log_unique`. `Mutex::new(None)` is const; the set is created
 /// lazily on first use so no non-const initializer is needed for the static.
 static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// 诊断脚手架(截帧 + 注点 + NO-OP 选择器记录)是给无头 macOS 验证流程用的
+/// **开发者工具**,默认【关闭】,仅当设置环境变量 `MOLE_DIAG` 时启用。原因:
+///   (1) Windows 没有 `/tmp` 目录,截帧的 `File::create("/tmp/...").unwrap()`
+///       会在首帧直接 panic(实测 ea5c0f3 在 RTX 5090 上崩于 debug.rs:16);
+///   (2) 对正式游戏而言,每 30 帧一次 glReadPixels + 每次 runloop 读 /tmp 文件
+///       是纯开销,还会乱写文件。
+/// 验证脚本(launch_game.sh)设 `MOLE_DIAG=1` 即可照常截帧。每进程只查一次环境变量。
+fn diag_enabled() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0=未知, 1=关, 2=开
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("MOLE_DIAG").is_some();
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 
 fn ensure_fresh() {
     if !TRUNCATED.swap(true, Ordering::SeqCst) {
@@ -51,6 +71,9 @@ fn append(line: &str) {
 
 /// Append a line unconditionally (used for the exp/leveling trace).
 pub fn log_line(line: &str) {
+    if !diag_enabled() {
+        return;
+    }
     ensure_fresh();
     append(line);
 }
@@ -58,6 +81,9 @@ pub fn log_line(line: &str) {
 /// Append a `class::selector` pair the first time it is seen, so the file
 /// becomes a compact unique list of every method that silently no-ops.
 pub fn log_unique(class: &str, selector: &str) {
+    if !diag_enabled() {
+        return;
+    }
     ensure_fresh();
     let key = format!("{}::{}", class, selector);
     let mut guard = match SEEN.lock() {
@@ -88,6 +114,9 @@ static FRAME_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// the developer can `Read` it as an image and see the game. Cheap enough at
 /// ~1-2 dumps/sec; glReadPixels is the only real cost.
 pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u32, u32)) {
+    if !diag_enabled() {
+        return;
+    }
     let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     if n % 30 != 0 {
         return;
@@ -116,6 +145,9 @@ static PENDING_UP: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 /// `/tmp/mole_input` of the form `tap <x> <y>` (guest screen points) and turns
 /// it into a Down (this call) followed by an Up (next call).
 pub fn next_inject() -> Option<Inject> {
+    if !diag_enabled() {
+        return None;
+    }
     // Finish a tap already in progress first.
     {
         let mut pend = match PENDING_UP.lock() {
