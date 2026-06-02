@@ -28,7 +28,9 @@ homepage = { workspace = true }
 
 [lib]
 # https://users.rust-lang.org/t/making-both-binary-and-cdylib-from-one-package/29105
-crate-type = ["cdylib", "rlib"]
+# staticlib added for iOS: the iOS app executable statically links libtouchHLE.a
+# (+ SDL2/openal/dynarmic) and calls SDL_main via SDL_UIKitRunApp.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "touchHLE"

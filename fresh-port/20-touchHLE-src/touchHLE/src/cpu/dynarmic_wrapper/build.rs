@@ -53,6 +53,15 @@ fn main() {
     // (or whether the target platform was detected correctly…)
     if boost_path.is_dir() {
         build.define("Boost_INCLUDE_DIR", boost_path);
+    } else if os.eq_ignore_ascii_case("ios") {
+        // [MoleWorld iOS] 交叉编译 iOS 时 find_package(Boost) 找不到 Boost(新版 CMake
+        // 还因策略 CMP0144 忽略 BOOST_ROOT 环境变量),而且本就没有 iOS 的 Boost 库——
+        // dynarmic 只用 Boost 的 header-only 部分。直接把 Boost_INCLUDE_DIR 指向头文件
+        // 目录(优先 BOOST_ROOT/include,否则用 macOS host 构建同款的 Homebrew 头)。
+        let inc = std::env::var("BOOST_ROOT")
+            .map(|r| Path::new(&r).join("include"))
+            .unwrap_or_else(|_| Path::new("/opt/homebrew/include").to_path_buf());
+        build.define("Boost_INCLUDE_DIR", inc);
     }
     // Prevent CMake from using macOS-only linker commands when cross-compiling
     // for Android.
