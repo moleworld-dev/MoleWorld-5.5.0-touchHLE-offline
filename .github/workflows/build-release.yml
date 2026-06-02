@@ -106,12 +106,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         working-directory: fresh-port/20-touchHLE-src/touchHLE
-        run: 7z a MoleWorld-5.5.0-Windows-x64.zip ./touchHLE_windows_bundle/*
+        run: 7z a MoleWorld_v0.0.1_beta_Windows_X86_64.zip ./touchHLE_windows_bundle/*
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Windows-x64.zip
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.1_beta_Windows_X86_64.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -153,32 +153,43 @@ jobs:
         env:
           CMAKE: /usr/bin/cmake
 
-      # 打包:touchHLE 二进制 + 资源 + 内置游戏 + 启动脚本(开箱即玩,与 Win/mac 一致)
-      - name: Package tar.gz (含内置游戏 + 启动器)
+      # 打包:touchHLE 二进制 + 资源 + 内置游戏 + 一键启动器(开箱即玩)。
+      # 关键修复(用户反馈 Linux 包"没有一键启动脚本、点击进到游戏根目录、根本启动不了"):
+      #  (1) 顶层带文件夹打包(tar 不再用 -C bundle .),解压后是干净的一个目录,
+      #      而非一地散文件(散文件里 MoleWorld.app 在 Linux 上只是个普通文件夹 →
+      #      用户双击就"进到游戏根目录",找不到怎么启动);
+      #  (2) 提供真正能用的启动器:启动游戏.sh(GNOME 双击 .sh 默认只用文本编辑器打开、
+      #      不会运行,脚本会自动在终端模拟器里重开并给提示)+ 安装到应用菜单.sh(生成
+      #      桌面/菜单图标,GNOME 最可靠的一键方式)+ 如何运行.txt 说明。
+      - name: Package tar.gz (含内置游戏 + 一键启动器)
         working-directory: fresh-port/20-touchHLE-src/touchHLE
         run: |
-          rm -rf touchHLE_linux_bundle
-          mkdir touchHLE_linux_bundle
-          cp target/release/touchHLE touchHLE_linux_bundle/
-          cp -r touchHLE_dylibs touchHLE_fonts touchHLE_linux_bundle/
-          cp touchHLE_default_options.txt touchHLE_linux_bundle/
-          cp -r ../../01-cracked/Payload/MoleWorld.app touchHLE_linux_bundle/MoleWorld.app
-          find touchHLE_linux_bundle/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
-          printf '#!/bin/sh\ncd "$(dirname "$0")"\n./touchHLE "MoleWorld.app" --landscape-right --device-family=ipad\n' > touchHLE_linux_bundle/run-moleworld.sh
-          chmod +x touchHLE_linux_bundle/run-moleworld.sh touchHLE_linux_bundle/touchHLE
-          tar czf MoleWorld-5.5.0-Linux-x64.tar.gz -C touchHLE_linux_bundle .
+          BUNDLE=MoleWorldHD-Linux-x64
+          rm -rf "$BUNDLE"
+          mkdir "$BUNDLE"
+          cp target/release/touchHLE "$BUNDLE"/
+          cp -r touchHLE_dylibs touchHLE_fonts "$BUNDLE"/
+          cp touchHLE_default_options.txt "$BUNDLE"/
+          cp res/icon.png "$BUNDLE"/icon.png
+          cp -r ../../01-cracked/Payload/MoleWorld.app "$BUNDLE"/MoleWorld.app
+          find "$BUNDLE"/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
+          cp dev-scripts/linux/启动游戏.sh        "$BUNDLE"/启动游戏.sh
+          cp dev-scripts/linux/安装到应用菜单.sh  "$BUNDLE"/安装到应用菜单.sh
+          cp dev-scripts/linux/如何运行.txt        "$BUNDLE"/如何运行.txt
+          chmod +x "$BUNDLE"/touchHLE "$BUNDLE"/启动游戏.sh "$BUNDLE"/安装到应用菜单.sh
+          tar czf MoleWorld_v0.0.1_beta_Linux_X86_64.tar.gz "$BUNDLE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MoleWorld_Linux_x86_64
-          path: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Linux-x64.tar.gz
+          path: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.1_beta_Linux_X86_64.tar.gz
 
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld-5.5.0-Linux-x64.tar.gz
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.1_beta_Linux_X86_64.tar.gz
 
   build-android:
     runs-on: ubuntu-latest
@@ -299,16 +310,16 @@ jobs:
 
       - name: Rename APK
         working-directory: fresh-port/20-touchHLE-src/touchHLE/android
-        run: cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/touchHLE.apk"
+        run: cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/MoleWorld_v0.0.1_beta_Android_AArch64.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: touchHLE_Android_AArch64
-          path: touchHLE.apk
+          path: MoleWorld_v0.0.1_beta_Android_AArch64.apk
 
       - name: Attach APK to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: touchHLE.apk
+          files: MoleWorld_v0.0.1_beta_Android_AArch64.apk
