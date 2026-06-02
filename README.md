@@ -82,9 +82,11 @@
 
 ```
 .
-├─ README.md
-├─ *.ipa                         # 五个版本 IPA（Git LFS）：1.1.5 / 2.4.3 / 5.4.0 / 5.5.0 / 5.5.0破解版
-├─ 启动摩尔庄园.command           # 一键启动脚本
+├─ README.md  /  NOTICE.md  /  LICENSE        # 说明 / 版权 / MPL-2.0
+├─ demo.png                       # 运行截图(README 顶图)
+├─ ios-packages/                  # 五个版本原始 IPA（Git LFS）：1.1.5 / 2.4.3 / 5.4.0 / 5.5.0 / 5.5.0破解版
+├─ .github/workflows/             # 跨平台发布 CI(Win/Linux/Android)
+├─ 启动摩尔庄园.command           # mac 一键启动脚本
 ├─ screenshot/                   # 运行截图
 └─ fresh-port/
    ├─ 01-cracked/                # 可运行的 5.5.0 游戏包（含离线补的音乐/成就图）

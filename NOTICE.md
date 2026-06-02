@@ -11,7 +11,7 @@
 - 打包进 macOS .app 的字体(`touchHLE_fonts/`,如 Liberation、Noto Sans SC)与动态库(`touchHLE_dylibs/`)遵循各自许可证。
 
 ## 3. 游戏本体与资源(淘米版权 —— **不在 MPL 覆盖范围内**)
-- 仓库内的 **IPA 文件**(`摩尔庄园*.ipa`)、解包的游戏包(`fresh-port/01-cracked/`)、旧版逆向素材与研究产物(`fresh-port/30-oldver/`、`fresh-port/02-ida/`、`fresh-port/03-objc/` 等)中的**游戏代码、美术、音频、数据**,**版权归淘米(Taomee)所有**。
+- 仓库内的 **IPA 文件**(`ios-packages/*.ipa`)、解包的游戏包(`fresh-port/01-cracked/`)、旧版逆向素材与研究产物(`fresh-port/30-oldver/`、`fresh-port/02-ida/`、`fresh-port/03-objc/` 等)中的**游戏代码、美术、音频、数据**,**版权归淘米(Taomee)所有**。
 - 这些内容仅用于**个人怀旧、技术研究与数字存档**,**严禁任何商业用途**。
 - 《摩尔庄园移动版/豪华版》已于 **2015 年停止运营、从 App Store 下架**,服务器关闭,无任何官方在售或下载渠道。
 - **如版权方提出异议,将立即移除相关内容。**
