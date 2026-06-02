@@ -12,6 +12,7 @@
 //! the user at least sees the original text instead of a blank page.
 
 use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
 use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::fs::GuestPath;
 use crate::objc::{
@@ -227,7 +228,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())loadHTMLString:(id)html_string baseURL:(id)_base_url {
     let html = to_rust_string(env, html_string).to_string();
     let white: id = msg_class![env; UIColor whiteColor];
-    show_text(env, this, &html_to_text(&html), white);
+    show_text(env, this, &html_to_text(&html), white, false);
 }
 - (())loadRequest:(id)request { // NSURLRequest*
     if request == nil {
@@ -250,14 +251,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         let (r, g, b) = crate::mole_sysinfo::HELP_BG_RGB;
         let bg: id = msg_class![env; UIColor colorWithRed:r green:g blue:b alpha:1.0f32];
         log!("UIWebView: [MoleWorld] 渲染自定义「关于」页(替代 {})", path);
-        show_text(env, this, &text, bg);
+        show_text(env, this, &text, bg, true);
     } else {
         match read_document(env, &path) {
             Some(html) => {
                 let text = html_to_text(&html);
                 log!("UIWebView: rendering {} ({} chars of extracted text)", path, text.len());
                 let white: id = msg_class![env; UIColor whiteColor];
-                show_text(env, this, &text, white);
+                show_text(env, this, &text, white, false);
             }
             None => {
                 log!("UIWebView: couldn't read {}", path);
@@ -293,7 +294,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// Build (or refresh) a multi-line label child showing `text`, filling this
 /// web view's bounds on a white background.
-fn show_text(env: &mut Environment, web_view: id, text: &str, bg_color: id) {
+fn show_text(env: &mut Environment, web_view: id, text: &str, bg_color: id, center: bool) {
     // Remove any previous label.
     let old: id = env.objc.borrow::<UIWebViewHostObject>(web_view).text_label;
     if old != nil {
@@ -319,6 +320,11 @@ fn show_text(env: &mut Environment, web_view: id, text: &str, bg_color: id) {
     let text_ns = from_rust_string(env, text.to_string());
     () = msg![env; label setText:text_ns];
     release(env, text_ns);
+
+    // MoleWorld「关于」页用居中对齐(贴近原版页脚版式);抽取文档保持左对齐。
+    if center {
+        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+    }
 
     () = msg![env; web_view addSubview:label];
     env.objc.borrow_mut::<UIWebViewHostObject>(web_view).text_label = label;
