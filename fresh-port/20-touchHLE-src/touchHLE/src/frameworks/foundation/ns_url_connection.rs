@@ -67,11 +67,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)sendSynchronousRequest:(id)request // NSURLRequest *
            returningResponse:(MutPtr<id>)response // NSURLResponse **
                        error:(MutPtr<id>)out_error { // NSError **
-    log!(
-        "[NSURLConnection sendSynchronousRequest:{:?} ('{}')] -> nil (offline)",
-        request,
-        url_string_from_request(env, request),
-    );
+    // [crash log] 离线下分析 SDK(如 TalkingData)会每帧重试同步上报,这条会刷爆日志
+    // (实测一份日志里 400+ 条同样的行),把崩溃前真正的操作淹没、文件也可能撑大。
+    // 只完整记录首条,之后同类离线同步请求不再每条刷屏。行为不变(始终返回 nil)。
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED_OFFLINE_ONCE: AtomicBool = AtomicBool::new(false);
+        if !LOGGED_OFFLINE_ONCE.swap(true, Ordering::Relaxed) {
+            log!(
+                "[NSURLConnection sendSynchronousRequest:{:?} ('{}')] -> nil (offline) [后续同类离线同步请求不再每条记录]",
+                request,
+                url_string_from_request(env, request),
+            );
+        }
+    }
     if !response.is_null() {
         env.mem.write(response, nil);
     }

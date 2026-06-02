@@ -413,6 +413,9 @@ impl Window {
             log!("Driver info: {}", desc);
             // [MoleWorld] 缓存给「关于」页用(此刻上下文 current,glGetString 安全)。
             crate::mole_sysinfo::set_gpu_desc(desc);
+            // [crash log] GPU 已缓存、游戏版本已在 main 缓存 → 输出一次完整运行诊断块,
+            // 方便用户贴日志时一眼看清「什么机器 / 什么系统 / 什么版本」。
+            echo!("{}", crate::mole_sysinfo::diag_block());
         }
         window.internal_gl_ins = Some(gl_ins);
 
