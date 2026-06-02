@@ -40,6 +40,19 @@ cp -R touchHLE_fonts "$APP/"
 cp -R touchHLE_dylibs "$APP/"
 cp touchHLE_default_options.txt "$APP/"
 
+# 2.5) [PlayCover/Apple Silicon] touchHLE_dylibs 是游戏(被模拟端)用的 ARMv6/v7 guest
+#      库(无 arm64);PlayCover 会扫描 .app 内每个 Mach-O 并要求含 arm64,否则报
+#      "无法在通用二进制文件中检索到 ARM64 架构"。给每个 guest dylib 追加一个 arm64 空
+#      slice:PlayCover 扫描满意,而 touchHLE 仍从 fat 里挑 armv6/v7 用(libgcc 本就是
+#      多 arm-slice 的 fat、touchHLE 正常加载,证明其 Mach-O 加载器按 arch 选 slice)。
+STUBC="$STAGE/_stub.c"; STUB="$STAGE/_arm64stub.dylib"
+echo 'static int _mw_a64=1; int _mw_a64_keep(void){return _mw_a64;}' > "$STUBC"
+xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=13.0 -dynamiclib -o "$STUB" "$STUBC"
+for dylib in "$APP"/touchHLE_dylibs/*.dylib; do
+	lipo "$dylib" "$STUB" -create -output "$dylib.fat" && mv "$dylib.fat" "$dylib"
+done
+rm -f "$STUB" "$STUBC"
+
 # 3) 把游戏打成 MoleWorld.ipa(store zip,Payload/MoleWorld.app 结构),放 .app 根;
 #    ios_entry() 读 <bundle>/MoleWorld.ipa,BundleData 直接就地解 zip。
 rm -rf _game_stage && mkdir -p _game_stage/Payload
