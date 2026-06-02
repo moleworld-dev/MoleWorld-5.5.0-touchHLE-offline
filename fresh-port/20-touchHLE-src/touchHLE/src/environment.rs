@@ -464,6 +464,9 @@ impl Environment {
                     env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
                     // Static initializers for libraries must be run before
                     // the initializer in the app binary.
+                    crate::mole_sysinfo::milestone(
+                        "即将执行 guest 静态初始化器(首次把 guest ARM 代码 JIT 成机器码并运行)",
+                    );
                     for bin_idx in env.get_sorted_bin_indices().unwrap() {
                         let Some(bin) = env.bins.get(bin_idx) else {
                             continue;
@@ -490,6 +493,7 @@ impl Environment {
                         }
                         log_dbg!("Static initialization done");
                     }
+                    crate::mole_sysinfo::milestone("guest 静态初始化器全部完成");
 
                     {
                         let bin_path = env.bundle.executable_path();
@@ -521,6 +525,9 @@ impl Environment {
                         stack::prep_stack_for_start(&mut env.mem, &mut env.cpu, &argv, envp, apple);
                     }
 
+                    crate::mole_sysinfo::milestone(
+                        "跳转 guest app 入口(_start → main → UIApplicationMain)",
+                    );
                     // Manually call here, since running call_from_host pushes
                     // a stack frame and disrupts abi for _start.
                     env.cpu

@@ -286,6 +286,12 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else {
             echo!("Rust panic: {}", payload);
         }
+        // [crash log] 崩溃日志自带机器信息 + 崩溃前的运行足迹,便于定位/复现/debug。
+        echo!("{}", crate::mole_sysinfo::diag_block());
+        echo!(
+            "最近运行足迹(早 → 晚):\n{}",
+            crate::mole_sysinfo::breadcrumbs_dump()
+        );
         echo!("栈回溯:\n{}", std::backtrace::Backtrace::force_capture());
     }));
 
@@ -406,6 +412,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     echo!("- Display name: {}", bundle.display_name());
     echo!("- Version: {}", bundle.bundle_version());
     echo!("- Identifier: {}", app_id);
+    // [crash log] 缓存「游戏本体」标识,供诊断块 / panic 日志使用(此处 bundle 信息已知)。
+    crate::mole_sysinfo::set_game_version(format!(
+        "{} {} ({})",
+        bundle.display_name(),
+        bundle.bundle_version(),
+        app_id
+    ));
     if let Some(canonical_name) = bundle.canonical_bundle_name() {
         echo!("- Internal name (canonical): {}.app", canonical_name);
     } else {
