@@ -104,6 +104,33 @@ cat > "$APP/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# 5.5) Ad-hoc 代码签名。Rust 产出的 iOS 二进制【完全未签名】,而 Apple Silicon
+#      (PlayCover 在 Mac 上跑、以及真机)要求二进制至少有签名,否则报
+#      "code object is not signed at all"。ad-hoc 签名(-s -)即可接上 PlayCover/
+#      AltStore 的重签链路。先签 guest dylib(Mach-O,bundle 扫描器要求有签名),
+#      再带 JIT 权限签主程序(dynarmic 需要 JIT)。
+cat > "$STAGE/entitlements.plist" <<'ENT'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key><true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+	<key>com.apple.security.cs.disable-library-validation</key><true/>
+	<key>dynamic-codesigning</key><true/>
+</dict>
+</plist>
+ENT
+for dylib in "$APP"/touchHLE_dylibs/*.dylib; do
+	codesign --force --sign - "$dylib" 2>/dev/null || echo "  (跳过签名 $dylib:guest dylib,无妨)"
+done
+# 单条 --deep --entitlements 一次签全:--deep 签嵌套(dylib)+ 主程序,entitlements
+# 落到主程序(JIT 权限),并封 bundle。避免"先签主程序带权限、再 --deep 整包"把权限覆盖掉。
+codesign --force --deep --sign - --entitlements "$STAGE/entitlements.plist" --generate-entitlement-der "$APP"
+echo "--- 签名核对 ---"
+codesign -dv "$APP/MoleWorldHD" 2>&1 | grep -iE "Signature|Identifier|format" | head -4 || true
+codesign --verify --verbose=2 "$APP/MoleWorldHD" 2>&1 | head -3 && echo "✓ 主程序签名通过" || echo "(verify 警告;ad-hoc 通常仍被 PlayCover 接受)"
+
 # 6) 打包成 IPA(Payload/ -> zip)
 rm -f "$TOUCHHLE_DIR/摩尔庄园HD.ipa"
 ( cd "$STAGE" && zip -r -X -q "$TOUCHHLE_DIR/摩尔庄园HD.ipa" Payload )
