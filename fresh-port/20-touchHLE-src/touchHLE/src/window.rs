@@ -409,7 +409,10 @@ impl Window {
         let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
         {
             let gl_ctx = gl_ins.make_current(&mut window);
-            log!("Driver info: {}", unsafe { gl_ctx.driver_description() });
+            let desc = unsafe { gl_ctx.driver_description() };
+            log!("Driver info: {}", desc);
+            // [MoleWorld] 缓存给「关于」页用(此刻上下文 current,glGetString 安全)。
+            crate::mole_sysinfo::set_gpu_desc(desc);
         }
         window.internal_gl_ins = Some(gl_ins);
 

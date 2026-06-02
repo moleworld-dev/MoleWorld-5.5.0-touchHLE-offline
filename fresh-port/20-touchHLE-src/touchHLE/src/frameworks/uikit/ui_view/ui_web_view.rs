@@ -226,7 +226,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())loadHTMLString:(id)html_string baseURL:(id)_base_url {
     let html = to_rust_string(env, html_string).to_string();
-    show_text(env, this, &html_to_text(&html));
+    let white: id = msg_class![env; UIColor whiteColor];
+    show_text(env, this, &html_to_text(&html), white);
 }
 - (())loadRequest:(id)request { // NSURLRequest*
     if request == nil {
@@ -241,14 +242,26 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     let path = to_rust_string(env, path_ns).to_string();
-    match read_document(env, &path) {
-        Some(html) => {
-            let text = html_to_text(&html);
-            log!("UIWebView: rendering {} ({} chars of extracted text)", path, text.len());
-            show_text(env, this, &text);
-        }
-        None => {
-            log!("UIWebView: couldn't read {}", path);
+    if path.contains("mole_help") {
+        // [MoleWorld] 原版帮助页(mole_help.html:FAQ + 官方技术支持 + 版权)替换为
+        // 本移植项目的「关于」页:作者 / 官方交流群 / 当前运行硬件(CPU/GPU/分辨率/
+        // 系统时间时区)/ 贡献者 / 版本 / 版权。背景沿用原版暖黄色。
+        let text = crate::mole_sysinfo::mole_help_text(env);
+        let (r, g, b) = crate::mole_sysinfo::HELP_BG_RGB;
+        let bg: id = msg_class![env; UIColor colorWithRed:r green:g blue:b alpha:1.0f32];
+        log!("UIWebView: [MoleWorld] 渲染自定义「关于」页(替代 {})", path);
+        show_text(env, this, &text, bg);
+    } else {
+        match read_document(env, &path) {
+            Some(html) => {
+                let text = html_to_text(&html);
+                log!("UIWebView: rendering {} ({} chars of extracted text)", path, text.len());
+                let white: id = msg_class![env; UIColor whiteColor];
+                show_text(env, this, &text, white);
+            }
+            None => {
+                log!("UIWebView: couldn't read {}", path);
+            }
         }
     }
     // Notify the delegate that loading "finished" so the host layer proceeds.
@@ -280,7 +293,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// Build (or refresh) a multi-line label child showing `text`, filling this
 /// web view's bounds on a white background.
-fn show_text(env: &mut Environment, web_view: id, text: &str) {
+fn show_text(env: &mut Environment, web_view: id, text: &str, bg_color: id) {
     // Remove any previous label.
     let old: id = env.objc.borrow::<UIWebViewHostObject>(web_view).text_label;
     if old != nil {
@@ -291,9 +304,8 @@ fn show_text(env: &mut Environment, web_view: id, text: &str) {
 
     let bounds: CGRect = msg![env; web_view bounds];
 
-    // White background so dark text is readable (matches the help page).
-    let white: id = msg_class![env; UIColor whiteColor];
-    () = msg![env; web_view setBackgroundColor:white];
+    // 背景:抽取文档用白底;MoleWorld「关于」页用原版暖黄(由调用方传入)。
+    () = msg![env; web_view setBackgroundColor:bg_color];
 
     let label: id = msg_class![env; UILabel alloc];
     let label: id = msg![env; label initWithFrame:bounds];
