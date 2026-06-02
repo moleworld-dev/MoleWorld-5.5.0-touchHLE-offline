@@ -152,17 +152,17 @@ fn ensure_bundled_moleworld() -> Option<String> {
     Some(target.to_string_lossy().into_owned())
 }
 
-/// This is the true entry point on iOS (SDL's UIKit `SDL_UIKitRunApp` shim calls
-/// it after UIApplication setup), analogous to the Android entry above. The game
-/// (MoleWorld.ipa) is bundled inside the .app, so we load it directly from the
-/// read-only bundle and skip the app picker → tap the icon to play. Saves go to
-/// the writable pref_path (see paths.rs get_macos_bundled_resources_path iOS arm).
+/// iOS entry, called from the app executable's `SDL_UIKitRunApp` callback in
+/// bin.rs (that callback is the `SDL_main_func` SDL invokes after UIApplication
+/// setup). Defined as a normal `pub fn` (NOT `#[no_mangle]`) so it survives
+/// cross-crate fat-LTO when the bin references it — a bare `#[no_mangle]` symbol
+/// in the lib gets internalized by the lib's LTO and isn't visible to the bin.
+/// The game (MoleWorld.ipa) is bundled inside the .app; we load it directly from
+/// the read-only bundle (BundleData reads the zip in place, no copy) and skip the
+/// app picker → tap the icon to play. Saves go to the writable pref_path (see
+/// paths.rs get_macos_bundled_resources_path iOS arm).
 #[cfg(target_os = "ios")]
-#[no_mangle]
-pub extern "C" fn SDL_main(
-    _argc: std::ffi::c_int,
-    _argv: *const *const std::ffi::c_char,
-) -> std::ffi::c_int {
+pub fn ios_entry() {
     std::panic::set_hook(Box::new(|info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s
@@ -178,9 +178,6 @@ pub extern "C" fn SDL_main(
         }
     }));
 
-    // SDL's base path on iOS is the .app bundle root; the bundled game sits at
-    // <bundle>/MoleWorld.ipa. BundleData reads the .ipa (zip) directly from the
-    // read-only bundle (no copy needed). Skip the picker by passing the path.
     let base = sdl2::filesystem::base_path().unwrap_or_else(|_| String::from("./"));
     let game = std::path::Path::new(&base).join("MoleWorld.ipa");
     let args = vec![
@@ -193,7 +190,6 @@ pub extern "C" fn SDL_main(
         Ok(_) => echo!("touchHLE finished"),
         Err(e) => echo!("touchHLE errored: {e:?}"),
     }
-    0
 }
 
 const USAGE: &str = "\
