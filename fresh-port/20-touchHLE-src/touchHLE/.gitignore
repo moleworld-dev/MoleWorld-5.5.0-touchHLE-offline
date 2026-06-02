@@ -27,3 +27,14 @@ android/build
 # Default developer dump file
 
 DUMP.txt
+
+# 本地打包产物(发布包 / IPA / 临时打包目录,不入库;CI 会重新生成)
+
+/摩尔庄园HD.ipa
+/MoleWorldHD-Linux-x64/
+/touchHLE_windows_bundle/
+/touchHLE_linux_bundle/
+/_ios_stage/
+/_game_stage/
+/MoleWorld_v0.0.1_beta_*.zip
+/MoleWorld_v0.0.1_beta_*.tar.gz

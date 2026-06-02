@@ -1,8 +1,8 @@
-# 摩尔庄园移动版/豪华版 5.5.0 — 离线移植（touchHLE）
+# 摩尔庄园HD 移动版 现代化离线移植（基于touchHLE）
 
 ![摩尔庄园 5.5.0 在 touchHLE 上离线运行（Apple Silicon Mac）](demo.png)
 
-把 2015 年已停运下架的《摩尔庄园移动版》（安卓叫《摩尔庄园豪华版》，**2D 平面模拟经营**，非现在的 3D 新版）的最后一个版本 **5.5.0（夏季海洋更新）**，通过 [touchHLE](https://touchhle.org)（Rust 写的 iOS 高层模拟器）**搬到 Apple Silicon Mac / 现代系统上离线游玩**。
+把 2015 年已停运下架的《摩尔庄园移动版》（安卓叫《摩尔庄园豪华版》，**2D 平面模拟经营**，非现在的 3D 新版）的最后一个版本 **5.5.0（夏季海洋更新）**，通过 [touchHLE](https://touchhle.org)（Rust 写的 iOS 高层模拟器）**搬到 macOS / Windows / Linux / Android 等现代系统上离线游玩**（iOS 原生版移植进行中）。
 
 > 这是一台 32 位 ARMv7 的 cocos2d-iphone 老游戏。官方服务器已彻底关停，本项目目标是**不依赖任何服务器、纯离线**把单机部分跑起来、并把原作者真机越狱修改器（贝壳/数值/解锁等）的能力复刻进模拟器。
 
@@ -59,17 +59,38 @@
 
 ## 🛠️ 支持情况 / 怎么跑
 
-- **平台**：Apple Silicon Mac（macOS）。touchHLE 走 iOS arm64 构建。
-- **构建**：进 `fresh-port/20-touchHLE-src/touchHLE/`，`cargo build --release`（首次需拉取 vendor 子模块依赖；boost 由构建脚本下载）。
-- **运行**：`./target/release/touchHLE "<MoleWorld.app 路径>" --landscape-right --device-family=ipad`，或用根目录的 `启动摩尔庄园.command`。游戏包在 `fresh-port/01-cracked/Payload/MoleWorld.app`（已含离线补的音乐/成就图）。
-- **修改器**：游戏内按 **T** 召出菜单。
+**支持平台**：macOS（Apple Silicon）、Windows x64、Linux x64、Android arm64 —— 这四个平台都提供**开箱即玩**的发布包（游戏已内置进包里，**点击即玩**，无需自己找 IPA）。iOS 原生版**移植进行中**(详见下文)。
+
+发布包从 GitHub Releases 页下载：<https://github.com/Shad0w23333/MoleWorld-5.5.0-touchHLE-offline/releases>
+
+### 🟢 开箱即玩（下载即跑，已内置游戏）
+
+- **🍎 macOS（Apple Silicon）**：下载 `.zip` → 解压 → **右键**「摩尔庄园.app」→「打开」（第一次需这样过 Gatekeeper，之后双击即可）→ 进游戏。
+- **🪟 Windows x64**：下载 `.zip` → 解压 → 双击 **`Run-MoleWorld.bat`** → 进游戏。
+- **🐧 Linux x64**：下载 `.tar.gz` → 解压得到一个文件夹 → 进文件夹双击 **`启动游戏.sh`**(KDE/XFCE 会弹「运行 / Run」；**GNOME 需右键 →「以程序运行 / Run as a Program」**，因为 GNOME 双击 `.sh` 默认只会用文本编辑器打开、不会运行)；也可在终端里 `./启动游戏.sh`。想要桌面/菜单图标(GNOME 最省心)就运行同目录的 **`安装到应用菜单.sh`**;详细说明见包内 **`如何运行.txt`**。需要系统装有 OpenGL / SDL2 运行库。
+- **🤖 Android arm64**：下载 `.apk` → 安装(debug 签名,需在系统里允许「未知来源 / 安装未知应用」)→ 直接进游戏(游戏已内置进 apk,**点击即玩**)。
+
+所有平台进游戏后,按 **T** 键召出修改器菜单。
+
+### 🧪 iOS（原生 arm64,移植进行中 / 实验性,尚未发布）
+
+基于 touchHLE 的 iOS arm64 构建。目前在 **Apple Silicon Mac 的 PlayCover** 上已经能安装、能启动、能跑到 GL 渲染阶段,但卡在 **GLES1.1 上下文**初始化(疑似 PlayCover / iOS-on-Mac 这套环境对古老 GLES1.1 的支持限制,**不是 IPA 本身的问题**);**原生 GLES1.1 的真机**验证尚未进行。该版本**还没有发布**,这里如实标注为「进行中」。
+
+### 🔧 从源码构建（可选）
+
+1. 进 `fresh-port/20-touchHLE-src/touchHLE/`,执行 `cargo build --release`。
+2. **无需** `git submodule` 初始化 —— vendor 依赖已摊平为仓库里的普通文件;boost 由构建脚本自动下载。
+3. 运行:`./target/release/touchHLE "<MoleWorld.app 路径>" --landscape-right --device-family=ipad`,或在 macOS 上用根目录的 `启动摩尔庄园.command`。游戏包在 `fresh-port/01-cracked/Payload/MoleWorld.app`(已含离线补的音乐/成就图)。
+4. 游戏内按 **T** 召出修改器菜单。
+
+> Windows / Linux / Android 三个平台的发布包由跨平台 CI(`.github/workflows/build-release.yml`)自动构建并附到 Release;macOS 的特制 `.app` 在本地打包后手动上传。
 
 ---
 
 ## 🔬 用了什么工具
 
 - **[touchHLE](https://touchhle.org)** — 本项目的运行基座（Rust iOS 高层模拟器），本仓库是带摩尔庄园移植改动的 fork。
-- **otool / nm / lipo**（Xacode 自带）— 反汇编、ObjC 元数据导出、胖二进制切片。
+- **otool / nm / lipo**（Xcode 自带）— 反汇编、ObjC 元数据导出、胖二进制切片。
 - **openssl** — 解密游戏数据表（**AES-128-ECB**，全版本通用 key = ASCII `39653543fa0d66aa`，`getEncrypKey` 前 16 字节）。
 - **plutil / Python** — 解析 bplist 数据表（物品/任务/等级/音乐映射）。
 - **cycript + Mach API**（历史，真机脱壳）— 老越狱设备上 `task_for_pid`+`vm_read_overwrite` 自进程脱壳。
@@ -107,6 +128,7 @@
 - **Never.** 的教程《记一次在老 iOS 设备上折腾"摩尔庄园移动版/豪华版（2015）"的经历》—— <https://dreamiao.com/2229/>（游戏身份/版本史/超级贝壳内购破解/存档与语言 bug 等背景知识）
 - **[touchHLE](https://touchhle.org)** 项目及其作者 —— 没有这个 iOS 模拟器,这一切都无从谈起。
 - 淘米《摩尔庄园》原作团队 —— 童年回忆。
+- **GitHub [@EdmundDHow](https://github.com/EdmundDHow)** 🧧 —— 慷慨赞助了 **30 元人民币**,为这个纯爱发电的怀旧项目添了一把柴。这份心意我们记下了,谢谢你！
 
 ---
 
