@@ -679,6 +679,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
 
     // Draw the quad
+    log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
     present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
 
     // Clean up the texture

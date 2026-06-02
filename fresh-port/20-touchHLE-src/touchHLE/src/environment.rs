@@ -377,6 +377,7 @@ impl Environment {
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
+        log!("[boot] splash 已过,即将加载主程序 Mach-O");
         let executable = mach_o::MachO::load_from_file(
             bundle.executable_path(),
             &fs,
@@ -384,6 +385,7 @@ impl Environment {
             /* slide: */ 0,
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
+        log!("[boot] 主程序 Mach-O 加载完成");
 
         let mut dylibs = Vec::new();
         for dylib in &executable.dynamic_libraries {
