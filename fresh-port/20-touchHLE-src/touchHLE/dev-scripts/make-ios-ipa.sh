@@ -26,8 +26,13 @@ APP="$STAGE/Payload/$APPNAME.app"
 
 rm -rf "$STAGE" && mkdir -p "$APP"
 
-# 1) 主可执行文件
-cp "$EXE" "$APP/$APPNAME"
+# 1) 主可执行文件。cargo 产出的是 THIN arm64;PlayCover/Apple Silicon 要从
+#    universal(fat)二进制里抽 arm64 slice,对 thin 会报"无法在通用二进制中检索
+#    到 ARM64 架构"。用 lipo 包成(单 arch 的)fat 二进制。必须在 codesign 之前——
+#    lipo 会清掉已有签名。
+cp "$EXE" "$APP/$APPNAME.thin"
+lipo -create "$APP/$APPNAME.thin" -output "$APP/$APPNAME"
+rm -f "$APP/$APPNAME.thin"
 chmod +x "$APP/$APPNAME"
 
 # 2) touchHLE 运行时资源(iOS 上从 .app 根 = SDL base_path 读取)
