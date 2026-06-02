@@ -227,6 +227,96 @@ fn objc_msgSend_inner(
         if let Some(&super::ClassHostObject { ref name, .. }) =
             ho.as_any().downcast_ref::<super::ClassHostObject>()
         {
+            // -[AvatarLayer showNetWorkError]: 离线改名落地。
+            //
+            // 改名流程(RE 自 5.5.0 armv7,对照 2.4.3):
+            //   用户在改名框点"确定"→ 收键盘 → -[AvatarLayer hideTextField]
+            //   (IMP 0xffb74)。hideTextField 先把输入框/背景 setHidden:/setVisible:
+            //   收起(UI 拆解,无条件先执行),再 `if textField.text.length==0 return`,
+            //   然后唯一的"无网络门":
+            //       if ([[NetworkManager sharedInstance] isReachable]) [self VerifyNickName];
+            //       else                                              [self showNetWorkError];
+            //   在线分支 -[AvatarLayer VerifyNickName](0xffc4c)只做
+            //   `[<obj> sendNickNameToServer: self.textField.text]`(上传,不本地落地);
+            //   真正"本地改名+刷新屏幕昵称"在 -[AvatarLayer saveName](0xffca4),它做
+            //   `[[GameData sharedInstance].userInfoData setName: self.textField.text]`×2
+            //   + `[<label> setString: self.textField.text]`,只读 textField,绝不碰服务器
+            //   数据 → 离线调用 100% 安全。正常在线时 saveName 由服务器改名成功回包
+            //   (远在 0x229bc 的网络分发器)触发;离线那一回包永不到达,所以名字落不下来。
+            //   (-[AvatarLayer showEditNickNameResult:] 在 5.5.0 与 2.4.3 都是空壳 `bx lr`,
+            //   且全二进制无任何 selref 引用 → 驱动它毫无意义,这里不用它。)
+            //
+            // 为什么之前把 SCNetworkReachabilityGetFlags 谎报可达没用:门读的是
+            // NetworkManager 缓存的 isReachable_ ivar(由 reachability 回调写,离线永远
+            // 不触发),不是实时 GetFlags。
+            //
+            // 拦截点选 showNetWorkError 而非 hideTextField:已核实在整个 AvatarLayer
+            // 代码段(0xfc6c8..0x1001d3)里 showNetWorkError 只有 0xffc40 这一个调用点
+            // (就是上面的离线门),所以 `name=="AvatarLayer" && sel=="showNetWorkError"`
+            // 唯一对应"离线改名失败"这一条路 —— 既不误伤别处的无网络提示,又让 hideTextField
+            // 的 UI 拆解照常先跑完。拦到后:用游戏自己的 saveName 本地落地 + 刷新屏幕昵称,
+            // 再 -[GameData saveUserInfoData] 落盘(AES 归档,与 mole_menu 同一持久化路径),
+            // 最后吞掉"无网络"弹窗。
+            if name == "AvatarLayer" && selector.as_str(&env.mem) == "showNetWorkError" {
+                let recv = receiver;
+                drop(message_type_info);
+                // 1) 本地生效 + 刷新屏幕昵称(saveName 只读 self.textField,离线安全)。
+                if env.objc.object_has_method_named(&env.mem, recv, "saveName") {
+                    let save_name = env
+                        .objc
+                        .register_host_selector("saveName".to_string(), &mut env.mem);
+                    let _: () = crate::objc::msg_send(env, (recv, save_name));
+                } else {
+                    // 兜底(理论上 5.5.0 必有 saveName):直接
+                    // [[GameData sharedInstance].userInfoData setName: self.textField.text]。
+                    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+                    let shared = env
+                        .objc
+                        .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+                    let gd: id = crate::objc::msg_send(env, (gd_cls, shared));
+                    let ui_sel = env
+                        .objc
+                        .register_host_selector("userInfoData".to_string(), &mut env.mem);
+                    let ui: id = if gd != nil {
+                        crate::objc::msg_send(env, (gd, ui_sel))
+                    } else {
+                        nil
+                    };
+                    // self.textField:RE 显示 hideTextField/saveName 取 self 上的输入框 ivar;
+                    // 从 Rust 取不到该 ivar,故兜底走 AvatarLayer 的 -nickName getter(若有)
+                    // 或直接放弃改名值(只持久化已有状态)。saveName 路径几乎总会命中,
+                    // 这里仅作不崩的保险。
+                    if ui != nil && env.objc.object_has_method_named(&env.mem, recv, "nickName") {
+                        let nick_sel = env
+                            .objc
+                            .register_host_selector("nickName".to_string(), &mut env.mem);
+                        let nick: id = crate::objc::msg_send(env, (recv, nick_sel));
+                        if nick != nil {
+                            let set_name = env
+                                .objc
+                                .register_host_selector("setName:".to_string(), &mut env.mem);
+                            let _: () = crate::objc::msg_send(env, (ui, set_name, nick));
+                        }
+                    }
+                }
+                // 2) 落盘:-[GameData saveUserInfoData](AES 归档到 /Documents 的 .dat,
+                //    与 mole_menu 的 save_user_info 同路径)。
+                let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+                let shared = env
+                    .objc
+                    .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+                let gd: id = crate::objc::msg_send(env, (gd_cls, shared));
+                if gd != nil {
+                    let save = env
+                        .objc
+                        .register_host_selector("saveUserInfoData".to_string(), &mut env.mem);
+                    let _: () = crate::objc::msg_send(env, (gd, save));
+                }
+                log!("[改名] 离线改名已本地生效并落盘(saveName + saveUserInfoData),吞掉无网络弹窗");
+                // 3) 吞掉"无网络"弹窗 —— 不让原 showNetWorkError 跑。
+                env.cpu.regs_mut()[0..2].fill(0);
+                return;
+            }
             // -[IMCommonMgr checkUpdates:]: kicks off +[CryptUtils doCipher:...]
             // on network data that's empty offline, computing a negative (huge
             // unsigned) buffer size that corrupts memory. Pure analytics/update

@@ -337,13 +337,13 @@ pub fn mole_help_text(env: &mut Environment) -> String {
     let cpu = cpu_model();
     let gpu = gpu_name();
     let (time, tz) = local_time_and_tz();
-    // 移植发布版本号:CI 在 tag 上构建时 GITHUB_REF_NAME = 该 tag(如 v0.0.1-beta),
+    // 移植发布版本号:CI 在 tag 上构建时 GITHUB_REF_NAME = 该 tag(如 v0.0.2-beta),
     // 天然「随 GitHub build 更新」;本地 / 分支构建回退到常量。
     // (刻意不用 crate::VERSION/git describe:touchHLE 子目录残留内嵌 .git,本地
     //  git describe 会命中 touchHLE 上游版本 v0.2.3 而非本项目 tag。)
     let ver = crate::GITHUB_REF_NAME
         .filter(|s| s.starts_with('v'))
-        .unwrap_or("v0.0.1 beta");
+        .unwrap_or("v0.0.2 beta");
 
     format!(
         "\
@@ -382,7 +382,7 @@ Copyright © 2012 Shanghai Shengran Information Technology Co., Ltd. All Rights 
 pub fn diag_block() -> String {
     let ver = crate::GITHUB_REF_NAME
         .filter(|s| s.starts_with('v'))
-        .unwrap_or("v0.0.1 beta");
+        .unwrap_or("v0.0.2 beta");
     let game = game_version();
     let os = os_name_version();
     let cpu = cpu_model();

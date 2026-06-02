@@ -119,7 +119,27 @@ impl StringHostObject {
                 StringHostObject::Utf8(Cow::Owned(string))
             }
             NSUTF8StringEncoding => {
-                let string = String::from_utf8(bytes.into_owned()).unwrap();
+                // 真实 iOS 的 NSUTF8 解码对非法/截断字节是宽容的(不会崩)。touchHLE 原来
+                // 直接 unwrap():当多字节字符(如中文名)被某处定长缓冲/存档截断在 UTF-8
+                // 字符中间时(尾部出现半个汉字,如 0xE5),就 panic(实测离线改中文名后崩)。
+                // 改为宽容解码:取合法前缀,绝不崩 —— 与 iOS 行为一致或更宽松。
+                let string = match String::from_utf8(bytes.into_owned()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let valid = e.utf8_error().valid_up_to();
+                        let mut bytes = e.into_bytes();
+                        log!(
+                            "Warning: [MoleWorld] NSUTF8 解码遇到非法/截断字节(共 {} 字节,\
+                             合法到 {});取合法前缀避免崩溃(多半是某处定长缓冲把中文等多字节\
+                             字符截断在字符中间)。",
+                            bytes.len(),
+                            valid
+                        );
+                        bytes.truncate(valid);
+                        // SAFETY: bytes[..valid_up_to] 按 Utf8Error 定义是合法 UTF-8。
+                        unsafe { String::from_utf8_unchecked(bytes) }
+                    }
+                };
                 StringHostObject::Utf8(Cow::Owned(string))
             }
             NSWindowsCP1252StringEncoding => {
@@ -472,7 +492,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSUInteger)lengthOfBytesUsingEncoding:(NSStringEncoding)encoding {
     if C_STRING_FRIENDLY_ENCODINGS.contains(&encoding) {
         let string = to_rust_string(env, this);
-        assert!(string.as_bytes().iter().all(|byte| byte.is_ascii())); // TODO
+        // [MoleWorld] 原来 assert! 全 ASCII(TODO);对 UTF-8 编码,字节长度就是 string.len()
+        // (UTF-8 字节数),含中文也正确 → 去掉过严断言,中文名按 UTF-8 计长(常用于分配
+        // getCString: 缓冲)不再 panic。
         string.len().try_into().unwrap()
     } else {
         unimplemented!("lengthOfBytesUsingEncoding: {}", encoding)
@@ -1334,10 +1356,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())encodeWithCoder:(id)coder {
     let string = to_rust_string(env, this);
-    assert!(string.as_bytes().iter().all(|byte| byte.is_ascii())); // TODO
-
-    // TODO: use some kind of substitution instead?
-    // See "Making Substitutions During Coding" in the doc https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Archiving/Articles/codingobjects.html
+    // [MoleWorld] 原来这里 assert! 全 ASCII(TODO 占位),导致归档含中文的字符串
+    // (如离线改的中文庄园名,经 saveUserInfoData → NSKeyedArchiver → encodeWithCoder:)
+    // 直接 panic(实测离线改中文名稳定复现)。二进制 plist 写入器(plist::to_writer_binary,
+    // 见 ns_keyed_archiver.rs)原生支持 UTF-8,plist::Value::String 可容纳任意 UTF-8 字符串
+    // → 去掉这个过严断言即可正确归档非 ASCII 字符串,与真实 iOS 行为一致。
     set_value_to_encode_for_current_key(env, coder, plist::Value::String(string.to_string()));
 }
 

@@ -219,6 +219,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())touchesBegan:(id)_touches // NSSet* of UITouch*
          withEvent:(id)_event { // UIEvent*
+    log!("[改名诊断] UITextField {:?} 被点中(touchesBegan)→ 请求 becomeFirstResponder", this);
     let _: bool = msg![env; this becomeFirstResponder];
 }
 
@@ -227,7 +228,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)becomeFirstResponder {
-    log_dbg!("becomeFirstResponder");
+    log!("[改名诊断] UITextField {:?} becomeFirstResponder(将设为第一响应者 + 开启文本输入)", this);
 
     if env.objc.borrow::<UITextFieldHostObject>(this).editing {
         return true;
@@ -321,7 +322,17 @@ pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
     log_dbg!("Calling handle_text for {:?} with '{}'", text_field, text);
     let txt = ns_string::from_rust_string(env, text);
     let txt_len: NSUInteger = msg![env; txt length];
-    assert_eq!(txt_len, 1);
+    // [MoleWorld] 原 assert_eq!(txt_len, 1) 假设每次文本输入恰好 1 个 UTF-16 码元,但:
+    //  · 中文等输入法一次会提交多字(如"摩尔" = 2 码元);
+    //  · emoji / 补充平面字符是代理对(2 码元);
+    //  · 粘贴是任意长度。
+    // → 改庄园名(尤其中文)时 txt_len≠1,断言失败 → 全平台稳定闪退。
+    // 改为接受任意长度:空串直接跳过,其余整串作为替换文本插入(下方本就按整串
+    // stringByAppendingString: 处理,只有这个断言写死成 1)。
+    if txt_len == 0 {
+        release(env, txt);
+        return;
+    }
 
     let text_label = env
         .objc
