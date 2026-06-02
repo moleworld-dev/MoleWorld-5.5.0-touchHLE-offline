@@ -146,7 +146,10 @@ fn alcGetError(env: &mut Environment, device: MutPtr<GuestALCdevice>) -> i32 {
     let &host_device = State::get(env).devices.get(&device).unwrap();
 
     let res = unsafe { al::alcGetError(host_device) };
-    log_dbg!("alcGetError({:?}) => {:#x}", host_device, res);
+    // [MoleWorld] 同 alGetError:只在真有错误时记录(0 = ALC_NO_ERROR),避免轮询刷屏。
+    if res != 0 {
+        log_dbg!("alcGetError({:?}) => {:#x}", host_device, res);
+    }
     res
 }
 
@@ -323,7 +326,11 @@ fn alGetError(env: &mut Environment) -> i32 {
     // (typically from another thread), so we need to silently be ok with this.
     try_get_context!(env, context, al::AL_NO_ERROR);
     let res = unsafe { context.GetError() };
-    log_dbg!("alGetError() => {:#x}", res);
+    // [MoleWorld] 只在真有错误时记录:游戏每帧轮询 alGetError,无错误(0=AL_NO_ERROR)时
+    // 这条会刷爆日志(音频诊断构建点亮 openal log_dbg 时实测一直刷 `=> 0x0`)。
+    if res != al::AL_NO_ERROR {
+        log_dbg!("alGetError() => {:#x}", res);
+    }
     res
 }
 

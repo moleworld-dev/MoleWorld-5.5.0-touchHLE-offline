@@ -209,6 +209,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                             ui_view::ui_control::ui_text_field::handle_return(env, responder)
                         }
                     }
+                } else {
+                    // [MoleWorld 改名诊断] 收到文本输入但没有聚焦的 UITextField → 输入被丢弃。
+                    // 改名时若一直走这里,说明 becomeFirstResponder 没触发(tap 没命中输入框)。
+                    log!(
+                        "[改名诊断] 收到文本输入但 first_responder={:?} 不是 UITextField,输入被丢弃",
+                        responder
+                    );
                 }
             }
         }

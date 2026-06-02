@@ -212,6 +212,12 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
     surface
 }
 
+/// [MoleWorld] 文本输入是否激活(某个 UITextField 成为第一响应者)。仅此状态下物理
+/// `T` 键当普通字符输入,不再误触发修改器菜单(见 `poll_for_events` 的 T 分支);
+/// `start/stop_text_input` 写、事件翻译处读。用全局原子量(那两个方法是 `&self`)。
+static MOLE_TEXT_INPUT_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
@@ -832,11 +838,13 @@ impl Window {
                     echo!("F12 pressed, EnterDebugger event queued.");
                     Event::EnterDebugger
                 }
-                // [MoleWorld] T toggles the built-in debug/cheat menu.
+                // [MoleWorld] T toggles the built-in debug/cheat menu — but only when
+                // no text field is focused, otherwise typing a name containing 't'
+                // would pop the menu instead of inserting the character.
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::T),
                     ..
-                } => {
+                } if !MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) => {
                     echo!("T pressed, toggling MoleWorld debug menu.");
                     Event::ToggleMoleMenu
                 }
@@ -1475,12 +1483,15 @@ impl Window {
 
     pub fn start_text_input(&self) {
         assert!(self.on_main_stack);
+        // [MoleWorld] 标记文本输入激活:让物理 T 键在编辑时当普通字符(见 poll_for_events)。
+        MOLE_TEXT_INPUT_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             sdl2_sys::SDL_StartTextInput();
         }
     }
     pub fn stop_text_input(&self) {
         assert!(self.on_main_stack);
+        MOLE_TEXT_INPUT_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             sdl2_sys::SDL_StopTextInput();
         }
