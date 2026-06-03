@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 const O: Ordering = Ordering::Relaxed;
 
+/// 强制 VIP 的等级上限。游戏真实上限是 VIP10,但本移植按用户要求封顶 **VIP4**
+/// (调试菜单「VIP等级」在 1..=VIP_LEVEL_MAX 循环,getVipInfoDataWithLevel: 也 clamp 到此)。
+const VIP_LEVEL_MAX: i32 = 4;
+
 static FREE_SHOP: AtomicBool = AtomicBool::new(false);
 static KILL_ANTICHEAT: AtomicBool = AtomicBool::new(false);
 static FORCE_VIP: AtomicBool = AtomicBool::new(false);
@@ -30,8 +34,8 @@ static INSTANT_CROP: AtomicBool = AtomicBool::new(false);
 static NO_WITHER: AtomicBool = AtomicBool::new(false);
 static NO_COOLDOWN: AtomicBool = AtomicBool::new(false);
 static INSTANT_BUILD: AtomicBool = AtomicBool::new(false);
-/// VIP level reported while force_vip is on (cycled 1..=15 by the menu).
-static VIP_LEVEL: AtomicI32 = AtomicI32::new(10);
+/// VIP level reported while force_vip is on (cycled 1..=VIP_LEVEL_MAX by the menu).
+static VIP_LEVEL: AtomicI32 = AtomicI32::new(VIP_LEVEL_MAX);
 /// Forced player level (0 = off; cycled 0/10/.../100 by the menu). Overrides the
 /// curLevel getter, mirroring how FORCE_VIP overrides vipLevel.
 static FORCE_LEVEL: AtomicI32 = AtomicI32::new(0);
@@ -66,9 +70,9 @@ pub fn vip_level() -> i32 {
     VIP_LEVEL.load(O)
 }
 
-/// Cycle the forced VIP level 1..=15 and make sure force_vip is on so it shows.
+/// Cycle the forced VIP level 1..=VIP_LEVEL_MAX and make sure force_vip is on so it shows.
 pub fn bump_vip_level() {
-    let next = if VIP_LEVEL.load(O) >= 15 { 1 } else { VIP_LEVEL.load(O) + 1 };
+    let next = if VIP_LEVEL.load(O) >= VIP_LEVEL_MAX { 1 } else { VIP_LEVEL.load(O) + 1 };
     VIP_LEVEL.store(next, O);
     FORCE_VIP.store(true, O);
     log!("[MOLECHEAT] vip_level -> {} (force_vip on)", next);
@@ -280,15 +284,43 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   - UserVIPInfoData vipValue           (raw VIP growth points)
     if FORCE_VIP.load(O) {
         match (class, sel) {
-            ("WrapperManager", "checkIsVipUser")
-            | ("UserInfoLayer", "isShowVIPFunctionsButton:") => {
-                env.cpu.regs_mut()[0] = 1; // YES / shown
+            ("WrapperManager", "checkIsVipUser") => {
+                env.cpu.regs_mut()[0] = 1; // YES — treat as a VIP user
                 return true;
             }
+            // 修1:isShowVIPFunctionsButton: 是【带 BOOL 参(r2)的 void setter】,不是
+            // getter。原来和 checkIsVipUser 并臂 r0=1+return true,等于把这个 setter 整个
+            // 跳过、VIP 按钮的显示逻辑根本没跑。正确做法:把参数 r2 强制成 1(YES)再
+            // 放行原方法(return false),让它把 VIP UI 按钮真正接上。
+            ("UserInfoLayer", "isShowVIPFunctionsButton:") => {
+                env.cpu.regs_mut()[2] = 1; // BOOL arg = YES
+                return false; // run the real setter with the forced argument
+            }
+            // ★ 闪退真凶修复:vipLevelWithNewType 返回的是【NSString*】(类型编码 @8@0:4,
+            // 真身 `[NSString stringWithFormat:@"%d", decryptInt(vipLevel_)]`),不是 int。
+            // 所有调用方拿到后立刻 `[结果 intValue]`(VIP 总闸 checkIsVipUser 就是
+            // `[[...vipLevelWithNewType] intValue] > 0`)。原来这里把 r0 写成裸整数 1..4 当
+            // 指针返回 → `[0x00000004 intValue]` 向非法地址发消息 → EXC_BAD_ACCESS 闪退
+            // (一开强制VIP、一进 VIP 相关 UI/商店就崩的根因)。改成返回一个永驻 NSString
+            // (VIP_LEVEL 的字符串):[intValue] 得到正确等级、VIP 判定通过、且绝不崩。
             ("UserVIPInfoData", "vipLevelWithNewType") => {
-                env.cpu.regs_mut()[0] = VIP_LEVEL.load(O) as u32; // forced level
+                let s = match VIP_LEVEL.load(O).clamp(1, VIP_LEVEL_MAX) {
+                    1 => "1",
+                    2 => "2",
+                    3 => "3",
+                    _ => "4",
+                };
+                let ns = crate::frameworks::foundation::ns_string::get_static_str(env, s);
+                env.cpu.regs_mut()[0] = ns.to_bits();
                 return true;
             }
+            // (原「修2」拦 GameData getVipInfoDataOfCurrentUser 已删:它调
+            //  getVipInfoDataWithLevel: 读的 vipDataDic_ 只有服务器下发才填、离线恒空 →
+            //  返回 nil,既无收益又拉长链路。删掉后该方法走原版逻辑、离线返回 nil,各调用点
+            //  对 nil 续发消息 nil-safe、不崩。逆向实锤崩点在 vipLevelWithNewType 的裸 int,
+            //  不在此处。若日后发现个别 VIP 专属面板需要非 nil 的 VIP 配置对象,可用
+            //  `[[VipInfoData alloc] init]`(游戏自带的本地 blessed 构造器 imp 0x37503c)缓存
+            //  返回——但当前最小修复不需要。)
             ("UserVIPInfoData", "vipValue") => {
                 env.cpu.regs_mut()[0] = 999_999; // plenty of VIP growth value
                 return true;

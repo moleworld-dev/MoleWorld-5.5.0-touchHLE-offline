@@ -63,7 +63,16 @@ android {
         buildConfigField("String", "APP_NAME", "\"摩尔庄园HD\"")
         manifestPlaceholders["icon"] = "@drawable/icon"
         buildConfigField("int", "APP_ICON", "R.drawable.icon")
-        versionName = join(getTouchHLEVersionName(), " ", branding)
+        // [MoleWorld] 版本号大一统:与 src/mole_sysinfo.rs 的 USER_VERSION 对齐,展示
+        // 「v0.0.4 beta (短hash)」,不再用 git-describe 的 UNOFFICIAL 迷惑串。CI 注入
+        // MOLE_USER_VERSION/MOLE_BUILD_HASH/MOLE_VERSION_CODE(build-release.yml),本地回退。
+        // versionCode 由 v0.0.X 的 X 派生(=4)、随发版递增(覆盖更新需只增不减)。
+        // 注意:applicationId 仍保留 .unofficial 后缀不动 —— 改包名会让老用户装成另一个 App、
+        // 永远无法更新覆盖。
+        val moleUserVersion = System.getenv("MOLE_USER_VERSION") ?: "v0.0.4 beta"
+        val moleBuildHash = System.getenv("MOLE_BUILD_HASH")?.takeIf { it.isNotEmpty() }?.take(7) ?: "local"
+        versionName = "$moleUserVersion ($moleBuildHash)"
+        versionCode = (System.getenv("MOLE_VERSION_CODE") ?: "4").toInt()
 
         minSdk = 21 // first version with AArch64
         targetSdk = 31
@@ -90,9 +99,21 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    // [MoleWorld] 固定 release 签名:用提交进仓库的 moleworld-release.p12(PKCS12,alias
+    // moleworld)。固定签名 → 安卓更新可直接覆盖安装、不再每版签名冲突。(私钥+弱口令明文
+    // 进公开仓库,纯爱好/非上架项目的取舍;要更安全可改用 GitHub secret 注入同一把 key。)
+    signingConfigs {
+        create("release") {
+            storeFile = file("moleworld-release.p12")
+            storePassword = "moleworld2025"
+            keyAlias = "moleworld"
+            keyPassword = "moleworld2025"
+            storeType = "PKCS12"
+        }
+    }
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             isDebuggable = true // allow use of ADB to manage files, etc
         }

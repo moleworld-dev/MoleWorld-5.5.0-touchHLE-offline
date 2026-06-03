@@ -353,14 +353,12 @@ impl Environment {
 
             Some(Box::new(window::Window::new(
                 &format!(
-                    "{} (touchHLE {}{}{})",
-                    bundle.display_name(),
-                    super::branding(),
-                    if super::branding().is_empty() {
-                        ""
-                    } else {
-                        " "
-                    },
+                    // 窗口标题:统一展示【用户版】(v0.0.X beta + 追溯短hash,见
+                    // mole_sysinfo::version()),touchHLE【内核版】单列一段;不再插
+                    // super::branding() 的 "UNOFFICIAL" 迷惑串。如:
+                    //   摩尔庄园HD · v0.0.4 beta (7f94007) · kernel touchHLE v0.0.3-beta
+                    "摩尔庄园HD · {} · kernel touchHLE {}",
+                    crate::mole_sysinfo::version(),
                     super::VERSION
                 ),
                 icon.ok(),

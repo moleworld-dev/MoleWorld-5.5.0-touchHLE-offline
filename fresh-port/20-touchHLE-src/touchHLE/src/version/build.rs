@@ -19,7 +19,14 @@ pub fn main() {
     // Cargo.toml version. This is used in main.rs
 
     let toml_version = std::env::var("CARGO_PKG_VERSION").unwrap();
-    let version = Command::new("git").arg("describe").arg("--always").output();
+    // [MoleWorld] 加 --tags:不带它的 `git describe` 只认 annotated tag,而本项目
+    // v0.0.2-beta/v0.0.3-beta/… 多是 lightweight tag,会退到唯一的 annotated v0.0.1-beta
+    // 给出 `v0.0.1-beta-8-g…` 的误导串。加 --tags 让内核版串至少落到最近的 tag。
+    let version = Command::new("git")
+        .arg("describe")
+        .arg("--tags")
+        .arg("--always")
+        .output();
     let version = match version.as_ref() {
         Ok(version) if version.status.success() => {
             rerun_if_changed(&workspace_root.join(".git/HEAD"));
