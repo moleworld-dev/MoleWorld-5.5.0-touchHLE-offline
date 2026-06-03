@@ -38,6 +38,8 @@ pub struct Options {
     pub device_family: Option<DeviceFamily>,
     pub initial_orientation: DeviceOrientation,
     pub scale_hack: NonZeroU32,
+    /// [MoleWorld] 窗口模式锁定宽高比(等比 letterbox 黑边);默认 false=自由拉伸铺满。
+    pub lock_aspect: bool,
     pub deadzone: f32,
     pub analog_stick_tilt_controls: bool,
     pub x_tilt_range: f32,
@@ -71,6 +73,7 @@ impl Default for Options {
             device_family: None,
             initial_orientation: DeviceOrientation::Portrait,
             scale_hack: NonZeroU32::new(1).unwrap(),
+            lock_aspect: false,
             analog_stick_tilt_controls: true,
             deadzone: 0.1,
             x_tilt_range: 60.0,
@@ -130,6 +133,9 @@ impl Options {
             self.scale_hack = value
                 .parse()
                 .map_err(|_| "Invalid scale hack factor".to_string())?;
+        } else if arg == "--lock-aspect" {
+            // [MoleWorld] 窗口锁定宽高比:窗口模式改为等比 letterbox(四周黑边),不自由拉伸。
+            self.lock_aspect = true;
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {

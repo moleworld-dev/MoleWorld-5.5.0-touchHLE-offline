@@ -237,6 +237,8 @@ pub struct Window {
     /// [Self::rotatable_fullscreen] returns [true].
     fullscreen: bool,
     scale_hack: NonZeroU32,
+    /// [MoleWorld] 窗口模式锁定宽高比(等比 letterbox);false=自由拉伸铺满。见 viewport()。
+    lock_aspect: bool,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     splash_image: Option<Image>,
     device_family: DeviceFamily,
@@ -305,6 +307,7 @@ impl Window {
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
         let fullscreen = options.fullscreen;
+        let lock_aspect = options.lock_aspect;
 
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
@@ -330,12 +333,17 @@ impl Window {
         } else {
             let (width, height) =
                 size_for_orientation(device_family, device_orientation, scale_hack);
-            let window = video_ctx
+            // [MoleWorld] 窗口可自由改变大小、拉伸适配屏幕(用户要求)。.resizable()
+            // 开放拖拽缩放;set_minimum_size 防止缩到 0。画面缩放在 viewport() 里按窗口
+            // 实际 drawable_size 算(自由拉伸铺满),触摸映射沿用 viewport() 自动跟随。
+            let mut window = video_ctx
                 .window(title, width, height)
                 .position_centered()
+                .resizable()
                 .opengl()
                 .build()
                 .unwrap();
+            window.set_minimum_size(256, 192).ok();
             window
         };
 
@@ -386,6 +394,7 @@ impl Window {
             viewport_y_offset: 0,
             fullscreen,
             scale_hack,
+            lock_aspect,
             internal_gl_ins: None,
             splash_image: launch_image,
             device_family,
@@ -552,6 +561,43 @@ impl Window {
                 } => {
                     let (x, y) = transform_virt_accel_coords(self, (x, y));
                     self.virtual_accelerometer_last = Some((x, y, false));
+                }
+                // [MoleWorld] 窗口缩放事件:
+                // ① 锁比例(--lock-aspect):把【窗口本身】约束回 app 宽高比(4:3 / 3:2)——
+                //    用户拖大拖小时窗口始终保持游戏比例,画面自由拉伸铺满即【等比、不变形、
+                //    无黑边】(=用户要的"游戏随窗口同步等比缩放",而不是 letterbox 两条黑边)。
+                // ② macOS framebuffer y-offset 补偿(SDL/macOS 缩放后 framebuffer 取 max(新,旧)、
+                //    视口 y 轴错位),用最终 window.size()(点;未开 allow_highdpi)重算。
+                // push_back 那个 match 对 Window 事件走 `_ => continue` 不入队,故此处只做副作用。
+                E::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::SizeChanged(w, h)
+                        | sdl2::event::WindowEvent::Resized(w, h),
+                    ..
+                } => {
+                    if self.lock_aspect && w > 0 && h > 0 {
+                        let (app_w, app_h) = size_for_orientation(
+                            self.device_family,
+                            self.device_orientation,
+                            self.scale_hack,
+                        );
+                        // 取宽/高两方向里更大的缩放比 → 窗口跟随主拖拽方向、保持 app 比例。
+                        let scale = (w as f32 / app_w as f32)
+                            .max(h as f32 / app_h as f32)
+                            .max(0.15);
+                        let tw = ((app_w as f32 * scale).round() as u32).max(1);
+                        let th = ((app_h as f32 * scale).round() as u32).max(1);
+                        // set_size 会再触发一次 resize;约束已满足时不再 set,避免抖动/死循环。
+                        if (tw, th) != self.window.size() {
+                            let _ = self.window.set_size(tw, th);
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (_, fh) = self.window.size();
+                        self.max_height = self.max_height.max(fh);
+                        self.viewport_y_offset = self.max_height - fh;
+                    }
                 }
                 _ => {}
             }
@@ -1424,11 +1470,20 @@ impl Window {
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
         let (app_width, app_height) =
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
-            return (0, 0, app_width, app_height);
-        }
-
         let (screen_width, screen_height) = self.window.drawable_size();
+
+        // [MoleWorld] 窗口模式(非全屏)「自由拉伸」:画面铺满整个窗口、忽略宽高比
+        // (用户要的「自由调节适配屏幕拉伸」)。注意:默认固定尺寸窗口下 drawable 尺寸
+        // == app 原生尺寸,这里返回 (0,0,app_w,app_h),与旧行为完全一致 → 零回归;窗口被
+        // 拖动缩放后,drawable_size 跟着变,present 的 glViewport 与触摸映射(都基于
+        // viewport())自动跟随。全屏 / rotatable-fullscreen 仍走下面的等比 letterbox(保持
+        // 原状,不回归)。
+        if !self.fullscreen && !Self::rotatable_fullscreen() {
+            // 窗口模式恒「自由拉伸铺满」。锁比例(--lock-aspect)不在这里做 letterbox(黑边
+            // 不优雅),而是在 resize 事件里把【窗口本身】约束成 app 宽高比 → 铺满即等比无
+            // 变形、无黑边(见 poll_for_events 的 E::Window 分支)。
+            return (0, 0, screen_width, screen_height);
+        }
 
         let app_aspect = app_width as f32 / app_height as f32;
         let screen_aspect = screen_width as f32 / screen_height as f32;

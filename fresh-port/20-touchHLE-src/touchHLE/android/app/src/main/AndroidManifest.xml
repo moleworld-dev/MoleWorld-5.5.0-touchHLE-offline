@@ -10,8 +10,9 @@
      com.gamemaker.game
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    android:installLocation="auto"
-    android:versionCode="1">
+    android:installLocation="auto">
+    <!-- [MoleWorld] versionCode 改由 build.gradle.kts 统一提供(= v0.0.X 的 X,随发版递增);
+         此处不再硬编码 1,避免每版都是 1 导致系统视为同版本无法升级。 -->
 
     <!-- Touchscreen support -->
     <uses-feature

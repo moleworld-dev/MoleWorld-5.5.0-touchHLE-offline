@@ -331,19 +331,38 @@ fn local_time_and_tz() -> (String, String) {
     }
 }
 
+/// 权威「用户版本」号 —— 全平台唯一真源,改这一处即同步(窗口标题 / 「关于」页 /
+/// 崩溃诊断块;安卓 versionName / CI 产物名通过 build-release.yml 的 env 与此对齐)。
+pub const USER_VERSION: &str = "v0.0.4 beta";
+
+/// 构建追溯短 hash:CI 在 tag 上构建时由 build-release.yml 注入 github.sha 前 7 位
+/// (编译期 `option_env!` 读 `MOLE_BUILD_HASH`);本地 / 无注入时为 None。
+pub fn build_hash() -> Option<&'static str> {
+    // CI 注入的是完整 40 位 github.sha,这里取前 7 位短 hash(纯 ASCII 十六进制,
+    // 字节边界=字符边界,切片安全)。
+    option_env!("MOLE_BUILD_HASH")
+        .filter(|s| !s.is_empty())
+        .map(|s| &s[..s.len().min(7)])
+}
+
+/// 移植发布版本号统一展示串(窗口标题 / 「关于」页 / 崩溃诊断块共用):
+/// `v0.0.4 beta (7f94007)`;本地无追溯 hash 时退回 `v0.0.4 beta (local)`。
+/// (刻意不用 `crate::VERSION`/git describe —— 那条因仓库双 .git + lightweight tag 会给出
+///  `v0.0.1-beta-8-g… UNOFFICIAL` 的迷惑串;`crate::VERSION` 只留作「touchHLE 内核版」单列。)
+pub fn version() -> String {
+    match build_hash() {
+        Some(h) => format!("{USER_VERSION} ({h})"),
+        None => format!("{USER_VERSION} (local)"),
+    }
+}
+
 /// 组装「关于」页全文(供 `ui_web_view` 在加载 `mole_help` 时渲染)。
 pub fn mole_help_text(env: &mut Environment) -> String {
     let (_, _, vw, vh) = env.window().viewport();
     let cpu = cpu_model();
     let gpu = gpu_name();
     let (time, tz) = local_time_and_tz();
-    // 移植发布版本号:CI 在 tag 上构建时 GITHUB_REF_NAME = 该 tag(如 v0.0.3-beta),
-    // 天然「随 GitHub build 更新」;本地 / 分支构建回退到常量。
-    // (刻意不用 crate::VERSION/git describe:touchHLE 子目录残留内嵌 .git,本地
-    //  git describe 会命中 touchHLE 上游版本 v0.2.3 而非本项目 tag。)
-    let ver = crate::GITHUB_REF_NAME
-        .filter(|s| s.starts_with('v'))
-        .unwrap_or("v0.0.3 beta");
+    let ver = version();
 
     format!(
         "\
@@ -380,9 +399,7 @@ Copyright © 2012 Shanghai Shengran Information Technology Co., Ltd. All Rights 
 /// 系统时间时区」汇成一个方便用户复制粘贴的可读方框。`window.rs` 在 GL 初始化后输出一次;
 /// panic 钩子也会输出一次(确保崩溃日志自带机器信息)。
 pub fn diag_block() -> String {
-    let ver = crate::GITHUB_REF_NAME
-        .filter(|s| s.starts_with('v'))
-        .unwrap_or("v0.0.3 beta");
+    let ver = version();
     let game = game_version();
     let os = os_name_version();
     let cpu = cpu_model();
