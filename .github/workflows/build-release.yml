@@ -106,12 +106,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         working-directory: fresh-port/20-touchHLE-src/touchHLE
-        run: 7z a MoleWorld_v0.0.2_beta_Windows_X86_64.zip ./touchHLE_windows_bundle/*
+        run: 7z a MoleWorld_v0.0.3_beta_Windows_X86_64.zip ./touchHLE_windows_bundle/*
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.2_beta_Windows_X86_64.zip
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.3_beta_Windows_X86_64.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -177,19 +177,19 @@ jobs:
           cp dev-scripts/linux/安装到应用菜单.sh  "$BUNDLE"/安装到应用菜单.sh
           cp dev-scripts/linux/如何运行.txt        "$BUNDLE"/如何运行.txt
           chmod +x "$BUNDLE"/touchHLE "$BUNDLE"/启动游戏.sh "$BUNDLE"/安装到应用菜单.sh
-          tar czf MoleWorld_v0.0.2_beta_Linux_X86_64.tar.gz "$BUNDLE"
+          tar czf MoleWorld_v0.0.3_beta_Linux_X86_64.tar.gz "$BUNDLE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MoleWorld_Linux_x86_64
-          path: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.2_beta_Linux_X86_64.tar.gz
+          path: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.3_beta_Linux_X86_64.tar.gz
 
       - name: Attach to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.2_beta_Linux_X86_64.tar.gz
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.3_beta_Linux_X86_64.tar.gz
 
   build-android:
     runs-on: ubuntu-latest
@@ -310,16 +310,16 @@ jobs:
 
       - name: Rename APK
         working-directory: fresh-port/20-touchHLE-src/touchHLE/android
-        run: cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/MoleWorld_v0.0.2_beta_Android_AArch64.apk"
+        run: cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/MoleWorld_v0.0.3_beta_Android_AArch64.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: touchHLE_Android_AArch64
-          path: MoleWorld_v0.0.2_beta_Android_AArch64.apk
+          path: MoleWorld_v0.0.3_beta_Android_AArch64.apk
 
       - name: Attach APK to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: MoleWorld_v0.0.2_beta_Android_AArch64.apk
+          files: MoleWorld_v0.0.3_beta_Android_AArch64.apk

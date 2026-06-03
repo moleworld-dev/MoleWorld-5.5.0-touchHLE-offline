@@ -26,6 +26,12 @@ use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// [MoleWorld] 递归卫:`-[UserInfoData initWithCoder:]` 的离线贝壳还原拦截内部要再调用
+/// 一次真正的 `initWithCoder:`(让原方法把存档各字段解出来),那一次必须落到正常派发、
+/// 不能再被本拦截截走,否则无限递归。进入拦截前置 true,放行原方法后置回 false。
+static MOLE_IN_UID_INITCODER: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct ThreadInitializer {
     mutex: MutPtr<pthread_mutex_t>,
@@ -315,6 +321,75 @@ fn objc_msgSend_inner(
                 log!("[改名] 离线改名已本地生效并落盘(saveName + saveUserInfoData),吞掉无网络弹窗");
                 // 3) 吞掉"无网络"弹窗 —— 不让原 showNetWorkError 跑。
                 env.cpu.regs_mut()[0..2].fill(0);
+                return;
+            }
+            // -[UserInfoData initWithCoder:]: 离线"忠于原版"地还原贝壳(vipGold)。
+            //
+            // 这个破解包(无限贝壳版)在读本地存档(NSKeyedUnarchiver → initWithCoder:)时,
+            // 把贝壳写死成 2097151(0x1FFFFF):VA 0xb9ce0
+            //   `[self setNewVipGold:[CryptUtils encryptInt:2097151]]`
+            // 同一函数里 curLevel/xp/gold/totalWorkers 等其它字段统统老老实实
+            // `decodeIntForKey:` 读存档真实值,唯独 vipGold 被塞死常量 → 每次进游戏都把贝壳
+            // 覆写成 2097151(全二进制仅此一处 0x1FFFFF;2.4.3 零此常量、且根本没有
+            // setNewVipGold: → 实锤是破解作者新加的私货,作者原话"重进游戏贝壳数自动变 2097151")。
+            //
+            // 我们要的是"离线、但贝壳像原版一样从存档自然持久化、能花能存",而不是每次被强制重置。
+            // 做法:拦截 initWithCoder:,先放行原方法整段跑完(所有字段照常解出,包括那个被塞死的
+            // 2097151),拿到返回的 self 后,用作者删掉的那行原始逻辑——
+            //   `[self setNewVipGold:[CryptUtils encryptInt:[coder decodeIntForKey:@"vipGold"]]]`
+            // ——把贝壳改回存档里的真实值。archive key 实测为 "vipGold"(AES 解密玩家 userinfo.dat
+            // 的 NSKeyedArchiver 键名:username/userId/curLevel/xp/gold/vipGold/totalWorkers/…)。
+            // setNewVipGold: 存的是密文(getter 用 CryptUtils decryptInt: 解),所以要先 encryptInt:
+            // 再写,与原版完全一致。
+            //
+            // 只拦"读本地存档"这一条路径(initWithCoder:);联网同步 decodeRemoteData:/排行榜/
+            // copyWithZone:/调试菜单里也会用到 setNewVipGold:,那些一律放行不动。占卜扣费走
+            // [WrapperManager addVipGold:]、T 菜单加贝壳同样走 addVipGold:,都读 vipGold 真实值,
+            // 不受影响。MOLE_IN_UID_INITCODER 是递归卫(定义见文件顶部)。
+            if name == "UserInfoData"
+                && !MOLE_IN_UID_INITCODER.load(Ordering::Relaxed)
+                && selector.as_str(&env.mem) == "initWithCoder:"
+            {
+                let recv = receiver;
+                // initWithCoder: 的 NSCoder 实参在 r2(r0=self, r1=_cmd, r2=arg1);
+                // 必须在任何 msg_send 之前读出(后续调用会覆写寄存器)。
+                let coder: id = MutPtr::from_bits(env.cpu.regs()[2]);
+                drop(message_type_info);
+                // 1) 放行原 initWithCoder:(递归卫=true → 落正常派发跑原方法)。
+                MOLE_IN_UID_INITCODER.store(true, Ordering::Relaxed);
+                let result: id = crate::objc::msg_send(env, (recv, selector, coder));
+                MOLE_IN_UID_INITCODER.store(false, Ordering::Relaxed);
+                // 2) 把 vipGold 从"塞死的 2097151"还原成存档真实值(= 作者删掉的那行)。
+                if result != nil && coder != nil {
+                    let key = crate::frameworks::foundation::ns_string::from_rust_string(
+                        env,
+                        "vipGold".to_string(),
+                    );
+                    let decode_sel = env
+                        .objc
+                        .register_host_selector("decodeIntForKey:".to_string(), &mut env.mem);
+                    let real_vip: i32 = crate::objc::msg_send(env, (coder, decode_sel, key));
+                    let crypt_cls = env.objc.get_known_class("CryptUtils", &mut env.mem);
+                    if crypt_cls != nil {
+                        let enc_sel = env
+                            .objc
+                            .register_host_selector("encryptInt:".to_string(), &mut env.mem);
+                        let enc_vip: i32 =
+                            crate::objc::msg_send(env, (crypt_cls, enc_sel, real_vip));
+                        let set_sel = env
+                            .objc
+                            .register_host_selector("setNewVipGold:".to_string(), &mut env.mem);
+                        let _: () = crate::objc::msg_send(env, (result, set_sel, enc_vip));
+                        log!(
+                            "[贝壳] 读档:跳过破解版强制 2097151,vipGold 还原为存档真实值 {}(保持加密持久化)",
+                            real_vip
+                        );
+                    } else {
+                        log!("[贝壳] 警告:未找到 CryptUtils 类,vipGold 未还原(仍为破解版默认)");
+                    }
+                }
+                // 3) 返回原 initWithCoder: 的 self(上面的 msg_send 已覆写 r0,这里写回)。
+                env.cpu.regs_mut()[0] = result.to_bits();
                 return;
             }
             // -[IMCommonMgr checkUpdates:]: kicks off +[CryptUtils doCipher:...]
