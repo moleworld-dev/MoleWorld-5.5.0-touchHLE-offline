@@ -333,7 +333,7 @@ fn local_time_and_tz() -> (String, String) {
 
 /// 权威「用户版本」号 —— 全平台唯一真源,改这一处即同步(窗口标题 / 「关于」页 /
 /// 崩溃诊断块;安卓 versionName / CI 产物名通过 build-release.yml 的 env 与此对齐)。
-pub const USER_VERSION: &str = "v0.0.4 beta";
+pub const USER_VERSION: &str = "v0.0.5 beta";
 
 /// 构建追溯短 hash:CI 在 tag 上构建时由 build-release.yml 注入 github.sha 前 7 位
 /// (编译期 `option_env!` 读 `MOLE_BUILD_HASH`);本地 / 无注入时为 None。
@@ -381,10 +381,19 @@ GPU:{gpu}
 · 哔哩哔哩 @萌新迎风听雨(安装包与思路)
 · Never.(教程)   ·   touchHLE(模拟器内核)
 · @Ross74U(Arch Linux 测试 / 编译)
-· 小小摩尔 QQ 群 @EdmundDHow(赞助)
 · 哔哩哔哩 @叔权(B 站 / 小红书宣发、镜像打包)
 · 平行摩尔(52摩尔) · 小小摩尔 · 摩尔新桃源社区
 · 淘米《摩尔庄园》原作团队
+
+—— 赞赏榜 · 感谢打赏(纯爱发电 · 永久免费) ——
+· 2001太空漫遊🔴🔵(EdmundDHow) ¥30 · 天堂雨 ¥20 · 傲骨(残柔傲骨) ¥20
+· 秋生°(圆头耗子锄大地) ¥3 · z ¥50 · 欣欣然(呱呱) ¥35 · 和 ¥10
+· 小锗12138 ¥10 · vv²(草莓小熊软糖) ¥100 · 般般 ¥20 · 33(秋遥) ¥30
+· 小型贴图 ¥20 · 潘多洛 ¥30 · 鸽子 ¥50 · 灵龍 ¥15 · ^H^ ¥10
+· Rain ¥30 · 麦门在逃薯条(池竹雪) ¥10 · 白鱼肚 ¥199 · 威风堂堂 de ¥25
+· GF 繁花 ¥20 · 文火(PROBER) ¥10 · 西伯利亚正红旗(是飞雪城中剑) ¥30
+· 往向孤独的晚灯 ¥10 · The Au Lait(猫箱里没有猫) ¥50
+· 共 25 位小摩尔 · 合计 ¥837 —— 你们的支持是我开发的动力!
 
 Version 5.5.0 · 移植版 {ver}
 

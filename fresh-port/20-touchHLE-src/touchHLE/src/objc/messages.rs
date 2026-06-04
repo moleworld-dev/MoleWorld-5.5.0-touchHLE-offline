@@ -196,6 +196,26 @@ fn objc_msgSend_inner(
         return;
     }
 
+    // [MoleWorld offline port] A non-nil "receiver" inside the null page (< 0x1000)
+    // is not a real object — it's an uninitialized sentinel (e.g. 0x1) that an
+    // offline island code path passes where an object is expected (our one-key
+    // entry bypasses some of the game's normal scene wiring, leaving sentinel
+    // slots). Reading its isa would either fault (null-page access at 0x1) or yield
+    // garbage that then fails class lookup ("Could not get class name!"), aborting
+    // the whole emulator. Treat it like a message to nil (no-op, return 0) instead.
+    // Nothing valid lives below 0x1000 (the guest image loads at 0x4000+, the heap
+    // is far higher), so this never masks a real object. Robust last line of
+    // defense for the island touch-0x1 crash, independent of any guest-side hook.
+    if receiver.to_bits() < 0x1000 {
+        log_dbg!(
+            "[(null-page receiver {:?}) {}] -> treating as nil (no-op)",
+            receiver,
+            selector.as_str(&env.mem)
+        );
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
+
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     // MoleWorld offline port: a non-nil receiver can still have a nil isa/class
     // when it isn't a real object — e.g. the analytics/ad SDKs use the result of
@@ -441,6 +461,12 @@ fn objc_msgSend_inner(
             if name == "NewStyleStoreMainLayer"
                 && selector.as_str(&env.mem) == "onBuyVIPGold:"
             {
+                // onBuyVIPGold:(int 档位索引):regs[2] = 包索引(0..=6;原版 cmp r2,8)。
+                // 按原版各档真实贝壳数发放(20/105/225/370/650/1500/3500),不再死值 1000。
+                // 必须在任何 msg_send 前读 regs[2],否则被覆盖。
+                let pack_idx = env.cpu.regs()[2] as usize;
+                const SHELL_PACKS: [i32; 7] = [20, 105, 225, 370, 650, 1500, 3500];
+                let shells = SHELL_PACKS.get(pack_idx).copied().unwrap_or(20);
                 let gd_class = env.objc.get_known_class("GameData", &mut env.mem);
                 let shared_sel = env
                     .objc
@@ -452,12 +478,12 @@ fn objc_msgSend_inner(
                 drop(message_type_info);
                 let gd: id = crate::objc::msg_send(env, (gd_class, shared_sel));
                 if gd != nil {
-                    let amount: i32 = 1000;
+                    let amount: i32 = shells;
                     let do_update: bool = true;
                     let _: () = crate::objc::msg_send(env, (gd, add_sel, amount, do_update));
                     log!(
-                        "[SHELLHOOK] granted {} shells for free (offline IAP bypass)",
-                        amount
+                        "[SHELLHOOK] granted {} shells (pack idx {}, offline IAP bypass)",
+                        amount, pack_idx
                     );
                 }
                 env.cpu.regs_mut()[0..2].fill(0);

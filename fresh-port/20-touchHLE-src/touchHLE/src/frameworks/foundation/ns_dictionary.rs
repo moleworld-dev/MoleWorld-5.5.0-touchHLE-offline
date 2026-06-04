@@ -340,6 +340,11 @@ fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) 
                 "[MOLEDICT] initWithDictionary: src {:?} is {} (count={}) into {}; emptying.",
                 other_dict, other_name, count, this_name
             );
+            // 坏档信号:本应是字典的源对象其实是数组。置位以抑制收菜成就重复触发崩溃。
+            // 注意:这里 `this` 是 encodeWithCoder: 里新 alloc 的临时字典(本就空),清空它
+            // 不破坏原 ivar;配合 ns_keyed_archiver.rs 的归档期 retain 修复,损坏字段会在本次
+            // 保存被正确写成"独立的空字典"(而非再次塌缩),旧坏档由此自愈。
+            crate::mole_cheats::note_dict_as_array_corruption();
             *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
             return this;
         }
