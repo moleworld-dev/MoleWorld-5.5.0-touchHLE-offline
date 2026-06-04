@@ -668,6 +668,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     build_description(env, this)
 }
 
+// ---- 坏档兜底:把"被当成字典用的损坏数组"安全降级为"空字典" ----
+// 个别旧存档因 NSKeyedArchiver 去重 bug(已在 ns_keyed_archiver.rs 治本)把本该是
+// NSMutableDictionary 的字段(UserInfoData.achieveUnlock / attributeValue,或 mapData)
+// 写成了 NSMutableArray。游戏随后仍对它发字典消息(allKeys / objectForKey: / setObject:forKey:)。
+// 这些 selector 原先走 messages.rs 的 "无此方法 → 返回 nil" 兜底,后果:
+//   1) GameManager loadMapByStep 的分步加载进度依赖 [mapData allKeys],拿到 nil → 进度
+//      永远推不动 → 每帧重注册定时器 → 进入游戏页死循环卡死(玩家报"再进入闪退")。
+//   2) VillageMenuLayer onEnter 把 achieveUnlock/attributeValue 当字典查 → 刷 allKeys 警告风暴。
+// 让损坏数组对字典消息表现为"空字典":allKeys 返回空数组(count=0 而非 nil),分步加载
+// 进度立即收敛(count==0 → 结束 → 取消定时器),死循环被打破;并置坏档标志供 mole_cheats
+// 抑制成就重复触发(见 SAVE_HAS_DICT_AS_ARRAY)。NSArray/NSMutableArray 本无这些 selector,无冲突。
+- (id)allKeys { // NSArray*
+    crate::mole_cheats::note_dict_as_array_corruption();
+    let empty: id = from_vec(env, Vec::new());
+    autorelease(env, empty)
+}
+- (id)allValues { // NSArray*
+    crate::mole_cheats::note_dict_as_array_corruption();
+    let empty: id = from_vec(env, Vec::new());
+    autorelease(env, empty)
+}
+- (id)objectForKey:(id)_key {
+    crate::mole_cheats::note_dict_as_array_corruption();
+    nil
+}
+- (())setObject:(id)_object forKey:(id)_key {
+    // 坏档伪字典:无法在数组上按 key 存,静默吞(不崩、不写脏数据)。
+    crate::mole_cheats::note_dict_as_array_corruption();
+}
+- (())removeObjectForKey:(id)_key {
+    crate::mole_cheats::note_dict_as_array_corruption();
+}
+
 // TODO: more mutation methods
 
 - (())insertObject:(id)object

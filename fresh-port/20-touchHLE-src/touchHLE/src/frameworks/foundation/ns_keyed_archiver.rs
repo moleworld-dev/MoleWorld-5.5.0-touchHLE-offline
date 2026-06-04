@@ -38,6 +38,12 @@ struct NSKeyedArchiverHostObject {
     current_key: Option<Uid>,
     /// map of id => Uid
     already_archived: HashMap<id, Uid>,
+    /// Every *instance* archived during this session, retained until the
+    /// archiver is deallocated. See `encode_object` for why: without keeping
+    /// archived objects alive, a guest pointer freed mid-archive can be reused
+    /// by a later object, causing `already_archived` (keyed on the raw pointer)
+    /// to false-hit and collapse distinct fields into one — corrupting saves.
+    retained_objects: Vec<id>,
 }
 impl HostObject for NSKeyedArchiverHostObject {}
 
@@ -63,7 +69,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         encoded_data: nil,
         output_data: nil,
         current_key: None,
-        already_archived
+        already_archived,
+        retained_objects: Vec::new(),
     }), &mut env.mem)
 }
 
@@ -216,6 +223,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let NSKeyedArchiverHostObject { encoded_data, output_data, .. } = *env.objc.borrow::<NSKeyedArchiverHostObject>(this);
+    // Release every instance we kept alive during archiving (see encode_object).
+    let retained = std::mem::take(
+        &mut env.objc.borrow_mut::<NSKeyedArchiverHostObject>(this).retained_objects,
+    );
+    for obj in retained {
+        release(env, obj);
+    }
     release(env, encoded_data);
     if output_data != nil { release(env, output_data); }
     env.objc.dealloc_object(this, &mut env.mem);
@@ -341,6 +355,21 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
             env.objc
                 .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
                 .current_key = previous_key;
+        }
+        // Keep this archived instance alive until the archiver is deallocated.
+        // -[UserInfoData encodeWithCoder:] allocs a temporary wrapper container
+        // per field (npcs / achieveUnlock / attributeValue), encodes it, then
+        // releases it; the next field's wrapper would otherwise reuse the
+        // just-freed guest address and false-hit `already_archived`, collapsing
+        // the three distinct fields into one object and corrupting the save.
+        // Retaining prevents the address from being recycled mid-archive.
+        // Classes (object == class) are not refcounted instances; skip them.
+        if object != class {
+            retain(env, object);
+            env.objc
+                .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
+                .retained_objects
+                .push(object);
         }
         let host_object = env.objc.borrow_mut::<NSKeyedArchiverHostObject>(archiver);
         host_object.already_archived.insert(object, new_uid);

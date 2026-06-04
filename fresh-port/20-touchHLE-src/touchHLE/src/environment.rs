@@ -1577,6 +1577,9 @@ impl Environment {
                     break;
                 }
             }
+            // [MoleWorld] 死循环看门狗:进岛卡死时(guest 死循环、drawScene 帧停)在此 dump
+            // PC/回溯。仅 ENABLE_NEWSCENE_ISLAND 开时生效,常态零开销。
+            crate::mole_cheats::watchdog_check(self);
             self.yield_thread(ThreadBlock::NotBlocked);
         }
     }

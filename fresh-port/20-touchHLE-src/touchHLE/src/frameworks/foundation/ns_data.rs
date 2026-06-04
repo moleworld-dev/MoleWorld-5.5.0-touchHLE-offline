@@ -5,7 +5,7 @@
  */
 //! `NSData` and `NSMutableData`.
 
-use super::ns_string::to_rust_string;
+use super::ns_string::{get_static_str, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::fs::GuestPath;
@@ -209,6 +209,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, this);
     // Note: Assuming NSKeyedUnarchiver as coder here
     decode_current_data(env, coder, /* is_mutable: */ true)
+}
+
+// NSCoding 编码侧(与上面 initWithCoder:→decode_current_data 对称:都用 "NS.data" 键)。
+// ★缺它会害死性能:归档器 encode_object 对每个对象发 encodeWithCoder:,NSData/NSMutableData
+// 原来没实现 → 命中"未实现选择子"兜底,每个都刷一行 "NSMutableData does not respond to
+// encodeWithCoder:; no-op" 警告【且把字节丢掉=存档里 NSData 字段全空】。摩尔庄园岛上每次交互
+// 都自动存档、归档里有大量 NSMutableData(图集/缓冲块),于是点击建筑/NPC 就狂刷几十~上千行
+// 警告 = I/O 卡顿,且存档不完整。补上对称编码后:警告全消、存档 NSData 正确往返、卡顿消失。
+// NSMutableData 是 NSData 子类,继承此方法。
+- (())encodeWithCoder:(id)coder {
+    let bytes: ConstVoidPtr = msg![env; this bytes];
+    let length: NSUInteger = msg![env; this length];
+    let key = get_static_str(env, "NS.data");
+    let bytes_u8: ConstPtr<u8> = bytes.cast();
+    () = msg![env; coder encodeBytes:bytes_u8 length:length forKey:key];
 }
 
 - (id)mutableCopyWithZone:(NSZonePtr)_zone {

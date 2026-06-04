@@ -94,18 +94,46 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let slice = env.mem.bytes_at(bytes.cast(), length);
 
+    // [MoleWorld 离线移植] 防御性解析:把易碎的 plist 解析放在借用 host_obj 之前,任何一步
+    // 失败(空/截断/非法档案,如自动存档被写残的 userinfo.dat)都【返回 nil】而不是 unwrap
+    // panic 崩掉整个模拟器。调用方 `unarchiveObjectWithData:` 对 nil unarchiver 续发
+    // decodeObjectForKey: 得 nil → 游戏当作"无存档"正常启动,而非启动即崩。
+    let plist = match Value::from_reader(Cursor::new(slice)) {
+        Ok(p) => p,
+        Err(e) => {
+            log!(
+                "[!] NSKeyedUnarchiver: 坏档({} 字节)无法解析:{:?} — 返回 nil(当无存档,避免崩启动)",
+                length,
+                e
+            );
+            return nil;
+        }
+    };
+    let plist = match plist.into_dictionary() {
+        Some(d) => d,
+        None => {
+            log!("[!] NSKeyedUnarchiver: 档案根非字典 — 返回 nil");
+            return nil;
+        }
+    };
+    if plist.get("$version").and_then(|v| v.as_unsigned_integer()) != Some(100000)
+        || plist.get("$archiver").and_then(|v| v.as_string()) != Some("NSKeyedArchiver")
+    {
+        log!("[!] NSKeyedUnarchiver: $version/$archiver 不符 — 返回 nil");
+        return nil;
+    }
+    let key_count = match plist.get("$objects").and_then(|v| v.as_array()) {
+        Some(a) => a.len(),
+        None => {
+            log!("[!] NSKeyedUnarchiver: 缺 $objects 数组 — 返回 nil");
+            return nil;
+        }
+    };
+
     let host_obj = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
     assert!(host_obj.already_unarchived.is_empty());
     assert!(host_obj.current_key.is_none());
     assert!(host_obj.plist.is_empty());
-
-    let plist = Value::from_reader(Cursor::new(slice)).unwrap();
-    let plist = plist.into_dictionary().unwrap();
-    assert!(plist["$version"].as_unsigned_integer() == Some(100000));
-    assert!(plist["$archiver"].as_string() == Some("NSKeyedArchiver"));
-
-    let key_count = plist["$objects"].as_array().unwrap().len();
-
     host_obj.already_unarchived = vec![None; key_count];
     host_obj.plist = plist;
 
@@ -411,31 +439,33 @@ pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id
 /// Shortcut for use by `[NSDate initWithCoder:]`.
 pub fn decode_current_date(env: &mut Environment, unarchiver: id) -> id {
     let key = get_static_str(env, "NS.time");
+    // [MoleWorld] 健壮化:缺 NS.time 键时默认 0.0(参考日期),不再 unwrap(None) panic。
     let timestamp = get_value_to_decode_for_key(env, unarchiver, key)
-        .unwrap()
-        .as_real()
-        .unwrap();
+        .and_then(|v| v.as_real())
+        .unwrap_or(0.0);
 
     let date: id = msg_class![env; NSDate alloc];
     msg![env; date initWithTimeIntervalSinceReferenceDate:timestamp]
 }
 
 /// Shortcut for use by `[NSData initWithCoder:]`.
-pub fn decode_current_data(env: &mut Environment, unarchiver: id, is_mutable: bool) -> id {
+pub fn decode_current_data(env: &mut Environment, unarchiver: id, _is_mutable: bool) -> id {
     let key = get_static_str(env, "NS.data");
-    // TODO: avoid copying (twice!)
-    let bytes = get_value_to_decode_for_key(env, unarchiver, key)
-        .unwrap()
-        .as_data()
-        .unwrap()
-        .to_vec();
+    // [MoleWorld] 健壮化:缺 NS.data 键(如离线 keychain/分析 SDK 解空归档)时返回空 NSData,
+    // 不再 .unwrap() panic —— 原 unwrap(None) 导致 P0 启动闪退(本函数 .unwrap())。
+    let bytes: Vec<u8> = get_value_to_decode_for_key(env, unarchiver, key)
+        .and_then(|v| v.as_data())
+        .map(|d| d.to_vec())
+        .unwrap_or_default();
     let len: GuestUSize = bytes.len().try_into().unwrap();
-    let guest_bytes: MutVoidPtr = env.mem.alloc(len);
-    env.mem
-        .bytes_at_mut(guest_bytes.cast(), len)
-        .copy_from_slice(bytes.as_slice());
-
-    assert!(is_mutable); // TODO
+    // alloc(0) 不安全:至少分配 1 字节;length 仍按真实 len(0=空 NSData)。
+    let guest_bytes: MutVoidPtr = env.mem.alloc(len.max(1));
+    if len > 0 {
+        env.mem
+            .bytes_at_mut(guest_bytes.cast(), len)
+            .copy_from_slice(bytes.as_slice());
+    }
+    // 始终给 NSMutableData(NSData 子类,可当不可变用),顺带去掉原 assert!(is_mutable) 崩点。
     let data: id = msg_class![env; NSMutableData alloc];
     msg![env; data initWithBytesNoCopy:guest_bytes length:len freeWhenDone:true]
 }
