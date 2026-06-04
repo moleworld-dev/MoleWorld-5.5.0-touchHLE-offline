@@ -330,3 +330,83 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: MoleWorld_v0.0.5_beta_Android_AArch64.apk
+
+  build-macos:
+    # macOS「双击即玩」包(Apple Silicon / arm64):CI 自动打包,产出 摩尔庄园.app(内置游戏 + 启动器)。
+    # 此前 mac 版需本地手工打包再手动传 Release;现并入 CI,与 Win/Linux/Android 一致自动出包上传。
+    # macos-latest 当前即 Apple Silicon(arm64),cargo build 直接产 arm64 二进制。
+    runs-on: macos-latest
+    steps:
+      - name: Checkout (no LFS, no submodules)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fresh-port/20-touchHLE-src/touchHLE
+
+      - name: Install Boost (dynarmic 头文件依赖)
+        run: brew install boost
+
+      - name: Build (release, arm64)
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: cargo build --release
+        env:
+          CMAKE_PREFIX_PATH: /opt/homebrew
+          BOOST_ROOT: /opt/homebrew
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+      # 组装「双击即玩」的 摩尔庄园.app:可执行文件是个启动脚本,cd 到 Resources 后以
+      # iPad 横屏参数运行 touchHLE 并显式加载内置 MoleWorld.app(显式传路径=不经 app 选择器,
+      # 直接进游戏)。该配方已在 Apple Silicon 真机端到端验证(splash + 游戏本体启动)。
+      - name: Create 摩尔庄园.app (双击即玩,内置游戏 + 启动器)
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: |
+          set -e
+          APP="摩尔庄园.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/touchHLE "$APP/Contents/Resources/touchHLE"
+          cp -r touchHLE_dylibs touchHLE_fonts touchHLE_default_options.txt "$APP/Contents/Resources/"
+          cp -r ../../01-cracked/Payload/MoleWorld.app "$APP/Contents/Resources/MoleWorld.app"
+          find "$APP/Contents/Resources/MoleWorld.app" \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
+          rm -rf icon.iconset icon.icns
+          mkdir icon.iconset
+          cp res/icon.png icon.iconset/icon_512x512.png
+          iconutil -c icns -o icon.icns icon.iconset
+          cp icon.icns "$APP/Contents/Resources/icon.icns"
+          printf '#!/bin/bash\ncd "$(cd "$(dirname "$0")/../Resources" && pwd)" || exit 1\nexec ./touchHLE "MoleWorld.app" --landscape-right --device-family=ipad\n' > "$APP/Contents/MacOS/摩尔庄园"
+          chmod +x "$APP/Contents/Resources/touchHLE" "$APP/Contents/MacOS/摩尔庄园"
+          PLIST="$APP/Contents/Info.plist"
+          plutil -create xml1 "$PLIST"
+          plutil -insert CFBundleName -string "摩尔庄园" "$PLIST"
+          plutil -insert CFBundleDisplayName -string "摩尔庄园HD" "$PLIST"
+          plutil -insert CFBundleShortVersionString -string "$MOLE_USER_VERSION" "$PLIST"
+          plutil -insert CFBundleExecutable -string "摩尔庄园" "$PLIST"
+          plutil -insert CFBundleIconFile -string "icon" "$PLIST"
+          plutil -insert CFBundleIdentifier -string "org.touchhle.moleworld" "$PLIST"
+          plutil -insert CFBundlePackageType -string "APPL" "$PLIST"
+
+      - name: Zip bundle for release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: fresh-port/20-touchHLE-src/touchHLE
+        run: ditto -c -k --sequesterRsrc --keepParent "摩尔庄园.app" "MoleWorld_v0.0.5_beta_macOS_AArch64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoleWorld_macOS_AArch64
+          path: fresh-port/20-touchHLE-src/touchHLE/摩尔庄园.app
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: fresh-port/20-touchHLE-src/touchHLE/MoleWorld_v0.0.5_beta_macOS_AArch64.zip
