@@ -363,6 +363,53 @@ fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) 
     this
 }
 
+/// Helper for `initWithDictionary:copyItems:`. With `copy_items == false` this is exactly
+/// `initWithDictionary:`. With `copy_items == true` each VALUE is deep-copied via `copyWithZone:`
+/// (NSCopying), as Cocoa does. MoleWorld's -[RemoteMapData setMapdata:] builds the village map with
+/// `[[NSMutableDictionary alloc] initWithDictionary:serverMap copyItems:YES]`; without this selector
+/// the alloc'd dictionary stayed empty, so -[GameData remoteMapData].mapdata.count was 0 and the
+/// 1001 handler bailed to "SERVER_DATA_ERROR" instead of entering the village.
+fn init_with_dictionary_copy_items_common(
+    env: &mut Environment,
+    this: id,
+    other_dict: id,
+    copy_items: bool,
+) -> id {
+    if !copy_items {
+        return init_with_dictionary_common(env, this, other_dict);
+    }
+    if other_dict == nil {
+        *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
+        return this;
+    }
+    // Same non-dictionary guard as init_with_dictionary_common (avoid host-type-mismatch panics).
+    {
+        let nsdict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
+        let is_dict: bool = msg![env; other_dict isKindOfClass:nsdict_class];
+        if !is_dict {
+            *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
+            return this;
+        }
+    }
+    let other_host_object: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(other_dict));
+    let mut host_object = <DictionaryHostObject as Default>::default();
+    let zone: NSZonePtr = crate::mem::Ptr::null();
+    for key in other_host_object.iter_keys() {
+        let object = other_host_object.lookup(env, key);
+        // Deep-copy the value (NSCopying). If the value's class has no copyWithZone: (copy → nil),
+        // fall back to retaining the original so the entry isn't silently dropped.
+        let copied: id = msg![env; object copyWithZone:zone];
+        let stored = if copied == nil { object } else { copied };
+        host_object.insert(env, key, stored, /* copy_key: */ true);
+        if copied != nil {
+            release(env, copied); // insert() retained it; balance copyWithZone:'s +1
+        }
+    }
+    *env.objc.borrow_mut(this) = host_object;
+    *env.objc.borrow_mut(other_dict) = other_host_object;
+    this
+}
+
 /// Helper function so share `initWithObjects:ForKeys:` implementations
 fn init_with_objects_for_keys_common(env: &mut Environment, this: id, objects: id, keys: id) -> id {
     let keys_size: NSUInteger = msg![env; keys count];
@@ -658,6 +705,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
 }
+- (id)initWithDictionary:(id)dictionary
+                copyItems:(bool)flag {
+    init_with_dictionary_copy_items_common(env, this, dictionary, flag)
+}
 
 - (id)initWithObjects:(id)objects //NSArray *
               forKeys:(id)keys { //NSArray *
@@ -771,6 +822,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
+}
+- (id)initWithDictionary:(id)dictionary
+                copyItems:(bool)flag {
+    init_with_dictionary_copy_items_common(env, this, dictionary, flag)
 }
 
 - (id)init {
