@@ -776,6 +776,22 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, array)
 }
 
+- (id)initWithData:(id)data // NSData *
+          encoding:(NSStringEncoding)encoding {
+    // Defined on the ABSTRACT NSString (not the concrete _touchHLE_NSString) so BOTH concrete string
+    // subclasses — _touchHLE_NSString AND _touchHLE_NSMutableString — inherit it. The game decodes its
+    // HTTP serverlist body via [[NSMutableString alloc] initWithData:encoding:NSUTF8StringEncoding];
+    // while this lived on _touchHLE_NSString only, the mutable subclass did NOT respond to the selector
+    // → no-op'd to nil → the serverlist string was empty → the parse produced zero servers →
+    // -[NetworkManager onServerListResult:] got a3=0 → "Error connecting to server" → entermainmenu,
+    // which in this port stops the render run loop (village builds but never paints). Both concrete
+    // subclasses implement initWithBytes:length:encoding:, so this dispatches correctly for each.
+    let bytes: ConstVoidPtr = msg![env; data bytes];
+    let bytes: ConstPtr<u8> = bytes.cast();
+    let length: NSUInteger = msg![env; data length];
+    msg![env; this initWithBytes:bytes length:length encoding:encoding]
+}
+
 - (())getCharacters:(MutPtr<unichar>)buffer
               range:(NSRange)range {
     // TODO: avoid copying
@@ -1362,16 +1378,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     // 见 ns_keyed_archiver.rs)原生支持 UTF-8,plist::Value::String 可容纳任意 UTF-8 字符串
     // → 去掉这个过严断言即可正确归档非 ASCII 字符串,与真实 iOS 行为一致。
     set_value_to_encode_for_current_key(env, coder, plist::Value::String(string.to_string()));
-}
-
-- (id)initWithData:(id)data // NSData *
-          encoding:(NSStringEncoding)encoding {
-    let bytes: ConstVoidPtr = msg![env; data bytes];
-    let bytes: ConstPtr<u8> = bytes.cast();
-    let length: NSUInteger = msg![env; data length];
-    let new = msg![env; this initWithBytes:bytes length:length encoding:encoding];
-    log_dbg!("initWithData:encoding: {}", to_rust_string(env, new));
-    new
 }
 
 - (id)initWithFormat:(id)format, // NSString*
