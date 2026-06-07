@@ -434,7 +434,10 @@ pub fn run_run_loop(
                 if selector.as_str(&env.mem).ends_with(':') {
                     () = msg_send(env, (target, selector, argument));
                 } else {
-                    assert!(argument.is_null());
+                    // A no-argument (no-colon) selector enqueued via the withObject: API: iOS retains the
+                    // object for the request but does NOT pass it to a 0-arg selector. Call without the
+                    // argument (it is released by the cleanup below) instead of asserting it is null — the
+                    // game does enqueue a 0-arg selector with a non-nil object (hit on entering the village).
                     () = msg_send(env, (target, selector));
                 }
 
