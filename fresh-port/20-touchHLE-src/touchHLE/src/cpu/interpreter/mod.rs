@@ -582,6 +582,9 @@ impl InterpreterCpu {
         // [P1 debug] log first few instructions, and any jump into the stack
         // region (control-flow bug) together with the PREVIOUS instruction (the
         // culprit that wrote the bad PC).
+        // 逐指令开销(trace 环写 / dbg_n / heartbeat / DERAIL 检测)在 release 默认编译掉:
+        // 广谱启动每条指令都付这份固定开销,关掉是均匀提速。需要抓脱轨时开 interp_debug。
+        #[cfg(any(feature = "interp_debug", debug_assertions))]
         {
             self.dbg_n = self.dbg_n.wrapping_add(1);
             let _n = self.dbg_n;
