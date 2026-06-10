@@ -1,13 +1,17 @@
 #!/bin/bash
 # Assemble 摩尔庄园HD.ipa (unsigned) for iOS from the device executable + bundled
-# game + touchHLE runtime resources. AltStore/SideStore re-signs on install; the
-# user enables JIT (StikDebug/JitStreamer) at runtime.
+# game + touchHLE runtime resources. AltStore/SideStore re-signs on install.
 #
-# Build the device executable first:
+# 【无 JIT 路线 / Path B：纯 Rust ARMv7 解释器(cpu_interpreter)】
+# 解释器后端不生成可执行代码,因此【不需要 JIT、不需要 StikDebug/JitStreamer、
+# 不需要调试器附加 CS_DEBUGGED】,在 A17+/iOS 26 (TXM) 上普通侧载即可运行。
+#
+# Build the device executable first（务必带 --no-default-features ...,cpu_interpreter）:
 #   SB=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin
 #   BOOST_ROOT=/opt/homebrew CMAKE_PREFIX_PATH=/opt/homebrew \
 #     CMAKE_POLICY_VERSION_MINIMUM=3.5 IPHONEOS_DEPLOYMENT_TARGET=13.0 \
-#     RUSTC=$SB/rustc $SB/cargo build --release --target aarch64-apple-ios --bin touchHLE
+#     RUSTC=$SB/rustc $SB/cargo build --release --target aarch64-apple-ios \
+#       --no-default-features --features static,cpu_interpreter --bin touchHLE
 # Then run this from the touchHLE dir: dev-scripts/make-ios-ipa.sh
 set -euo pipefail
 
@@ -129,24 +133,25 @@ PLIST
 #      (PlayCover 在 Mac 上跑、以及真机)要求二进制至少有签名,否则报
 #      "code object is not signed at all"。ad-hoc 签名(-s -)即可接上 PlayCover/
 #      AltStore 的重签链路。先签 guest dylib(Mach-O,bundle 扫描器要求有签名),
-#      再带 JIT 权限签主程序(dynarmic 需要 JIT)。
+#      再签主程序。
+#      【无 JIT】cpu_interpreter 后端不生成可执行代码,不需要任何 JIT 相关 entitlement
+#      (allow-jit / allow-unsigned-executable-memory / dynamic-codesigning 全部删除)。
+#      留空 entitlements;AltStore/SideStore 安装时会自行补 get-task-allow。
+#      guest dylib 由 touchHLE 的 HLE 加载器载入 guest 内存(非系统 dyld),
+#      因此也不需要 disable-library-validation。
 cat > "$STAGE/entitlements.plist" <<'ENT'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.cs.allow-jit</key><true/>
-	<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
-	<key>com.apple.security.cs.disable-library-validation</key><true/>
-	<key>dynamic-codesigning</key><true/>
 </dict>
 </plist>
 ENT
 for dylib in "$APP"/touchHLE_dylibs/*.dylib; do
 	codesign --force --sign - "$dylib" 2>/dev/null || echo "  (跳过签名 $dylib:guest dylib,无妨)"
 done
-# 单条 --deep --entitlements 一次签全:--deep 签嵌套(dylib)+ 主程序,entitlements
-# 落到主程序(JIT 权限),并封 bundle。避免"先签主程序带权限、再 --deep 整包"把权限覆盖掉。
+# 单条 --deep --entitlements 一次签全:--deep 签嵌套(dylib)+ 主程序,并封 bundle。
+# (entitlements 为空 dict,无 JIT 权限。)避免"先签主程序、再 --deep 整包"把签名覆盖掉。
 codesign --force --deep --sign - --entitlements "$STAGE/entitlements.plist" --generate-entitlement-der "$APP"
 echo "--- 签名核对 ---"
 codesign -dv "$APP/MoleWorldHD" 2>&1 | grep -iE "Signature|Identifier|format" | head -4 || true
