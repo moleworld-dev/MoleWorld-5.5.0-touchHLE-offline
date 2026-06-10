@@ -73,6 +73,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_application::CONSTANTS,
         ui_device::CONSTANTS,
         ui_view::ui_control::ui_text_field::CONSTANTS,
+        ui_view::ui_scroll_view::ui_text_view::CONSTANTS,
         ui_view::ui_window::CONSTANTS,
     ],
     function_exports: &[
@@ -120,6 +121,17 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     ui_touch::handle_event(
                         env,
                         Event::TouchesDown(std::collections::HashMap::from([(
+                            crate::window::FingerId::Mouse,
+                            (x, y),
+                        )])),
+                    );
+                }
+            }
+            crate::mole_diag::Inject::Move(x, y) => {
+                if !crate::mole_menu::is_open() {
+                    ui_touch::handle_event(
+                        env,
+                        Event::TouchesMove(std::collections::HashMap::from([(
                             crate::window::FingerId::Mouse,
                             (x, y),
                         )])),

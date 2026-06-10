@@ -21,9 +21,37 @@ use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
     retain, todo_objc_setter, ClassExports, NSZonePtr,
 };
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::Environment;
 
 type UIDataDetectorTypes = NSUInteger;
+
+/// `UITextView` 文本通知名。摩尔庄园好友留言板 -[LeaveMessageLayer init] 一进来就
+/// `addObserver:selector:name:UITextViewTextDidChangeNotification object:`;若不导出这个
+/// NSString 常量,guest 的非惰性符号指针 `_UITextViewTextDidChangeNotification_ptr` 留 0,
+/// 取常量值的 `LDR Rn,[Rn]`(Rn=0)就 null 页读 → MemoryError 整机崩(PC=0x1b1bd4)。
+/// 只需非空即可:touchHLE 不实际 post 这些通知(留言框不随编辑自动反应,这里无害)。
+pub const UITextViewTextDidChangeNotification: &str = "UITextViewTextDidChangeNotification";
+pub const UITextViewTextDidBeginEditingNotification: &str =
+    "UITextViewTextDidBeginEditingNotification";
+pub const UITextViewTextDidEndEditingNotification: &str =
+    "UITextViewTextDidEndEditingNotification";
+
+/// `NSNotificationName` values.
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UITextViewTextDidChangeNotification",
+        HostConstant::NSString(UITextViewTextDidChangeNotification),
+    ),
+    (
+        "_UITextViewTextDidBeginEditingNotification",
+        HostConstant::NSString(UITextViewTextDidBeginEditingNotification),
+    ),
+    (
+        "_UITextViewTextDidEndEditingNotification",
+        HostConstant::NSString(UITextViewTextDidEndEditingNotification),
+    ),
+];
 
 pub struct UITextViewHostObject {
     superclass: super::UIScrollViewHostObject,
