@@ -470,6 +470,37 @@ fn objc_msgSend_inner(
                 env.cpu.regs_mut()[0..2].fill(0); // no-op (void)
                 return;
             }
+            // +[CrashLog initCrashLogNotShowViewWithDelegate:andGameType:] @0x53dfc0:
+            // the Flurry/Quincy crash-reporter entry called in didFinishLaunching.
+            // Faking BWQuincyManager (classes.rs) already neuters the core, but this
+            // wrapper still builds args + drives the install. void return, result
+            // unused at the call site (decomp) -> cut the whole wrapper here.
+            if name == "CrashLog"
+                && selector.as_str(&env.mem) == "initCrashLogNotShowViewWithDelegate:andGameType:"
+            {
+                env.cpu.regs_mut()[0..2].fill(0); // no-op (void)
+                return;
+            }
+            // +[AdWallsManager init*] @0x39ecb4..0x39ed68: per-ad-network boot setup
+            // (Tapjoy/Taomee/MiDi/PunchBox + taomeeAnalytics) called synchronously in
+            // didFinishLaunching. All void, results unused (decomp). Offline-dead: the
+            // ad walls themselves are user-triggered and gated by isReachable, never
+            // shown offline. NOTE: do NOT touch sharedInstance/setRootViewController:
+            // — the game uses the AdWallsManager singleton (so the class is NOT faked);
+            // only these boot init* class methods are cut.
+            if name == "AdWallsManager"
+                && matches!(
+                    selector.as_str(&env.mem),
+                    "initTaomee"
+                        | "taomeeAnalytics"
+                        | "initMiDi"
+                        | "initPunchBox"
+                        | "initTapjoyRequestInAppDelegate"
+                )
+            {
+                env.cpu.regs_mut()[0..2].fill(0); // no-op (void)
+                return;
+            }
             // -[LogoLayer shownewFunctionIntroductionLayer]: presents a swipeable
             // promo intro whose paging needs UITapGestureRecognizer/UIScrollView
             // gestures we don't implement, so boot would stall there. Its own

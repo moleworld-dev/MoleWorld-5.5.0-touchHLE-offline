@@ -128,6 +128,14 @@ impl ObjC {
                 "umengAnalyze",
                 "startTaomeeAndFlurryStatisticsSession",
                 "reportAppOpenToAdMob",
+                // Dead-SDK boot inits cut directly at the call site (messages.rs):
+                // CrashLog (Flurry crash reporter) + AdWallsManager per-ad-network init*.
+                "initCrashLogNotShowViewWithDelegate:andGameType:",
+                "initTaomee",
+                "taomeeAnalytics",
+                "initMiDi",
+                "initPunchBox",
+                "initTapjoyRequestInAppDelegate",
             ];
             let sels: Vec<SEL> = HOOK_SEL_NAMES
                 .iter()
