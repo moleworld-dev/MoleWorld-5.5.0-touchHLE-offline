@@ -533,6 +533,52 @@ impl InterpreterCpu {
             return CpuState::Svc(imm24);
         }
 
+        // [TEX-FASTPATH] 摩尔庄园专用:-[CCTexture2D initWithImage:resolutionType:] 的
+        // RGBA8888->RGBA4444 转换内循环(0x2e7102: ldr.w r6,[r3],#4 ... strh r0,[r5],#2 / bne)。
+        // 该循环按像素逐次跑,几百张大纹理(单张达 2048²=4M 像素)累计上亿次迭代,在解释器上
+        // = 启动黑屏数分钟。检测到该循环(精确 PC + 精确指令字 + 整段范围预校验)就用原生 Rust
+        // 整段转换(位运算逐位复刻 0x2e7108-0x2e711c 的 and/orr/移位,bit-for-bit 等价),约 100x。
+        // 任一守卫不符则落普通解释。属游戏特定优化(硬编码 PC),仅对本游戏二进制生效。
+        if pc == 0x002e7102 && insn == 0xf853_6b04 {
+            let count = self.regs[4];
+            let src0 = self.regs[3];
+            let dst0 = self.regs[5];
+            let src_ok = src0 >= self.null_segment_size
+                && (src0 as u64) + 4u64 * (count as u64) <= 0x1_0000_0000;
+            let dst_ok = dst0 >= self.null_segment_size
+                && (dst0 as u64) + 2u64 * (count as u64) <= 0x1_0000_0000;
+            if count > 0 && src_ok && dst_ok {
+                let mut src = src0;
+                let mut dst = dst0;
+                let mut r6 = 0u32;
+                let mut r0 = 0u32;
+                let mut r1 = 0u32;
+                for _ in 0..count {
+                    r6 = self.data_r_u32(mem, src).unwrap_or(0);
+                    r0 = (r6 << 8) & 0xf000;
+                    r1 = (r6 >> 4) & 0xf00;
+                    r1 |= r6 >> 28;
+                    r0 |= r1;
+                    r1 = (r6 >> 16) & 0xf0;
+                    r0 |= r1;
+                    self.data_w_u16(mem, dst, r0 as u16);
+                    src = src.wrapping_add(4);
+                    dst = dst.wrapping_add(2);
+                }
+                // 复刻循环退出态:r3/r5 推进、r4=0、r6/r0/r1=末轮;末轮 subs r4(1->0)留 Z=1/C=1;
+                // PC 落 bne 之后的 0x2e7126(b 0x2e71b2)。
+                self.regs[3] = src;
+                self.regs[5] = dst;
+                self.regs[4] = 0;
+                self.regs[6] = r6;
+                self.regs[0] = r0;
+                self.regs[1] = r1;
+                self.set_nzcv(0, true, false);
+                self.regs[PC] = 0x002e7126;
+                return CpuState::Normal;
+            }
+        }
+
         // [P1 debug] log first few instructions, and any jump into the stack
         // region (control-flow bug) together with the PREVIOUS instruction (the
         // culprit that wrote the bad PC).
