@@ -333,7 +333,7 @@ fn local_time_and_tz() -> (String, String) {
 
 /// 权威「用户版本」号 —— 全平台唯一真源,改这一处即同步(窗口标题 / 「关于」页 /
 /// 崩溃诊断块;安卓 versionName / CI 产物名通过 build-release.yml 的 env 与此对齐)。
-pub const USER_VERSION: &str = "v0.0.5 beta";
+pub const USER_VERSION: &str = "v0.0.6 beta";
 
 /// 构建追溯短 hash:CI 在 tag 上构建时由 build-release.yml 注入 github.sha 前 7 位
 /// (编译期 `option_env!` 读 `MOLE_BUILD_HASH`);本地 / 无注入时为 None。

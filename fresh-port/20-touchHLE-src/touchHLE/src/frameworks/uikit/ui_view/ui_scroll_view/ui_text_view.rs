@@ -8,7 +8,7 @@
 use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
 use crate::frameworks::core_graphics::cg_geometry::CGPointZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::to_rust_string;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::{NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_color;
 use crate::frameworks::uikit::ui_font::{
@@ -21,9 +21,37 @@ use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
     retain, todo_objc_setter, ClassExports, NSZonePtr,
 };
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::Environment;
 
 type UIDataDetectorTypes = NSUInteger;
+
+/// `UITextView` 文本通知名。摩尔庄园好友留言板 -[LeaveMessageLayer init] 一进来就
+/// `addObserver:selector:name:UITextViewTextDidChangeNotification object:`;若不导出这个
+/// NSString 常量,guest 的非惰性符号指针 `_UITextViewTextDidChangeNotification_ptr` 留 0,
+/// 取常量值的 `LDR Rn,[Rn]`(Rn=0)就 null 页读 → MemoryError 整机崩(PC=0x1b1bd4)。
+/// 只需非空即可:touchHLE 不实际 post 这些通知(留言框不随编辑自动反应,这里无害)。
+pub const UITextViewTextDidChangeNotification: &str = "UITextViewTextDidChangeNotification";
+pub const UITextViewTextDidBeginEditingNotification: &str =
+    "UITextViewTextDidBeginEditingNotification";
+pub const UITextViewTextDidEndEditingNotification: &str =
+    "UITextViewTextDidEndEditingNotification";
+
+/// `NSNotificationName` values.
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UITextViewTextDidChangeNotification",
+        HostConstant::NSString(UITextViewTextDidChangeNotification),
+    ),
+    (
+        "_UITextViewTextDidBeginEditingNotification",
+        HostConstant::NSString(UITextViewTextDidBeginEditingNotification),
+    ),
+    (
+        "_UITextViewTextDidEndEditingNotification",
+        HostConstant::NSString(UITextViewTextDidEndEditingNotification),
+    ),
+];
 
 pub struct UITextViewHostObject {
     superclass: super::UIScrollViewHostObject,
@@ -116,7 +144,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)text {
-    env.objc.borrow::<UITextViewHostObject>(this).text
+    let text = env.objc.borrow::<UITextViewHostObject>(this).text;
+    // iOS 保证 UITextView.text 永不为 nil(未设值默认 @"")。摩尔庄园 -[GiftAndMessageLayer
+    // displayUI] 直接 strlen([textView.text UTF8String]) 不做 nil 检查;若这里返回 nil →
+    // [nil UTF8String]=NULL → strlen(NULL) → null 页读 MemoryError 整机崩(PC=0x884cb4,
+    // 调用者 -[GiftAndMessageLayer displayUI]@0x3e11c0)。未设值时回空串,与 iOS 行为一致。
+    if text == nil {
+        get_static_str(env, "")
+    } else {
+        text
+    }
 }
 - (())setText:(id)new_text { // NSString*
     let hostobj  = env.objc.borrow_mut::<UITextViewHostObject>(this);

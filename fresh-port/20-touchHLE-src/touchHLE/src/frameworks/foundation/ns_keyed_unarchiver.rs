@@ -76,10 +76,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)unarchiveObjectWithData:(id)data { // NSData *
+    let dlen: NSUInteger = if data == nil { 0 } else { msg![env; data length] };
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initForReadingWithData:data];
     let root_key = get_static_str(env, NSKeyedArchiveRootObjectKey);
     let result: id = msg![env; new decodeObjectForKey:root_key];
+    // DIAG (map.dat is the big one, ~11.7KB): is the unarchive result nil or a real dict?
+    if dlen > 4096 {
+        let cnt: i64 = if result == nil {
+            -1
+        } else {
+            let c: NSUInteger = msg![env; result count];
+            c as i64
+        };
+        log!("[MOLECHEAT] unarchiveObjectWithData: {}B -> count={}", dlen, cnt);
+    }
     autorelease(env, result)
 }
 
@@ -422,6 +433,16 @@ pub fn decode_current_array(env: &mut Environment, unarchiver: id) -> Vec<id> {
 pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id)> {
     let keys = keys_for_key(env, unarchiver, "NS.keys");
     let vals = keys_for_key(env, unarchiver, "NS.objects");
+    // DIAG: surface what the unarchiver actually reads for a big dict (the village map is the only
+    // large dict here). NS.keys==0 ⇒ the gunzip'd bplist's root dict is empty (server/gzip/body
+    // offset issue); NS.keys==N>0 but final count 0 ⇒ key/val unarchive or insert drops them.
+    if keys.len() > 8 {
+        eprintln!(
+            "[MOLECHEAT] decode_current_dict: NS.keys={} NS.objects={}",
+            keys.len(),
+            vals.len()
+        );
+    }
     log_dbg!("decode_current_dict: keys {:?}, vals {:?}", keys, vals);
 
     let keys: Vec<id> = keys

@@ -9,7 +9,7 @@ use super::ns_string::{get_static_str, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::fs::GuestPath;
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
@@ -21,6 +21,10 @@ pub(super) struct NSDataHostObject {
     free_when_done: bool,
 }
 impl HostObject for NSDataHostObject {}
+
+/// Diagnostic rate-limiter for getBytes:range: out-of-range logs (a garbage-count parser can hit it
+/// tens of thousands of times in one frame).
+static OVERRUN_LOG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -129,6 +133,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let absolute_str: id = msg![env; url absoluteString];
         let path = to_rust_string(env, absolute_str);
+        // MoleWorld online mode: the game reads its serverlist body via
+        // [[NSData alloc] initWithContentsOfURL:] on the dead Taomee URL
+        // (http://imolelogin.61.com:8080/dynamic/online.imole). Serve our private
+        // server instead. Body: "<areaId>\n<host>:<port>\n" (MOLE_SERVER override).
+        if env.options.network_access
+            && (path.contains("online.imole") || path.contains("imolelogin"))
+        {
+            let server = std::env::var("MOLE_SERVER")
+                .unwrap_or_else(|_| "login.moleworld.net:7821".to_string());
+            log!(
+                "[serverlist hook] NSData initWithContentsOfURL:{} -> private server '{}'",
+                path,
+                server
+            );
+            let body = format!("1\n{}\n", server).into_bytes();
+            let len = body.len() as GuestUSize;
+            let buf = env.mem.alloc(len);
+            env.mem.bytes_at_mut(buf.cast(), len).copy_from_slice(&body);
+            return msg![env; this initWithBytesNoCopy:buf length:len];
+        }
         assert!(path.starts_with("http"));
         log!("TODO: ignoring [(NSData*){:?} initWithContentsOfURL:{:?}]", this, path);
         release(env, this);
@@ -277,13 +301,36 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     let &NSDataHostObject { bytes, length, .. } = env.objc.borrow(this);
-    // TODO: throw NSRangeException if out-of-range instead of panic?
-    assert!(range.location < length && range.location + range.length <= length);
-    env.mem.memmove(
-        buffer.cast(),
-        bytes.cast_const() + range.location,
-        range.length,
-    );
+    // Real iOS raises NSRangeException for an out-of-range request; touchHLE has no ObjC exceptions, so
+    // assert!()-ing here SIGABRTs the whole emulator. A hand-rolled private server can legitimately send
+    // a shorter-than-expected reply — e.g. an empty body where the game's parser (parseFriendsList,
+    // cmd 1006) then reads a garbage count and loops getBytes:range: off the end of the NSData. Degrade
+    // gracefully instead of crashing: clamp to the in-bounds portion and zero-fill the rest of the
+    // destination buffer (mirrors subdataWithRange:'s clamping above). The protocol bug stays visible
+    // via the log so the server side can be fixed to send a well-formed body.
+    // Copy the packed NSRange fields into locals before use — formatting / &-borrowing a
+    // #[repr(packed)] field directly is an unaligned reference (rustc E0793).
+    let (loc, rlen) = (range.location, range.length);
+    if loc >= length || rlen > length - loc {
+        // Rate-limit: a garbage-count parser can call this tens of thousands of times in one frame.
+        let n = OVERRUN_LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            log!(
+                "[!] NSData getBytes:range: 越界(loc={} len={} data={}B)— 裁剪+补零不崩(贴近真机 NSRangeException)",
+                loc,
+                rlen,
+                length
+            );
+        }
+        env.mem.bytes_at_mut(buffer, rlen).fill(0);
+        if loc < length {
+            let avail = (length - loc).min(rlen);
+            env.mem
+                .memmove(buffer.cast(), bytes.cast_const() + loc, avail);
+        }
+        return;
+    }
+    env.mem.memmove(buffer.cast(), bytes.cast_const() + loc, rlen);
 }
 
 - (())getBytes:(MutPtr<u8>)buffer {
@@ -377,6 +424,53 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let &NSDataHostObject { bytes, .. } = env.objc.borrow(this);
     env.mem.memmove(bytes + range.location, replacement.cast(), range.length);
+}
+
+// -[NSMutableData replaceBytesInRange:withBytes:length:] — general form: remove range.length
+// bytes at range.location and insert `replacement_length` bytes from `replacement` (resizing
+// as needed; the tail after the range shifts). A NULL `replacement` zero-fills (the game's TCP
+// login builder uses withBytes:NULL length:16 to write a 16-zero password block). MoleWorld's
+// whole packet-build path (login + getAllObjects 1062 / user-info 1001 bodies) needs this; it
+// was missing, so every village command body built wrong → only cmd 1234 ever reached the server.
+- (())replaceBytesInRange:(NSRange)range
+                withBytes:(ConstPtr<u8>)replacement
+                   length:(NSUInteger)replacement_length {
+    let old_total = env.objc.borrow::<NSDataHostObject>(this).length;
+    let loc = range.location.min(old_total);
+    let end = loc.saturating_add(range.length).min(old_total);
+    let tail_len = old_total - end;
+    let new_total = loc + replacement_length + tail_len;
+    // Snapshot tail + replacement to host memory before reallocating (handles overlap/move).
+    let tail: Vec<u8> = if tail_len > 0 {
+        let &NSDataHostObject { bytes, .. } = env.objc.borrow(this);
+        env.mem.bytes_at((bytes + end).cast(), tail_len).to_vec()
+    } else {
+        Vec::new()
+    };
+    let repl: Vec<u8> = if replacement_length == 0 {
+        Vec::new()
+    } else if replacement.is_null() {
+        vec![0u8; replacement_length as usize]
+    } else {
+        env.mem
+            .bytes_at(replacement.cast(), replacement_length)
+            .to_vec()
+    };
+    let &NSDataHostObject { bytes, .. } = env.objc.borrow(this);
+    let new_bytes = env.mem.realloc(bytes, new_total.max(1));
+    if replacement_length > 0 {
+        env.mem
+            .bytes_at_mut((new_bytes + loc).cast(), replacement_length)
+            .copy_from_slice(&repl);
+    }
+    if tail_len > 0 {
+        env.mem
+            .bytes_at_mut((new_bytes + (loc + replacement_length)).cast(), tail_len)
+            .copy_from_slice(&tail);
+    }
+    let host = env.objc.borrow_mut::<NSDataHostObject>(this);
+    host.bytes = new_bytes;
+    host.length = new_total;
 }
 
 - (MutVoidPtr)mutableBytes {

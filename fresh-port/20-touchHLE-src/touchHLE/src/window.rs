@@ -241,6 +241,13 @@ pub struct Window {
     lock_aspect: bool,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     splash_image: Option<Image>,
+    /// [MoleWorld iOS] SDL 窗口的默认 framebuffer。桌面/安卓=0;iOS=SDL 绑到 CAEAGLLayer 的
+    /// 非 0 viewFramebuffer。present_frame 绘制前绑定它。
+    default_framebuffer: crate::gles::gles11_raw::types::GLuint,
+    /// [MoleWorld iOS] internal_gl_ins context 的 viewRenderbuffer。iOS 的 SDL swap 走
+    /// [presentRenderbuffer:GL_RENDERBUFFER],呈现【当前绑定的 renderbuffer】;故 splash /
+    /// composition 在 swap 前必须把它绑回 GL_RENDERBUFFER,否则呈现到错误缓冲=黑屏。桌面/安卓=0。
+    default_renderbuffer: crate::gles::gles11_raw::types::GLuint,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
@@ -397,6 +404,8 @@ impl Window {
             lock_aspect,
             internal_gl_ins: None,
             splash_image: launch_image,
+            default_framebuffer: 0,
+            default_renderbuffer: 0,
             device_family,
             device_orientation,
             controller_ctx,
@@ -422,8 +431,10 @@ impl Window {
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
         let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
+        let mut window_default_fbo: crate::gles::gles11_raw::types::GLuint = 0;
+        let mut window_default_rbo: crate::gles::gles11_raw::types::GLuint = 0;
         {
-            let gl_ctx = gl_ins.make_current(&mut window);
+            let mut gl_ctx = gl_ins.make_current(&mut window);
             let desc = unsafe { gl_ctx.driver_description() };
             log!("Driver info: {}", desc);
             // [MoleWorld] 缓存给「关于」页用(此刻上下文 current,glGetString 安全)。
@@ -431,7 +442,20 @@ impl Window {
             // [crash log] GPU 已缓存、游戏版本已在 main 缓存 → 输出一次完整运行诊断块,
             // 方便用户贴日志时一眼看清「什么机器 / 什么系统 / 什么版本」。
             echo!("{}", crate::mole_sysinfo::diag_block());
+            // [MoleWorld iOS] 此刻 SDL 刚 make_current、把窗口的 viewFramebuffer 留作当前绑定,
+            // 抓它作为窗口默认 framebuffer。桌面/安卓=0,iOS=CAEAGLLayer 的非 0 FBO。
+            let mut fbo: crate::gles::gles11_raw::types::GLint = 0;
+            let mut rbo: crate::gles::gles11_raw::types::GLint = 0;
+            unsafe {
+                gl_ctx.GetIntegerv(crate::gles::gles11_raw::FRAMEBUFFER_BINDING_OES, &mut fbo);
+                gl_ctx.GetIntegerv(crate::gles::gles11_raw::RENDERBUFFER_BINDING_OES, &mut rbo);
+            }
+            window_default_fbo = fbo as _;
+            window_default_rbo = rbo as _;
         }
+        window.default_framebuffer = window_default_fbo;
+        window.default_renderbuffer = window_default_rbo;
+        log!("[ios-present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
         window.internal_gl_ins = Some(gl_ins);
 
         if window.splash_image.is_some() {
@@ -483,7 +507,21 @@ impl Window {
             let out_x = (x + 0.5) * out_w as f32;
             let out_y = (y + 0.5) * out_h as f32;
             // Round to match touch precision of official devices.
-            (out_x.round(), out_y.round())
+            let out = (out_x.round(), out_y.round());
+            // [MoleWorld TOUCHDIAG] 拖动错位回归排查:打印 输入(窗口坐标)→viewport→输出(游戏坐标)。
+            // 限频每 10 次一条。看 out 是否随 in 线性跟随、vp/yoff 是否异常。
+            {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
+                    log!(
+                        "[TOUCHDIAG] in=({:.0},{:.0}) vp=({},{},{},{}) yoff={} unrot=({},{}) -> out=({:.0},{:.0})",
+                        in_x, in_y, vx, vy, vw, vh,
+                        window.viewport_y_offset(), out_w, out_h, out.0, out.1
+                    );
+                }
+            }
+            out
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
             let (_, _, vw, vh) = window.viewport();
@@ -1230,6 +1268,27 @@ impl Window {
 
         let gl_ctx = self.window.gl_create_context()?;
 
+        // [MoleWorld] macOS 26 的窗口服务器对【未同步上屏】的 GL 窗口(尤其独立 Space + 高频刷新)
+        // 会合成出闪烁(渲染内容平滑、上屏却闪)。MOLE_VSYNC 让 swap 同步到显示器刷新来消除:
+        // 1=VSync(同步),2=自适应撕裂同步(LateSwapTearing),其它/不设=保持原行为(Immediate)。
+        // env 门控、便于 A/B,不改默认行为(gl_create_context 后上下文已 current,可设 swap interval)。
+        if let Ok(mode) = std::env::var("MOLE_VSYNC") {
+            use sdl2::video::SwapInterval;
+            let (si, name) = match mode.as_str() {
+                "1" => (SwapInterval::VSync, "VSync"),
+                "2" => (SwapInterval::LateSwapTearing, "LateSwapTearing(自适应)"),
+                _ => (SwapInterval::Immediate, "Immediate"),
+            };
+            match self.video_ctx.gl_set_swap_interval(si) {
+                Ok(()) => {
+                    log!("[MoleWorld] gl_set_swap_interval={} 已应用 (MOLE_VSYNC={})", name, mode);
+                }
+                Err(e) => {
+                    log!("[MoleWorld] gl_set_swap_interval={} 失败: {}", name, e);
+                }
+            }
+        }
+
         Ok(GLContext(gl_ctx))
     }
 
@@ -1242,19 +1301,40 @@ impl Window {
         )
     }
 
-    /// [MoleWorld iOS] iOS 的 OpenGLES.framework 函数(glGetString 等)是直接链接进
-    /// 进程的符号,SDL_GL_GetProcAddress 对它们返回 NULL → gles11/gl21::load_with 拿到
-    /// 空指针、调用即段错误(实测在 PlayCover 上崩于 Window::new 的
-    /// driver_description → glGetString)。回退用 dlsym(RTLD_DEFAULT) 从进程已链接符号
-    /// 解析。桌面/Android 上 SDL 正常返回(addr 非空),此回退不触发,故无副作用。
+    /// [MoleWorld iOS] iOS 上的 GL 符号解析:**不信任 SDL_GL_GetProcAddress 的返回,一律
+    /// 优先从 OpenGLES.framework 解析。** 实测在 PlayCover / iOS-on-Mac 进程里,桌面
+    /// OpenGL.framework(libGL.dylib)被加载且导出同名 glGenTextures/glGetString:SDL 对
+    /// 一部分函数(如 glGenTextures)返回的正是【桌面 GL】的指针(addr 非空,它要 CGL/NSOpenGL
+    /// 上下文,而我们建的是 GLES/EAGLContext → 调用即崩),对另一些(如 glGetString)返回
+    /// NULL。所以「仅在 addr 为空时才回退」是不够的——glGenTextures 这种 addr 非空但指向桌面
+    /// GL 的会漏网。改为:只要 OpenGLES.framework 有该符号就用它(覆盖 SDL 的桌面指针),
+    /// OpenGLES 没有时才回落到 SDL 的 addr / RTLD_DEFAULT。仅编进 iOS target,桌面/Android
+    /// 走原生 SDL(返回 addr,本函数整体不参与)。
     fn gl_proc_ios_fallback(
         addr: *const std::ffi::c_void,
         procname: &str,
     ) -> *const std::ffi::c_void {
-        #[cfg(unix)]
-        if addr.is_null() {
-            if let Ok(cname) = std::ffi::CString::new(procname) {
-                let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+        #[cfg(target_os = "ios")]
+        if let Ok(cname) = std::ffi::CString::new(procname) {
+            unsafe {
+                // 优先从 OpenGLES.framework 专属 handle 解析(避开桌面 OpenGL.framework 同名符号)。
+                let gles_path = b"/System/Library/Frameworks/OpenGLES.framework/OpenGLES\0"
+                    .as_ptr() as *const libc::c_char;
+                let mut gles = libc::dlopen(gles_path, libc::RTLD_NOLOAD | libc::RTLD_LAZY);
+                if gles.is_null() {
+                    gles = libc::dlopen(gles_path, libc::RTLD_LAZY);
+                }
+                if !gles.is_null() {
+                    let sym = libc::dlsym(gles, cname.as_ptr());
+                    if !sym.is_null() {
+                        return sym as *const std::ffi::c_void;
+                    }
+                }
+                // OpenGLES 无该符号:SDL 的 addr 非空则用它,否则 RTLD_DEFAULT 兜底。
+                if !addr.is_null() {
+                    return addr;
+                }
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
                 if !sym.is_null() {
                     return sym as *const std::ffi::c_void;
                 }
@@ -1307,6 +1387,8 @@ impl Window {
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
 
         let image = self.splash_image.as_ref().unwrap();
+        let window_fbo = self.default_framebuffer();
+        let window_rbo = self.default_renderbuffer();
 
         unsafe {
             let mut gl_ctx = self
@@ -1351,6 +1433,27 @@ impl Window {
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // [MoleWorld iOS] The splash texture is NPOT (image-sized). iOS
+            // native GLES1 requires CLAMP_TO_EDGE wrap for NPOT textures to be
+            // complete; the default GL_REPEAT leaves it incomplete and the
+            // textured present draws solid white (the "白色闪一下" the device
+            // shows). Harmless on desktop. See composition.rs for the full note.
+            // [MoleWorld] CLAMP only on iOS; Mac keeps REPEAT (default). present_frame on
+            // Mac rotates texcoords via the TEXTURE matrix outside [0,1] where REPEAT wraps
+            // correctly and CLAMP_TO_EDGE would smear the splash into vertical bands.
+            #[cfg(target_os = "ios")]
+            {
+                gl_ctx.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gl_ctx.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
 
             log!("[splash] texture ready; calling present_frame (first GL draw / DrawArrays)");
             present_frame(
@@ -1358,8 +1461,12 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                window_fbo,
             );
             log!("[splash] present_frame returned OK");
+            // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer 契约)。
+            #[cfg(target_os = "ios")]
+            gl_ctx.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_rbo);
 
             gl_ctx.DeleteTextures(1, &texture);
         };
@@ -1373,6 +1480,16 @@ impl Window {
 
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
+    /// [MoleWorld iOS] 窗口的默认 framebuffer(见字段注释)。供 present_frame 绘制前绑定。
+    pub fn default_framebuffer(&self) -> crate::gles::gles11_raw::types::GLuint {
+        self.default_framebuffer
+    }
+
+    /// [MoleWorld iOS] 窗口的默认 viewRenderbuffer(见字段注释)。各 present 路径 swap 前绑回。
+    pub fn default_renderbuffer(&self) -> crate::gles::gles11_raw::types::GLuint {
+        self.default_renderbuffer
+    }
+
     pub fn swap_window(&self) {
         self.window.gl_swap_window();
     }
@@ -1471,6 +1588,21 @@ impl Window {
         let (app_width, app_height) =
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
         let (screen_width, screen_height) = self.window.drawable_size();
+        // [MoleWorld VPDIAG] 拖动错位回归排查:打印 app/drawable/窗口尺寸 + viewport_y_offset。
+        // render 用 viewport()+yoff,touch(transform_input_coords)用 viewport() 不加 yoff;
+        // 若 yoff≠0(启动时被 SizeChanged 置非零)→ render 偏移而 touch 不偏移 = 错位根因。
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) % 180 == 0 {
+                log!(
+                    "[VPDIAG] app=({},{}) drawable=({},{}) winsize={:?} yoff={} max_h={} fullscreen={} scale_hack={}",
+                    app_width, app_height, screen_width, screen_height,
+                    self.window.size(), self.viewport_y_offset, self.max_height,
+                    self.fullscreen, self.scale_hack
+                );
+            }
+        }
 
         // [MoleWorld] 窗口模式(非全屏)「自由拉伸」:画面铺满整个窗口、忽略宽高比
         // (用户要的「自由调节适配屏幕拉伸」)。注意:默认固定尺寸窗口下 drawable 尺寸

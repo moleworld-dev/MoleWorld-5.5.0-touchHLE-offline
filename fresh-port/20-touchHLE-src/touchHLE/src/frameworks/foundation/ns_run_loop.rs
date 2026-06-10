@@ -392,49 +392,70 @@ pub fn run_run_loop(
             render_audio_unit(env, audio_unit);
         }
 
-        loop {
-            let selector_objects = &mut env
-                .objc
-                .borrow_mut::<NSRunLoopHostObject>(run_loop)
-                .selector_objects;
-            let to_run = selector_objects
-                .iter()
-                .enumerate()
-                .find(|(_, oss)| oss.due_by.is_none_or(|due_by| Instant::now() >= due_by))
-                .map(|(index, _)| index);
-
-            match to_run {
-                Some(index) => {
-                    // TODO: remove() is linear here
-                    let ObjectSelectorSource {
-                        target,
-                        selector,
-                        argument,
-                        due_by: _,
-                        semaphore,
-                    } = selector_objects.remove(index).unwrap();
-                    log_dbg!("Running object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}", selector.as_str(env.mem.as_mut()));
-
-                    if selector.as_str(&env.mem).ends_with(':') {
-                        () = msg_send(env, (target, selector, argument));
+        // Service the performSelector: queue as a SNAPSHOT batch: run only the requests already due at
+        // the start of this run-loop pass. Requests (re-)enqueued WHILE the batch runs stay queued for
+        // the NEXT pass — matching CFRunLoop, which services the perform-queue present at the start of a
+        // pass and defers ones added during servicing. Without snapshotting, a source that re-arms
+        // itself every time it runs (CocoaAsyncSocket's -maybeDequeueRead / -maybeDequeueWrite
+        // re-schedule themselves via performSelector:) keeps this queue perpetually non-empty, so the
+        // old `loop`/`find` never exits, the timer phase below never runs again, the CCDirector mainLoop
+        // timer stops firing, and rendering freezes — while the socket is still serviced, so packets
+        // keep flowing (exactly the "village builds but never paints after a disconnect" symptom).
+        {
+            let mut batch: Vec<ObjectSelectorSource> = Vec::new();
+            {
+                let selector_objects = &mut env
+                    .objc
+                    .borrow_mut::<NSRunLoopHostObject>(run_loop)
+                    .selector_objects;
+                let now = Instant::now();
+                let mut i = 0;
+                while i < selector_objects.len() {
+                    if selector_objects[i].due_by.is_none_or(|due_by| now >= due_by) {
+                        // TODO: remove() is linear here
+                        batch.push(selector_objects.remove(i).unwrap());
                     } else {
-                        assert!(argument.is_null());
-                        () = msg_send(env, (target, selector));
-                    }
-
-                    release(env, target);
-                    release(env, argument);
-
-                    if !semaphore.is_null() {
-                        sem_post(env, semaphore);
+                        i += 1;
                     }
                 }
-                None => {
-                    for oss in selector_objects {
-                        limit_sleep_time(&mut sleep_until, oss.due_by);
-                    }
-                    break;
+            }
+            for ObjectSelectorSource {
+                target,
+                selector,
+                argument,
+                due_by: _,
+                semaphore,
+            } in batch
+            {
+                log_dbg!(
+                    "Running object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}",
+                    selector.as_str(&env.mem)
+                );
+                if selector.as_str(&env.mem).ends_with(':') {
+                    () = msg_send(env, (target, selector, argument));
+                } else {
+                    // A no-argument (no-colon) selector enqueued via the withObject: API: iOS retains the
+                    // object for the request but does NOT pass it to a 0-arg selector. Call without the
+                    // argument (it is released by the cleanup below) instead of asserting it is null — the
+                    // game does enqueue a 0-arg selector with a non-nil object (hit on entering the village).
+                    () = msg_send(env, (target, selector));
                 }
+
+                release(env, target);
+                release(env, argument);
+
+                if !semaphore.is_null() {
+                    sem_post(env, semaphore);
+                }
+            }
+            // Account remaining (not-yet-due, plus any freshly re-enqueued) requests toward the sleep
+            // deadline so the loop wakes to service them on the next pass.
+            let selector_objects = &env
+                .objc
+                .borrow::<NSRunLoopHostObject>(run_loop)
+                .selector_objects;
+            for oss in selector_objects {
+                limit_sleep_time(&mut sleep_until, oss.due_by);
             }
         }
 
@@ -456,6 +477,12 @@ pub fn run_run_loop(
         // The compromise used here is that we will wait for a 60th of a second,
         // or until the next scheduled event, whichever is sooner. iPhone OS
         // apps can't do more than 60fps so this should be fine.
+        // MoleWorld online mode: pump CFStream read/write client callbacks for the
+        // game's AsyncSocket connection (no-op when no streams / offline).
+        if is_main_run_loop {
+            crate::frameworks::core_foundation::cf_stream::drive_streams(env);
+        }
+
         let limit = Duration::from_millis(1000 / 60);
         env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
 

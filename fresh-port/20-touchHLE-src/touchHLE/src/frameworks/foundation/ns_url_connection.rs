@@ -13,9 +13,10 @@
 
 use super::{ns_string, NSInteger};
 use crate::environment::Environment;
-use crate::mem::MutPtr;
+use crate::mem::{GuestUSize, MutPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use std::borrow::Cow;
 
@@ -29,8 +30,18 @@ const NSURLErrorNotConnectedToInternet: NSURLErrorCode = -1009;
 struct NSURLConnectionHostObject {
     /// Strong reference to the delegate (may be nil).
     delegate: id,
+    /// Strong reference to the originating NSURLRequest (for the serverlist hook).
+    request: id,
 }
 impl HostObject for NSURLConnectionHostObject {}
+
+/// Minimal NSHTTPURLResponse so the serverlist fetch's `!resp || [resp statusCode]==404`
+/// guard passes in online mode (the game checks the response, then reads the body
+/// separately via NSData initWithContentsOfURL:).
+struct NSHTTPURLResponseHostObject {
+    status_code: NSInteger,
+}
+impl HostObject for NSHTTPURLResponseHostObject {}
 
 /// Deliver a "not connected to the internet" failure to a connection's
 /// delegate, if it implements `connection:didFailWithError:`.
@@ -53,6 +64,65 @@ fn fail_offline(env: &mut Environment, connection: id, delegate: id) {
     () = msg![env; delegate connection:connection didFailWithError:error];
 }
 
+/// MoleWorld online mode (`--allow-network-access`): the game fetches its server
+/// list from the dead Taomee URL `http://imolelogin.61.com:8080/dynamic/online.imole`.
+/// When online mode is on and a request targets that URL, hand the game OUR private
+/// server instead. Body mirrors the real serverlist: "<areaId>\n<host>:<port>\n".
+/// Override host:port via the MOLE_SERVER env var (default login.moleworld.net:7821).
+fn serverlist_override(env: &mut Environment, request: id) -> Option<Vec<u8>> {
+    if !env.options.network_access || request == nil {
+        return None;
+    }
+    let url = url_string_from_request(env, request);
+    if !(url.contains("online.imole") || url.contains("imolelogin")) {
+        return None;
+    }
+    let server =
+        std::env::var("MOLE_SERVER").unwrap_or_else(|_| "login.moleworld.net:7821".to_string());
+    log!(
+        "[serverlist hook] {} -> private server '{}' (online mode)",
+        url,
+        server
+    );
+    Some(format!("1\n{}\n", server).into_bytes())
+}
+
+/// Build an autoreleased NSData copying `bytes` into guest memory.
+fn nsdata_from_bytes(env: &mut Environment, bytes: &[u8]) -> id {
+    let len = bytes.len() as GuestUSize;
+    let buf = env.mem.alloc(len);
+    env.mem.bytes_at_mut(buf.cast(), len).copy_from_slice(bytes);
+    msg_class![env; NSData dataWithBytesNoCopy:buf length:len]
+}
+
+/// Deliver serverlist bytes to an async connection's delegate, mimicking a
+/// successful load: (optional) didReceiveResponse, then didReceiveData, then
+/// connectionDidFinishLoading.
+fn deliver_serverlist(env: &mut Environment, connection: id, delegate: id, body: &[u8]) {
+    if delegate == nil {
+        return;
+    }
+    let data = nsdata_from_bytes(env, body);
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "connection:didReceiveResponse:")
+    {
+        () = msg![env; delegate connection:connection didReceiveResponse:nil];
+    }
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "connection:didReceiveData:")
+    {
+        () = msg![env; delegate connection:connection didReceiveData:data];
+    }
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "connectionDidFinishLoading:")
+    {
+        () = msg![env; delegate connectionDidFinishLoading:connection];
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -67,6 +137,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)sendSynchronousRequest:(id)request // NSURLRequest *
            returningResponse:(MutPtr<id>)response // NSURLResponse **
                        error:(MutPtr<id>)out_error { // NSError **
+    // MoleWorld online mode: intercept the dead Taomee serverlist URL and hand
+    // the game our private server synchronously.
+    if let Some(body) = serverlist_override(env, request) {
+        let data = nsdata_from_bytes(env, &body);
+        if !response.is_null() {
+            // The caller (HttpManager) guards on `!resp || [resp statusCode]==404`,
+            // so hand back a non-nil 200 response. (It reads the body separately via
+            // NSData initWithContentsOfURL:, which we also intercept.)
+            let resp: id = msg_class![env; NSHTTPURLResponse alloc];
+            let resp: id = msg![env; resp init];
+            autorelease(env, resp);
+            env.mem.write(response, resp);
+        }
+        if !out_error.is_null() {
+            env.mem.write(out_error, nil);
+        }
+        log!("[NSURLConnection sendSynchronousRequest] serverlist hook -> {} bytes + 200 resp", body.len());
+        return data;
+    }
     // [crash log] 离线下分析 SDK(如 TalkingData)会每帧重试同步上报,这条会刷爆日志
     // (实测一份日志里 400+ 条同样的行),把崩溃前真正的操作淹没、文件也可能撑大。
     // 只完整记录首条,之后同类离线同步请求不再每条刷屏。行为不变(始终返回 nil)。
@@ -122,6 +211,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
     retain(env, delegate);
     env.objc.borrow_mut::<NSURLConnectionHostObject>(this).delegate = delegate;
+    retain(env, request);
+    env.objc.borrow_mut::<NSURLConnectionHostObject>(this).request = request;
     if start_immediately {
         () = msg![env; this start];
     }
@@ -136,9 +227,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())start {
+    let delegate = env.objc.borrow::<NSURLConnectionHostObject>(this).delegate;
+    let request = env.objc.borrow::<NSURLConnectionHostObject>(this).request;
+    // MoleWorld online mode: serve our private server for the serverlist URL.
+    if let Some(body) = serverlist_override(env, request) {
+        deliver_serverlist(env, this, delegate, &body);
+        return;
+    }
     // No real networking: report failure to the delegate so the game proceeds
     // down its offline / connection-error path instead of waiting forever.
-    let delegate = env.objc.borrow::<NSURLConnectionHostObject>(this).delegate;
     fail_offline(env, this, delegate);
 }
 
@@ -155,7 +252,29 @@ pub const CLASSES: ClassExports = objc_classes! {
     if delegate != nil {
         release(env, delegate);
     }
+    let request = env.objc.borrow::<NSURLConnectionHostObject>(this).request;
+    if request != nil {
+        release(env, request);
+    }
     env.objc.dealloc_object(this, &mut env.mem)
+}
+
+@end
+
+// Minimal NSHTTPURLResponse: enough for the serverlist fetch's statusCode check.
+@implementation NSHTTPURLResponse: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(NSHTTPURLResponseHostObject { status_code: 200 });
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (id)init {
+    this
+}
+
+- (NSInteger)statusCode {
+    env.objc.borrow::<NSHTTPURLResponseHostObject>(this).status_code
 }
 
 @end

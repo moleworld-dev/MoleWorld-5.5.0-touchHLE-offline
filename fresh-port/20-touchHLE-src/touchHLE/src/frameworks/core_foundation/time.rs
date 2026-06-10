@@ -5,7 +5,7 @@
  */
 //! Time things including `CFAbsoluteTime`.
 
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::NSTimeInterval;
 use crate::libc::time::{time_t, timestamp_to_calendar_date};
@@ -89,3 +89,19 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFAbsoluteTimeGetGregorianDate(_, _)),
     export_c_func!(CFAbsoluteTimeGetDayOfWeek(_, _)),
 ];
+
+pub const CONSTANTS: ConstantExports = &[(
+    // kCFAbsoluteTimeIntervalSince1970 is a CFTimeInterval (double): the number of seconds between the
+    // Unix epoch (1 Jan 1970) and CoreFoundation's absolute reference date (1 Jan 2001). Without it the
+    // non-lazy symbol pointer stays null, and code that reads it — e.g. the game's
+    // -[NetworkManager parseDailyTaskListWithSceneId:pos:len:], which converts a server timestamp via
+    // `serverTime - kCFAbsoluteTimeIntervalSince1970` — does `VLDR Dn, [0x0]` → null-page access → crash
+    // (observed on entering the village, when the server sends the daily-task list).
+    "_kCFAbsoluteTimeIntervalSince1970",
+    HostConstant::Custom(|env| {
+        env.mem
+            .alloc_and_write(SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64)
+            .cast()
+            .cast_const()
+    }),
+)];
