@@ -134,5 +134,34 @@ pub fn main() {
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
+
+        // [MoleWorld iOS] SDL2 的 ObjC(SDL_mfijoystick.m 等)用 @available,降级为
+        // clang compiler-rt 的 __isPlatformVersionAtLeast。rustc 的链接步骤不会自动带入
+        // 该 builtins 库,需显式链接 libclang_rt.ios.a,否则报
+        // "Undefined symbols for architecture arm64: ___isPlatformVersionAtLeast"。
+        // 资源目录在构建时用 `xcrun clang --print-resource-dir` 探测,不硬编码 clang 版本号。
+        if let Ok(out) = std::process::Command::new("xcrun")
+            .args(["clang", "--print-resource-dir"])
+            .output()
+        {
+            if out.status.success() {
+                let res_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let crt = std::path::Path::new(&res_dir)
+                    .join("lib")
+                    .join("darwin")
+                    .join("libclang_rt.ios.a");
+                if crt.exists() {
+                    // 用 link-arg 把 .a 直接作为链接器(clang)输入,绕开 rustc 的静态库
+                    // 归档解析(libclang_rt.ios.a 是特殊归档格式,`static=` 会报
+                    // "Unsupported archive identifier")。位置在 SDL 之后,符号按需解析。
+                    println!("cargo:rustc-link-arg={}", crt.display());
+                } else {
+                    println!(
+                        "cargo:warning=libclang_rt.ios.a not found at {}; iOS link may fail on __isPlatformVersionAtLeast",
+                        crt.display()
+                    );
+                }
+            }
+        }
     }
 }

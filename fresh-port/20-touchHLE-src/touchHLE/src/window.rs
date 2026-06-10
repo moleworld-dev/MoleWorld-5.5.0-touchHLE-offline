@@ -1591,6 +1591,9 @@ impl Window {
         // [MoleWorld VPDIAG] 拖动错位回归排查:打印 app/drawable/窗口尺寸 + viewport_y_offset。
         // render 用 viewport()+yoff,touch(transform_input_coords)用 viewport() 不加 yoff;
         // 若 yoff≠0(启动时被 SizeChanged 置非零)→ render 偏移而 touch 不偏移 = 错位根因。
+        // macOS-only:max_height / viewport_y_offset 字段是 #[cfg(target_os="macos")]
+        // (窗口可拖动缩放才有意义);iOS 全屏无窗口拖动,该诊断不适用,gate 掉以修复 iOS 构建。
+        #[cfg(target_os = "macos")]
         {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
