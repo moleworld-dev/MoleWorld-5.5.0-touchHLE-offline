@@ -122,6 +122,12 @@ impl ObjC {
                 "caribbeanData",
                 "showLayerWithTarget:selector:",
                 "getCaribbeanStateInfo:",
+                // [MoleWorld offline port] Dead-SDK AppDelegate wrappers no-op'd in
+                // messages.rs — must be here or is_mole_hook gates that block out.
+                "umengTrack",
+                "umengAnalyze",
+                "startTaomeeAndFlurryStatisticsSession",
+                "reportAppOpenToAdMob",
             ];
             let sels: Vec<SEL> = HOOK_SEL_NAMES
                 .iter()

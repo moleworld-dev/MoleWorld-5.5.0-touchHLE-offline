@@ -492,7 +492,23 @@ fn substitute_classes(
         // PunchBoxAd: ad SDK (startSession:/setMuteState:/setDebugMode:/
         // getInstance). Also called during didFinishLaunching before renderer
         // setup. Pure ads; fake to keep boot moving toward the cocos2d renderer.
-        || name == "PunchBoxAd")
+        || name == "PunchBoxAd"
+        // ===== [MoleWorld offline port] Dead-SDK ROOT manager/entry classes. =====
+        // Faking the ROOT facade makes its ENTIRE init tree disappear: every class
+        // method + instance method returns nil/0, and +initialize/+load never run.
+        // These analytics/ad/crash-report SDKs are pure network and 100% dead
+        // offline, yet their init drives signals / archive decode / resident
+        // timers / background threads = billions of wasted boot ObjC instructions.
+        // RULE: PRECISE `== "X"` ONLY (leaf facades, grep-verified non-superclass);
+        // a namespace prefix or a superclass triggers the "found FakeClass,
+        // expected ClassHostObject" panic in the superclass walk.
+        || name == "TalkingDataGA"    // P0 onStart: 12×sigaction + resident upload timer + saveLogToFile
+        || name == "MobClick"         // P0 Umeng session/disk/UMANWorker background postData
+        || name == "BWQuincyManager"  // P0 crash reporter core (CrashLog forwards here)
+        || name == "NewRelicAgent"    // P1 APM: harvest timer + URLProtocol/method swizzle
+        || name == "IMAdTracker"      // P1 InMobi conversion tracking: reachability + NSOperationQueue retries
+        || name == "MiidiManager"     // P1 Miidi offer-wall setup + plist probing
+        || name == "TaomeeAdWall")    // P1 Taomee offer-wall + bare network analytics
     {
         return None;
     }

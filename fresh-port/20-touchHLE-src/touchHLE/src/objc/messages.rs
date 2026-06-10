@@ -443,6 +443,33 @@ fn objc_msgSend_inner(
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
             }
+            // ===== [MoleWorld offline port] Dead-SDK AppDelegate wrapper no-ops. =====
+            // applicationDidFinishLaunching calls these wrappers, which fan out to
+            // analytics/ad SDKs that are 100% dead offline. Faking the SDK leaf
+            // classes (classes.rs) stops the leaves, but the GAME's own wrapper
+            // method still runs (builds args, NSBundle/NSURL round-trips, several
+            // outer msgSends, per-FakeClass log spam). Cut the whole wrapper here:
+            //   umengTrack            -> bare NSURLConnection ping to log.umtrack.com
+            //                            (NO fakeable class — MUST cut here).
+            //   umengAnalyze          -> MobClick startWithAppkey: chain.
+            //   startTaomeeAndFlurryStatisticsSession -> Flurry + Taomee session.
+            //   reportAppOpenToAdMob  -> background sync request to a.admob.com
+            //                            (offline timeout). Cut to skip the stall.
+            // All four return void; call sites don't read the result (verified).
+            // NOTE: these 4 selectors are registered in is_mole_hook_sel's
+            // HOOK_SEL_NAMES (selectors.rs), else is_mole_hook gates this block out.
+            if name == "iMoleVillageAppDelegate"
+                && matches!(
+                    selector.as_str(&env.mem),
+                    "umengTrack"
+                        | "umengAnalyze"
+                        | "startTaomeeAndFlurryStatisticsSession"
+                        | "reportAppOpenToAdMob"
+                )
+            {
+                env.cpu.regs_mut()[0..2].fill(0); // no-op (void)
+                return;
+            }
             // -[LogoLayer shownewFunctionIntroductionLayer]: presents a swipeable
             // promo intro whose paging needs UITapGestureRecognizer/UIScrollView
             // gestures we don't implement, so boot would stall there. Its own
