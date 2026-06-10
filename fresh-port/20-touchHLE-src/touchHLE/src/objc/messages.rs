@@ -258,14 +258,21 @@ fn objc_msgSend_inner(
             return;
         }
     }
-    // [MoleWorld] Two functional short-circuits for offline play. Gated on the
-    // class name FIRST (a cheap &str compare against the already-available class
-    // name) so the hot objc_msgSend path only pays a selector-string conversion
-    // for messages to these two specific classes — not for every message. (The
-    // earlier broad [SCENE]/[FLOW]/[COCOS]/[TOUCHDISP] tracing probes that ran a
-    // selector.as_str + dozens of string compares on EVERY message were removed;
-    // they were a major per-frame slowdown.)
-    if let Some(ho) = env.objc.get_host_object(orig_class) {
+    // [MoleWorld] Offline-play functional hooks. Gated on a cheap SELECTOR
+    // pre-check FIRST: selectors are interned (one canonical pointer per name),
+    // so `is_mole_hook_sel` matches the incoming selector against the precomputed
+    // hook-selector set by pointer identity (a few integer compares). The hot
+    // path is dominated by non-hook selectors (release/zOrder/compare:/draw/
+    // visit/transform/...); for those `.filter(|_| is_mole_hook)` makes the
+    // `if let` fall through, skipping the ClassHostObject downcast and the whole
+    // chain of class-name / selector-string compares below. Behaviour is
+    // identical to the old class-name-first form: every hook below is
+    // `name == X && selector == Y`, so a message whose selector isn't in the set
+    // could never have matched any hook. (The earlier broad
+    // [SCENE]/[FLOW]/[COCOS]/[TOUCHDISP] tracing probes that ran selector.as_str
+    // + dozens of string compares on EVERY message were already removed.)
+    let is_mole_hook = env.objc.is_mole_hook_sel(&mut env.mem, selector);
+    if let Some(ho) = env.objc.get_host_object(orig_class).filter(|_| is_mole_hook) {
         if let Some(&super::ClassHostObject { ref name, .. }) =
             ho.as_any().downcast_ref::<super::ClassHostObject>()
         {

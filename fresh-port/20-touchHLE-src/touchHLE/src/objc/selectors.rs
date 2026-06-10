@@ -90,6 +90,50 @@ impl ObjC {
         sel
     }
 
+    /// [MoleWorld offline port] Membership test for the offline-hook selectors
+    /// used by `messages::objc_msgSend_inner`'s hook block. The hook-selector
+    /// set is resolved (interned) once on the first call.
+    ///
+    /// Selectors are interned: there is exactly one canonical [SEL] pointer per
+    /// name (see [ObjC::register_host_selector] / [ObjC::register_bin_selector],
+    /// which dedup, and [ObjC::register_bin_selectors], which rewrites the
+    /// binary's `__objc_selrefs` to that canonical pointer). So an incoming
+    /// selector can be matched against the hook set by pointer identity — a few
+    /// integer comparisons — instead of reading + UTF-8-decoding + strcmp-ing a
+    /// guest C string per candidate. This is the cheap discriminator that gates
+    /// the (otherwise per-message) class-name and selector-string work.
+    pub(super) fn is_mole_hook_sel(&mut self, mem: &mut Mem, sel: SEL) -> bool {
+        if self.mole_hook_sels.is_none() {
+            // Every hook in that block fires on `selector == "<one of these>"`,
+            // so this is exactly the set that can trigger a hook — keep it in
+            // sync with the block. register_host_selector dedups against the
+            // interned table, yielding each name's canonical SEL.
+            const HOOK_SEL_NAMES: &[&str] = &[
+                "showNetWorkError",
+                "initWithCoder:",
+                "checkUpdates:",
+                "shownewFunctionIntroductionLayer",
+                "onMenuKefuSelected",
+                "onMenuChangeAccountSelected",
+                "onMenuChangePlayerSelected",
+                "onMenuVersionInfoSelected",
+                "onBuyVIPGold:",
+                "onButtonYesSelected:",
+                "caribbeanData",
+                "showLayerWithTarget:selector:",
+                "getCaribbeanStateInfo:",
+            ];
+            let sels: Vec<SEL> = HOOK_SEL_NAMES
+                .iter()
+                .map(|name| self.register_host_selector((*name).to_string(), mem))
+                .collect();
+            self.mole_hook_sels = Some(sels);
+        }
+        // SEL is a transparent ConstPtr<u8>; this is an integer comparison per
+        // element over a ~13-entry slice (the non-hook common case fails fast).
+        self.mole_hook_sels.as_ref().unwrap().contains(&sel)
+    }
+
     /// Register and deduplicate all the selectors of host classes.
     ///
     /// To avoid wasting guest memory, call this after calling

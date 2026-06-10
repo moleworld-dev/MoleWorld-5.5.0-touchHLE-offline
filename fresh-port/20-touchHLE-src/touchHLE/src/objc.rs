@@ -88,6 +88,13 @@ pub struct ObjC {
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
+
+    /// [MoleWorld offline port] Precomputed interned SELs for the offline-hook
+    /// block in `objc::messages::objc_msgSend_inner`. Filled once, lazily, on
+    /// the first dispatch (see `ObjC::is_mole_hook_sel`). Lets the hot path
+    /// reject the overwhelmingly-common non-hook selector with a few integer
+    /// (pointer) comparisons instead of a chain of guest-cstr reads + strcmps.
+    mole_hook_sels: Option<Vec<SEL>>,
 }
 
 impl ObjC {
@@ -99,6 +106,7 @@ impl ObjC {
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
+            mole_hook_sels: None,
         }
     }
 }
