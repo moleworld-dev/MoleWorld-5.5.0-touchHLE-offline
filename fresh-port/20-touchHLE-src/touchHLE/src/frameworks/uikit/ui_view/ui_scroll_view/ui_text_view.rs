@@ -8,7 +8,7 @@
 use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
 use crate::frameworks::core_graphics::cg_geometry::CGPointZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::to_rust_string;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::{NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_color;
 use crate::frameworks::uikit::ui_font::{
@@ -144,7 +144,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)text {
-    env.objc.borrow::<UITextViewHostObject>(this).text
+    let text = env.objc.borrow::<UITextViewHostObject>(this).text;
+    // iOS 保证 UITextView.text 永不为 nil(未设值默认 @"")。摩尔庄园 -[GiftAndMessageLayer
+    // displayUI] 直接 strlen([textView.text UTF8String]) 不做 nil 检查;若这里返回 nil →
+    // [nil UTF8String]=NULL → strlen(NULL) → null 页读 MemoryError 整机崩(PC=0x884cb4,
+    // 调用者 -[GiftAndMessageLayer displayUI]@0x3e11c0)。未设值时回空串,与 iOS 行为一致。
+    if text == nil {
+        get_static_str(env, "")
+    } else {
+        text
+    }
 }
 - (())setText:(id)new_text { // NSString*
     let hostobj  = env.objc.borrow_mut::<UITextViewHostObject>(this);

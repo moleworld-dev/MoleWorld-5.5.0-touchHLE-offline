@@ -127,7 +127,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)text {
     let text_label = env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label;
-    msg![env; text_label text]
+    let text: id = msg![env; text_label text];
+    // iOS 保证 UITextField.text 永不为 nil(未设值默认 @"")。内部 UILabel.text 未设时返回 nil,
+    // 若原样透出,调用方 strlen([textField.text UTF8String]) → strlen(NULL) → MemoryError 崩
+    // (同 UITextView 的 -[GiftAndMessageLayer displayUI] 崩因)。未设值回空串,与 iOS 一致。
+    if text == nil {
+        ns_string::get_static_str(env, "")
+    } else {
+        text
+    }
 }
 - (())setText:(id)text { // NSString*
     let text_label = env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label;
