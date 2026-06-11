@@ -280,7 +280,13 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
                     b"OpenGL ES-CM 1.1 (76)"
                 }
                 gles11::EXTENSIONS => {
-                    b"GL_APPLE_framebuffer_multisample GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object "
+                    // [MoleWorld iOS] 不再谎报 GL_APPLE_framebuffer_multisample:touchHLE 未实现
+                    // glResolveMultisampleFramebufferAPPLE(未实现函数被静默 no-op),若广告支持,
+                    // cocos2d 会进 MSAA 分支,把所有几何画进从不被 resolve 的多重采样 buffer,
+                    // present 读到的 colorRenderBuffer 永远是空黑帧。去掉该扩展 → 游戏走非 MSAA 路径,
+                    // 直接渲染到 colorRenderBuffer → 正常出帧。(GL_EXT_discard_framebuffer 留着:它对应的
+                    // glDiscardFramebufferEXT 被 no-op 是安全的纯性能 hint,不影响正确性。)
+                    b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object "
                 }
                 _ => unreachable!(),
             };

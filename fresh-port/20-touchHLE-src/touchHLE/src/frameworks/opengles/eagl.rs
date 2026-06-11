@@ -550,10 +550,20 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 unsafe fn present_renderbuffer(env: &mut Environment) {
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
+    // [MoleWorld iOS] cocos2d 的横屏游戏自己已经把场景渲染成横屏正向(它的 EAGL renderbuffer
+    // 就是 1024×768 横屏),iPhone 也横握,所以不能再叠加 device 方向的旋转;否则
+    // window.rotation_matrix()(LandscapeRight=+90°)会把画面再转 90° = 横躺。改用 identity 直接
+    // 呈现。桌面保持原 device 旋转(present_frame 桌面分支走矩阵形式,行为已验证、不回归)。
+    #[cfg(target_os = "ios")]
+    let rotation_matrix = crate::matrix::Matrix::<2>::identity();
+    #[cfg(not(target_os = "ios"))]
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
     // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定。
     let window_default_fbo = env.window.as_ref().unwrap().default_framebuffer();
+    // [MoleWorld iOS] swap 前要绑回的 view renderbuffer(与 splash/composition 同源)。
+    #[cfg(target_os = "ios")]
+    let window_default_rbo = env.window.as_ref().unwrap().default_renderbuffer();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -596,7 +606,9 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     gles.CopyTexImage2D(
         gles11::TEXTURE_2D,
         0,
-        gles11::RGB as _,
+        // RGBA: the source renderbuffer is RGBA8, so RGBA stays within the GLES
+        // glCopyTexImage2D format-superset rule (and is safe on desktop too).
+        gles11::RGBA as _,
         0,
         0,
         width,
@@ -610,6 +622,26 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         gles11::TEXTURE_MIN_FILTER,
         gles11::LINEAR as _,
     );
+    // [MoleWorld iOS] The present texture is the NPOT drawable/screen size. On iOS
+    // native OpenGL ES 1.1, an NPOT texture with the default GL_REPEAT wrap is an
+    // INCOMPLETE texture, so the texture unit samples "as if texturing were disabled"
+    // → the fullscreen quad shows glColor4f(1,1,1,1) = a solid WHITE screen (with no
+    // glError). CLAMP_TO_EDGE makes NPOT textures complete. The repo already does this
+    // at the sibling present sites (composition.rs:199-206 / the iOS splash in
+    // window.rs); present_renderbuffer was the one path missing it = the white-screen.
+    #[cfg(target_os = "ios")]
+    {
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+    }
 
     // Clean up the framebuffer object since we no longer need it.
     // This also sets the framebuffer bindings back to zero, so rendering
@@ -749,6 +781,14 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         old_tex_env_mode_arr.as_ptr().cast(),
     );
 
+    // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER:SDL 的 presentRenderbuffer
+    // 呈现【当前绑定的 renderbuffer】。整个 present_frame 期间 GL_RENDERBUFFER 仍绑着游戏自己的
+    // 离屏 renderbuffer(rb=3),不绑回则 swap 呈现的是那块离屏 buffer 而非刚画好的 view
+    // renderbuffer → 满帧 present 却全黑。这一行与 splash(window.rs:1469)/composition.rs:404
+    // 完全对齐——之前唯独游戏这条 present 路径漏了它。必须在 drop(gles_boxed) 之前(仍 current)。
+    #[cfg(target_os = "ios")]
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
+
     std::mem::drop(gles_boxed);
 
     // SDL2's documentation warns 0 should be bound to the draw framebuffer
@@ -757,6 +797,13 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
     let gles = gles_boxed.as_mut();
+
+    // [MoleWorld iOS] swap 用 view renderbuffer 呈现完后,把 GL_RENDERBUFFER 还原回游戏自己的离屏
+    // renderbuffer。cocos2d 只在 setup 时 glBindRenderbuffer 一次、之后整局靠它保持;若不还原,
+    // 下一帧 present 读到的是被 swap 前那行污染成 view rbo 的绑定 → bindings 查不到该 rb →
+    // NOT BOUND → 直接返回不出帧(实测:只第一帧上屏=白色加载屏,之后全 NOT BOUND)。
+    #[cfg(target_os = "ios")]
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
 
     // Restore the other bindings
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);

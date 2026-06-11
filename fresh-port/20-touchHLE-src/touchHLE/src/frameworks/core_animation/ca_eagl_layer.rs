@@ -79,7 +79,19 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // This is stricter than it should be. In theory we should accumulate
         // the transforms and handle different anchor points etc, but real apps
         // probably only use this common case.
-        if layer_host_obj.bounds.size != screen_bounds.size
+        // [MoleWorld iOS] Accept a *rotated* fullscreen layer. A landscape cocos2d
+        // game gives its CAEAGLLayer the swapped screen size (e.g. 1024x768 for a
+        // 768x1024 portrait UIScreen) plus a 90° affine_transform. It is still the
+        // single fullscreen layer; present_renderbuffer() orients the frame with the
+        // window's device rotation_matrix (NOT the layer's transform), so accept the
+        // swapped size and don't require an identity transform here. Without this we
+        // drop to the slow composition path, which never displays the frame = black
+        // screen (the renderbuffer is confirmed non-black, full game content).
+        let bsz = layer_host_obj.bounds.size;
+        let ssz = screen_bounds.size;
+        let size_ok = (bsz.width == ssz.width && bsz.height == ssz.height)
+            || (bsz.width == ssz.height && bsz.height == ssz.width);
+        if !size_ok
             || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
             || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
             || layer_host_obj.position
@@ -89,9 +101,6 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                 })
             || layer_host_obj.hidden
             || layer_host_obj.opacity != 1.0
-            // TODO: support affine transforms that result in a full-screen
-            //       layer (typical example is 90° rotation).
-            || !layer_host_obj.affine_transform.is_identity()
         {
             return nil;
         }
