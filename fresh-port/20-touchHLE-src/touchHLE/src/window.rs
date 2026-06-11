@@ -1613,6 +1613,10 @@ impl Window {
         // 拖动缩放后,drawable_size 跟着变,present 的 glViewport 与触摸映射(都基于
         // viewport())自动跟随。全屏 / rotatable-fullscreen 仍走下面的等比 letterbox(保持
         // 原状,不回归)。
+        // [MoleWorld iOS] iOS 是全屏设备、窗口不可拖拽,必须保持游戏原宽高比(4:3)撑满高度、
+        // 两侧留黑边(letterbox),不能强行拉伸成屏幕的超宽比例(否则画面横向变形)。因此 iOS
+        // 跳过下面这个「自由拉伸铺满」分支,直接落到等比 letterbox 计算。桌面/安卓保持自由拉伸不变。
+        #[cfg(not(target_os = "ios"))]
         if !self.fullscreen && !Self::rotatable_fullscreen() {
             // 窗口模式恒「自由拉伸铺满」。锁比例(--lock-aspect)不在这里做 letterbox(黑边
             // 不优雅),而是在 resize 事件里把【窗口本身】约束成 app 宽高比 → 铺满即等比无
