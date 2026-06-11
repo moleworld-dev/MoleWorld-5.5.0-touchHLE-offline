@@ -15,10 +15,11 @@
 
 use crate::frameworks::core_graphics::cg_geometry::CGPoint;
 use crate::mem::{ConstPtr, MutPtr, Ptr};
-use crate::objc::{id, msg_send, nil, retain};
+use crate::objc::{autorelease, id, msg_send, nil, release, retain};
 use crate::Environment;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const O: Ordering = Ordering::Relaxed;
@@ -102,7 +103,7 @@ static CARIBBEAN_DIRTY: AtomicBool = AtomicBool::new(false);
 /// 岛专属选择器(enterNewIslands/updateLoading/HolidayVillageLayer 等)上动作,主村期间几乎
 /// 全部空过(网络门只在 ISLAND_ENTER_WINDOW>0||ON_ISLAND 时强制,主村两者皆假);看门狗也
 /// 改为只在岛上生效。代价仅是 intercept 走全量消息(与开任意作弊时同档,可接受)。
-static ENABLE_NEWSCENE_ISLAND: AtomicBool = AtomicBool::new(true);
+static ENABLE_NEWSCENE_ISLAND: AtomicBool = AtomicBool::new(false);
 
 /// 进岛网络门强制窗口(剩余帧数;>0 时把 NetworkManager isConnected/state/isReachable
 /// 强制成"在线",**只覆盖进岛加载序列**,不污染主村离线行为)。每帧 drawScene 递减。
@@ -122,6 +123,762 @@ thread_local! {
     static ISLAND_INJECTED: Cell<bool> = const { Cell::new(false) };
     /// 诊断:上次记录的 LoadingHoliday curStep_,用于只在状态变化时打日志(看加载进度/卡点)。
     static ISLAND_LAST_STEP: Cell<i32> = const { Cell::new(-1) };
+}
+
+// ===== ONLINE MODE statics (boot-login passport bypass; see reference_touchhle_online_mode) =====
+/// G3 armed the deferred login synth (set in autoLoginWithUserID: intercept).
+static LOGIN_ARMED: AtomicBool = AtomicBool::new(false);
+/// Login synth already fired once this launch (latched).
+static LOGIN_FIRED: AtomicBool = AtomicBool::new(false);
+/// The 米米号 to log in as (= MOLE_MIMI), captured when armed.
+static LOGIN_MIMI: AtomicU32 = AtomicU32::new(0);
+/// drawScene frame counter for auto-login arming (online mode, no Play tap needed).
+static LOGIN_BOOT_FRAMES: AtomicU32 = AtomicU32::new(0);
+/// Diagnostic call counter for fire_online_login (logs the first few frames).
+static LOGIN_DIAG: AtomicU32 = AtomicU32::new(0);
+/// Captured live MainMenuScene instance. CCDirector runningScene is only a CCScene
+/// wrapper; the menu layer (which has onButtonChangeIDSelected:) is its child. 0 = unseen.
+static MAINMENU_SCENE: AtomicU32 = AtomicU32::new(0);
+/// Online login phase-2 one-shot: the login packet has been sent (after the socket connected).
+static LOGIN_PKT_SENT: AtomicBool = AtomicBool::new(false);
+/// Debug HUD live connection stats, counted in the changeStateTo: hook (state 6 = a packet was
+/// written, state 7 = a packet was parsed/received). loss/pending = sent - recv; RTT = the gap
+/// between the last state→6 and the next state→7.
+static PKTS_SENT: AtomicU32 = AtomicU32::new(0);
+static PKTS_RECV: AtomicU32 = AtomicU32::new(0);
+static LAST_RTT_MS: AtomicU32 = AtomicU32::new(0);
+/// Diagnostic: last logged GameData.remoteMapData.mapdata.count (-99 = never read). Tells us
+/// whether the server's 1001 map unarchives to a non-empty dict in THIS unarchiver (#2).
+static LAST_MAP_COUNT: AtomicI32 = AtomicI32::new(-99);
+/// The HUD must NOT msg_send during the connect window (state 4/6) — doing so starved the run-loop
+/// and dropped the cf_stream Open event. STATE_IS_7 (set by the changeStateTo: hook) gates HUD
+/// startup to AFTER the connection is up; HUD_TIMER_SET latches a 1s self-rescheduling tick that
+/// refreshes the HUD via performSelector:afterDelay: in the run-loop perform phase — never inside
+/// the drawScene frame stack — so it can't interfere with packets or the village scene transition.
+static STATE_IS_7: AtomicBool = AtomicBool::new(false);
+static HUD_TIMER_SET: AtomicBool = AtomicBool::new(false);
+/// Once the login round-trip reached state 7, drive the map request (cmd 1001) ourselves. The
+/// native 1234-reply handler only sends it when MainMenuScene.isOptionLayerShow_==0 AND it reaches
+/// the delegate, which our boot-synthesized flow doesn't reliably satisfy (server saw only
+/// 1234→1052, never 1001). Driving getLocalUserAndMapInfo + byte_B409B0 directly is robust.
+static SENT_1001: AtomicBool = AtomicBool::new(false);
+/// Village-render workaround. showWithTarget:4 schedules -[LoadingLayer update:] → (performSelector
+/// OnMainThread:) loadTarget → case 4 (loadFromLocal + [GameManager startGame]) = build the village.
+/// But in touchHLE the LoadingLayer's `update:` re-schedule after a prior loadTarget's
+/// unscheduleAllSelectors does NOT re-fire, so the village's loadTarget never runs and we stay on the
+/// title. We latch the LoadingLayer pointer at showWithTarget:4 and, if its natural update:/loadTarget
+/// hasn't fired within a few frames, drive loadTarget ourselves from the drawScene tick.
+static PENDING_LOADTARGET: AtomicU32 = AtomicU32::new(0);
+static PENDING_LOADTARGET_FRAMES: AtomicU32 = AtomicU32::new(0);
+/// 庄园地图持久化(修法甲)帧计数。进村稳定后(STATE_IS_7)host 周期性 saveMapData+updateInfoToServer
+/// 把活图整包(gzip blob)发上来——主庄园持久化唯一上行通道(非 1059 增量,那是黄金岛机制)。
+/// 原版自发上传被 saveMapData: 5道闸卡死→map 恒 0B;host 主动调已验证可用的无参 saveMapData 兜上。
+static MAP_UPLOAD_FRAMES: AtomicU32 = AtomicU32::new(0);
+thread_local! {
+    /// MOLE_PASSWORD cleartext (None = unset; server-lenient empty hash).
+    static LOGIN_PWD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// Instant of the last state→6 (packet written), for RTT to the next state→7.
+    static LAST_SEND_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// `Some(mimi)` only when online mode is on (`--allow-network-access`) AND `MOLE_MIMI`
+/// parses to a u32. Otherwise `None` so every online-login branch is a no-op and the
+/// offline single-player path is bit-for-bit unchanged.
+fn online_login_mimi(env: &Environment) -> Option<u32> {
+    if !env.options.network_access {
+        return None;
+    }
+    std::env::var("MOLE_MIMI")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+// ===== ACCOUNT-MENU MODE: 让 touchHLE 也弹出原版账号管理菜单(切换账号)=====
+// 默认在线模式靠 G3 吞掉 autoLoginWithUserID: + 帧180自动合成登录,passport UI 链从不出现。
+// MOLE_ACCOUNT_MENU=1 时:不自动合成、不吞 autoLogin,放原版走真 passport 流程(TMALoginViewController/
+// TMAccountManagerView);而 touchHLE 的 TMA_ASIHTTPRequest 出站是死桩,故把 app 发的 passport HTTP
+// 在 host 侧用 std::net::TcpStream 明文真发到私服 passport shim(已跑通真机),响应异步回灌原版 requestFinish:。
+// 全部门控在 account_menu_mode(),默认模式逐字节不变。
+
+/// MOLE_ACCOUNT_MENU 开关(缓存,避免每条消息都查 env)。
+fn account_menu_mode() -> bool {
+    use std::sync::atomic::AtomicU8;
+    static CACHE: AtomicU8 = AtomicU8::new(2); // 2=未初始化, 0=false, 1=true
+    let c = CACHE.load(O);
+    if c != 2 {
+        return c == 1;
+    }
+    let v = std::env::var_os("MOLE_ACCOUNT_MENU").is_some();
+    CACHE.store(u8::from(v), O);
+    v
+}
+
+/// 一笔在飞的 passport 代理:retain 住的 request/delegate + 后台线程填的响应槽。
+struct PassportProxy {
+    request: u32,
+    delegate: u32,
+    /// None=在飞;Some(None)=失败;Some(Some(bytes))=拿到响应体。
+    resp: Arc<Mutex<Option<Option<Vec<u8>>>>>,
+}
+static PASSPORT_PENDING: Mutex<Vec<PassportProxy>> = Mutex::new(Vec::new());
+/// 回灌期间原版 [request responseData] 的 hook 从这里取 JSON(request-bits -> body)。
+static PASSPORT_RESP: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
+/// 最近一次 TMAHttpManager sendRequest: 的命令字(reqID)。touchHLE 模拟原版 ASI 请求构建残缺
+/// (postData 丢了 service/extra_data 等字段),故 reqID 从 sendRequest: 参数直取,代理时据此构造 body。
+static PENDING_REQID: AtomicU32 = AtomicU32::new(0);
+/// 玩家点了"切换账号"(showAccountManagerViewWithDelegate:)后置真。只代理这之后的 passport;
+/// 进村后 app 自动发的 autoLogin(走静默登录分支 onLoginRequestFinishWithStatusCode,touchHLE 缺桩 null deref)不碰。
+static MENU_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// passport 私服端点:连私服 host 的明文 HTTP 端口,发 Host: account-mapi.61.com 让反代路由到 web passport。
+/// MOLE_PASSPORT 覆盖 connect host:port(默认 MOLE_SERVER 的 host + 80 = Caddy 的 http://account-mapi.61.com 块)。
+fn passport_endpoint() -> (String, u16) {
+    if let Ok(p) = std::env::var("MOLE_PASSPORT") {
+        if let Some((h, pt)) = p.rsplit_once(':') {
+            if let Ok(pt) = pt.parse::<u16>() {
+                return (h.to_string(), pt);
+            }
+        }
+        return (p, 80);
+    }
+    let server =
+        std::env::var("MOLE_SERVER").unwrap_or_else(|_| "login.moleworld.net:7821".to_string());
+    let host = server
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or(server);
+    (host, 80)
+}
+
+/// host 侧明文 HTTP/1.1 POST(无 TLS;私服 Caddy:80 明文 + 客户端 setValidatesSecureCertificate:0)。
+fn http_post_form(host: &str, port: u16, body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect((host, port)).ok()?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(8)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(8)));
+    let head = format!(
+        "POST /account_service.php HTTP/1.1\r\nHost: account-mapi.61.com\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).ok()?;
+    s.write_all(body).ok()?;
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).ok()?;
+    let idx = resp.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    Some(resp[idx..].to_vec())
+}
+
+/// 读 NSData 的字节(反向 nsdata_from_bytes;[data length] + [data bytes])。
+fn nsdata_to_bytes(env: &mut Environment, data: id) -> Vec<u8> {
+    if data == nil {
+        return Vec::new();
+    }
+    let len_sel = env
+        .objc
+        .register_host_selector("length".to_string(), &mut env.mem);
+    let len: crate::mem::GuestUSize = msg_send(env, (data, len_sel));
+    if len == 0 {
+        return Vec::new();
+    }
+    let bytes_sel = env
+        .objc
+        .register_host_selector("bytes".to_string(), &mut env.mem);
+    // NSData -bytes 返回 const void*(ConstVoidPtr),host msg_send 的返回类型必须精确匹配,
+    // 写成 ConstPtr<u8> 会触发 touchHLE 的 Type mismatch panic。取 ConstVoidPtr 再 cast。
+    let ptr: crate::mem::ConstVoidPtr = msg_send(env, (data, bytes_sel));
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    env.mem.bytes_at(ptr.cast(), len).to_vec()
+}
+
+/// 把扁平 JSON `{"k":v,...}` 解析成 (key,value) 串对(value 去引号)。passport 响应都是扁平的。
+/// 用来绕开 touchHLE 没实现的 JSONKit(JKDictionary/JKArray 是 unimplemented class)。
+fn parse_flat_json(bytes: &[u8]) -> Vec<(String, String)> {
+    let s = String::from_utf8_lossy(bytes);
+    let s = s.trim();
+    let s = s.strip_prefix('{').unwrap_or(s);
+    let s = s.strip_suffix('}').unwrap_or(s);
+    let mut out = Vec::new();
+    for pair in s.split(',') {
+        if let Some((k, v)) = pair.split_once(':') {
+            let k = k.trim().trim_matches('"').to_string();
+            let v = v.trim().trim_matches('"').to_string();
+            if !k.is_empty() {
+                out.push((k, v));
+            }
+        }
+    }
+    out
+}
+
+/// 用串对构造标准 NSMutableDictionary(值用 NSString,客户端 objectForKey: + intValue 可读),
+/// 替代 touchHLE 没实现的 JKDictionary。autoreleased。
+fn build_nsdict(env: &mut Environment, pairs: &[(String, String)]) -> id {
+    let cls = env
+        .objc
+        .get_known_class("NSMutableDictionary", &mut env.mem);
+    let alloc = env
+        .objc
+        .register_host_selector("alloc".to_string(), &mut env.mem);
+    let init = env
+        .objc
+        .register_host_selector("init".to_string(), &mut env.mem);
+    let set = env
+        .objc
+        .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
+    let dict: id = msg_send(env, (cls, alloc));
+    let dict: id = msg_send(env, (dict, init));
+    for (k, v) in pairs {
+        let key = crate::frameworks::foundation::ns_string::from_rust_string(env, k.clone());
+        let val = crate::frameworks::foundation::ns_string::from_rust_string(env, v.clone());
+        let _: () = msg_send(env, (dict, set, val, key));
+    }
+    autorelease(env, dict)
+}
+
+/// 最小 url-encode(只保留 unreserved,其余 %XX)。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// 自己从 ASIFormDataRequest 的 postData(NSArray of {@"key",@"value"})拼 url-encoded body。
+/// 绕开 touchHLE 有 bug 的 NSMutableData buildPostBody(实测它只构出残缺末尾字段 + null)。
+fn asi_build_body(env: &mut Environment, req: id) -> Vec<u8> {
+    let pd_sel = env
+        .objc
+        .register_host_selector("postData".to_string(), &mut env.mem);
+    let arr: id = msg_send(env, (req, pd_sel));
+    if arr == nil {
+        return Vec::new();
+    }
+    let count_sel = env
+        .objc
+        .register_host_selector("count".to_string(), &mut env.mem);
+    let count: crate::mem::GuestUSize = msg_send(env, (arr, count_sel));
+    let obj_sel = env
+        .objc
+        .register_host_selector("objectAtIndex:".to_string(), &mut env.mem);
+    let get_sel = env
+        .objc
+        .register_host_selector("objectForKey:".to_string(), &mut env.mem);
+    let key_k = crate::frameworks::foundation::ns_string::from_rust_string(env, "key".to_string());
+    let val_k =
+        crate::frameworks::foundation::ns_string::from_rust_string(env, "value".to_string());
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..count {
+        let dict: id = msg_send(env, (arr, obj_sel, i));
+        if dict == nil {
+            continue;
+        }
+        let k: id = msg_send(env, (dict, get_sel, key_k));
+        if k == nil {
+            continue;
+        }
+        let v: id = msg_send(env, (dict, get_sel, val_k));
+        let ks = crate::frameworks::foundation::ns_string::to_rust_string(env, k).into_owned();
+        let vs = if v != nil {
+            crate::frameworks::foundation::ns_string::to_rust_string(env, v).into_owned()
+        } else {
+            String::new()
+        };
+        parts.push(format!("{}={}", urlencode(&ks), urlencode(&vs)));
+    }
+    parts.join("&").into_bytes()
+}
+
+/// [[req url] absoluteString] -> Rust String。
+fn asi_request_url(env: &mut Environment, req: id) -> String {
+    let url_sel = env
+        .objc
+        .register_host_selector("url".to_string(), &mut env.mem);
+    let nsurl: id = msg_send(env, (req, url_sel));
+    if nsurl == nil {
+        return String::new();
+    }
+    let abs_sel = env
+        .objc
+        .register_host_selector("absoluteString".to_string(), &mut env.mem);
+    let s: id = msg_send(env, (nsurl, abs_sel));
+    if s == nil {
+        return String::new();
+    }
+    crate::frameworks::foundation::ns_string::to_rust_string(env, s).into_owned()
+}
+
+/// 拦 TMA_ASINetworkQueue addOperation:(passport 的实际发送动作)。若是 passport 请求:先 buildPostBody 取
+/// body,retain 住 request/delegate,后台线程 host HTTP 发到私服,返回 true 跳过死的真出站;由 drive_passport 回灌。
+fn passport_proxy_enqueue(env: &mut Environment, req: id) -> bool {
+    if req == nil {
+        return false;
+    }
+    let url = asi_request_url(env, req);
+    if !(url.contains("account_service.php") || url.contains("account-mapi")) {
+        return false;
+    }
+    // touchHLE 模拟原版 ASI 请求构建残缺(postData 丢 service/extra_data,sign 也空),没法从请求对象提取 body。
+    // 改用 sendRequest: 抓到的 reqID + 登录米米号自己构造最小 passport body:
+    //   service=reqID(服务端按它路由)、user_id/userid=米米号(1012 回显要与请求一致)、
+    //   extra_data=reqID(客户端 requestFinish: 算 extra_data%65535=reqID 路由;reqID<65535 故就是 reqID)。
+    let reqid = PENDING_REQID.load(O);
+    if reqid == 0 {
+        log!("[MOLECHEAT] passport 代理: 未捕获 reqID,放弃代理放行");
+        return false;
+    }
+    let mimi = LOGIN_MIMI.load(O);
+    let body =
+        format!("service={reqid}&user_id={mimi}&userid={mimi}&extra_data={reqid}").into_bytes();
+    let del_sel = env
+        .objc
+        .register_host_selector("delegate".to_string(), &mut env.mem);
+    let delegate: id = msg_send(env, (req, del_sel));
+    // 跳过了真 addOperation:(queue 不会 retain),自己 retain 住到回灌后再 release。
+    let req_r = retain(env, req);
+    let del_r = retain(env, delegate);
+    let (host, port) = passport_endpoint();
+    let preview: String = String::from_utf8_lossy(&body[..body.len().min(140)]).into_owned();
+    log!(
+        "[MOLECHEAT] passport 代理: {} ({}B) -> {}:{} body={:?}",
+        url,
+        body.len(),
+        host,
+        port,
+        preview
+    );
+    let resp: Arc<Mutex<Option<Option<Vec<u8>>>>> = if reqid == 1012 {
+        // ★autoLogin(1012)直接合成 status_code:1011:客户端 requestFinish: 走 case 1011 →
+        //   [viewController showAccountManagerView] 弹账号菜单,绕过 status_code:0 走的
+        //   onLoginRequestFinishWithStatusCode(touchHLE 缺桩 → null-page 崩)。
+        let json =
+            format!(r#"{{"status_code":1011,"result":0,"user_id":{mimi},"extra_data":{reqid}}}"#);
+        log!("[MOLECHEAT] passport 1012 → 合成 status_code:1011(直接弹账号菜单,绕静默登录崩溃路径)");
+        Arc::new(Mutex::new(Some(Some(json.into_bytes()))))
+    } else {
+        // 其它 reqID(1004 换号输框 / 1006 / 1008 邮箱...)走真代理到私服。
+        let r: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let rc = r.clone();
+        std::thread::spawn(move || {
+            *rc.lock().unwrap() = Some(http_post_form(&host, port, &body));
+        });
+        r
+    };
+    PASSPORT_PENDING.lock().unwrap().push(PassportProxy {
+        request: req_r.to_bits(),
+        delegate: del_r.to_bits(),
+        resp,
+    });
+    true
+}
+
+/// 每帧调(drawScene):把后台线程已拿到响应的 passport 代理回灌给原版 requestFinish:/requestFailed:。
+/// 含 msg_send(clobber 寄存器),只在 drawScene 的 saved_r0/r1 恢复区内调用。
+fn drive_passport(env: &mut Environment) {
+    let mut done: Vec<(u32, u32, Option<Vec<u8>>)> = Vec::new();
+    {
+        let mut pend = match PASSPORT_PENDING.try_lock() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if pend.is_empty() {
+            return;
+        }
+        pend.retain(|p| match p.resp.lock().unwrap().take() {
+            Some(result) => {
+                done.push((p.request, p.delegate, result));
+                false
+            }
+            None => true,
+        });
+    }
+    for (req_bits, del_bits, body) in done {
+        let req: id = Ptr::from_bits(req_bits);
+        let delegate: id = Ptr::from_bits(del_bits);
+        match body {
+            Some(bytes) => {
+                PASSPORT_RESP.lock().unwrap().push((req_bits, bytes));
+                let rf = env
+                    .objc
+                    .register_host_selector("requestFinish:".to_string(), &mut env.mem);
+                let _: () = msg_send(env, (delegate, rf, req));
+                PASSPORT_RESP.lock().unwrap().retain(|(b, _)| *b != req_bits);
+                log!("[MOLECHEAT] passport 代理回灌 requestFinish: req={:#x}", req_bits);
+            }
+            None => {
+                let rf = env
+                    .objc
+                    .register_host_selector("requestFailed:".to_string(), &mut env.mem);
+                let _: () = msg_send(env, (delegate, rf, req));
+                log!("[MOLECHEAT] passport 代理失败 requestFailed: req={:#x}", req_bits);
+            }
+        }
+        release(env, req);
+        release(env, delegate);
+    }
+}
+
+/// Deferred boot-login synth, fired once from the safe drawScene/mainLoop frame edge
+/// (NEVER inline from the intercept — cocos2d re-entrancy freezes, same as the island
+/// lesson). Builds GameData.taomeeUserInfo = TaomeeUserInfo{MOLE_MIMI, MOLE_PASSWORD},
+/// resolves the live login delegate (MainMenuScene), and drives
+/// onTaomeeLoginViewDidUnloadWithUserID:password:returnCode: which (because isReachable
+/// was forced true) runs establishConnection -> serverlist -> AsyncSocket/CFStream connect.
+fn fire_online_login(env: &mut Environment) {
+    if LOGIN_PKT_SENT.load(O) {
+        return; // both phases done
+    }
+    // PHASE 2: phase 1 fired the cold native passport callback, which armed the scene (+235) and ran
+    // establishConnection. Once the socket reached state 4 (connected), re-fire the SAME callback —
+    // its state==4 branch sets delegateLoginMainMenu (so 1234/1001 replies reach
+    // onLoginMainMenuCommandReceived:) and sends the native login (sendType 3). One [nm state] read
+    // per frame is light enough not to disturb the connect (it was the HUD's MANY per-frame msg_sends
+    // that dropped the Open event, not a single state read).
+    if LOGIN_FIRED.load(O) {
+        let scene: id = Ptr::from_bits(MAINMENU_SCENE.load(O));
+        if scene == nil {
+            return;
+        }
+        let nm_cls = env.objc.get_known_class("NetworkManager", &mut env.mem);
+        let shared = env
+            .objc
+            .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+        let nm: id = msg_send(env, (nm_cls, shared));
+        if nm == nil {
+            return;
+        }
+        let st = env
+            .objc
+            .register_host_selector("state".to_string(), &mut env.mem);
+        let state: i32 = msg_send(env, (nm, st));
+        if state != 4 {
+            return; // still connecting; retry next frame
+        }
+        LOGIN_PKT_SENT.store(true, O);
+        let mimi = LOGIN_MIMI.load(O);
+        let pwd = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+        fire_passport_unload(env, scene, mimi, &pwd);
+        log!(
+            "[MOLECHEAT] 在线:phase2 原生 passport 回调@state4(挂 delegateLoginMainMenu + 发原生登录),米米号={}",
+            mimi
+        );
+        return;
+    }
+    // Use the captured live MainMenuScene instance (running scene is just a CCScene wrapper;
+    // onButtonChangeIDSelected: lives on this menu layer).
+    let scene: id = Ptr::from_bits(MAINMENU_SCENE.load(O));
+    if scene == nil {
+        return; // MainMenuScene not seen yet; retry next frame
+    }
+    let resp_btn = env
+        .objc
+        .object_has_method_named(&env.mem, scene, "onButtonChangeIDSelected:");
+    {
+        let n = LOGIN_DIAG.fetch_add(1, O);
+        if n < 4 {
+            let resp_unload = env.objc.object_has_method_named(
+                &env.mem,
+                scene,
+                "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:",
+            );
+            log!(
+                "[MOLECHEAT] 在线诊断#{}: scene={:?} respButton={} respUnload={}",
+                n,
+                scene,
+                resp_btn,
+                resp_unload
+            );
+        }
+    }
+    // Wait until MainMenuScene is the running scene (it implements the Play handler).
+    if !resp_btn {
+        return; // not ready yet; retry next frame (LOGIN_FIRED stays false)
+    }
+
+    LOGIN_FIRED.store(true, O);
+    // Populate GameData.serverLinkInfoList directly with the private server. This is
+    // deterministic and skips the async serverlist HTTP + background NSOperationQueue timing
+    // race: establishConnection then sees a non-empty list and goes straight to connectToHost
+    // (RE: establishConnection iterates serverLinkInfoList of ServerLinkData(ip,port)).
+    // (Tested removing this — the "remote player" disconnect persisted AND the village no longer stayed
+    // on screen, so it is NOT the churn cause and is load-bearing for a stable connection. Keep it.)
+    if let Ok(server) = std::env::var("MOLE_SERVER") {
+        let (ip, port) = match server.trim().rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.trim().parse::<i32>().unwrap_or(7821)),
+            None => (server.trim().to_string(), 7821),
+        };
+        let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+        let shared0 = env
+            .objc
+            .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+        let gd: id = msg_send(env, (gd_cls, shared0));
+        if gd != nil {
+            let rm = env.objc.register_host_selector(
+                "removeAllObjectFromServerLinkList".to_string(),
+                &mut env.mem,
+            );
+            let _: () = msg_send(env, (gd, rm));
+            let sld_cls = env.objc.get_known_class("ServerLinkData", &mut env.mem);
+            let alloc_s = env
+                .objc
+                .register_host_selector("alloc".to_string(), &mut env.mem);
+            let sld: id = msg_send(env, (sld_cls, alloc_s));
+            let init_s = env
+                .objc
+                .register_host_selector("init".to_string(), &mut env.mem);
+            let sld: id = msg_send(env, (sld, init_s));
+            let ip_ns = crate::frameworks::foundation::ns_string::from_rust_string(env, ip.clone());
+            let setip = env
+                .objc
+                .register_host_selector("setIp:".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (sld, setip, ip_ns));
+            let setport = env
+                .objc
+                .register_host_selector("setPort:".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (sld, setport, port));
+            let addobj = env.objc.register_host_selector(
+                "addObjectToServerLinkListWithObject:".to_string(),
+                &mut env.mem,
+            );
+            let _: () = msg_send(env, (gd, addobj, sld));
+            let rel = env
+                .objc
+                .register_host_selector("release".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (sld, rel));
+            log!(
+                "[MOLECHEAT] 在线:已直接注入 serverLinkInfoList -> {}:{}",
+                ip,
+                port
+            );
+        }
+    }
+    // Hand off to the game's NATIVE online entry instead of poking the state machine out-of-band
+    // (RE-confirmed root cause: out-of-band parked at state 4, where -[NetworkManager
+    // sendPacket:commandId:]@0xe231c REDIRECTS every non-1234 packet back into re-login, so the
+    // server only ever saw cmd=1234 — AND we never set delegateGameData, the master gate).
+    // -[GameManager connect2Server]@0x1aedc: `if [NM isReachable](method, our G1 hook→1) {
+    //   setDelegateGameData:GameManager (★the gate); setDelegateFriends:0; if !connected {
+    //   setState:2; establishConnection } }`. On connect, -[GameManager onStateChangedTo:]@0x21984
+    // case 4 auto-sends login (sendType 3) → the state machine advances 4→6→7, after which the
+    // native village fetches (1001/1062) actually transmit. We only pre-seed what establishConnection
+    // / the sendType-3 login read directly: the isReachable_ IVAR, the header userId (=米米号), a
+    // TaomeeUserInfo password fallback, and serverLinkInfoList (injected just above). Then the game runs.
+    let mimi = LOGIN_MIMI.load(O);
+    let nm_cls = env.objc.get_known_class("NetworkManager", &mut env.mem);
+    let shared = env
+        .objc
+        .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+    let nm: id = msg_send(env, (nm_cls, shared));
+    if nm == nil {
+        return;
+    }
+    let set_reach = env
+        .objc
+        .register_host_selector("setIsReachable:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (nm, set_reach, true));
+    // header userId = 米米号 (loginWithDeviceInfo sendType 3 reads getLocalUserInfoDataFromGameData.userId)
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    let gd: id = msg_send(env, (gd_cls, shared));
+    let glu = env
+        .objc
+        .register_host_selector("getLocalUserInfoDataFromGameData".to_string(), &mut env.mem);
+    let uinfo: id = msg_send(env, (gd, glu));
+    if uinfo != nil {
+        let set_uid = env
+            .objc
+            .register_host_selector("setUserId:".to_string(), &mut env.mem);
+        let _: () = msg_send(env, (uinfo, set_uid, mimi));
+    }
+    // TaomeeUserInfo{米米号, MOLE_PASSWORD} — password fallback for the sendType-3 login builder.
+    let pwd = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+    let tui_cls = env.objc.get_known_class("TaomeeUserInfo", &mut env.mem);
+    let alloc_s = env
+        .objc
+        .register_host_selector("alloc".to_string(), &mut env.mem);
+    let tui: id = msg_send(env, (tui_cls, alloc_s));
+    let init_s = env
+        .objc
+        .register_host_selector("init".to_string(), &mut env.mem);
+    let tui: id = msg_send(env, (tui, init_s));
+    let set_tuid = env
+        .objc
+        .register_host_selector("setTaomeeUserID:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, set_tuid, mimi));
+    let pwd_ns = crate::frameworks::foundation::ns_string::from_rust_string(env, pwd);
+    let set_pwd = env
+        .objc
+        .register_host_selector("setTaomeePasswordOfUserID:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, set_pwd, pwd_ns));
+    let set_tui = env
+        .objc
+        .register_host_selector("setTaomeeUserInfo:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (gd, set_tui, tui));
+    let rel = env
+        .objc
+        .register_host_selector("release".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, rel));
+    // Step 2 / Plan A — drive the game's GENUINE passport-success path instead of out-of-band
+    // connect2Server. Call the live MainMenuScene's onTaomeeLoginViewDidUnloadWithUserID:password:
+    // returnCode:0. In the cold (not-yet-connected) state this ARMS the scene (+235=1) and runs
+    // setState:2 + establishConnection — exactly the native cold-start. PHASE 2 (top of this fn)
+    // re-fires it at state 4 so its state==4 branch sets delegateLoginMainMenu + sends the native
+    // login. The genuine state machine then runs: 1234(sendFlag=1234→byte_B409B0)/1001 replies →
+    // onLoginMainMenuCommandReceived: → onButtonPlaySelected:→OnLoginOk→showWithTarget:4 → village.
+    // (connect2Server is a FriendsVillageLayer helper; it set delegateGameData but NOT the scene's
+    // armed flag / delegateLoginMainMenu, which is why hand-wiring those looped — RE-confirmed.)
+    let pwd_unload = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+    fire_passport_unload(env, scene, mimi, &pwd_unload);
+    log!(
+        "[MOLECHEAT] 在线:phase1 原生 passport 回调(冷态 arm 场景 + establishConnection),米米号={}",
+        mimi
+    );
+}
+
+/// Fire the game's native Taomee-passport success callback on the live MainMenuScene:
+/// `-[MainMenuScene onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:]`@0xb7e78.
+/// userID is a NUMERIC uint (matched against GameData.userInfoData.userId), password is an NSString,
+/// returnCode 0 = success. Cold → arms scene + establishConnection; at state 4 → delegate + login.
+fn fire_passport_unload(env: &mut Environment, scene: id, mimi: u32, pwd: &str) {
+    let pw_ns = crate::frameworks::foundation::ns_string::from_rust_string(env, pwd.to_string());
+    let sel = env.objc.register_host_selector(
+        "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:".to_string(),
+        &mut env.mem,
+    );
+    let _: () = msg_send(env, (scene, sel, mimi, pw_ns, 0i32));
+}
+
+/// Inject the private server into the serverlist, bypassing the dead HTTP path.
+/// The game's `-[TaomeeGetServerIpListManager getServerListWithServiceName:andDelegate:]`
+/// fetches `http://mlogin.61.com/ipsvr.fcgi?...&Format=json` via TM_ASIHTTPRequest (CFHTTP,
+/// which touchHLE doesn't implement → dead) and parses the JSON array
+/// `[{"ip":..,"port":..}]` via `parseData:` into TaomeeServerData. We build that exact JSON
+/// for MOLE_SERVER, run the game's OWN `parseData:` to get the array, and hand it to the
+/// delegate's `getListSuccAndReturnByArray:`/`getListSucc:` exactly like `requestFinished:`.
+fn inject_serverlist(env: &mut Environment, manager: id, delegate: id) {
+    let server = match std::env::var("MOLE_SERVER") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let (ip, port) = match server.trim().rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.to_string()),
+        None => (server.trim().to_string(), "7821".to_string()),
+    };
+    let json = format!("[{{\"ip\":\"{}\",\"port\":\"{}\"}}]", ip, port);
+    let json_ns = crate::frameworks::foundation::ns_string::from_rust_string(env, json);
+    // NSData via dataUsingEncoding:NSUTF8StringEncoding(4)
+    let due = env
+        .objc
+        .register_host_selector("dataUsingEncoding:".to_string(), &mut env.mem);
+    let data: id = msg_send(env, (json_ns, due, 4u32));
+    // Reuse the game's own JSON parser → array of TaomeeServerData.
+    let pd = env
+        .objc
+        .register_host_selector("parseData:".to_string(), &mut env.mem);
+    let arr: id = msg_send(env, (manager, pd, data));
+    if delegate != nil {
+        if env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "getListSuccAndReturnByArray:")
+        {
+            let s = env
+                .objc
+                .register_host_selector("getListSuccAndReturnByArray:".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (delegate, s, arr));
+        }
+        if env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "getListSucc:")
+        {
+            let s = env
+                .objc
+                .register_host_selector("getListSucc:".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (delegate, s, data));
+        }
+    }
+    log!(
+        "[MOLECHEAT] 在线:已注入 serverlist -> {}:{}(JSON,复用游戏 parseData:)",
+        ip,
+        port
+    );
+}
+
+/// Phase 2 of online login: once the socket is connected (NetworkManager state==4), send the
+/// login packet. didConnect (onSocket:didConnectToHost:) only sets connected=1 + state=4 — it
+/// does NOT auto-send login; the game drives -[NetworkManager
+/// loginWithDeviceInfoAndUserIDInfoInSendType:] separately. We set GameData.taomeeUserInfo =
+/// TaomeeUserInfo{米米号, MOLE_PASSWORD} and send sendType=1 (wire commandId 0x4D2=1234; the
+/// builder reads taomeeUserInfo userID+password). taomeePassword MUST be non-nil (the builder
+/// does UTF8String/strlen on it) — we always set a string (empty = the 16-zero password path).
+fn send_login_packet_if_connected(env: &mut Environment) {
+    if LOGIN_PKT_SENT.load(O) {
+        return;
+    }
+    let nm_cls = env.objc.get_known_class("NetworkManager", &mut env.mem);
+    let shared = env
+        .objc
+        .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+    let nm: id = msg_send(env, (nm_cls, shared));
+    if nm == nil {
+        return;
+    }
+    let state_sel = env
+        .objc
+        .register_host_selector("state".to_string(), &mut env.mem);
+    let state: i32 = msg_send(env, (nm, state_sel));
+    if state != 4 {
+        return; // socket not connected yet; retry next frame
+    }
+    LOGIN_PKT_SENT.store(true, O);
+    // GameData.taomeeUserInfo = TaomeeUserInfo{米米号, MOLE_PASSWORD}.
+    let mimi = LOGIN_MIMI.load(O);
+    let pwd = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+    let tui_cls = env.objc.get_known_class("TaomeeUserInfo", &mut env.mem);
+    let alloc_s = env
+        .objc
+        .register_host_selector("alloc".to_string(), &mut env.mem);
+    let tui: id = msg_send(env, (tui_cls, alloc_s));
+    let init_s = env
+        .objc
+        .register_host_selector("init".to_string(), &mut env.mem);
+    let tui: id = msg_send(env, (tui, init_s));
+    let set_uid = env
+        .objc
+        .register_host_selector("setTaomeeUserID:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, set_uid, mimi));
+    let pwd_ns = crate::frameworks::foundation::ns_string::from_rust_string(env, pwd);
+    let set_pwd = env
+        .objc
+        .register_host_selector("setTaomeePasswordOfUserID:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, set_pwd, pwd_ns));
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    let gd: id = msg_send(env, (gd_cls, shared));
+    let set_tui = env
+        .objc
+        .register_host_selector("setTaomeeUserInfo:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (gd, set_tui, tui));
+    let rel = env
+        .objc
+        .register_host_selector("release".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (tui, rel));
+    // Send the login packet (sendType 1 → taomeeUserInfo creds; commandId 1234).
+    let login_sel = env.objc.register_host_selector(
+        "loginWithDeviceInfoAndUserIDInfoInSendType:".to_string(),
+        &mut env.mem,
+    );
+    let _: () = msg_send(env, (nm, login_sel, 1i32));
+    log!(
+        "[MOLECHEAT] 在线:已发送登录包(loginWithDeviceInfo sendType=1, 米米号={})",
+        mimi
+    );
 }
 
 /// Current forced VIP level (for the menu label).
@@ -644,6 +1401,9 @@ enum CrackGroup {
     StoreVip,
     Island,
     ParseSkip,
+    /// 庄园持久化:NOP 掉 -[GameData saveMapData:] 的第4道闸(m_isLoadMap!=0→bail,0x768fa BNE.W)。
+    /// 仅在线模式开(MAP_SYNC_PATCH);活图 objects.count=111 满图,其余4道闸都过,卡这一道→map 发 0B。
+    MapSync,
 }
 struct CrackPatch {
     vaddr: u32,
@@ -667,6 +1427,9 @@ static STORE_NO_VIP: AtomicBool = AtomicBool::new(false);
 static ENTER_NEWISLANDS: AtomicBool = AtomicBool::new(true);
 /// 跳过对象数据校验(GameData.parseObjectData: 一处取值强制 0)。默认 OFF=香草真值。
 static SKIP_PARSE_CHECK: AtomicBool = AtomicBool::new(false);
+/// 庄园持久化补丁(NOP saveMapData 第4道闸)开关。默认 OFF=香草;在线登录 arm 时置 ON(见 fire_online_login
+/// 上游),让客户端能把活图整包经 updateInfoToServer 发上来。离线单机永不开,零污染。
+static MAP_SYNC_PATCH: AtomicBool = AtomicBool::new(false);
 /// 任一破解开关变更后置位;下次 intercept 把补丁写入/还原到模拟内存。初始 true=启动即按默认态应用。
 static CRACK_PATCHES_DIRTY: AtomicBool = AtomicBool::new(true);
 
@@ -692,6 +1455,10 @@ static CRACK_PATCHES: &[CrackPatch] = &[
     CrackPatch{vaddr:0x7c8de6, group:CrackGroup::Jailbreak, vanilla:&[0x01], cracked:&[0x00]},
     CrackPatch{vaddr:0x7c8e1c, group:CrackGroup::Jailbreak, vanilla:&[0x01], cracked:&[0x00]},
     CrackPatch{vaddr:0x85aaa0, group:CrackGroup::Jailbreak, vanilla:&[0x01,0x26,0x2a,0xf0,0x56,0xeb,0x10,0xf0,0xff,0x0f,0x18,0xbf,0x01], cracked:&[0x00,0x26,0x2a,0xf0,0x56,0xeb,0x10,0xf0,0xff,0x0f,0x18,0xbf,0x00]},
+    // 庄园持久化:NOP -[GameData saveMapData:]@0x768fa 的 `BNE.W loc_7902C`(第4道闸 m_isLoadMap!=0→bail)。
+    // 原字节 42 f0 97 83 = BNE.W;改成两个 16位 NOP(00 bf 00 bf)→落空不 bail→序列化活图 111 对象。
+    // 仅在线模式(MAP_SYNC_PATCH)生效;离线为香草字节零改动。
+    CrackPatch{vaddr:0x768fa, group:CrackGroup::MapSync, vanilla:&[0x42,0xf0,0x97,0x83], cracked:&[0x00,0xbf,0x00,0xbf]},
 ];
 
 fn crack_group_on(g: CrackGroup) -> bool {
@@ -702,6 +1469,7 @@ fn crack_group_on(g: CrackGroup) -> bool {
         CrackGroup::StoreVip => STORE_NO_VIP.load(O),
         CrackGroup::Island => ENTER_NEWISLANDS.load(O),
         CrackGroup::ParseSkip => SKIP_PARSE_CHECK.load(O),
+        CrackGroup::MapSync => MAP_SYNC_PATCH.load(O),
     }
 }
 
@@ -722,8 +1490,22 @@ fn apply_crack_patches(env: &mut Environment) {
     );
 }
 
+/// [MoleWorld] 在线进村存档 mapExtend 写错的修复开关。mapExtend 低5位=已扩展地图区域位掩码;
+/// -[VillageLayer curVisibleArea] 取 `(unsigned __int8)mapExtend & 0x1F` 查可视区矩形。在线下发
+/// 的 userinfo.mapExtend=6(只2区)却配满图内容(到 y148)→ 查到小/空可视区 → 拖动摄像机夹值
+/// 震荡闪屏错位。强制 mapExtend getter 返回 0x1F(满图全区=不闪存档 287 的有效低字节)消除矛盾。
+/// MOLE_FIX_MAPEXTEND=1 启用(确认阶段);确认后改默认策略。
+fn fix_mapextend_on() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MOLE_FIX_MAPEXTEND").is_some())
+}
+
 /// Cheap gate so the hot message path pays nothing when all cheats are off.
 pub fn any_enabled() -> bool {
+    if fix_mapextend_on() {
+        return true;
+    }
     FREE_SHOP.load(O)
         || KILL_ANTICHEAT.load(O)
         || FORCE_VIP.load(O)
@@ -755,11 +1537,682 @@ pub fn any_enabled() -> bool {
 /// Intercept a `[class sel ...]` message. Returns `true` if fully handled (the
 /// caller must `return` without dispatching); `false` to let the real method
 /// run (possibly with an argument register tweaked in place).
+/// Schedule one HUD refresh ~1s out via performSelector:afterDelay: (run-loop perform phase). The
+/// moleHudTick intercept runs update_debug_hud then calls this again, forming a 1s repeating timer
+/// that lives entirely OUTSIDE the drawScene frame stack (so it never starves the run-loop / drops
+/// the cf_stream Open event the way per-frame drawScene-stack msg_sends did).
+fn schedule_hud_tick(env: &mut Environment) {
+    let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+    let smgr = env
+        .objc
+        .register_host_selector("sharedManager".to_string(), &mut env.mem);
+    let gm: id = msg_send(env, (gm_cls, smgr));
+    if gm == nil {
+        return;
+    }
+    let tick = env
+        .objc
+        .register_host_selector("moleHudTick".to_string(), &mut env.mem);
+    let perform = env.objc.register_host_selector(
+        "performSelector:withObject:afterDelay:".to_string(),
+        &mut env.mem,
+    );
+    let _: () = msg_send(env, (gm, perform, tick, nil, 1.0f64));
+}
+
+/// Draw/refresh the debug HUD overlay (connection state / RTT / packet counters) over whatever
+/// scene is running. Mirrors the game's own HUD idiom (a CCLabelTTF on a CCLayer added to the
+/// running scene at a high z; cf. TestLayer@0x1444a0). It self-heals across scene swaps: if the
+/// tagged layer is gone (scene changed) it rebuilds, otherwise it just updates the label text.
+/// Toggle off with MOLE_HUD=0. armv7 ObjC ABI: float args to objc_msgSend are raw f32 bit
+/// patterns in core registers; CGPoint = two consecutive 32-bit slots.
+fn update_debug_hud(env: &mut Environment, mimi: u32) {
+    if std::env::var("MOLE_HUD").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    let dir_cls = env.objc.get_known_class("CCDirector", &mut env.mem);
+    let shared_dir = env
+        .objc
+        .register_host_selector("sharedDirector".to_string(), &mut env.mem);
+    let dir: id = msg_send(env, (dir_cls, shared_dir));
+    if dir == nil {
+        return;
+    }
+    let running = env
+        .objc
+        .register_host_selector("runningScene".to_string(), &mut env.mem);
+    let scene: id = msg_send(env, (dir, running));
+    if scene == nil {
+        return;
+    }
+    let nm_cls = env.objc.get_known_class("NetworkManager", &mut env.mem);
+    let shared = env
+        .objc
+        .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+    let nm: id = msg_send(env, (nm_cls, shared));
+    let state: i32 = if nm == nil {
+        -1
+    } else {
+        let st = env.objc.register_host_selector("state".to_string(), &mut env.mem);
+        msg_send(env, (nm, st))
+    };
+    let state_label = match state {
+        0 => "空闲",
+        1 => "连接中",
+        2 => "请求连接",
+        4 => "已连接",
+        6 => "发送中",
+        7 => "在线就绪",
+        8 => "错误/断开",
+        9 => "登录完成",
+        _ => "?",
+    };
+    let sent = PKTS_SENT.load(O);
+    let recv = PKTS_RECV.load(O);
+    let rtt = LAST_RTT_MS.load(O);
+    let pending = sent.saturating_sub(recv);
+    // SAFE to read here: the HUD runs in the run-loop perform phase (the moleHudTick timer), NOT in
+    // the packet-handler critical path, so these msg_sends can't clobber any in-flight method's args.
+    // count: did the 1001 map unarchive (gzipInflate→NSKeyedUnarchiver) into a non-empty dict?
+    // byte_B409B0: did the native 1234-reply handler set the fresh-login flag (the village-branch gate)?
+    let map_count: i64 = {
+        let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+        let gd: id = msg_send(env, (gd_cls, shared));
+        let rmd: id = if gd == nil {
+            nil
+        } else {
+            let s = env
+                .objc
+                .register_host_selector("remoteMapData".to_string(), &mut env.mem);
+            msg_send(env, (gd, s))
+        };
+        let md: id = if rmd == nil {
+            nil
+        } else {
+            let s = env
+                .objc
+                .register_host_selector("mapdata".to_string(), &mut env.mem);
+            msg_send(env, (rmd, s))
+        };
+        if md == nil {
+            -1
+        } else {
+            let dc = env.objc.get_known_class("NSDictionary", &mut env.mem);
+            let ik = env
+                .objc
+                .register_host_selector("isKindOfClass:".to_string(), &mut env.mem);
+            let isd: bool = msg_send(env, (md, ik, dc));
+            if isd {
+                let c = env
+                    .objc
+                    .register_host_selector("count".to_string(), &mut env.mem);
+                let n: u32 = msg_send(env, (md, c));
+                n as i64
+            } else {
+                -2
+            }
+        }
+    };
+    let b409: u8 = env.mem.read(crate::mem::ConstPtr::<u8>::from_bits(0xb409b0));
+    // Which scene is actually on screen? -1 dir nil / -2 scene nil / 0 = NOT InGameScene (still title)
+    // / 1 = InGameScene (village transitioned). Distinguishes "replaceScene didn't switch" from
+    // "switched but InGameScene renders nothing".
+    let scene_is_ingame: i32 = {
+        let cd = env.objc.get_known_class("CCDirector", &mut env.mem);
+        let sdir = env
+            .objc
+            .register_host_selector("sharedDirector".to_string(), &mut env.mem);
+        let dir: id = msg_send(env, (cd, sdir));
+        if dir == nil {
+            -1
+        } else {
+            let rss = env
+                .objc
+                .register_host_selector("runningScene".to_string(), &mut env.mem);
+            let scene: id = msg_send(env, (dir, rss));
+            if scene == nil {
+                -2
+            } else {
+                let igc = env.objc.get_known_class("InGameScene", &mut env.mem);
+                let ik = env
+                    .objc
+                    .register_host_selector("isKindOfClass:".to_string(), &mut env.mem);
+                let isig: bool = msg_send(env, (scene, ik, igc));
+                if isig {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    };
+    if LAST_MAP_COUNT.swap(map_count as i32, O) != map_count as i32 {
+        log!(
+            "[MOLECHEAT] 在线诊断(HUD,安全): remoteMapData.mapdata.count={} byte_B409B0={} runningScene_isInGame={}",
+            map_count,
+            b409,
+            scene_is_ingame
+        );
+    }
+    let text = format!(
+        "[摩尔私服 DEBUG]\n米米号 {}\n状态 {} ({})\n延迟 {} ms\n发包 {}  收包 {}\n在途/丢 {}\n地图 {}  B409 {}",
+        mimi, state_label, state, rtt, sent, recv, pending, map_count, b409
+    );
+    let ns_text = crate::frameworks::foundation::ns_string::from_rust_string(env, text);
+    let get_tag = env
+        .objc
+        .register_host_selector("getChildByTag:".to_string(), &mut env.mem);
+    let set_str = env
+        .objc
+        .register_host_selector("setString:".to_string(), &mut env.mem);
+    let hud: id = msg_send(env, (scene, get_tag, 9000i32));
+    if hud != nil {
+        let lbl: id = msg_send(env, (hud, get_tag, 9001i32));
+        if lbl != nil {
+            let _: () = msg_send(env, (lbl, set_str, ns_text));
+        }
+        return;
+    }
+    // Build it: a CCLayer holding one multi-line CCLabelTTF, anchored bottom-left.
+    let set_tag = env
+        .objc
+        .register_host_selector("setTag:".to_string(), &mut env.mem);
+    let node = env
+        .objc
+        .register_host_selector("node".to_string(), &mut env.mem);
+    let layer_cls = env.objc.get_known_class("CCLayer", &mut env.mem);
+    let hud: id = msg_send(env, (layer_cls, node));
+    if hud == nil {
+        return;
+    }
+    let _: () = msg_send(env, (hud, set_tag, 9000i32));
+    let lbl_cls = env.objc.get_known_class("CCLabelTTF", &mut env.mem);
+    let font =
+        crate::frameworks::foundation::ns_string::from_rust_string(env, "Times New Roman".to_string());
+    let label_with = env.objc.register_host_selector(
+        "labelWithString:fontName:fontSize:".to_string(),
+        &mut env.mem,
+    );
+    let lbl: id = msg_send(env, (lbl_cls, label_with, ns_text, font, 18.0f32.to_bits()));
+    if lbl == nil {
+        return;
+    }
+    let set_anchor = env
+        .objc
+        .register_host_selector("setAnchorPoint:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (lbl, set_anchor, 0u32, 0u32)); // (0,0) = bottom-left
+    let set_pos = env
+        .objc
+        .register_host_selector("setPosition:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (lbl, set_pos, 8.0f32.to_bits(), 8.0f32.to_bits()));
+    let set_color = env
+        .objc
+        .register_host_selector("setColor:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (lbl, set_color, 0x00_FF00u32)); // green ccColor3B
+    let _: () = msg_send(env, (lbl, set_tag, 9001i32));
+    let add_child = env
+        .objc
+        .register_host_selector("addChild:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (hud, add_child, lbl));
+    let add_child_z = env
+        .objc
+        .register_host_selector("addChild:z:".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (scene, add_child_z, hud, 99_999i32));
+    log!("[MOLECHEAT] 调试悬浮窗已创建(MOLE_HUD=0 可关)");
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 启动时 / 任一破解开关变更后,按当前开关状态把破解补丁写入或还原到模拟内存(香草基底)。
     // 写在最前面、只在 dirty 时跑一次:invalidate_cache_range 让 dynarmic 重新编译被改的指令。
     if CRACK_PATCHES_DIRTY.swap(false, O) {
         apply_crack_patches(env);
+    }
+
+    // ===== ONLINE MODE:登录通行证绕过 + 米米号注入(全 gate 在 online_login_mimi) =====
+    // 离线(默认)每条分支都是空过,单机路径逐字节不变。仅 --allow-network-access + MOLE_MIMI 时生效。
+    if let Some(mimi) = online_login_mimi(env) {
+        // 捕获真正的 MainMenuScene 实例(runningScene 只是 CCScene 壳,菜单层在其子节点)。
+        if class == "MainMenuScene" {
+            let s = env.cpu.regs()[0];
+            if s != 0 {
+                MAINMENU_SCENE.store(s, O);
+            }
+        }
+        // (0) Serverlist 注入:游戏向 mlogin.61.com/ipsvr.fcgi 发 ASIHTTPRequest 取 JSON(CFHTTP
+        // touchHLE 没实现=死路)。直接注入私服、复用游戏 parseData:,跳过死 HTTP,放行后不跑真方法。
+        if class == "TaomeeGetServerIpListManager"
+            && sel == "getServerListWithServiceName:andDelegate:"
+        {
+            let manager: id = Ptr::from_bits(env.cpu.regs()[0]);
+            let delegate: id = Ptr::from_bits(env.cpu.regs()[3]);
+            inject_serverlist(env, manager, delegate);
+            return true; // handled; skip the dead real HTTP fetch
+        }
+        // AsyncSocket.setSocketFromStreamsAndReturnError: pulls the native socket fd via
+        // CFReadStreamCopyProperty(kCFStreamPropertySocketNativeHandle), which touchHLE doesn't
+        // implement → it returns null and AsyncSocket would closeWithError (or crash) so the
+        // connection never reaches didConnect. We don't need the native socket — read/write go
+        // through the CFStreams — so force success (BOOL YES) and skip the real method; then
+        // doStreamOpen proceeds to onSocket:didConnectToHost: (state=4). connectedHost/connectedPort
+        // are nil-safe (return nil/0) when theSocket4/6 stay unset.
+        if class == "AsyncSocket" && sel == "setSocketFromStreamsAndReturnError:" {
+            env.cpu.regs_mut()[0] = 1; // BOOL YES
+            return true;
+        }
+        // (1) 强制 wire 米米号:MVPacketHeader setUserID: 的入参在 R2,改写后放行真 setter
+        //     (覆盖所有 sendType,含 onStateChangedTo:4 走 sendType3 读本地 userId 的路径)。
+        if LOGIN_ARMED.load(O) && class == "MVPacketHeader" && sel == "setUserID:" {
+            // 账号菜单模式用真正登录的米米号(passport 回的 user_id),默认模式仍用 MOLE_MIMI。
+            env.cpu.regs_mut()[2] = if account_menu_mode() {
+                LOGIN_MIMI.load(O)
+            } else {
+                mimi
+            };
+            // 落到下面:返回 false,真 setUserID: 用我们的值
+        }
+        // (2) 登录密码 MD5 块的明文来源:taomeePassword getter 返回 MOLE_PASSWORD。
+        //     未设则不拦(空哈希,宽松服务器接受)。
+        if LOGIN_ARMED.load(O) && class == "TaomeeUserInfo" && sel == "taomeePassword" {
+            if let Ok(p) = std::env::var("MOLE_PASSWORD") {
+                let ns = crate::frameworks::foundation::ns_string::from_rust_string(env, p);
+                env.cpu.regs_mut()[0] = ns.to_bits();
+                return true;
+            }
+        }
+        // (G1) Gate A(onButtonChangeIDSelected:)+ Gate C(onTaomeeLoginViewDidUnload:)。
+        if LOGIN_ARMED.load(O) && class == "NetworkManager" && sel == "isReachable" {
+            env.cpu.regs_mut()[0] = 1;
+            return true;
+        }
+        // (G2) Gate B(showAccountManagerViewWithDelegate:)。
+        if LOGIN_ARMED.load(O) && class == "TMA_ASIHTTPRequest" && sel == "isNetworkReachable" {
+            env.cpu.regs_mut()[0] = 1;
+            return true;
+        }
+        // (G3) 吞掉死掉的淘米通行证 HTTP(sendRequest:1012),改为 arm 延迟合成。
+        // ★账号菜单模式:不吞,放原版发真 passport 1012,让账号管理菜单 UI 走真流程渲染出来。
+        if class == "TMADataManager" && sel == "autoLoginWithUserID:" {
+            if account_menu_mode() {
+                return false;
+            }
+            if LOGIN_ARMED.load(O) {
+                LOGIN_MIMI.store(mimi, O);
+                LOGIN_PWD.with(|c| *c.borrow_mut() = std::env::var("MOLE_PASSWORD").ok());
+                if !LOGIN_ARMED.swap(true, O) {
+                    log!(
+                        "[MOLECHEAT] 在线:拦截 autoLoginWithUserID:,改为合成登录成功 米米号={}",
+                        mimi
+                    );
+                }
+                return true;
+            }
+        }
+        // ===== 账号菜单模式 passport 代理(让 touchHLE 也弹原版账号菜单)=====
+        if account_menu_mode() {
+            // 诊断:账号菜单渲染路径。showBackgroudView=空加载框,showAccountManagerView=填6按钮那步。
+            if sel == "showAccountManagerView"
+                || sel == "showBackgroudView"
+                || sel == "showLoginViewWithAuthCode:andAuthImage:"
+            {
+                log!("[MOLECHEAT] 账号菜单诊断: -[{} {}]", class, sel);
+            }
+            // 玩家点"切换账号"= showAccountManagerViewWithDelegate:andUserID:,激活 passport 代理。
+            // 只代理这之后的 passport;之前进村自动发的 autoLogin 不碰(它走会崩的静默登录分支)。
+            if sel == "showAccountManagerViewWithDelegate:andUserID:" {
+                if !MENU_ACTIVE.swap(true, O) {
+                    log!("[MOLECHEAT] ★切换账号入口,激活 passport 代理");
+                }
+            }
+            // (P0) 抓 TMAHttpManager sendRequest: 的命令字(reqID),紧接着的 addOperation: 代理时据此构造 body。
+            if class == "TMAHttpManager" && sel == "sendRequest:" {
+                PENDING_REQID.store(env.cpu.regs()[2], O);
+            }
+            // (K) keychain 桩:TMA_SSKeychain 被 touchHLE fake 成 nil,登录成功路径拿 allAccounts(nil)
+            //     当指针解引用 → null-page 崩。至少让 allAccounts 回【空数组】(非 nil)。
+            if class == "TMA_SSKeychain" && sel == "allAccounts" {
+                let arr = crate::frameworks::foundation::ns_array::from_vec(env, vec![]);
+                let arr = autorelease(env, arr);
+                env.cpu.regs_mut()[0] = arr.to_bits();
+                return true;
+            }
+            // (J) ★绕开 touchHLE 没实现的 JSONKit(JKDictionary/JKArray 是 unimplemented class → 解析 nil → 崩):
+            //     拦 TMAHttpManager getDictionaryWithJsonData:,自己在 Rust 解析 passport 响应 JSON
+            //     构造【标准 NSDictionary】喂回,客户端 requestFinish: 照常 objectForKey: 取 status_code/extra_data 分发。
+            if class == "TMAHttpManager" && sel == "getDictionaryWithJsonData:" {
+                let data: id = Ptr::from_bits(env.cpu.regs()[2]);
+                let bytes = nsdata_to_bytes(env, data);
+                let pairs = parse_flat_json(&bytes);
+                if !pairs.is_empty() {
+                    let dict = build_nsdict(env, &pairs);
+                    log!(
+                        "[MOLECHEAT] getDictionaryWithJsonData: 绕 JSONKit → Rust 构造 NSDictionary({} 键)",
+                        pairs.len()
+                    );
+                    env.cpu.regs_mut()[0] = dict.to_bits();
+                    return true;
+                }
+            }
+            // (P1) 拦 TMA_ASINetworkQueue addOperation:(passport 真正的发送动作),代理到私服 shim。
+            //      只在切换账号激活后代理(避免碰进村自动 autoLogin 的静默登录崩溃分支)。
+            if MENU_ACTIVE.load(O) && class == "TMA_ASINetworkQueue" && sel == "addOperation:" {
+                let req: id = Ptr::from_bits(env.cpu.regs()[2]);
+                if passport_proxy_enqueue(env, req) {
+                    return true;
+                }
+            }
+            // (P2) 回灌:原版 requestFinish: 读 [request responseData] 时,把代理拿到的 JSON 喂回去。
+            if sel == "responseData"
+                && (class == "TMA_ASIFormDataRequest" || class == "TMA_ASIHTTPRequest")
+            {
+                let req_bits = env.cpu.regs()[0] as u32;
+                let bytes = {
+                    let resp = PASSPORT_RESP.lock().unwrap();
+                    resp.iter()
+                        .find(|(b, _)| *b == req_bits)
+                        .map(|(_, v)| v.clone())
+                };
+                if let Some(bytes) = bytes {
+                    let data = crate::frameworks::foundation::ns_url_connection::nsdata_from_bytes(
+                        env, &bytes,
+                    );
+                    env.cpu.regs_mut()[0] = data.to_bits();
+                    return true;
+                }
+            }
+            // (P3) passport 登录成功后原版回调 onTaomeeLoginViewDidUnload...,捕获 user_id 武装 TCP 登录链
+            //      (setUserID/taomeePassword/isReachable 等门 gate 在 LOGIN_ARMED),让换号后能真连 TCP 1234。
+            if class == "MainMenuScene"
+                && sel == "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:"
+            {
+                let uid = env.cpu.regs()[2];
+                if uid != 0 {
+                    LOGIN_MIMI.store(uid, O);
+                    LOGIN_PWD.with(|c| *c.borrow_mut() = std::env::var("MOLE_PASSWORD").ok());
+                    if !LOGIN_ARMED.swap(true, O) {
+                        log!(
+                            "[MOLECHEAT] 账号菜单模式:passport 登录成功 user_id={},武装 TCP 登录链",
+                            uid
+                        );
+                    }
+                }
+                // 放行真回调(establishConnection -> serverlist -> TCP)。
+            }
+        }
+        // establishConnection 开头 `if(self->isReachable_)` 读的是 IVAR(G1 只改了方法),
+        // 进入前先 [self setIsReachable:YES] 置 ivar,否则直接 bail 不连。放行真方法。
+        if LOGIN_ARMED.load(O) && class == "NetworkManager" && sel == "establishConnection" {
+            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+            let set = env
+                .objc
+                .register_host_selector("setIsReachable:".to_string(), &mut env.mem);
+            let _: () = msg_send(env, (nm, set, true));
+            // 落到下面 -> 返回 false,真 establishConnection 用 isReachable_=1 运行
+        }
+        // DIAG(pass-through):暴露收 1001 后 ~30-70s 断开的真因。checkTimeOut@0xe0748 在断开前
+        // 调 changeStateTo:8 withMessage:@"Time out in command: %ld";打印 state+message 即可
+        // 看清是不是看门狗超时(及哪个命令),以及状态机 4→6→7→… 的真实走向。
+        if class == "NetworkManager" && sel == "changeStateTo:withMessage:" {
+            let state = env.cpu.regs()[2] as i32;
+            // Capture LR (return address) at method entry = who called changeStateTo: — for state 8
+            // (the spurious "Error connecting" disconnect) this pins the offending caller function.
+            let caller_lr = env.cpu.regs()[14];
+            // HUD stats: state 6 = a packet was written, state 7 = a packet was parsed.
+            if state == 6 {
+                PKTS_SENT.fetch_add(1, O);
+                LAST_SEND_AT.with(|c| c.set(Some(std::time::Instant::now())));
+            } else if state == 7 {
+                PKTS_RECV.fetch_add(1, O);
+                STATE_IS_7.store(true, O); // connection is up → safe to start the HUD tick
+                LAST_SEND_AT.with(|c| {
+                    if let Some(t) = c.get() {
+                        LAST_RTT_MS.store(t.elapsed().as_millis() as u32, O);
+                    }
+                });
+            }
+            let msg_id: id = Ptr::from_bits(env.cpu.regs()[3]);
+            let msg = if msg_id == nil {
+                String::new()
+            } else {
+                crate::frameworks::foundation::ns_string::to_rust_string(env, msg_id).into_owned()
+            };
+            if state == 8 {
+                // NOTE: do NOT suppress this state-8. Empirically, the onServerListResult: HTTP-list
+                // failure → changeStateTo:8 → entermainmenu is part of the connect-RETRY flow; skipping
+                // it leaves the connection unestablished. The real village blocker is downstream (the
+                // LoadingLayer update:/loadTarget not re-firing for the village showWithTarget:4).
+                log!(
+                    "[MOLECHEAT] 在线诊断: changeStateTo:8 调用者LR={:#x} msg=\"{}\"",
+                    caller_lr,
+                    msg
+                );
+            } else {
+                log!("[MOLECHEAT] 在线诊断: changeStateTo:{} msg=\"{}\"", state, msg);
+            }
+            return false;
+        }
+        if class == "NetworkManager" && sel == "disconnect" {
+            log!("[MOLECHEAT] 在线诊断: NetworkManager disconnect() 被调用");
+            return false;
+        }
+        // ★ 15s 断连根治(走原版 play-login 语义)。passport 回调以 sendType 3 发登录(1234)→
+        // loginWith...InSendType: 末尾 switch 把 sendType 3 映射成 sendFlag=1000;但客户端把发出的命令
+        // 按 sendFlag 当 key 存进 UnreadPacketsDic_(sendPacket:commandId:),回包按 sendFlag 移除。
+        // 服务端登录回包用 sendFlag=1234(原版语义:onLoginMainMenuCommandReceived 据此置 byte_B409B0
+        // 进村)→ 对不上 key "1000" → 清不掉 → checkTimeOut@15s 超时 → disconnect → 重连 churn →
+        // socket 回调狂刷饿死 run-loop → 画面冻结。原版 play-login 本就是 sendType 1(switch:1→
+        // sendFlag 1234),与 3 的唯一实际差别就是 sendFlag(userID/密码都回落到 taomeeUserID+
+        // taomeePassword,mole_cheats 已设)。把 3 改成 1 → 请求 sendFlag=1234 → 回包自然匹配清超时
+        // + 置 byte_B409B0 → 进村。服务端一行不改,纯把客户端登录摆回原版姿势。
+        if class == "NetworkManager" && sel == "loginWithDeviceInfoAndUserIDInfoInSendType:" {
+            if env.cpu.regs()[2] == 3 {
+                env.cpu.regs_mut()[2] = 1;
+                log!("[MOLECHEAT] 在线:登录 sendType 3→1(原版 play-login,请求 sendFlag=1234,根治 15s 超时断连)");
+            }
+            return false; // 用改过的 sendType 跑真 loginWith...
+        }
+        // ★ Spurious-disconnect root cause (empirically pinned via the changeStateTo:8 caller-LR =
+        // 0xebc60 = -[NetworkManager onServerListResult:], message "Error connecting to server"):
+        // the game's ORIGINAL flow fetches the server list over HTTP, but our private host serves only
+        // the raw TCP game protocol (no HTTP list endpoint), so onServerListResult: is invoked with
+        // success=NO → it falls straight through to changeStateTo:8 "Error connecting to server" →
+        // MainMenuScene goes back to the title (entermainmenu), derailing village loading. Our
+        // synthetic passport flow already establishes the TCP link directly (establishConnection
+        // cold-connect; 1234→1052→1001 all succeed regardless of this HTTP result), so this HTTP
+        // server-list callback is redundant — skip it to kill the bogus disconnect. (Verified: with
+        // the island hook OFF the state-8 still fired from here, and no -[NetworkManager disconnect]
+        // was ever called, ruling out the OnLoginOk userId-guard / onSocketDidDisconnect: path.)
+        // onServerListResult: is called BOTH with success=YES (a3!=0 → it connects to the
+        // serverLinkInfoList; THIS is the live connection path — must NOT be skipped) and with
+        // success=NO (a3==0 → the HTTP list fetch failed → falls through to changeStateTo:8 "Error
+        // connecting to server" → entermainmenu → derails the village). So skip ONLY the a3==0 call
+        // (suppress the bogus disconnect) and let the a3!=0 call run normally (keep the connection).
+        // onServerListResult:(success) is -[HttpManager callDelegateServerList]'s callback with
+        // success = HttpManager.result_ (the HTTP server-list fetch result). Our private host serves
+        // only the raw TCP game protocol (no HTTP list endpoint), so result_ == NO → onServerListResult:
+        // falls through to changeStateTo:8 "Error connecting to server" → entermainmenu → derails the
+        // village. FAITHFUL fix: force success = YES so it takes the connect path instead — if already
+        // connected (our establishConnection cold-connect) it just returns; otherwise it connects to
+        // the injected serverLinkInfoList. Either way: no bogus disconnect, and the real flow proceeds.
+        if sel == "onServerListResult:" {
+            log!(
+                "[MOLECHEAT] 在线诊断: onServerListResult: a3={}(其虚假 state-8 由 changeStateTo 钩子按 LR 抑制)",
+                env.cpu.regs()[2] as i32
+            );
+            return false;
+        }
+        // Diagnose the village render: -[LoadingLayer update:] (scheduled by showWithTarget:) is what
+        // schedules loadTarget on the main thread. If it never fires after showWithTarget:4, the village
+        // scene (case 4 → loadFromLocal + startGame) is never built.
+        if class == "LoadingLayer" && sel == "update:" {
+            // Natural update: fired → loadTarget will run via the perform queue; cancel our fallback.
+            PENDING_LOADTARGET.store(0, O);
+            log!("[MOLECHEAT] 在线诊断: LoadingLayer update: 触发(将投递 loadTarget)");
+            return false;
+        }
+        // Lightweight scene/flow transition log (fires only on these rare events).
+        if sel == "onButtonPlaySelected:" || sel == "OnLoginOk" || sel == "showLoginView"
+            || sel == "showDifferentGameDataComparingView"
+            || sel == "loadTarget" || sel == "startGame" || sel == "startGame:"
+            || sel == "loadFromLocal" || sel == "entermainmenu"
+            || sel == "showMessageOfDisableNonHDiPhone" || sel == "loadMapFromData:"
+            || sel == "endLoadCallBack"
+            || sel == "runWithScene:" || sel == "popScene"
+            || sel == "setNextScene" || sel == "replaceScene:"
+        {
+            log!("[MOLECHEAT] 在线诊断: {} {}", class, sel);
+            return false;
+        }
+        if sel == "showWithTarget:" {
+            let tgt = env.cpu.regs()[2] as i32;
+            log!("[MOLECHEAT] 在线诊断: {} showWithTarget:{}", class, tgt);
+            // Latch the village transition (target 4) so the drawScene tick can drive loadTarget if the
+            // LoadingLayer's natural update: never re-fires (see PENDING_LOADTARGET).
+            if tgt == 4 {
+                PENDING_LOADTARGET.store(env.cpu.regs()[0], O);
+                PENDING_LOADTARGET_FRAMES.store(0, O);
+            }
+            return false;
+        }
+        // The 1s HUD tick (fired by performSelector:afterDelay: in the run-loop perform phase, NOT
+        // the drawScene frame stack). Refresh the overlay, then reschedule the next tick. GameManager
+        // doesn't implement moleHudTick — we intercept it before the real (no-op) dispatch.
+        if sel == "moleHudTick" {
+            update_debug_hud(env, LOGIN_MIMI.load(O));
+            schedule_hud_tick(env);
+            return true;
+        }
+        // 在线自动登录:启动若干帧后自动 arm(无需点 Play;离线/未设 MOLE_MIMI 永不到这)。
+        // 然后在同一安全帧边界(drawScene/mainLoop)一次性 fire 合成登录,绝不内联派发。
+        if sel == "drawScene" || sel == "mainLoop" {
+            // ★ Save self/sel. Everything below (fire_online_login, the loadTarget drive, the 8×
+            // drive_streams drain) does host msg_sends that clobber r0-r3. We return false so the REAL
+            // -[CCDirectorIOS drawScene] runs next, and touchHLE dispatches it with the POST-hook
+            // registers — a clobbered r0 = wrong director self → it reads nextScene_ off the wrong
+            // object (nil) and never calls setNextScene → scene transitions silently stop after our flow
+            // engages (exactly the symptom: nextScene_=InGameScene set in memory but never applied). So
+            // restore r0/r1 before falling through. (drawScene/mainLoop take no further args.)
+            let saved_r0 = env.cpu.regs()[0];
+            let saved_r1 = env.cpu.regs()[1];
+            // 账号菜单模式也保留自动合成登录(进村),玩家在游戏里点"切换账号"时 G3 放行真 passport 弹菜单
+            //(主菜单的摩尔标志是 placeholder 没登录入口,停标题反而点不动;走熟悉的进村→切换账号流程)。
+            if !LOGIN_ARMED.load(O) && !LOGIN_FIRED.load(O) {
+                let n = LOGIN_BOOT_FRAMES.fetch_add(1, O);
+                if n >= 180 && !LOGIN_ARMED.swap(true, O) {
+                    LOGIN_MIMI.store(mimi, O);
+                    LOGIN_PWD.with(|c| *c.borrow_mut() = std::env::var("MOLE_PASSWORD").ok());
+                    // 在线模式开启庄园持久化补丁(NOP saveMapData 第4道闸),让活图能整包上传。
+                    MAP_SYNC_PATCH.store(true, O);
+                    CRACK_PATCHES_DIRTY.store(true, O);
+                    log!("[MOLECHEAT] 在线:启动后自动登录 米米号={}(开启 MapSync 持久化补丁)", mimi);
+                }
+            }
+            // Once armed, drive the native passport login: phase 1 (cold connect) then phase 2
+            // (send login at state 4). fire_online_login latches both via LOGIN_FIRED/LOGIN_PKT_SENT.
+            if LOGIN_ARMED.load(O) && !LOGIN_PKT_SENT.load(O) {
+                fire_online_login(env);
+            }
+            // Village-render fallback (see PENDING_LOADTARGET): showWithTarget:4 latched a LoadingLayer,
+            // but in touchHLE its update: doesn't re-fire so loadTarget(case 4) never builds the village.
+            // After a short grace (so a natural update: can cancel us), drive loadTarget ourselves.
+            {
+                let pend = PENDING_LOADTARGET.load(O);
+                if pend != 0 && PENDING_LOADTARGET_FRAMES.fetch_add(1, O) >= 6 {
+                    PENDING_LOADTARGET.store(0, O);
+                    let ll: id = Ptr::from_bits(pend);
+                    let lt = env
+                        .objc
+                        .register_host_selector("loadTarget".to_string(), &mut env.mem);
+                    // Queue loadTarget on the main run loop EXACTLY as -[LoadingLayer update:] would
+                    // (performSelectorOnMainThread:), so the replaceScene: it triggers is applied by the
+                    // director in its normal scene-switch phase rather than inline in this drawScene.
+                    let psomt = env.objc.register_host_selector(
+                        "performSelectorOnMainThread:withObject:waitUntilDone:".to_string(),
+                        &mut env.mem,
+                    );
+                    let _: () = msg_send(env, (ll, psomt, lt, nil, false));
+                    log!("[MOLECHEAT] 在线:★原生 update: 未复活→手动 performSelectorOnMainThread:loadTarget(渲染村庄 case4)");
+                }
+            }
+            // FLAKY FIX (aggressive stream drain) — RE-confirmed root cause: -[AsyncSocket
+            // doBytesAvailable] completes only ONE queued read per HasBytes, and a packet is read in
+            // stages (a 24B header read, THEN a body read; each reply is 2+ reads). The game's
+            // CADisplayLink frame loop doesn't pump the run-loop's CFStream callbacks reliably, so a
+            // single pump/frame routinely leaves the login reply header-read-but-body-pending → state
+            // stuck at 4 → sendPacket re-login spam → watchdog drop (the intermittent never-reaches-7).
+            // Fix: while online, drain the socket SEVERAL times every frame. drive_streams peeks+reads
+            // and runs the same stream callbacks the run loop would (cheap no-op when nothing buffered),
+            // so header+body+the whole 1234/1052/1001 sequence + ongoing traffic all drain promptly.
+            // Continuous (not state-gated, no msg_send) — drive_streams is host-side, never re-enters a
+            // scene swap (the village transition is deferred to the next frame via showWithTarget:).
+            if LOGIN_FIRED.load(O) || account_menu_mode() {
+                for _ in 0..8 {
+                    crate::frameworks::core_foundation::cf_stream::drive_streams(env);
+                }
+            }
+            // 账号菜单模式:每帧把后台 HTTP 拿到的 passport 响应回灌原版(在 saved_r0/r1 恢复区内,msg_send 安全)。
+            if account_menu_mode() {
+                drive_passport(env);
+            }
+            // Debug HUD: do NOT refresh it from this drawScene frame stack (that starved the
+            // run-loop during the connect window and killed the Open event). Instead, ONCE the
+            // connection reached state 7, kick off a 1s self-rescheduling tick (performSelector:
+            // afterDelay:) that refreshes the HUD entirely in the run-loop perform phase. Gated on
+            // STATE_IS_7 so nothing fires during state 4/6 (the疯狂发包 connect window).
+            if LOGIN_FIRED.load(O)
+                && STATE_IS_7.load(O)
+                && !HUD_TIMER_SET.load(O)
+                && std::env::var("MOLE_HUD").map(|v| v != "0").unwrap_or(true)
+            {
+                HUD_TIMER_SET.store(true, O);
+                schedule_hud_tick(env);
+            }
+            // (Removed the direct getLocalUserAndMapInfo + byte_B409B0 force — that was the "spare
+            // key" shortcut. The native 1234-reply handler must request the map itself; see the
+            // isOptionLayerShow_ fix below.)
+            // ★ 庄园地图持久化(修法甲):进村稳定后(STATE_IS_7)host 主动把活图整包发上来。主庄园持久化
+            // 唯一上行=updateInfoToServer 追加的 gzip map blob(非 1059 增量=黄金岛机制)。原版自发上传被
+            // saveMapData: 的 5 道闸卡死(touchHLE 活图状态不满足)→ map 恒 0B。host 先调已验证可用的无参
+            // saveMapData 把活图写进 mapdata_,再 updateInfoToServer(内部 encodeLocalMapData 见 mapdata_
+            // 非空→编 blob→发)。服务端 Stage A 已就位存 map_blob、1001 回吐。频率 once/~30s 不每帧探测。
+            if LOGIN_PKT_SENT.load(O) && STATE_IS_7.load(O) {
+                let n = MAP_UPLOAD_FRAMES.fetch_add(1, O);
+                if n == 600 || (n > 600 && (n - 600) % 1800 == 0) {
+                    let shared = env
+                        .objc
+                        .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+                    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+                    let gd: id = msg_send(env, (gd_cls, shared));
+                    if gd != nil {
+                        // 把活图写进 mapdata_:无参 saveMapData→saveMapData:0。MapSync 补丁已 NOP 掉第4道闸
+                        // (m_isLoadMap!=0→bail),前3道(currentGameMode/curSceneId)+第5道(objects≥14)本就过,
+                        // 故 saveMapData 把 ObjectManager 活图序列化进 mapdata_(满村 count=42)。
+                        let save = env
+                            .objc
+                            .register_host_selector("saveMapData".to_string(), &mut env.mem);
+                        let _: () = msg_send(env, (gd, save));
+                        // 发整图上传 1019:updateInfoToServer→encodeLocalMapData→gzipDeflate(已补 deflate 压缩族)
+                        // →gzip blob→sendPacket。服务端 Stage A 存 user_info.map_blob,下次登录 1001 回吐→持久化闭环。
+                        let nm_cls = env.objc.get_known_class("NetworkManager", &mut env.mem);
+                        let nm: id = msg_send(env, (nm_cls, shared));
+                        if nm != nil {
+                            let upd = env.objc.register_host_selector(
+                                "updateInfoToServer".to_string(),
+                                &mut env.mem,
+                            );
+                            let _: () = msg_send(env, (nm, upd));
+                        }
+                        log!(
+                            "[MOLECHEAT] 在线:庄园地图持久化上传(saveMapData+updateInfoToServer,帧{})",
+                            n
+                        );
+                    }
+                }
+            }
+            // ★ Restore self/sel so the real drawScene/mainLoop runs on the correct director and its
+            // `if(nextScene_) setNextScene` applies pending scene transitions (the village switch).
+            env.cpu.regs_mut()[0] = saved_r0;
+            env.cpu.regs_mut()[1] = saved_r1;
+        }
     }
 
     // ===== 离线黄金岛(NewScene 可建筑岛,scene id 10)进岛打通 =====
@@ -1231,6 +2684,16 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 return true;
             }
             _ => {}
+        }
+    }
+
+    // [MoleWorld] mapExtend 修复(见 fix_mapextend_on() 注释):在线进村存档 mapExtend=6 与满图
+    // 内容不一致 → curVisibleArea/curWalkableArea/curBornArea/setBkg 算出错误可视区 → 拖动闪。
+    // 强制 mapExtend getter 返回 0x1F(满图全区)。
+    if fix_mapextend_on() {
+        if let ("UserInfoData", "mapExtend") = (class, sel) {
+            env.cpu.regs_mut()[0] = 0x1F;
+            return true;
         }
     }
 
