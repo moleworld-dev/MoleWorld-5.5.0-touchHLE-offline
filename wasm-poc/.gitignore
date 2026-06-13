@@ -1,0 +1,6 @@
+# Rust 构建产物
+**/target/
+# node
+node_modules/
+.DS_Store
+# 注意:web/*.wasm 故意提交(静态站点/部署所需的可演示资产)
