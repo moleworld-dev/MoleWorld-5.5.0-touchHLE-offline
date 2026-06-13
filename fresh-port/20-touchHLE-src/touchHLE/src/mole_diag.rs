@@ -50,6 +50,11 @@ fn diag_enabled() -> bool {
         1 => false,
         2 => true,
         _ => {
+            // NB: do NOT force-enable on iOS — maybe_dump_frame's glReadPixels,
+            // on the device's tile-based deferred GPU, resolves+discards the
+            // renderbuffer that presentRenderbuffer then presents, blanking the
+            // on-screen frame (the dump file still reads the image, which made
+            // this maddening to diagnose). Env-var-gated only.
             let on = std::env::var_os("MOLE_DIAG").is_some();
             STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
@@ -109,6 +114,8 @@ const FRAME_PATH: &str = "/tmp/mole_frame.ppm";
 const INPUT_PATH: &str = "/tmp/mole_input";
 
 static FRAME_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Rolling counter for the MOLE_FRAMESEQ frame-by-frame dump (debugging the drag flashing).
+static SEQ_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Snapshot the just-presented window framebuffer to disk every ~30 frames, so
 /// the developer can `Read` it as an image and see the game. Cheap enough at
@@ -117,14 +124,34 @@ pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u
     if !diag_enabled() {
         return;
     }
-    let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if n % 30 != 0 {
-        return;
-    }
     let (x, y, w, h) = viewport;
     if w == 0 || h == 0 {
         return;
     }
+    // [MoleWorld DIAG] MOLE_FRAMESEQ=1: dump EVERY presented frame to a rolling numbered sequence
+    // (/tmp/moleframes/NNN.ppm, last ~180 frames). Lets a drag be reviewed frame-by-frame to see what
+    // actually alternates ("flashing"). Read newest-first by mtime. Desktop only.
+    #[cfg(not(target_os = "ios"))]
+    if std::env::var_os("MOLE_FRAMESEQ").is_some() {
+        let seq = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 180;
+        let _ = std::fs::create_dir_all("/tmp/moleframes");
+        crate::debug::dump_framebuffer(&format!("/tmp/moleframes/{:03}.ppm", seq), x, y, w, h, gles);
+        return;
+    }
+    let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % 30 != 0 {
+        return;
+    }
+    // [MoleWorld iOS] /tmp isn't writable in the iOS sandbox; dump into the
+    // app's Documents (Files-app visible, pullable via devicectl) so we can see
+    // what the DEVICE actually rendered into its CAEAGLLayer framebuffer.
+    #[cfg(target_os = "ios")]
+    {
+        let path = crate::paths::user_data_base_path().join("mole_frame.ppm");
+        crate::debug::dump_framebuffer(&path.to_string_lossy(), x, y, w, h, gles);
+        return;
+    }
+    #[cfg(not(target_os = "ios"))]
     crate::debug::dump_framebuffer(FRAME_PATH, x, y, w, h, gles);
 }
 
@@ -133,6 +160,8 @@ pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u
 #[derive(Clone, Copy)]
 pub enum Inject {
     Down(f32, f32),
+    /// A touch-move step (for synthesising a drag/pan gesture).
+    Move(f32, f32),
     Up(f32, f32),
     /// Toggle the debug menu (same as pressing T) — lets the harness drive the
     /// menu without synthesising a keyboard event.
@@ -140,15 +169,29 @@ pub enum Inject {
 }
 
 static PENDING_UP: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+/// Queued multi-step gesture (e.g. a drag): one step returned per next_inject() call.
+static INJECT_QUEUE: Mutex<std::collections::VecDeque<Inject>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// Returns the next synthetic touch step, or None. Reads a one-line command file
-/// `/tmp/mole_input` of the form `tap <x> <y>` (guest screen points) and turns
-/// it into a Down (this call) followed by an Up (next call).
+/// `/tmp/mole_input`:
+///   `tap <x> <y>`                      — Down then Up at (x,y)
+///   `drag <x1> <y1> <x2> <y2> [steps]` — Down at (x1,y1), `steps` interpolated Moves to (x2,y2), Up
+///                                        (synthesises a map pan to reproduce the drag-flashing bug)
+///   `menu`                             — toggle the debug menu
+/// Coordinates are guest screen points. Multi-step gestures are queued and drained one per call.
 pub fn next_inject() -> Option<Inject> {
     if !diag_enabled() {
         return None;
     }
-    // Finish a tap already in progress first.
+    // Drain a queued multi-step gesture (drag) first.
+    {
+        let mut q = INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(step) = q.pop_front() {
+            return Some(step);
+        }
+    }
+    // Finish a tap already in progress.
     {
         let mut pend = match PENDING_UP.lock() {
             Ok(g) => g,
@@ -176,6 +219,28 @@ pub fn next_inject() -> Option<Inject> {
             *pend = Some((x, y));
             log_line(&format!("INJECT tap {} {}", x, y));
             Some(Inject::Down(x, y))
+        }
+        Some("drag") => {
+            let x1: f32 = it.next()?.parse().ok()?;
+            let y1: f32 = it.next()?.parse().ok()?;
+            let x2: f32 = it.next()?.parse().ok()?;
+            let y2: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24)
+                .clamp(2, 240);
+            let mut q = INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+            for i in 1..=steps {
+                let t = i as f32 / steps as f32;
+                q.push_back(Inject::Move(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t));
+            }
+            q.push_back(Inject::Up(x2, y2));
+            log_line(&format!(
+                "INJECT drag {} {} -> {} {} ({} steps)",
+                x1, y1, x2, y2, steps
+            ));
+            Some(Inject::Down(x1, y1))
         }
         _ => None,
     }

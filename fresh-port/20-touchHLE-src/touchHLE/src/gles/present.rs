@@ -49,6 +49,9 @@ pub unsafe fn present_frame(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    // [MoleWorld iOS] 窗口的默认 framebuffer:桌面/安卓=0(=窗口);iOS=SDL 绑到 CAEAGLLayer
+    // 的非 0 viewFramebuffer。绘制前必须绑定它,否则 iOS 上画进空的 FBO 0 → 窗口灰屏不显示。
+    default_framebuffer: gles11::types::GLuint,
 ) {
     // While this is a generic utility, it is closely tied to
     // crate::frameworks::opengles::eagl::present_renderbuffer, which handles
@@ -56,6 +59,13 @@ pub unsafe fn present_frame(
     // so these need to be updated in tandem.
 
     use gles11::types::*;
+
+    // [MoleWorld iOS] 绘制前绑定窗口的默认 framebuffer(绘制目标)。桌面/安卓 default_framebuffer=0
+    // (=窗口);iOS 上由各 present 路径传入【该 context 自己的 viewFramebuffer】(splash/composition
+    // 走 internal_gl_ins,其 viewFramebuffer=1)。★iOS 的 SDL swap 走 [presentRenderbuffer:],呈现
+    // GL_RENDERBUFFER 当前绑定——故各路径在 swap 前还必须把【该 context 的 viewRenderbuffer】绑回
+    // GL_RENDERBUFFER(见 composition.rs / window.rs splash 的 swap 前 BindRenderbufferOES),否则黑屏。
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, default_framebuffer);
 
     // Draw the quad
     gles.Viewport(
@@ -72,12 +82,35 @@ pub unsafe fn present_frame(
     ];
     gles.EnableClientState(gles11::VERTEX_ARRAY);
     gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
-    let tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    #[allow(unused_mut)]
+    let mut tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    gles.MatrixMode(gles11::TEXTURE);
+    // [MoleWorld iOS] The orientation rotation must NOT be applied via the
+    // GL_TEXTURE matrix on the device: that rotates the texcoords around the
+    // ORIGIN, pushing them outside [0,1]; with CLAMP_TO_EDGE the whole quad then
+    // samples one edge → the image smears into vertical bands. Instead rotate
+    // the texcoords around their CENTRE (0.5,0.5) on the CPU and keep the
+    // texture matrix identity (a centred rotation keeps the unit square in
+    // place). Desktop keeps the matrix form unchanged (it renders correctly and
+    // we don't want to risk a regression on the working path).
+    #[cfg(target_os = "ios")]
+    {
+        let mut i = 0;
+        while i < tex_coords.len() {
+            let [s, t] = rotation_matrix.transform([tex_coords[i] - 0.5, tex_coords[i + 1] - 0.5]);
+            tex_coords[i] = s + 0.5;
+            tex_coords[i + 1] = t + 0.5;
+            i += 2;
+        }
+        gles.LoadIdentity();
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let matrix = Matrix::<4>::from(&rotation_matrix);
+        gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
+    }
     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
     gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
-    let matrix = Matrix::<4>::from(&rotation_matrix);
-    gles.MatrixMode(gles11::TEXTURE);
-    gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
     gles.Enable(gles11::TEXTURE_2D);
     gles.DrawArrays(gles11::TRIANGLES, 0, 6);
     // clean this up so we don't need to worry about it in e.g. Core Animation

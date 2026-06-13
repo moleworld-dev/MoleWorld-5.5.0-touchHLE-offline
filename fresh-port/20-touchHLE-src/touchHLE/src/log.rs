@@ -71,7 +71,9 @@ macro_rules! echo {
         {
             let formatted_str = format!($($arg)+);
 
-            #[cfg(target_os = "android")]
+            // [MoleWorld iOS] iOS 也走 SDL_Log → NSLog → 统一日志(Console.app 可见,
+            // 真机调试用);eprintln! 到 stderr 仍保留(无害冗余)。
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             {
                 sdl2::log::log(&formatted_str);
             }
@@ -89,7 +91,7 @@ macro_rules! echo {
     };
     () => {
         {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             {
                 sdl2::log::log("");
             }

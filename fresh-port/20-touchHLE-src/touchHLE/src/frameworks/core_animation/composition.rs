@@ -142,6 +142,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
     );
+    // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定;
+    // 以及 viewRenderbuffer,swap 前绑回 GL_RENDERBUFFER。
+    let window_default_fbo = env.window().default_framebuffer();
+    let window_default_rbo = env.window().default_renderbuffer();
 
     // TODO: draw status bar if it's not hidden
 
@@ -192,6 +196,31 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // [MoleWorld iOS] This compositor render-target texture is NPOT
+            // (screen-sized). iOS native GLES1 only allows NPOT textures with
+            // CLAMP_TO_EDGE wrap + non-mipmap filter; with the default GL_REPEAT
+            // the texture is INCOMPLETE, so when present_frame samples it the
+            // draw silently behaves as if texturing were disabled → a solid
+            // white quad (no glError). Desktop GL2 tolerates NPOT+REPEAT, which
+            // is why this only broke on the device. CLAMP is also semantically
+            // correct here (we sample [0,1] exactly).
+            // [MoleWorld] CLAMP only on iOS (native GLES1 needs it for NPOT completeness).
+            // On Mac present_frame rotates texcoords via the TEXTURE matrix, sending them
+            // outside [0,1] where the default REPEAT wraps correctly but CLAMP_TO_EDGE
+            // smears the frame into vertical bands (the "撕裂" regression). Mac keeps REPEAT.
+            #[cfg(target_os = "ios")]
+            {
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
 
             gles.GenFramebuffersOES(1, &mut framebuffer);
             gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
@@ -357,17 +386,22 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         assert_eq!(gles.GetError(), 0);
     }
 
-    // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
-    // default framebuffer (0) so we need to unbind our internal framebuffer.
+    // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
+    // window's default framebuffer (0 on desktop/Android, the CAEAGLLayer FBO on
+    // iOS) before drawing, so we no longer hardcode-bind framebuffer 0 here.
     unsafe {
         gles.BindTexture(gles11::TEXTURE_2D, texture);
-        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
         present_frame(
             gles.as_mut(),
             present_frame_args.0,
             present_frame_args.1,
             present_frame_args.2,
+            window_default_fbo,
         );
+        // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer
+        // 契约:呈现当前绑定的 renderbuffer;present_frame 期间可能绑了别的)。
+        #[cfg(target_os = "ios")]
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
     }
     std::mem::drop(gles);
     window.swap_window();
@@ -726,4 +760,20 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
         gles11::TEXTURE_MAG_FILTER,
         gles11::LINEAR as _,
     );
+    // [MoleWorld iOS] Layer/content pixels are NPOT (screen-sized). iOS native GLES1
+    // needs CLAMP_TO_EDGE for NPOT completeness; Mac keeps the default REPEAT (see the
+    // render-target note above — CLAMP + the Mac present rotation = torn bands).
+    #[cfg(target_os = "ios")]
+    {
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+    }
 }

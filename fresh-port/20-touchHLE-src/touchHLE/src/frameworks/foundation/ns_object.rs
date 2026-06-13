@@ -402,6 +402,15 @@ forUndefinedKey:(id)key { // NSString*
     add_perform_request(env, run_loop, this, sel, arg, Some(delay), false);
 }
 
+- (())performSelector:(SEL)sel withObject:(id)arg afterDelay:(NSTimeInterval)delay inModes:(id)_modes {
+    // We don't model run-loop modes, so schedule exactly like the plain afterDelay:
+    // variant. CocoaAsyncSocket's AsyncSocket uses this to schedule its connect/read
+    // work on the run loop; without it the call was a silent no-op and the socket never
+    // progressed (no getaddrinfo, no connection).
+    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
+    add_perform_request(env, run_loop, this, sel, arg, Some(delay), false);
+}
+
 - (())performSelectorOnMainThread:(SEL)sel withObject:(id)arg waitUntilDone:(bool)wait {
     log_dbg!("performSelectorOnMainThread:{} withObject:{:?} waitUntilDone:{}", sel.as_str(&env.mem), arg, wait);
     if wait && env.current_thread == 0 {

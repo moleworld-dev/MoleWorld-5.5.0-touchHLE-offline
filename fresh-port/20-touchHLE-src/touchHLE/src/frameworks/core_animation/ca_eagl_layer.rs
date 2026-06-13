@@ -46,7 +46,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// and present it directly from the app's context. This function is used to
 /// determine when that will happen.
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
+    // [MoleWorld] 编辑文本时强制走 composition 路径(返回 nil = 无 fullscreen 快路径),
+    // 否则 UITextField/UILabel 的逐字符更新永远不上屏(快路径只 present 游戏 GL renderbuffer,
+    // recomposite 又在 fullscreen-EAGL 处早退跳过 UIKit overlay)。返回 nil 后 presentRenderbuffer:
+    // 走 slow path 存 presented_pixels 底图,故合成时游戏画面+输入框文字一起显示,不黑屏。
+    if env.options.force_composition || crate::window::mole_text_input_active() {
         return nil;
     }
 
