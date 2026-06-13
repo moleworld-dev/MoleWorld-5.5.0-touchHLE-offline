@@ -65,15 +65,23 @@
 
 pub mod gles1_native;
 pub mod gles1_on_gl2;
+// [WASM] GLES1.1 → WebGL2/ES3 着色器后端(仅 wasm)。
+#[cfg(target_arch = "wasm32")]
+pub mod gles1_on_webgl2;
 mod gles_generic;
 pub mod present;
 mod util;
 
 use touchHLE_gl_bindings::gl21compat as gl21compat_raw;
 pub use touchHLE_gl_bindings::gles11 as gles11_raw;
+// [WASM] ES3.0/WebGL2 原始绑定(仅 wasm 后端用)。
+#[cfg(target_arch = "wasm32")]
+pub use touchHLE_gl_bindings::gles30 as gles30_raw;
 
 use gles1_native::GLES1NativeContext;
 use gles1_on_gl2::GLES1OnGL2Context;
+#[cfg(target_arch = "wasm32")]
+use gles1_on_webgl2::GLES1OnWebGL2Context;
 pub use gles_generic::GLESContext;
 pub use gles_generic::GLES;
 
@@ -86,16 +94,26 @@ pub enum GLESImplementation {
     GLES1Native,
     /// [gles1_on_gl2::GLES1OnGL2].
     GLES1OnGL2,
+    /// [gles1_on_webgl2::GLES1OnWebGL2](仅 wasm)。
+    #[cfg(target_arch = "wasm32")]
+    GLES1OnWebGL2,
 }
 impl GLESImplementation {
     /// List of OpenGL ES 1.1 implementations in order of preference.
+    // [WASM] wasm 下 GLES1Native(无 native ES1.1)/GLES1OnGL2(无 GL2.1 兼容 profile)
+    // 都建不出上下文,直接只列 WebGL2 后端。桌面/iOS 保持原列表不变。
+    #[cfg(not(target_arch = "wasm32"))]
     pub const GLES1_IMPLEMENTATIONS: &'static [Self] = &[Self::GLES1Native, Self::GLES1OnGL2];
+    #[cfg(target_arch = "wasm32")]
+    pub const GLES1_IMPLEMENTATIONS: &'static [Self] = &[Self::GLES1OnWebGL2];
     /// Convert from short name used for command-line arguments. Returns [Err]
     /// if name is not recognized..
     pub fn from_short_name(name: &str) -> Result<Self, ()> {
         match name {
             "gles1_on_gl2" => Ok(Self::GLES1OnGL2),
             "gles1_native" => Ok(Self::GLES1Native),
+            #[cfg(target_arch = "wasm32")]
+            "gles1_on_webgl2" => Ok(Self::GLES1OnWebGL2),
             _ => Err(()),
         }
     }
@@ -104,6 +122,8 @@ impl GLESImplementation {
         match self {
             Self::GLES1Native => GLES1NativeContext::description(),
             Self::GLES1OnGL2 => GLES1OnGL2Context::description(),
+            #[cfg(target_arch = "wasm32")]
+            Self::GLES1OnWebGL2 => GLES1OnWebGL2Context::description(),
         }
     }
     /// See [GLESContext::new].
@@ -117,6 +137,8 @@ impl GLESImplementation {
         match self {
             Self::GLES1Native => GLES1NativeContext::new(window).map(boxer),
             Self::GLES1OnGL2 => GLES1OnGL2Context::new(window).map(boxer),
+            #[cfg(target_arch = "wasm32")]
+            Self::GLES1OnWebGL2 => GLES1OnWebGL2Context::new(window).map(boxer),
         }
     }
 }

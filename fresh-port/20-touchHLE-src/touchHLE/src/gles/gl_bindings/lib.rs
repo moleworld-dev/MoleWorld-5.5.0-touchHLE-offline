@@ -18,3 +18,8 @@ pub mod gl21compat {
 pub mod gles11 {
     include!(concat!(env!("OUT_DIR"), "/gles11.rs"));
 }
+// [WASM] OpenGL ES 3.0 / WebGL2 绑定(仅 wasm 的 GLES1OnWebGL2 后端使用)。
+#[allow(warnings)]
+pub mod gles30 {
+    include!(concat!(env!("OUT_DIR"), "/gles30.rs"));
+}
