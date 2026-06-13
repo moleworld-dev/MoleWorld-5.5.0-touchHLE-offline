@@ -1719,6 +1719,16 @@ pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
 /// The window argument allows for passing in the parent window for the
 /// messagebox, which is not required but should be done if possible.
 pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
+    // [WASM] 浏览器没有 SDL 原生弹窗(show_message_box 返回 Err → 旧代码 panic,掩盖真错误)。
+    // 错误信息已由 panic 钩子/echo! 落到 console,这里直接返回,让真正的错误暴露出来。
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = window;
+        log!("[wasm] (错误弹窗在浏览器不可用)touchHLE error: {}", error_message);
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     assert!(window.is_none_or(|win| win.on_main_stack));
     use sdl2::messagebox;
     let mbox = [
@@ -1766,6 +1776,7 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
             }
         }
     }
+    } // end #[cfg(not(target_arch = "wasm32"))] block
 }
 
 /// Get current battery state from SDL2.

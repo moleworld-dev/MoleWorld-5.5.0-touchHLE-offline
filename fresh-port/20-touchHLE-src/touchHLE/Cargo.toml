@@ -11,6 +11,13 @@
 lto = "fat"
 codegen-units = 1
 
+# [WASM] mach_object 0.1.17 的 ULEB128 解码器(opcode.rs:619 `n << bits`,bits 增到 63)
+# 假设 64 位 usize;wasm32(usize 32 位)下 bits>=32 触发 debug 溢出检查 panic。桌面 64 位
+# 本就不溢出,故对该依赖关溢出检查=桌面零影响、wasm 改为按 32 位 wrap(32 位 Mach-O 的
+# ULEB 实际值 <32 位,wrap 不改变有效结果)。
+[profile.dev.package.mach_object]
+overflow-checks = false
+
 [workspace.package]
 version = "0.2.3"
 edition = "2021"

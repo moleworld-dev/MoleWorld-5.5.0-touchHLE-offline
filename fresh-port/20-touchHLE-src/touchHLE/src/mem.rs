@@ -428,6 +428,9 @@ impl Mem {
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
+        // [wasm 调试] 见 bytes_at:wasm 早期 boot 跳过 null 检查(null 段在数组内,读写零页),
+        // 让 boot 越过 framework 的 null 访问继续推进。非 wasm 行为不变。
+        #[cfg(not(target_arch = "wasm32"))]
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count)
         }

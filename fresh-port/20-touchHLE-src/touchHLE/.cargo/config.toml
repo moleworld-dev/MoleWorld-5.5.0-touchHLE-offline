@@ -31,4 +31,12 @@ rustflags = [
   "-C", "link-arg=-sINITIAL_MEMORY=536870912",
   # 主 wasm 栈(默认 64KB 太小):加载/解析 105MB IPA + Mach-O + frameworks 调用深。
   "-C", "link-arg=-sSTACK_SIZE=16777216",
+  # 把 touchHLE 运行期需要的支持文件烤进 emscripten FS(/touchHLE_dylibs 等):
+  # 游戏链接的 iOS 系统 dylib(libstdc++/libgcc/libz)+ 字体 + 默认选项。
+  "-C", "link-arg=--preload-file",
+  "-C", "link-arg=touchHLE_dylibs",
+  "-C", "link-arg=--preload-file",
+  "-C", "link-arg=touchHLE_fonts",
+  "-C", "link-arg=--preload-file",
+  "-C", "link-arg=touchHLE_default_options.txt",
 ]
