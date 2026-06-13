@@ -2,3 +2,23 @@
 # the documentation for the touchHLE crate is intended to include private items
 # alas this isn't scoped to that crate!
 rustdocflags = ["--document-private-items"]
+
+# ===========================================================================
+# WASM 移植(wasm-poc 分支)专属:emscripten link 参数。target-scoped,只影响
+# wasm32-unknown-emscripten 构建,五平台(mac/win/linux/android/ios)完全不受影响。
+# 让 emcc 用内置 SDL2/OpenAL/WebGL ports 解析 touchHLE 引用的 SDL/AL/GL 符号
+# (这是 emscripten 路线的核心红利:现有平台层代码几乎原样链接)。
+# ===========================================================================
+[target.wasm32-unknown-emscripten]
+rustflags = [
+  "-C", "link-arg=-sUSE_SDL=2",
+  "-C", "link-arg=-lopenal",
+  "-C", "link-arg=-sMAX_WEBGL_VERSION=2",
+  "-C", "link-arg=-sMIN_WEBGL_VERSION=2",
+  "-C", "link-arg=-sFULL_ES2=1",
+  "-C", "link-arg=-sALLOW_MEMORY_GROWTH=1",
+  "-C", "link-arg=-sMAXIMUM_MEMORY=2147483648",
+  "-C", "link-arg=-sEXIT_RUNTIME=0",
+  "-C", "link-arg=-sASSERTIONS=1",
+  "-C", "link-arg=-sALLOW_TABLE_GROWTH=1",
+]
