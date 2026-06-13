@@ -1599,6 +1599,9 @@ impl Window {
         // [MoleWorld VPDIAG] 拖动错位回归排查:打印 app/drawable/窗口尺寸 + viewport_y_offset。
         // render 用 viewport()+yoff,touch(transform_input_coords)用 viewport() 不加 yoff;
         // 若 yoff≠0(启动时被 SizeChanged 置非零)→ render 偏移而 touch 不偏移 = 错位根因。
+        // [wasm M0] 此 VPDIAG 调试日志访问 viewport_y_offset / max_height 字段,而这两个字段
+        // 在 Window 结构体里是 cfg(非wasm) 的(wasm 平台层尚未实现)。仅诊断用,wasm 下跳过。
+        #[cfg(not(target_arch = "wasm32"))]
         {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);

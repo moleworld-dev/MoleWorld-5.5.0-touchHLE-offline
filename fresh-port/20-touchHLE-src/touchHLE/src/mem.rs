@@ -207,7 +207,14 @@ unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 pub trait SafeWrite: Sized {}
 impl<T: SafeRead> SafeWrite for T {}
 
+#[cfg(not(target_arch = "wasm32"))]
 type Bytes = [u8; 1 << 32];
+// [wasm M0] wasm32 的 usize 是 32 位,`1 << 32` 在编译期溢出。先用 1GiB 占位让 crate 能编到
+// wasm。⚠️ 真正的「mem 手术」(收缩 guest 地址窗口 + 把主栈从 0xFFF00000 重定位到低地址,使
+// guest 空间塞进 wasm 线性内存)是 M1 的工作;现在高于 1GiB 的 guest 地址(含主栈)运行期会
+// 越界,但 M0 目标只是「能编 + 能加载」。
+#[cfg(target_arch = "wasm32")]
+type Bytes = [u8; 1 << 30];
 
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
