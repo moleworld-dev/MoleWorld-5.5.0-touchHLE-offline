@@ -55,4 +55,18 @@ fn main() {
     )
     .write_bindings(GlobalGenerator, &mut file)
     .unwrap();
+
+    // [WASM] OpenGL ES 3.0 (= WebGL2) 绑定:供 wasm 的 GLES1OnWebGL2 着色器后端
+    // 调用可编程管线(shader/VBO/VAO/vertex attrib/uniform/texture)。仅 wasm 后端使用,
+    // 桌面/iOS 生成但不调用(零影响)。ES3 是 GLES1/GL21 的超集(可编程部分),WebGL2 原生支持。
+    let mut file = File::create(out_dir.join("gles30.rs")).unwrap();
+    Registry::new(
+        Api::Gles2,
+        (3, 0),
+        Profile::Core,
+        Fallbacks::All,
+        [],
+    )
+    .write_bindings(GlobalGenerator, &mut file)
+    .unwrap();
 }

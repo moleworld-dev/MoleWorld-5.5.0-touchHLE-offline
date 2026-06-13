@@ -181,6 +181,9 @@ pub enum GLVersion {
     GLES11,
     /// OpenGL 2.1 compatibility profile
     GL21Compat,
+    /// [WASM] OpenGL ES 3.0 / WebGL 2.0(仅 wasm,供 GLES1OnWebGL2 着色器后端)
+    #[cfg(target_arch = "wasm32")]
+    WebGL2,
 }
 
 pub struct GLContext(sdl2::video::GLContext);
@@ -1271,6 +1274,13 @@ impl Window {
             GLVersion::GL21Compat => {
                 attr.set_context_version(2, 1);
                 attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+            }
+            // [WASM] emscripten 把 GLES + (3,0) 映射为 WebGL2 上下文。
+            #[cfg(target_arch = "wasm32")]
+            GLVersion::WebGL2 => {
+                attr.set_context_version(3, 0);
+                attr.set_context_profile(sdl2::video::GLProfile::GLES);
+                attr.set_depth_size(16);
             }
         }
 
