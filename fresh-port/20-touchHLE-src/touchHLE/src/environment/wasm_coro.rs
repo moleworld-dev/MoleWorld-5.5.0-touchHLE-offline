@@ -74,6 +74,18 @@ const C_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// 每个 fiber 的 asyncify 栈大小(保存 async 展开/重绕状态)。
 const ASYNCIFY_STACK_SIZE: usize = 1024 * 1024;
 
+/// 分配 `size` 字节(须为 16 的倍数)的清零、**16 字节对齐**缓冲区。
+///
+/// emscripten fiber 的 C 栈必须 16 字节对齐:`emscripten_fiber_init` 不会内部对齐栈顶,
+/// 而栈上 alloca 出来的 EM_ASM 参数缓冲带 `assert(buf % 16 == 0)`。原来用
+/// `vec![0u8; ..]`(对齐=1)拿到的栈基址常常不是 16 的倍数,导致协程里任何走 EM_ASM 的
+/// SDL 调用(locale / 以及 on_parent_stack_in_coroutine 包的一众 SDL 操作)abort。
+/// 用 `Box<[u128]>`(对齐=16)天然满足,且按 u128 布局 drop 正确释放。
+fn aligned_zeroed(size: usize) -> Box<[u128]> {
+    assert!(size % 16 == 0, "fiber 栈大小必须是 16 的倍数");
+    vec![0u128; size / 16].into_boxed_slice()
+}
+
 // ===========================================================================
 // host fiber(thread-local,代表 host 主上下文)
 // ===========================================================================
@@ -92,7 +104,7 @@ fn host_fiber_ptr() -> *mut EmFiber {
         }
         // 首次:分配 host fiber + asyncify 栈,从当前上下文初始化。
         let fiber = Box::into_raw(Box::new(EmFiber::zeroed()));
-        let asyncify = vec![0u8; ASYNCIFY_STACK_SIZE].into_boxed_slice();
+        let asyncify = aligned_zeroed(ASYNCIFY_STACK_SIZE);
         let asyncify = Box::leak(asyncify);
         unsafe {
             emscripten_fiber_init_from_current_context(
@@ -113,9 +125,9 @@ fn host_fiber_ptr() -> *mut EmFiber {
 /// 协程内部状态(堆分配,地址稳定——fiber/栈指针/user_data 全指向它)。
 struct CoroutineImpl<Input, Yield, Return> {
     fiber: EmFiber,
-    // 栈:保持所有权使其与 fiber 同生命周期(地址稳定)。
-    _c_stack: Box<[u8]>,
-    _asyncify_stack: Box<[u8]>,
+    // 栈:保持所有权使其与 fiber 同生命周期(地址稳定)。16 字节对齐(见 aligned_zeroed)。
+    _c_stack: Box<[u128]>,
+    _asyncify_stack: Box<[u128]>,
     /// 入口闭包(首次 resume 时被 coro_entry 取走运行)。
     closure: Option<Box<dyn FnOnce(&Yielder<Yield, Input>, Input) -> Return>>,
     /// host→coro:resume 传入的值。
@@ -161,8 +173,8 @@ impl<Input, Yield, Return> Coroutine<Input, Yield, Return> {
         Yield: 'static,
         Return: 'static,
     {
-        let c_stack = vec![0u8; C_STACK_SIZE].into_boxed_slice();
-        let asyncify_stack = vec![0u8; ASYNCIFY_STACK_SIZE].into_boxed_slice();
+        let c_stack = aligned_zeroed(C_STACK_SIZE);
+        let asyncify_stack = aligned_zeroed(ASYNCIFY_STACK_SIZE);
         let mut imp = Box::new(CoroutineImpl {
             fiber: EmFiber::zeroed(),
             _c_stack: c_stack,
