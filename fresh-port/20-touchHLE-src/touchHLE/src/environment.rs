@@ -455,6 +455,25 @@ impl Environment {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 env.with_yielder(yielder, move |env| {
                     echo!("CPU emulation begins now.");
+                    // [MoleWorld iOS] 一次性查进程代码签名标志:确认调试器是否真把 CS_DEBUGGED
+                    // (0x10000000)置上。这是 iOS 真机能否跑 JIT 的最终判据——没 CS_DEBUGGED 且
+                    // 没 JIT 权限时,执行 JIT 页必 EXC_BAD_ACCESS。csops(CS_OPS_STATUS=0)。
+                    #[cfg(target_os = "ios")]
+                    unsafe {
+                        extern "C" {
+                            fn csops(pid: i32, ops: u32, useraddr: *mut std::ffi::c_void, usersize: usize) -> i32;
+                            fn getpid() -> i32;
+                        }
+                        let mut flags: u32 = 0;
+                        let r = csops(getpid(), 0, &mut flags as *mut u32 as *mut std::ffi::c_void, 4);
+                        echo!(
+                            "[iOS JIT] csops r={} flags=0x{:08x} CS_DEBUGGED={} CS_GET_TASK_ALLOW={} CS_VALID={}",
+                            r, flags,
+                            (flags & 0x10000000) != 0,
+                            (flags & 0x00000004) != 0,
+                            (flags & 0x00000001) != 0,
+                        );
+                    }
                     // Some apps use the stack inside the static initializer.
                     // While properly behaving apps should be fine, some app
                     // will try to poke the top of the stack, so we'll give

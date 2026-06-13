@@ -552,6 +552,8 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定。
+    let window_default_fbo = env.window.as_ref().unwrap().default_framebuffer();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -680,7 +682,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     // Draw the quad
     log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
 
     // Clean up the texture
     gles.DeleteTextures(1, &texture);

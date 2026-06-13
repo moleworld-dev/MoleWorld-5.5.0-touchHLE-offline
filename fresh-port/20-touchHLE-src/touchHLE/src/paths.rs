@@ -146,7 +146,18 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
         }
         Cow::from(Path::new(std::ffi::CStr::from_ptr(path).to_str().unwrap()))
     }
-    #[cfg(not(target_os = "android"))]
+    // [MoleWorld iOS] Put user data (touchHLE_log.txt + the save sandbox) in the
+    // app's Documents directory so the iOS Files app can see / import / export it
+    // (requires UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace in the
+    // Info.plist; see make-ios-ipa.sh). $HOME is the app sandbox root on iOS.
+    #[cfg(target_os = "ios")]
+    {
+        let docs = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+            .join("Documents");
+        let _ = std::fs::create_dir_all(&docs);
+        return Cow::from(docs);
+    }
+    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
     {
         // When touchHLE is run from a .app bundle on macOS, the user might not
         // be able to control the current directory, so user data needs to go in
@@ -171,6 +182,17 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
             if brand.is_empty() { "" } else { "." },
             brand.to_lowercase()
         ))
+    } else if std::env::consts::OS == "ios" {
+        // [MoleWorld iOS] Open the Files app at the app's Documents folder (where
+        // the log + saves now live). `shareddocuments://<path>` is the Files-app
+        // scheme; SDL_OpenURL routes it to UIApplication openURL.
+        let path = user_data_base_path()
+            .canonicalize()
+            .map_err(|e| format!("Can't canonicalize user data directory: {e}"))?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| "User data directory path is not UTF-8".to_string())?;
+        Ok(format!("shareddocuments://{path}"))
     } else {
         let path = user_data_base_path()
             .join(".")
