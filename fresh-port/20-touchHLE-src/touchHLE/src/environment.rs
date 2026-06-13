@@ -39,6 +39,12 @@ use corosensei::{Coroutine, Yielder};
 // 限定路径 + 非限定 `Coroutine`/`Yielder` 都解析到 wasm_coro。
 #[cfg(target_arch = "wasm32")]
 use crate::environment::wasm_coro::{self as corosensei, Coroutine, Yielder};
+// [WASM 主循环反应堆化] emscripten 的协作让出(需 -sASYNCIFY):把主上下文展开回 JS 事件
+// 循环,让浏览器绘制/响应,再重绕回来。见 run() 的注入点。
+#[cfg(target_arch = "wasm32")]
+extern "C" {
+    fn emscripten_sleep(ms: std::ffi::c_uint);
+}
 pub use mutex::{MutexId, MutexType, PTHREAD_MUTEX_DEFAULT};
 use nullable_box::NullableBox;
 
@@ -1245,7 +1251,21 @@ impl Environment {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
+        // [WASM 主循环反应堆化] touchHLE 的 run() 是个永不返回的阻塞循环;浏览器主线程被它
+        // 霸占就会冻结(不绘制、不响应)。ASYNCIFY 下 emscripten_sleep 会把主上下文展开回
+        // JS 事件循环(让浏览器绘制 canvas + 处理事件),之后再重绕回来继续。每隔约 16ms
+        // 让出一次(用 Instant 节流,避免每次迭代都付 asyncify 展开开销)。
+        #[cfg(target_arch = "wasm32")]
+        let mut last_yield = Instant::now();
         loop {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if last_yield.elapsed() >= Duration::from_millis(16) {
+                    // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
+                    unsafe { emscripten_sleep(0) };
+                    last_yield = Instant::now();
+                }
+            }
             if stepping {
                 self.remaining_ticks = None;
             } else {
