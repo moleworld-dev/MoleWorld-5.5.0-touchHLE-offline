@@ -111,6 +111,14 @@ cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 corosensei = "0.3.2"
 uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
 
+# ===========================================================================
+# WASM 移植(wasm-poc 分支)专属依赖。全部 target-gate 到 wasm32,五平台零影响。
+# ===========================================================================
+# uuid v4 依赖 getrandom;wasm32-unknown-unknown(target_os="unknown")须用 "js" 后端
+# (crypto.getRandomValues)。emscripten 有原生 getrandom,故不挂在这里。
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [build-dependencies]
 cargo-license = "0.5.1"
 cc = { workspace = true }
