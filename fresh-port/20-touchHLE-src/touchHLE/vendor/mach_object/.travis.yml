@@ -1,0 +1,20 @@
+sudo: false
+language: rust
+rust:
+  - stable
+  - beta
+  - nightly
+matrix:
+  allow_failures:
+    - rust: nightly
+os:
+  - linux
+  - osx
+after_sucess:
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then cargo test --features integration_tests ; fi
+after_failure:
+  - tree -h
+env:
+  global:
+    - RUST_BACKTRACE=1
+    - RUST_LOG=macho=debug,integration_tests=trace

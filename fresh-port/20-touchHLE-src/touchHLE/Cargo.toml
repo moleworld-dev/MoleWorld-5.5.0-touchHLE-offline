@@ -11,12 +11,15 @@
 lto = "fat"
 codegen-units = 1
 
-# [WASM] mach_object 0.1.17 的 ULEB128 解码器(opcode.rs:619 `n << bits`,bits 增到 63)
-# 假设 64 位 usize;wasm32(usize 32 位)下 bits>=32 触发 debug 溢出检查 panic。桌面 64 位
-# 本就不溢出,故对该依赖关溢出检查=桌面零影响、wasm 改为按 32 位 wrap(32 位 Mach-O 的
-# ULEB 实际值 <32 位,wrap 不改变有效结果)。
-[profile.dev.package.mach_object]
-overflow-checks = false
+# [WASM 根因修复] mach_object 0.1.17 的 read_uleb128(opcode.rs:619 `v |= n << bits`)在
+# usize 上累加。这个 32 位 Mach-O 的 dyld_info bind/rebase 流里含有需要 >=6 字节的 ULEB
+# (bits 达到 35+),在 32 位 host(wasm32,usize=32)上 `n << bits` 左移量 >=32 会被掩码
+# (bits % 32),不仅溢出(原来靠关 overflow-checks 掩盖),还把字节落到错误的低位 -> bind
+# 地址算错 -> ObjC category 的 class 指针绑不上(留 0)-> register_bin_categories 崩。
+# 治本:vendor 一份 mach_object,把 read_uleb128 改成 u64 累加(见 vendor/mach_object)。
+# 该修复在 64 位 host 上行为完全不变(本就 64 位累加),故五平台零回归。
+[patch.crates-io]
+mach_object = { path = "vendor/mach_object" }
 
 [workspace.package]
 version = "0.2.3"
