@@ -21,4 +21,14 @@ rustflags = [
   "-C", "link-arg=-sEXIT_RUNTIME=0",
   "-C", "link-arg=-sASSERTIONS=1",
   "-C", "link-arg=-sALLOW_TABLE_GROWTH=1",
+  # [M1] emscripten fibers(guest 协程栈切换,替 corosensei)必需 ASYNCIFY 插桩。
+  "-C", "link-arg=-sASYNCIFY=1",
+  # 主上下文 asyncify 栈:run() 在此 emscripten_sleep 让出给浏览器,需足够深。
+  "-C", "link-arg=-sASYNCIFY_STACK_SIZE=131072",
+  # 导出 Module.FS,供加载器 preRun 把 IPA 写进 MEMFS。
+  "-C", "link-arg=-sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall",
+  # IPA 105MB + guest 1GiB,放宽初始内存。
+  "-C", "link-arg=-sINITIAL_MEMORY=536870912",
+  # 主 wasm 栈(默认 64KB 太小):加载/解析 105MB IPA + Mach-O + frameworks 调用深。
+  "-C", "link-arg=-sSTACK_SIZE=16777216",
 ]
