@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>touchHLE WASM (M0.5 加载测试)</title>
+<style>
+  body { background:#0d1117; color:#e6edf3; font:13px ui-monospace,Menlo,monospace; margin:0; padding:12px; }
+  #canvas { border:1px solid #30363d; background:#000; display:block; margin-bottom:10px; }
+  #log { white-space:pre-wrap; max-height:70vh; overflow:auto; background:#161b22; padding:10px; border-radius:6px; }
+  .err { color:#f85149; } .abort { color:#d29922; }
+</style>
+</head>
+<body>
+<canvas id="canvas" width="480" height="320" tabindex="-1"></canvas>
+<div id="log"></div>
+<script>
+  const logEl = document.getElementById('log');
+  const lines = [];
+  window.__logs = lines;
+  function add(t, cls) { lines.push((cls?'['+cls+'] ':'')+t); logEl.innerHTML = lines.slice(-400).map(l=>{
+    const e = l.startsWith('[err]')||l.startsWith('[abort]'); return e?'<span class="err">'+l+'</span>':l;
+  }).join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+  window.__firstAbort = null;
+  var Module = {
+    canvas: (function(){ const c = document.getElementById('canvas'); return c; })(),
+    arguments: [],            // 无参 → 游戏会走 app picker(预期撞协程 stub)
+    print: t => add(t),
+    printErr: t => { add(t, 'err'); },
+    onAbort: w => { if(!window.__firstAbort) window.__firstAbort = String(w); add('ABORT: '+w, 'abort'); },
+    onRuntimeInitialized: () => add('=== onRuntimeInitialized(wasm 运行时已起) ==='),
+  };
+  window.__moduleStart = performance.now();
+  add('加载 touchHLE.js …');
+</script>
+<script src="touchHLE.js"></script>
+</body>
+</html>

@@ -17,6 +17,18 @@
 | M3 | 音频+输入+GL 补全 → 进村可玩 | ⏳ | 浏览器进村交互 |
 | M4 | IPA 加载+存档+联机+公开 URL | ⏳ | 公开 URL 完整可玩 |
 
+## M0.5 实测:真实模拟器在 Chrome boot(2026-06-13)
+
+构建完整模拟器(`wasm-poc/emulator/build-emulator.sh`)+ 浏览器加载(`loader.html`),实测:
+**真实 touchHLE 模拟器 wasm 在 Brave/Chrome 里启动**——打印 touchHLE 启动 banner、解析参数、
+base path、进 app picker、输出诊断块(`操作系统: emscripten (wasm32) · CPU: wasm32 1核`)。
+
+**第一道运行期墙 = GL 上下文创建**(`src/gles.rs:160` panic "Couldn't create OpenGL ES 1.1
+context"):游戏要 ES1.1(EGL_BAD_CONFIG)或 GL2.1-compat(context attributes not supported),
+WebGL 两者都不给。→ 这正是 **M2 的 GLES1→WebGL2 着色器后端**(需新写第三个 GLES 实现请求
+WebGL2/ES3 上下文 + 按状态生成 GLSL ES 着色器模拟固定管线)。主机侧 init 全通,协程/mem 墙
+在 GL 之后才会撞到。
+
 ## M0 关键发现(2026-06-13)
 
 试编 `wasm32-unknown-unknown` 暴露的错误面**高度集中**:
