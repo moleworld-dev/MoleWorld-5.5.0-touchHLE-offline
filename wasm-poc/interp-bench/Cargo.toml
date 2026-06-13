@@ -1,0 +1,26 @@
+[package]
+name = "interp-bench"
+version = "0.1.0"
+edition = "2021"
+description = "touchHLE ARMv7 interpreter carved out for WASM feasibility (Gate 0)"
+license = "MPL-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# 这两个 feature 是原版解释器里 diff.rs / 测试模块引用的 cfg。两者都不启用,
+# 使所有 dynarmic 依赖与测试代码干净地 cfg 掉,解释器核心照常编译。
+cpu_dynarmic = []
+cpu_interpreter = []
+# 开启后原生(非 wasm)构建下 echo! 会打到 stderr;默认关闭(基准时静默)。
+echo_stderr = []
+# 开启后剥离解释器 step_one 里每条指令的调试设施(heartbeat/trace/derail),
+# 模拟生产构建,测量性能天花板。默认关闭 = 与原版逐字一致。
+strip_debug = []
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
