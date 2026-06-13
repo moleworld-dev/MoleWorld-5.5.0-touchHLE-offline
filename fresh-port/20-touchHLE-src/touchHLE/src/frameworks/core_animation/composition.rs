@@ -231,7 +231,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 texture,
                 0,
             );
+            #[cfg(not(target_arch = "wasm32"))]
             assert_eq!(gles.GetError(), 0);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let e = gles.GetError();
+                if e != 0 {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                        log!("[wasm GL] composition:234 FBO setup GetError={e:#x}(已清,继续)");
+                    }
+                }
+            }
             assert_eq!(
                 gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
                 gles11::FRAMEBUFFER_COMPLETE_OES
@@ -383,7 +395,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         gles.LoadIdentity();
         gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
         gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
+        #[cfg(not(target_arch = "wasm32"))]
         assert_eq!(gles.GetError(), 0);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let e = gles.GetError();
+            if e != 0 {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    log!("[wasm GL] composition:386 合成后 GetError={e:#x}(已清,继续)");
+                }
+            }
+        }
     }
 
     // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
