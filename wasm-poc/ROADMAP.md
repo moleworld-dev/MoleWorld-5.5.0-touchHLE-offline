@@ -11,8 +11,8 @@
 | Phase 0 | wasm-poc 分支 + PoC 迁入 | ✅ **完成** | 同上(本地 http 服务) |
 | M0 基线 | 同步 touchHLE 当前源码到分支 | ✅ **完成** | — |
 | M0 | 真实 crate **lib 编译到 wasm** | ✅ **核心达成** | touchHLE.wasm 55MB 产出 |
-| M0.5 | binary 链接(emcc link flags) → 可加载 .wasm+.js | ⏳ 下一步 | 浏览器加载不崩 |
-| M1 | guest 跑起来 + 协程(fibers/JSPI)+ 主循环反应堆化 | ⏳ | — |
+| M0.5 | **binary 链接 → 可加载 .wasm+.js** | ✅ **达成** | touchHLE.js 564KB + .wasm 76MB |
+| M1 | guest 跑起来(协程 fibers/JSPI + mem 手术 + 主循环反应堆化) | ⏳ 下一步 | 浏览器加载+启动到 cocos2d |
 | M2 | 标题画面第一帧(GLES1→WebGL2) | ⏳ | 浏览器渲染海洋标题 |
 | M3 | 音频+输入+GL 补全 → 进村可玩 | ⏳ | 浏览器进村交互 |
 | M4 | IPA 加载+存档+联机+公开 URL | ⏳ | 公开 URL 完整可玩 |
