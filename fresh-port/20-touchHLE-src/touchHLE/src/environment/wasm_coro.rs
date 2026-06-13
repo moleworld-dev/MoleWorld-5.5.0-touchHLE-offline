@@ -24,8 +24,15 @@ use std::marker::PhantomData;
 // emscripten fiber FFI
 // ===========================================================================
 
-/// 对应 C 的 `emscripten_fiber_t`(emscripten/fiber.h)。7 个指针 = 28 字节(wasm32)。
-/// 字段由 emscripten 填写,我们只需保证布局/大小正确且地址稳定。
+/// 对应 C 的 `emscripten_fiber_t`(emscripten/fiber.h):5 个指针 + 内嵌
+/// `asyncify_data_t{ stack_ptr, stack_limit, int rewind_id }` = **8 字段 / 32 字节**(wasm32)。
+/// 字段由 emscripten 填写,我们只需保证布局/大小完全一致且地址稳定。
+///
+/// ⚠️ 历史 bug:原来漏了 `asyncify_data.rewind_id`(只有 7 字段 / 28 字节)。emscripten 在
+/// fiber yield/swap 时把 rewind_id 写到 offset 28(=结构体外!)、resume 时从那读回——既越界
+/// 改写相邻内存(CoroutineImpl 里紧跟的 `_c_stack` Box 指针),又读到垃圾 rewind_id →
+/// asyncify 的 `getDataRewindFunc` 断言 `id N not found in callStackIdToFunc` abort。boot 越深
+/// (app 初始化里 fiber yield/resume 越多)越容易撞。补齐第 8 个字段即治本。
 #[repr(C)]
 struct EmFiber {
     stack_base: *mut c_void,
@@ -33,8 +40,10 @@ struct EmFiber {
     stack_ptr: *mut c_void,
     entry: *mut c_void,
     user_data: *mut c_void,
+    // 内嵌 asyncify_data_t(12 字节):
     asyncify_stack_ptr: *mut c_void,
     asyncify_stack_limit: *mut c_void,
+    asyncify_rewind_id: i32, // C 的 `int`(wasm32 上 4 字节)
 }
 
 impl EmFiber {
@@ -47,6 +56,7 @@ impl EmFiber {
             user_data: std::ptr::null_mut(),
             asyncify_stack_ptr: std::ptr::null_mut(),
             asyncify_stack_limit: std::ptr::null_mut(),
+            asyncify_rewind_id: 0,
         }
     }
 }
