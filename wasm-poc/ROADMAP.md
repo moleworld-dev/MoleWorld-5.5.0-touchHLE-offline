@@ -12,10 +12,32 @@
 | M0 基线 | 同步 touchHLE 当前源码到分支 | ✅ **完成** | — |
 | M0 | 真实 crate **lib 编译到 wasm** | ✅ **核心达成** | touchHLE.wasm 55MB 产出 |
 | M0.5 | **binary 链接 → 可加载 .wasm+.js** | ✅ **达成** | touchHLE.js 564KB + .wasm 76MB |
-| M1 | guest 跑起来(协程 fibers/JSPI + mem 手术 + 主循环反应堆化) | ⏳ 下一步 | 浏览器加载+启动到 cocos2d |
-| M2 | 标题画面第一帧(GLES1→WebGL2) | ⏳ | 浏览器渲染海洋标题 |
+| M1 | guest 跑起来(协程 fibers/JSPI + mem 手术 + 主循环反应堆化) | ✅ **达成** | boot 打到 UIApplicationMain + app delegate |
+| M2 | 标题画面第一帧(GLES1→WebGL2) | 🔄 **进行中** | ✅GL ES1.1 via WebGL2 上下文创建成功 + splash 首帧渲染;⏳卡 asyncify fiber |
 | M3 | 音频+输入+GL 补全 → 进村可玩 | ⏳ | 浏览器进村交互 |
 | M4 | IPA 加载+存档+联机+公开 URL | ⏳ | 公开 URL 完整可玩 |
+
+## M1→M2 大突破(2026-06-13):5 个 wasm 专属根因修复,boot 打到 GL 渲染
+
+无头调试主回路:`emulator/run-headless.py`(playwright + SwiftShader WebGL2 + /log 服务 + 截图)。
+boot 链已打通:wasm init → 解密 IPA 加载 → Mach-O/dyld → ObjC 运行时(类+category 全注册)→
+**静态初始化器全跑完 → UIApplicationMain → app delegate**(Flurry/Taomee analytics/keychain 全 faked)→
+**GL ES1.1 via WebGL2 上下文创建成功(攻破 M0.5 的 GL 墙)→ splash 首帧通过 WebGL2 渲染**。
+
+五个根因(每个单独 commit,均 cfg/target 门控、五平台零回归):
+1. **★mach_object `read_uleb128` 用 usize 累加**:32 位 Mach-O 的 dyld bind 流有 ≥6 字节 ULEB,
+   wasm32 上 `n << bits`(bits≥32)被掩码 mod 32 → bind 地址全算错 → ObjC category 的 cls 绑不上
+   崩。治本=vendor mach_object 改 u64 累加(`vendor/mach_object`)。这是最大根因,撤掉了所有 null 旁路。
+2. **静态初始化器 SP / 线程栈区上界**还钉死 4GiB 顶,没随 mem 手术重定位到 1GiB 窗口 → 越界。
+3. **emscripten fiber 的 C 栈没 16 对齐**(`vec![0u8]` 对齐=1)→ 协程栈上 SDL 的 EM_ASM 参数缓冲
+   触发 `assert(buf%16==0)` abort。改 `Box<[u128]>`。影响 12 个 on_parent_stack 点(含 GL 上下文)。
+4. **webgl2 GET_PARAMS 表不全** → 游戏查 `GL_MAX_MODELVIEW_STACK_DEPTH` panic。补表+未登记不崩。
+5. **debug 下 copy_nonoverlapping「对齐」UB 误报**(guest 指针对 host 不对齐,memcpy 本就安全)→
+   wasm target 加 `-C debug-assertions=off`。
+
+**当前墙(M2 继续)**:splash 渲染后,app 继续初始化(到 keychain 读写)时撞 emscripten asyncify
+`Assertion failed: id 27 not found in callStackIdToFunc`(fiber rewind 时 call-stack-id 对不上)。
+=fiber + asyncify 状态管理的深层问题,可能要调 asyncify 栈管理或转 JSPI。
 
 ## M0.5 实测:真实模拟器在 Chrome boot(2026-06-13)
 
