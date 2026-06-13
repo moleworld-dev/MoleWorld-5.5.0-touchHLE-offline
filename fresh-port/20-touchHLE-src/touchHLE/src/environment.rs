@@ -492,7 +492,13 @@ impl Environment {
                     // While properly behaving apps should be fine, some app
                     // will try to poke the top of the stack, so we'll give
                     // it some room.
-                    env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+                    // [wasm M1 mem手术] 原版钉死 0xFFFFF000(4GiB 顶下 0x1000)。wasm guest
+                    // 地址空间收缩到 1GiB,主栈区已重定位到 [LOW_END, LOW_END+SIZE),这里
+                    // 必须落进该窗口顶端否则越界。下式在 64 位 host 上 LOW_END+SIZE 回绕到 0,
+                    // 再 -0x1000 = 0xFFFFF000(与原版逐位一致,五平台零变化);wasm 上 = 0x3FFFF000。
+                    env.cpu.regs_mut()[Cpu::SP] = mem::Mem::MAIN_THREAD_STACK_LOW_END
+                        .wrapping_add(mem::Mem::MAIN_THREAD_STACK_SIZE)
+                        .wrapping_sub(0x1000);
                     // Static initializers for libraries must be run before
                     // the initializer in the app binary.
                     crate::mole_sysinfo::milestone(
@@ -581,7 +587,14 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            // [wasm M1 mem手术] 栈区上界随 LOW_END 一起落进 1GiB 窗口顶端。64 位 host 上
+            // LOW_END+SIZE 回绕到 0、-1 = 0xFFFFFFFF(与原版一致);wasm 上 = 0x3FFFFFFF。
+            stack: Some(
+                mem::Mem::MAIN_THREAD_STACK_LOW_END
+                    ..=mem::Mem::MAIN_THREAD_STACK_LOW_END
+                        .wrapping_add(mem::Mem::MAIN_THREAD_STACK_SIZE)
+                        .wrapping_sub(1),
+            ),
         };
 
         let mut env = Environment {
@@ -715,7 +728,14 @@ impl Environment {
             return_value: None,
             guest_context: None,
             host_context: None,
-            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            // [wasm M1 mem手术] 栈区上界随 LOW_END 一起落进 1GiB 窗口顶端。64 位 host 上
+            // LOW_END+SIZE 回绕到 0、-1 = 0xFFFFFFFF(与原版一致);wasm 上 = 0x3FFFFFFF。
+            stack: Some(
+                mem::Mem::MAIN_THREAD_STACK_LOW_END
+                    ..=mem::Mem::MAIN_THREAD_STACK_LOW_END
+                        .wrapping_add(mem::Mem::MAIN_THREAD_STACK_SIZE)
+                        .wrapping_sub(1),
+            ),
         };
 
         let mut env = Environment {
