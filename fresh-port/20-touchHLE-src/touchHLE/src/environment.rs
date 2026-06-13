@@ -11,6 +11,9 @@
 pub mod app_picker;
 mod mutex;
 mod nullable_box;
+// WASM:corosensei 的 API 兼容 shim(corosensei 无 wasm 后端,见 wasm_coro.rs)。仅 wasm 编入。
+#[cfg(target_arch = "wasm32")]
+mod wasm_coro;
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
@@ -30,7 +33,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::libc::pthread::cond::pthread_cond_t;
 use crate::libc::stdio::FILE;
 use crate::window::DeviceFamily;
+#[cfg(not(target_arch = "wasm32"))]
 use corosensei::{Coroutine, Yielder};
+// WASM:把 `corosensei` 路径 alias 到 shim,使 `corosensei::CoroutineResult` 等
+// 限定路径 + 非限定 `Coroutine`/`Yielder` 都解析到 wasm_coro。
+#[cfg(target_arch = "wasm32")]
+use crate::environment::wasm_coro::{self as corosensei, Coroutine, Yielder};
 pub use mutex::{MutexId, MutexType, PTHREAD_MUTEX_DEFAULT};
 use nullable_box::NullableBox;
 
