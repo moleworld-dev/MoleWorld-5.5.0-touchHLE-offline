@@ -157,7 +157,26 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     // framebuffer/renderbuffer 绑定(present_renderbuffer 备份)
     (gles11::FRAMEBUFFER_BINDING_OES, ParamType::Int, 1),
     (gles11::RENDERBUFFER_BINDING_OES, ParamType::Int, 1),
+    // 固定管线上限(WebGL2/ES3 没有,返回 GLES1.1 保证下限的模拟值,见 GetIntegerv)。
+    (0x0D31, ParamType::Int, 1), // GL_MAX_LIGHTS
+    (0x0D32, ParamType::Int, 1), // GL_MAX_CLIP_PLANES
+    (0x0D36, ParamType::Int, 1), // GL_MAX_MODELVIEW_STACK_DEPTH
+    (0x0D38, ParamType::Int, 1), // GL_MAX_PROJECTION_STACK_DEPTH
+    (0x0D39, ParamType::Int, 1), // GL_MAX_TEXTURE_STACK_DEPTH
 ]);
+
+/// wasm GL 后端:查 [GET_PARAMS],但未登记的参数**不 panic**(原版 `assert_known_param`
+/// 会崩,这对一个还在补全的 WebGL2 后端太脆——游戏会零星查各种 glGet 参数)。未登记项
+/// log 一次性质的告警后按 `(Int, 1)` 处理(值落到 GetIntegerv 的 `_ => 0`)。便于继续渲染,
+/// 漏的参数事后看日志补。
+fn param_info_or_default(pname: GLenum) -> (ParamType, u8) {
+    if GET_PARAMS.contains(pname) {
+        GET_PARAMS.get_type_info(pname)
+    } else {
+        log!("[wasm GL] 未登记 glGet 参数 {pname:#x},按 (Int,1)=0 处理(待补表)");
+        (ParamType::Int, 1)
+    }
+}
 
 // ───────────────────────────── 着色器源码 ─────────────────────────────
 
@@ -1025,7 +1044,7 @@ impl GLES for GLES1OnWebGL2<'_> {
             gles11::ALPHA_TEST_REF => *params = self.state.alpha_ref,
             _ => {
                 // 其它整型参数转 float 返回。
-                let (_t, count) = GET_PARAMS.get_type_info(pname);
+                let (_t, count) = param_info_or_default(pname);
                 let mut tmp = [0 as GLint; 4];
                 self.GetIntegerv(pname, tmp.as_mut_ptr());
                 for i in 0..count as usize {
@@ -1035,8 +1054,8 @@ impl GLES for GLES1OnWebGL2<'_> {
         }
     }
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
-        // 确保 pname 已登记(否则 panic,便于补表)。
-        GET_PARAMS.assert_known_param(pname);
+        // 未登记参数不再 panic,改为 log 一次后按默认返回(见 param_info_or_default)。
+        let _ = param_info_or_default(pname);
         match pname {
             gles11::ACTIVE_TEXTURE => *params = self.state.active_texture as GLint,
             gles11::CLIENT_ACTIVE_TEXTURE => {
@@ -1059,6 +1078,12 @@ impl GLES for GLES1OnWebGL2<'_> {
             }
             gles11::MAX_TEXTURE_SIZE => *params = 4096,
             gles11::MAX_TEXTURE_UNITS => *params = MAX_TEX_UNITS as GLint,
+            // 固定管线上限:WebGL2 没有,返回 GLES1.1 保证下限的模拟值。
+            0x0D31 => *params = 8, // GL_MAX_LIGHTS
+            0x0D32 => *params = 6, // GL_MAX_CLIP_PLANES
+            0x0D36 => *params = 16, // GL_MAX_MODELVIEW_STACK_DEPTH
+            0x0D38 => *params = 2, // GL_MAX_PROJECTION_STACK_DEPTH
+            0x0D39 => *params = 2, // GL_MAX_TEXTURE_STACK_DEPTH
             gles11::TEXTURE_BINDING_2D => {
                 *params = self.state.bound_texture_2d[self.state.active_tex_idx()] as GLint
             }
