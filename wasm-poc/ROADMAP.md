@@ -10,8 +10,9 @@
 | Gate 0 | 解释器能否编 wasm + 性能 | ✅ **完成** | `wasm-poc/web/index.html`,Chrome 130-150 MIPS |
 | Phase 0 | wasm-poc 分支 + PoC 迁入 | ✅ **完成** | 同上(本地 http 服务) |
 | M0 基线 | 同步 touchHLE 当前源码到分支 | ✅ **完成** | — |
-| M0 | 真实 crate 编译到 wasm | 🔄 **进行中** | — |
-| M1 | guest 跑起来 + 主循环反应堆化 | ⏳ | — |
+| M0 | 真实 crate **lib 编译到 wasm** | ✅ **核心达成** | touchHLE.wasm 55MB 产出 |
+| M0.5 | binary 链接(emcc link flags) → 可加载 .wasm+.js | ⏳ 下一步 | 浏览器加载不崩 |
+| M1 | guest 跑起来 + 协程(fibers/JSPI)+ 主循环反应堆化 | ⏳ | — |
 | M2 | 标题画面第一帧(GLES1→WebGL2) | ⏳ | 浏览器渲染海洋标题 |
 | M3 | 音频+输入+GL 补全 → 进村可玩 | ⏳ | 浏览器进村交互 |
 | M4 | IPA 加载+存档+联机+公开 URL | ⏳ | 公开 URL 完整可玩 |
