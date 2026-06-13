@@ -279,7 +279,13 @@ impl Mem {
     ///
     /// We are arbitrarily putting the stack at the top of the virtual address
     /// space (see also: stack.rs), I have no idea if this matches iPhone OS.
+    #[cfg(not(target_arch = "wasm32"))]
     pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32.wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
+    // [wasm M1] mem 手术:wasm 的 guest 地址空间收缩到 1GiB(Bytes=[u8; 1<<30],塞进 wasm
+    // 线性内存),所以主栈不能在 4GiB 顶端,而重定位到 1GiB 窗口顶端 [0x3FF00000, 0x40000000)。
+    // guest 不依赖主栈的绝对地址,只要 stack.rs 的 stack_base 与此一致即可。
+    #[cfg(target_arch = "wasm32")]
+    pub const MAIN_THREAD_STACK_LOW_END: VAddr = (1 << 30) - Self::MAIN_THREAD_STACK_SIZE;
 
     /// iPhone OS secondary thread stack size.
     pub const SECONDARY_THREAD_DEFAULT_STACK_SIZE: GuestUSize = 512 * 1024;

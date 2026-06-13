@@ -32,10 +32,11 @@ pub fn prep_stack_for_start(
     // Since the stack grows downwards, its first byte would be 0xffffffff.
     #[cfg(not(target_arch = "wasm32"))]
     let stack_base: usize = 1 << 32;
-    // [wasm M0] wasm32 usize 是 32 位,`1 << 32` 编译期溢出。用 0xFFFF_F000 占位(仍在 u32
-    // 范围,后续 try_into::<u32> 不会失败)。真实主栈地址随 M1 mem 手术重定。
+    // [wasm M1] mem 手术:guest 地址空间收缩到 1GiB,主栈重定位到 1GiB 窗口顶端。
+    // stack_base = 1<<30(exclusive 顶,首字节 0x3FFFFFFF),与 mem::MAIN_THREAD_STACK_LOW_END
+    // = 0x3FF00000 一致,栈区 [0x3FF00000, 0x40000000) 全在 [u8; 1<<30] 数组内。
     #[cfg(target_arch = "wasm32")]
-    let stack_base: usize = 0xFFFF_F000;
+    let stack_base: usize = 1 << 30;
 
     // Rust vectors grow upwards but we need to grow this one downwards, so
     // let's push the strings onto it reversed.
