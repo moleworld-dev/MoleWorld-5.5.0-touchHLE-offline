@@ -11,6 +11,12 @@ rustdocflags = ["--document-private-items"]
 # ===========================================================================
 [target.wasm32-unknown-emscripten]
 rustflags = [
+  # [WASM] guest 指针对 host 而言常常不是 4/8 字节对齐;touchHLE 拷贝 guest 内存用
+  # copy_nonoverlapping(memcpy 语义,任意对齐都正确)。但 rustc 1.78+ 的 std 在 debug 下
+  # 加了「指针必须对齐」的 UB 前置断言,会对这些本就安全的拷贝 panic(GL 纹理/像素路径首撞)。
+  # rustc 1.96 还没有 -C ub-checks,只能整体关 debug-assertions(= release 对该类检查的行为)。
+  # 拷贝运行时完全正确,关掉只是去掉误报。target-scoped 只作用 wasm,五平台零影响。
+  "-C", "debug-assertions=off",
   "-C", "link-arg=-sUSE_SDL=2",
   "-C", "link-arg=-lopenal",
   "-C", "link-arg=-sMAX_WEBGL_VERSION=2",
