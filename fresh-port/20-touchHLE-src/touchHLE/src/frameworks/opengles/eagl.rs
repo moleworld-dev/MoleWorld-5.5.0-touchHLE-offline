@@ -290,14 +290,27 @@ pub const CLASSES: ClassExports = objc_classes! {
         renderbuffer as _
     };
 
+    // [MoleWorld wasm] cocos2d 上一帧实际渲染到的 framebuffer。real iOS / 桌面:游戏画进自己创建的
+    // FBO(drawable 的 renderbuffer 作 color attachment),presentRenderbuffer 读那块 renderbuffer 即得帧。
+    // 但 wasm(GLES1-on-WebGL2)下实测 cocos2d 的 FBO 绑定丢成 0 → 村庄被画进 default framebuffer(canvas),
+    // 而 drawable 的 renderbuffer 停在早期启动图。下方 slow path 据此从正确的 framebuffer 读帧。
+    #[cfg(target_arch = "wasm32")]
+    let cocos2d_render_fbo: GLuint = unsafe {
+        let mut fbo = 0;
+        gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut fbo);
+        fbo as _
+    };
+
     std::mem::drop(gles);
 
-    let Some(&drawable) = env
+    let drawable_opt = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
         .borrow()
-        .get(&renderbuffer) else {
+        .get(&renderbuffer)
+        .copied();
+    let Some(drawable) = drawable_opt else {
         log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
         return false;
     };
@@ -346,9 +359,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         // re-borrow
         let (pixels_vec, width, height) = {
             let mut gles = super::sync_context(&mut env.framework_state.opengles, &mut env.objc, env.window.as_mut().unwrap(), env.current_thread);
-            unsafe {
-                read_renderbuffer(gles.as_mut(), pixels_vec)
-            }
+            // [MoleWorld wasm] 若游戏这帧画进了 default framebuffer(canvas,cocos2d_render_fbo==0,
+            // wasm 下 cocos2d 的 FBO 绑定丢失的实测症状),drawable 的 renderbuffer 是陈旧的(停在早期
+            // 启动图)→ 从 fbo 0 读真正渲染好的村庄,喂给合成器,避免启动图盖掉村庄。桌面/iOS 不受影响。
+            #[cfg(target_arch = "wasm32")]
+            let result = unsafe {
+                if cocos2d_render_fbo == 0 {
+                    read_default_framebuffer(gles.as_mut(), pixels_vec)
+                } else {
+                    read_renderbuffer(gles.as_mut(), pixels_vec)
+                }
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let result = unsafe { read_renderbuffer(gles.as_mut(), pixels_vec) };
+            result
         };
         present_pixels(env, drawable, pixels_vec, width, height);
     }
@@ -538,6 +562,46 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     gles.DeleteFramebuffersOES(1, &src_framebuffer);
 
     // Restore the framebuffer binding
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+
+    (pixel_buffer, width_u32, height_u32)
+}
+
+/// [MoleWorld wasm] Like [read_renderbuffer], but reads the **default framebuffer**
+/// (FBO 0 = the canvas) instead of the drawable's renderbuffer. Used when cocos2d
+/// rendered the frame into FBO 0 (the wasm GLES1-on-WebGL2 symptom where the app's
+/// FBO binding is lost), so the drawable's renderbuffer is stale. The size is taken
+/// from the still-bound renderbuffer, which matches the canvas size.
+#[cfg(target_arch = "wasm32")]
+unsafe fn read_default_framebuffer(
+    gles: &mut dyn GLES,
+    mut pixel_buffer: Vec<u8>,
+) -> (Vec<u8>, u32, u32) {
+    let (width, height) = get_renderbuffer_size(gles);
+    let width_u32: u32 = width.try_into().unwrap();
+    let height_u32: u32 = height.try_into().unwrap();
+
+    let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+
+    let size = (width_u32 as usize)
+        .checked_mul(height_u32 as usize)
+        .unwrap()
+        .checked_mul(4)
+        .unwrap();
+    pixel_buffer.clear();
+    pixel_buffer.reserve_exact(size);
+    gles.ReadPixels(
+        0,
+        0,
+        width,
+        height,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixel_buffer.as_mut_ptr() as *mut _,
+    );
+    pixel_buffer.set_len(size);
+
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
 
     (pixel_buffer, width_u32, height_u32)
