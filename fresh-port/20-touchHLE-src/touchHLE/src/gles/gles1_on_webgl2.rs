@@ -1545,23 +1545,32 @@ impl GLES for GLES1OnWebGL2<'_> {
         gl30::BindTexture(target, texture);
     }
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) {
+        // GENERATE_MIPMAP(0x8191)是 GLES1.1 的 pname,ES3/WebGL2 没有(被独立的
+        // glGenerateMipmap 取代)→ 原样转发会 GL_INVALID_ENUM(0x500,实测 composition 报的)。
+        // ES3 下改为:param!=0 时显式 GenerateMipmap,否则忽略。
+        if pname == 0x8191 {
+            if param != 0 {
+                gl30::GenerateMipmap(target);
+            }
+            return;
+        }
         gl30::TexParameteri(target, pname, param);
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
-        gl30::TexParameteri(target, pname, param as GLint);
+        self.TexParameteri(target, pname, param as GLint);
     }
     unsafe fn TexParameterx(&mut self, target: GLenum, pname: GLenum, param: GLfixed) {
         // GLES1 的 x 版纹理参数其实是整型枚举,不需缩放。
-        gl30::TexParameteri(target, pname, param);
+        self.TexParameteri(target, pname, param);
     }
     unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, params: *const GLint) {
-        gl30::TexParameteri(target, pname, *params);
+        self.TexParameteri(target, pname, *params);
     }
     unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, params: *const GLfloat) {
-        gl30::TexParameteri(target, pname, *params as GLint);
+        self.TexParameteri(target, pname, *params as GLint);
     }
     unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, params: *const GLfixed) {
-        gl30::TexParameteri(target, pname, *params);
+        self.TexParameteri(target, pname, *params);
     }
     unsafe fn TexImage2D(
         &mut self,
@@ -1587,8 +1596,8 @@ impl GLES for GLES1OnWebGL2<'_> {
             type_,
             pixels,
         );
-        // NPOT 纹理在 WebGL2 默认 REPEAT 会 incomplete → 采样全黑。强制 CLAMP_TO_EDGE,
-        // 并把 min filter 设为 LINEAR(无 mipmap)。仅对 level 0 的 TEXTURE_2D 设置。
+        // NPOT 纹理在 WebGL2 默认 REPEAT wrap + NEAREST_MIPMAP_LINEAR min filter 会 incomplete
+        // → 采样全黑。强制 CLAMP_TO_EDGE + LINEAR(无 mipmap)。仅对 level 0 的 TEXTURE_2D。
         if target == gles11::TEXTURE_2D && level == 0 {
             gl30::TexParameteri(
                 gles11::TEXTURE_2D,
@@ -1599,6 +1608,16 @@ impl GLES for GLES1OnWebGL2<'_> {
                 gles11::TEXTURE_2D,
                 gles11::TEXTURE_WRAP_T,
                 gles11::CLAMP_TO_EDGE as GLint,
+            );
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as GLint,
+            );
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MAG_FILTER,
+                gles11::LINEAR as GLint,
             );
         }
     }
@@ -1647,6 +1666,34 @@ impl GLES for GLES1OnWebGL2<'_> {
         border: GLint,
     ) {
         gl30::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        // ★根因修复:游戏 EAGL 快速路径(present_renderbuffer)把屏幕大小的 NPOT renderbuffer
+        // 用 CopyTexImage2D 拷成纹理,但只设了 MIN_FILTER、没设 WRAP。WebGL2/ES3 下 NPOT 纹理
+        // 默认 REPEAT wrap(+ 默认 NEAREST_MIPMAP_LINEAR min filter)是 incomplete → 采样返回
+        // (0,0,0,1) 全黑(实测游戏帧 RGB=0 A=255 的精确根因)。这里和 TexImage2D 一样强制
+        // CLAMP_TO_EDGE + LINEAR 让纹理 complete。仅 level 0 的 TEXTURE_2D。桌面 GL2.1 容忍
+        // NPOT+REPEAT 所以是 wasm 专属;此后端本就只在 wasm 编译。
+        if target == gles11::TEXTURE_2D && level == 0 {
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_S,
+                gles11::CLAMP_TO_EDGE as GLint,
+            );
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_WRAP_T,
+                gles11::CLAMP_TO_EDGE as GLint,
+            );
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as GLint,
+            );
+            gl30::TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MAG_FILTER,
+                gles11::LINEAR as GLint,
+            );
+        }
     }
     unsafe fn CopyTexSubImage2D(
         &mut self,
