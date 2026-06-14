@@ -243,6 +243,12 @@ def main():
         browser.close()
     httpd.shutdown()
 
+    try:
+        with open("/tmp/mole-console-all.txt", "w") as f:
+            f.write("\n".join(console_lines))
+        print(f"[harness] 全部 console({len(console_lines)} 行)-> /tmp/mole-console-all.txt")
+    except OSError:
+        pass
     print("\n===== console (浏览器 JS 侧) 末尾 =====")
     for l in console_lines[-25:]:
         print(l)
