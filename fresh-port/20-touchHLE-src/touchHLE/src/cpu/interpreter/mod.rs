@@ -72,8 +72,6 @@ pub struct InterpreterCpu {
     extregs: [u32; 64],
     cpsr: u32,
     fpscr: u32,
-    /// Bytes below this address are the guest null segment; any access faults.
-    null_segment_size: u32,
     /// Local exclusive monitor address (LDREX/STREX). Single host thread, so we
     /// only track the address; STREX succeeds iff it matches a prior LDREX.
     excl_addr: Option<u32>,
@@ -92,13 +90,17 @@ pub struct InterpreterCpu {
 }
 
 impl InterpreterCpu {
-    pub fn new(null_page_count: u32) -> Box<Self> {
+    /// `_null_page_count` is kept for call-site symmetry with the dynarmic
+    /// backend, but the interpreter no longer caches it: every memory access
+    /// goes through `Mem::get_bytes_fallible(_mut)`, which does the authoritative
+    /// null-page check against the *live* `Mem::null_segment_size` (no stale-copy
+    /// hazard, and one fewer always-predicted branch per load/store/fetch).
+    pub fn new(_null_page_count: u32) -> Box<Self> {
         Box::new(InterpreterCpu {
             regs: [0; 16],
             extregs: [0; 64],
             cpsr: CPSR_USER_MODE,
             fpscr: 0,
-            null_segment_size: null_page_count * 0x1000,
             excl_addr: None,
             trace: [(0, 0); 64],
             trace_pos: 0,
@@ -165,6 +167,7 @@ impl InterpreterCpu {
         std::mem::swap(&mut self.fpscr, &mut ctx.fpscr);
     }
 
+    #[inline]
     fn is_thumb(&self) -> bool {
         self.cpsr & CPSR_THUMB != 0
     }
@@ -236,15 +239,19 @@ impl InterpreterCpu {
         self.regs[n] = val;
     }
 
+    #[inline]
     pub(super) fn flag_n(&self) -> bool {
         self.cpsr & (1 << 31) != 0
     }
+    #[inline]
     pub(super) fn flag_z(&self) -> bool {
         self.cpsr & (1 << 30) != 0
     }
+    #[inline]
     pub(super) fn flag_c(&self) -> bool {
         self.cpsr & (1 << 29) != 0
     }
+    #[inline]
     pub(super) fn flag_v(&self) -> bool {
         self.cpsr & (1 << 28) != 0
     }
@@ -311,6 +318,7 @@ impl InterpreterCpu {
     }
 
     /// Evaluate an ARM condition code against current NZCV.
+    #[inline]
     pub(super) fn cond_passed(&self, cond: u32) -> bool {
         let (n, z, c, v) = (self.flag_n(), self.flag_z(), self.flag_c(), self.flag_v());
         match cond & 0xF {
@@ -334,6 +342,7 @@ impl InterpreterCpu {
 
     // ===== P1 Group 4: Thumb IT-block (ITSTATE in CPSR[15:10] + CPSR[26:25]) =====
     /// Read ITSTATE[7:0]: [1:0] = CPSR[26:25], [7:2] = CPSR[15:10].
+    #[inline]
     pub(super) fn itstate(&self) -> u8 {
         let lo = (self.cpsr >> 25) & 0b11;
         let hi = (self.cpsr >> 10) & 0b11_1111;
@@ -346,6 +355,7 @@ impl InterpreterCpu {
         self.cpsr |= (it & 0b11) << 25;
     }
     /// In an IT block iff the low 4 bits of ITSTATE are nonzero.
+    #[inline]
     pub(super) fn in_it_block(&self) -> bool {
         self.itstate() & 0x0f != 0
     }
@@ -371,31 +381,26 @@ impl InterpreterCpu {
     }
 
     // ----- data memory access (fault-aware; None/false = MemoryError) -----
+    // The null-page check lives once in `Mem::get_bytes_fallible(_mut)`; these
+    // helpers don't re-check (see `InterpreterCpu::new`). `#[inline]` so the
+    // per-instruction load/store path folds into the executors under LTO.
+    #[inline]
     pub(super) fn data_r_u32(&self, mem: &Mem, addr: u32) -> Option<u32> {
-        if addr < self.null_segment_size {
-            return None;
-        }
         let b = mem.get_bytes_fallible(Ptr::from_bits(addr), 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+    #[inline]
     pub(super) fn data_r_u16(&self, mem: &Mem, addr: u32) -> Option<u16> {
-        if addr < self.null_segment_size {
-            return None;
-        }
         let b = mem.get_bytes_fallible(Ptr::from_bits(addr), 2)?;
         Some(u16::from_le_bytes([b[0], b[1]]))
     }
+    #[inline]
     pub(super) fn data_r_u8(&self, mem: &Mem, addr: u32) -> Option<u8> {
-        if addr < self.null_segment_size {
-            return None;
-        }
         let b = mem.get_bytes_fallible(Ptr::from_bits(addr), 1)?;
         Some(b[0])
     }
+    #[inline]
     pub(super) fn data_w_u32(&self, mem: &mut Mem, addr: u32, val: u32) -> bool {
-        if addr < self.null_segment_size {
-            return false;
-        }
         match mem.get_bytes_fallible_mut(Ptr::from_bits(addr), 4) {
             Some(b) => {
                 b.copy_from_slice(&val.to_le_bytes());
@@ -404,10 +409,8 @@ impl InterpreterCpu {
             None => false,
         }
     }
+    #[inline]
     pub(super) fn data_w_u16(&self, mem: &mut Mem, addr: u32, val: u16) -> bool {
-        if addr < self.null_segment_size {
-            return false;
-        }
         match mem.get_bytes_fallible_mut(Ptr::from_bits(addr), 2) {
             Some(b) => {
                 b.copy_from_slice(&val.to_le_bytes());
@@ -416,10 +419,8 @@ impl InterpreterCpu {
             None => false,
         }
     }
+    #[inline]
     pub(super) fn data_w_u8(&self, mem: &mut Mem, addr: u32, val: u8) -> bool {
-        if addr < self.null_segment_size {
-            return false;
-        }
         match mem.get_bytes_fallible_mut(Ptr::from_bits(addr), 1) {
             Some(b) => {
                 b[0] = val;
@@ -459,18 +460,16 @@ impl InterpreterCpu {
     }
 
     /// Fetch a code halfword. `None` = fetch fault (null page / unmapped).
+    /// Null-page check is done by `get_bytes_fallible` (see `new`); `#[inline]`
+    /// because this is on the per-instruction fetch path (twice for Thumb-2).
+    #[inline]
     fn read_code_u16(&self, mem: &Mem, addr: u32) -> Option<u16> {
-        if addr < self.null_segment_size {
-            return None;
-        }
         let p: ConstVoidPtr = Ptr::from_bits(addr);
         let b = mem.get_bytes_fallible(p, 2)?;
         Some(u16::from_le_bytes([b[0], b[1]]))
     }
+    #[inline]
     fn read_code_u32(&self, mem: &Mem, addr: u32) -> Option<u32> {
-        if addr < self.null_segment_size {
-            return None;
-        }
         let p: ConstVoidPtr = Ptr::from_bits(addr);
         let b = mem.get_bytes_fallible(p, 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -513,6 +512,7 @@ impl InterpreterCpu {
         }
     }
 
+    #[inline]
     fn step_one(&mut self, mem: &mut Mem) -> CpuState {
         let pc = self.regs[PC];
         let thumb = self.is_thumb();
