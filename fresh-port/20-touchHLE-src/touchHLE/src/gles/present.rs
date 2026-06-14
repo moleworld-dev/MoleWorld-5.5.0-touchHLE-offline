@@ -93,7 +93,11 @@ pub unsafe fn present_frame(
     // texture matrix identity (a centred rotation keeps the unit square in
     // place). Desktop keeps the matrix form unchanged (it renders correctly and
     // we don't want to risk a regression on the working path).
-    #[cfg(target_os = "ios")]
+    // [MoleWorld wasm] wasm 后端的纹理也强制 CLAMP_TO_EDGE(NPOT 完整性,见 gles1_on_webgl2),
+    // 与 iOS 行为一致:用 GL_TEXTURE 矩阵绕原点转 texcoord 会把它推出 [0,1]、被 CLAMP 夹到边缘
+    // → 整屏采到一条边(黑/拉丝)。所以 wasm 也走 iOS 的「CPU 绕中心(0.5,0.5)转 texcoord +
+    // 纹理矩阵保持 identity」路径。桌面/安卓保持矩阵法不变。
+    #[cfg(any(target_os = "ios", target_arch = "wasm32"))]
     {
         let mut i = 0;
         while i < tex_coords.len() {
@@ -104,7 +108,7 @@ pub unsafe fn present_frame(
         }
         gles.LoadIdentity();
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
     {
         let matrix = Matrix::<4>::from(&rotation_matrix);
         gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
