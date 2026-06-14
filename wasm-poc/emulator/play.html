@@ -210,6 +210,26 @@
         Module.FS.writeFile('/MoleWorld.ipa', d);
         addLog('[launcher] IPA 已写入 MEMFS:' + d.length + ' 字节');
       } catch (e) { addLog('[launcher] 写 IPA 失败:' + e); }
+      // [离线种子存档] 把真实存档写进 touchHLE 的 wasm 沙盒,让离线 [GameData loadFromLocal] 读到
+      // 非空庄园(否则进村是空的、盖不住启动图)。沙盒根 = user_data_base_path()(wasm 上="."→CWD"/")
+      // /touchHLE_sandbox/<bundleid>/。userinfo/map 落 Documents、plist 落 Library/Preferences。
+      try {
+        const SBOX = '/touchHLE_sandbox/com.taomee.MoleWorld';
+        const dest = (name) => name.endsWith('.plist')
+          ? SBOX + '/Library/Preferences/' + name
+          : SBOX + '/Documents/' + name;
+        const seeds = window.__seeds || [];
+        if (seeds.length) {
+          for (const [name, buf] of seeds) {
+            const path = dest(name);
+            Module.FS.mkdirTree(path.slice(0, path.lastIndexOf('/')));
+            Module.FS.writeFile(path, new Uint8Array(buf));
+            addLog('[launcher] 种子写入:' + path + ' (' + buf.byteLength + ' 字节)');
+          }
+        } else {
+          addLog('[launcher] 无种子存档 → 进村为空');
+        }
+      } catch (e) { addLog('[launcher] 写种子存档失败:' + e); }
     }],
   };
 
@@ -221,6 +241,19 @@
       if (!resp.ok) throw new Error('HTTP ' + resp.status + '(MoleWorld.ipa 没放在同目录?)');
       window.__ipaBuf = await resp.arrayBuffer();
       addLog('[launcher] IPA 下载完成:' + window.__ipaBuf.byteLength + ' 字节');
+      // [离线种子存档] 同目录可选的真实存档,fetch 到内存留给 preRun 写进沙盒(没有就跳过,不影响启动)。
+      //   userinfo.dat / map.dat              → Documents/
+      //   com.taomee.MoleWorld.plist          → Library/Preferences/(NSUserDefaults:isEncrypt/EV130/userId…)
+      // 三件必须配套:userinfo 是加密的,但「是否加密」标志存在 NSUserDefaults 里——少了 plist,
+      // GameSettings.isEncrypt=NO → loadUserInfoData 误判「本地存档损坏」弹框 + exit。
+      window.__seeds = [];
+      for (const name of ['userinfo.dat', 'map.dat', 'com.taomee.MoleWorld.plist']) {
+        try {
+          const r = await fetch(name + '?cb=' + CB);
+          if (r.ok) { const buf = await r.arrayBuffer(); window.__seeds.push([name, buf]);
+            addLog('[launcher] 种子下载:' + name + ' ' + buf.byteLength + ' 字节'); }
+        } catch (e) { /* 无该种子,可接受 */ }
+      }
     } catch (e) {
       setStatus('加载失败', 'err');
       hintEl.textContent = '加载 MoleWorld.ipa 失败:' + e.message;

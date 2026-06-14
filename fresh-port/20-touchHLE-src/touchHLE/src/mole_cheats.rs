@@ -170,6 +170,11 @@ static SENT_1001: AtomicBool = AtomicBool::new(false);
 /// hasn't fired within a few frames, drive loadTarget ourselves from the drawScene tick.
 static PENDING_LOADTARGET: AtomicU32 = AtomicU32::new(0);
 static PENDING_LOADTARGET_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// [离线进村] 已驱动过 OnLoginOk(进村)一次的闩;到达主菜单 + 若干帧后置位。
+static OFFLINE_ENTERED: AtomicBool = AtomicBool::new(false);
+/// [离线进村] 主菜单出现后的帧计数(到阈值再驱动 OnLoginOk,让菜单先稳定)。
+static OFFLINE_BOOT_FRAMES: AtomicU32 = AtomicU32::new(0);
 /// 庄园地图持久化(修法甲)帧计数。进村稳定后(STATE_IS_7)host 周期性 saveMapData+updateInfoToServer
 /// 把活图整包(gzip blob)发上来——主庄园持久化唯一上行通道(非 1059 增量,那是黄金岛机制)。
 /// 原版自发上传被 saveMapData: 5道闸卡死→map 恒 0B;host 主动调已验证可用的无参 saveMapData 兜上。
@@ -191,6 +196,27 @@ fn online_login_mimi(env: &Environment) -> Option<u32> {
     std::env::var("MOLE_MIMI")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// [离线进村] 浏览器 wasm 没有网络:游戏的登录→连接链永远走不通(passport HTTPS 死桩 + TCP 连不上),
+/// 卡在 splash/title。但主庄园本身是离线自洽的(startGame:@0x19164 的网络 fetch 全在 if(isConnected)
+/// 里;sendGameData2Server:@0x20f00 整 tick 被 if(isReachable_) 门控;LoadingMainVillage case0x14 永远
+/// loadFromLocal)。所以离线只需把状态机从 splash/title 推到 loadTarget case4(=loadFromLocal+startGame),
+/// **不强制 isConnected/isReachable=1**(保持 false 让 startGame: 走纯本地分支)。
+/// 默认在 wasm 上 ON(那是唯一模式),其余平台需 MOLE_OFFLINE_VILLAGE=1 显式开。缓存避免每条消息查 env。
+fn offline_village() -> bool {
+    use std::sync::atomic::AtomicU8;
+    static CACHE: AtomicU8 = AtomicU8::new(2); // 2=未初始化
+    let c = CACHE.load(O);
+    if c != 2 {
+        return c == 1;
+    }
+    let default_on = cfg!(target_arch = "wasm32");
+    let on = std::env::var("MOLE_OFFLINE_VILLAGE")
+        .map(|v| v != "0")
+        .unwrap_or(default_on);
+    CACHE.store(u8::from(on), O);
+    on
 }
 
 // ===== ACCOUNT-MENU MODE: 让 touchHLE 也弹出原版账号管理菜单(切换账号)=====
@@ -1532,6 +1558,7 @@ pub fn any_enabled() -> bool {
         || STORE_NO_VIP.load(O)
         || ENTER_NEWISLANDS.load(O)
         || SKIP_PARSE_CHECK.load(O)
+        || offline_village()
 }
 
 /// Intercept a `[class sel ...]` message. Returns `true` if fully handled (the
@@ -1766,6 +1793,67 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 写在最前面、只在 dirty 时跑一次:invalidate_cache_range 让 dynarmic 重新编译被改的指令。
     if CRACK_PATCHES_DIRTY.swap(false, O) {
         apply_crack_patches(env);
+    }
+
+    // ===== [离线进村] wasm 无网络:游戏卡在主菜单(连不上私服)。主庄园本身离线自洽,只需把它从
+    // 菜单推进到村庄。-[MainMenuScene OnLoginOk]@0xb4a94 实证:它【无条件】调 [LoadingLayer
+    // showWithTarget:4](进村),仅 `if state==4` 那条门控的是在线登录发包——离线 state!=4,登录发包跳过,
+    // showWithTarget:4 照常跑。故离线只要在菜单出现后主动调一次 OnLoginOk 即进村(纯本地 loadFromLocal+
+    // startGame:,不强制 isConnected/isReachable)。复用既有 showWithTarget:4 latch + loadTarget 兜底驱动。
+    if offline_village() {
+        // 捕获 MainMenuScene 实例(进村入口的 self)。
+        if class == "MainMenuScene" {
+            let s = env.cpu.regs()[0];
+            if s != 0 {
+                MAINMENU_SCENE.store(s, O);
+            }
+        }
+        // 锁存村庄过场(showWithTarget:4),让 drawScene tick 在原生 update: 不复活时兜底驱动 loadTarget。
+        if class == "LoadingLayer" && sel == "showWithTarget:" && env.cpu.regs()[2] == 4 {
+            PENDING_LOADTARGET.store(env.cpu.regs()[0], O);
+            PENDING_LOADTARGET_FRAMES.store(0, O);
+        }
+        // 原生 update: 复活了 → 取消兜底。
+        if class == "LoadingLayer" && sel == "update:" {
+            PENDING_LOADTARGET.store(0, O);
+        }
+        // drawScene/mainLoop:安全帧边界。菜单稳定后驱动一次 OnLoginOk(进村);并兜底驱动 loadTarget。
+        if sel == "drawScene" || sel == "mainLoop" {
+            // ★ 下面的 msg_send 会 clobber r0-r3;返回 false 让真 drawScene 接着跑,它用 POST-hook
+            // 寄存器派发——clobber 的 r0=错 director self → 读错 nextScene_ → 场景切换静默停。故落前恢复 r0/r1。
+            let saved_r0 = env.cpu.regs()[0];
+            let saved_r1 = env.cpu.regs()[1];
+            if !OFFLINE_ENTERED.load(O) {
+                let mm = MAINMENU_SCENE.load(O);
+                if mm != 0 && OFFLINE_BOOT_FRAMES.fetch_add(1, O) >= 120 && !OFFLINE_ENTERED.swap(true, O)
+                {
+                    let scene: id = Ptr::from_bits(mm);
+                    let olo = env
+                        .objc
+                        .register_host_selector("OnLoginOk".to_string(), &mut env.mem);
+                    let _: () = msg_send(env, (scene, olo));
+                    log!("[MOLECHEAT] 离线:驱动 [MainMenuScene OnLoginOk] → showWithTarget:4(纯本地进村)");
+                }
+            }
+            // 村庄渲染兜底:showWithTarget:4 锁存了 LoadingLayer 但 update: 不复活 → 手动驱动 loadTarget。
+            let pend = PENDING_LOADTARGET.load(O);
+            if pend != 0 && PENDING_LOADTARGET_FRAMES.fetch_add(1, O) >= 6 {
+                PENDING_LOADTARGET.store(0, O);
+                let ll: id = Ptr::from_bits(pend);
+                let lt = env
+                    .objc
+                    .register_host_selector("loadTarget".to_string(), &mut env.mem);
+                let psomt = env.objc.register_host_selector(
+                    "performSelectorOnMainThread:withObject:waitUntilDone:".to_string(),
+                    &mut env.mem,
+                );
+                let _: () = msg_send(env, (ll, psomt, lt, nil, false));
+                log!("[MOLECHEAT] 离线:★手动 performSelectorOnMainThread:loadTarget(渲染村庄 case4)");
+            }
+            // 恢复 r0/r1,真 drawScene 用对的 self。
+            env.cpu.regs_mut()[0] = saved_r0;
+            env.cpu.regs_mut()[1] = saved_r1;
+        }
     }
 
     // ===== ONLINE MODE:登录通行证绕过 + 米米号注入(全 gate 在 online_login_mimi) =====
