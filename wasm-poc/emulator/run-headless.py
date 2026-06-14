@@ -100,6 +100,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=45)
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--periodic-shots", action="store_true")
     ap.add_argument("--shot", default="/tmp/mole-wasm-shot.png")
     args = ap.parse_args()
 
@@ -117,14 +118,20 @@ def main():
 
     from playwright.sync_api import sync_playwright
 
-    gl_args = [
-        "--enable-unsafe-swiftshader",
-        "--use-gl=angle",
-        "--use-angle=swiftshader",
-        "--ignore-gpu-blocklist",
-        "--enable-webgl",
-        "--disable-gpu-sandbox",
-    ]
+    if args.headed:
+        # 有头 + 真 GPU(Mac 的 Metal/ANGLE):WebGL canvas 能被正确合成/截图。
+        gl_args = ["--ignore-gpu-blocklist", "--enable-webgl"]
+    else:
+        # 无头:用 SwiftShader 软 WebGL2(注意:其 framebuffer 内容截图常抓不到,
+        # 用 present.rs 的 glReadPixels 日志确认渲染)。
+        gl_args = [
+            "--enable-unsafe-swiftshader",
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--ignore-gpu-blocklist",
+            "--enable-webgl",
+            "--disable-gpu-sandbox",
+        ]
     console_lines = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed, args=gl_args)
@@ -137,13 +144,33 @@ def main():
             "addEventListener('error',e=>{window.__jserr.push('ERROR: '+((e.error&&e.error.stack)||e.message||String(e)))});"
             "addEventListener('unhandledrejection',e=>{window.__jserr.push('REJECT: '+((e.reason&&e.reason.stack)||String(e.reason)))});"
         )
+        # 强制 preserveDrawingBuffer=true,这样 playwright 截图能抓到 WebGL canvas 内容
+        # (默认 false 时截图永远是黑的,即便游戏其实在正常渲染)。仅调试用,不改游戏代码。
+        page.add_init_script(
+            "(function(){const o=HTMLCanvasElement.prototype.getContext;"
+            "HTMLCanvasElement.prototype.getContext=function(t,a){"
+            "if(t==='webgl2'||t==='webgl'||t==='experimental-webgl'){a=Object.assign({},a,{preserveDrawingBuffer:true,alpha:false});}"
+            "return o.call(this,t,a);};})();"
+        )
         page.goto(url, wait_until="commit")
 
         deadline = time.time() + args.timeout
         terminal = ("Rust panic", "ABORT:", "abort(", "RuntimeError", "thread 'main' panicked")
         last_size = -1
+        shot_n = 0
+        next_shot = time.time() + 3
         while time.time() < deadline:
             time.sleep(1.0)
+            # 周期截图,观察渲染随时间的变化(定位黑屏发生点)。
+            if args.periodic_shots and time.time() >= next_shot:
+                try:
+                    p = f"/tmp/mole-wasm-shot-{shot_n}.png"
+                    page.screenshot(path=p)
+                    print(f"[harness] 周期截图 -> {p}")
+                    shot_n += 1
+                except Exception:
+                    pass
+                next_shot = time.time() + 3
             try:
                 with open(LOG_PATH) as f:
                     txt = f.read()
@@ -155,6 +182,36 @@ def main():
                 print("[harness] 检测到终止标志,提前结束")
                 time.sleep(2.0)
                 break
+        try:
+            info = page.evaluate(
+                "(()=>{const c=document.getElementById('canvas');"
+                "let attrs=null;try{const g=c.getContext('webgl2')||c.getContext('webgl');"
+                "attrs=g&&g.getContextAttributes();}catch(e){}"
+                "return {w:c&&c.width,h:c&&c.height,cssw:c&&c.clientWidth,cssh:c&&c.clientHeight,"
+                "preserve:attrs&&attrs.preserveDrawingBuffer};})()"
+            )
+            print(f"[harness] canvas backing={info.get('w')}x{info.get('h')} "
+                  f"css={info.get('cssw')}x{info.get('cssh')} preserveDrawingBuffer={info.get('preserve')}")
+        except Exception as e:
+            print(f"[harness] canvas info 失败: {e}")
+        # 从 emscripten MEMFS 读 /frame.ppm(present.rs 写的真实渲染帧),存成 PNG。
+        try:
+            b64 = page.evaluate(
+                "(()=>{try{const d=Module.FS.readFile('/frame.ppm');let s='';"
+                "const C=0x8000;for(let i=0;i<d.length;i+=C){"
+                "s+=String.fromCharCode.apply(null,d.subarray(i,i+C));}return btoa(s);}"
+                "catch(e){return 'ERR:'+e;}})()"
+            )
+            if b64 and not b64.startswith("ERR:"):
+                import base64
+                raw = base64.b64decode(b64)
+                with open("/tmp/mole-frame.ppm", "wb") as f:
+                    f.write(raw)
+                print(f"[harness] 真实渲染帧 -> /tmp/mole-frame.ppm ({len(raw)} bytes)")
+            else:
+                print(f"[harness] 读 /frame.ppm: {b64}")
+        except Exception as e:
+            print(f"[harness] 读 frame.ppm 失败: {e}")
         try:
             jserr = page.evaluate("window.__jserr || []")
             if jserr:
