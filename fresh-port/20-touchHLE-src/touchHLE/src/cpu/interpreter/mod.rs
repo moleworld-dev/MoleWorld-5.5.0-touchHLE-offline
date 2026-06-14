@@ -19,6 +19,9 @@ use crate::mem::{ConstVoidPtr, Mem, Ptr};
 /// Differential test harness (only active with both CPU backends; see diff.rs).
 #[allow(dead_code)]
 mod diff;
+/// CPU-bound throughput micro-bench for the live interpreter (test-only).
+#[cfg(test)]
+mod bench;
 mod arm;
 mod thumb16;
 mod thumb32;
