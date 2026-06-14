@@ -365,6 +365,15 @@ impl Window {
             window
         };
 
+        // [wasm] emscripten 的 SDL2 SDL_CreateWindow 不会把 canvas 调到请求尺寸(实测落到
+        // set_minimum_size 的 256x192),导致游戏只在 1/4 分辨率渲染。显式 set_size 把 canvas
+        // 拉到请求分辨率(emscripten 下 SDL_SetWindowSize 会 emscripten_set_canvas_element_size)。
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (rw, rh) = size_for_orientation(device_family, device_orientation, scale_hack);
+            let _ = window.set_size(rw, rh);
+        }
+
         if env::consts::OS == "android" {
             // Sanity check
             let gl_attr = video_ctx.gl_attr();
