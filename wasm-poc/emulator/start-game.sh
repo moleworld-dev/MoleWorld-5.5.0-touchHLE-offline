@@ -37,6 +37,13 @@ fi
 
 [ -f "$OUT/touchHLE.js" ] || { echo "✗ 没有 $OUT/touchHLE.js —— 先构建一次(去掉 --no-build,或换 --release)" >&2; exit 1; }
 
+# emscripten 的 preload 数据(touchHLE.data,字体/dylib)有时只落在 deps/ 而没拷到 profile
+# 根目录(release 尤其),loader fetch touchHLE.data 会 404 卡在加载。这里补齐到根目录。
+if [ ! -f "$OUT/touchHLE.data" ] && [ -f "$OUT/deps/touchHLE.data" ]; then
+  cp "$OUT/deps/touchHLE.data" "$OUT/touchHLE.data"
+  echo "[*] 补齐 touchHLE.data 到 $MODE 根目录"
+fi
+
 # 3) 放启动页;IPA 没有就从 debug 目录借一份(两个 mode 用同一个 IPA)
 cp "$HERE/play.html" "$OUT/index.html"
 if [ ! -f "$OUT/MoleWorld.ipa" ]; then
