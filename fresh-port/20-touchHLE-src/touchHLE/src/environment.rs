@@ -1286,6 +1286,14 @@ impl Environment {
             #[cfg(target_arch = "wasm32")]
             {
                 if last_yield.elapsed() >= Duration::from_millis(16) {
+                    // [WASM 启动页闪烁修复] guest 卡死时(如等离线服务器、稳态 0.3 MIPS)其 run loop
+                    // 几乎不 tick → 合成器 recomposite 不被调用 → canvas 不重绘 → 浏览器在两次稀疏
+                    // 绘制之间合成到陈旧/被清空的黑 canvas → 画面与黑屏来回闪。让出给浏览器前强制
+                    // 合成一次,保证 canvas 始终是最新一帧(全屏 EAGL 快路径的游戏 recomposite 会自己
+                    // 早退,无副作用;桌面/iOS 不走此 reactor 分支,五平台零回归)。
+                    // ★只重 present 上次合成好的纹理(纯 GL,不发 ObjC),不能调 recomposite——它会
+                    // 发 ObjC 消息回弹 guest 代码、而此处无 guest CPU 上下文 → 崩(classes.rs:225)。
+                    crate::frameworks::core_animation::repaint_last_frame(&mut self);
                     // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
                     unsafe { emscripten_sleep(0) };
                     last_yield = Instant::now();
