@@ -13,7 +13,7 @@
 | M0 | 真实 crate **lib 编译到 wasm** | ✅ **核心达成** | touchHLE.wasm 55MB 产出 |
 | M0.5 | **binary 链接 → 可加载 .wasm+.js** | ✅ **达成** | touchHLE.js 564KB + .wasm 76MB |
 | M1 | guest 跑起来(协程 fibers/JSPI + mem 手术 + 主循环反应堆化) | ✅ **达成** | boot 打到 UIApplicationMain + app delegate |
-| M2 | 标题画面第一帧(GLES1→WebGL2) | 🔄 **进行中** | ✅GL ES1.1 via WebGL2 上下文创建成功 + splash 首帧渲染;⏳卡 asyncify fiber |
+| M2 | 标题画面第一帧(GLES1→WebGL2) | ✅ **达成** | **浏览器渲染出淘米 logo→摩尔庄园海洋标题画面**(全彩纹理/几何全通) |
 | M3 | 音频+输入+GL 补全 → 进村可玩 | ⏳ | 浏览器进村交互 |
 | M4 | IPA 加载+存档+联机+公开 URL | ⏳ | 公开 URL 完整可玩 |
 
