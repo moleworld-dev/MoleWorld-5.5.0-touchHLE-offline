@@ -6,7 +6,7 @@
 //! `CAEAGLLayer`.
 
 use super::ca_layer::CALayerHostObject;
-use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::objc::{id, msg, msg_class, nil, objc_classes, Class, ClassExports};
 use crate::Environment;
 
@@ -70,18 +70,6 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         msg![env; screen bounds]
     };
 
-    let screen = screen_bounds.size;
-    // The screen with width/height swapped — a landscape app's fullscreen layer
-    // on a portrait iPad screen has these dimensions (and a 90° rotation).
-    let swapped = CGSize {
-        width: screen.height,
-        height: screen.width,
-    };
-    let center = CGPoint {
-        x: screen.width / 2.0,
-        y: screen.height / 2.0,
-    };
-
     let mut layer: id = msg![env; top_window layer];
 
     // Descend through the hierarchy, looking only at the last layer in each
@@ -90,42 +78,29 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     loop {
         assert!(layer != nil);
 
-        let h: &CALayerHostObject = env.objc.borrow(layer);
+        let layer_host_obj: &CALayerHostObject = env.objc.borrow(layer);
 
         // This is stricter than it should be. In theory we should accumulate
         // the transforms and handle different anchor points etc, but real apps
         // probably only use this common case.
-        let identity_fs = h.affine_transform.is_identity() && h.bounds.size == screen;
-        // [MoleWorld wasm 启动页闪烁修复] 摩尔是横屏游戏跑在竖屏 iPad(UIScreen=768x1024)上,
-        // 把全屏 CAEAGLLayer 旋转 90°(bounds 与屏幕宽高对调)。原逻辑只认 identity 全屏,这种
-        // 旋转全屏被打回 slow-path 合成;wasm 的 webgl2 后端下 slow-path 每帧 glReadPixels 取游戏
-        // renderbuffer 会抖动(交替读到淘米 splash 帧与游戏帧)→ 启动页来回闪。认下「旋转 90° 后
-        // 仍全屏」即走 fast path 直接 present 当前 renderbuffer(朝向由窗口 rotation_matrix 处理),
-        // 一帧一present,彻底消除合成抖动。只 wasm 门控:桌面/iOS 的 slow-path 本就不闪,保持原样
-        // = 五平台零回归。判旋转:仿射 a≈0,d≈0,|b|≈|c|≈1,b≈-c(纯 90°/270° 转,非翻转/缩放)。
-        let rotated_fs = if cfg!(target_arch = "wasm32") {
-            let t = h.affine_transform;
-            let is_quarter = t.a.abs() < 1e-3
-                && t.d.abs() < 1e-3
-                && (t.b.abs() - 1.0).abs() < 1e-3
-                && (t.c.abs() - 1.0).abs() < 1e-3
-                && (t.b + t.c).abs() < 1e-3;
-            is_quarter && h.bounds.size == swapped
-        } else {
-            false
-        };
-
-        let ok = (identity_fs || rotated_fs)
-            && h.bounds.origin == (CGPoint { x: 0.0, y: 0.0 })
-            && h.anchor_point == (CGPoint { x: 0.5, y: 0.5 })
-            && h.position == center
-            && !h.hidden
-            && h.opacity == 1.0;
-        if !ok {
+        if layer_host_obj.bounds.size != screen_bounds.size
+            || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
+            || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
+            || layer_host_obj.position
+                != (CGPoint {
+                    x: screen_bounds.size.width / 2.0,
+                    y: screen_bounds.size.height / 2.0,
+                })
+            || layer_host_obj.hidden
+            || layer_host_obj.opacity != 1.0
+            // TODO: support affine transforms that result in a full-screen
+            //       layer (typical example is 90° rotation).
+            || !layer_host_obj.affine_transform.is_identity()
+        {
             return nil;
         }
 
-        if let Some(&next) = h.sublayers.last() {
+        if let Some(&next) = layer_host_obj.sublayers.last() {
             layer = next;
         } else {
             break;
