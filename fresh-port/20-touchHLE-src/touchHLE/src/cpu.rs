@@ -379,3 +379,10 @@ impl Cpu {
         }
     }
 }
+
+/// [WASM 性能仪表] 读累计已执行 guest 指令数(由解释器在 chunk 边界累加)。
+/// `environment::run()` 每秒读它算 MIPS。wasm 必走解释器,故只在此目标编入。
+#[cfg(target_arch = "wasm32")]
+pub fn guest_insns_executed() -> u64 {
+    interpreter::INSN_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+}

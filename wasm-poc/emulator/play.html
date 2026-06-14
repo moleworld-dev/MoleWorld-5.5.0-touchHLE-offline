@@ -90,6 +90,7 @@
   <span class="title">🐹 摩尔庄园 · 浏览器版</span>
   <span class="badge" id="status">准备中…</span>
   <span class="badge" id="fps">FPS —</span>
+  <span class="badge" id="mips" title="解释器吞吐:每秒执行的 guest 指令数(百万)">— MIPS</span>
   <span class="spacer"></span>
   <button id="reload" title="重新加载页面重启游戏">↻ 重启</button>
   <button id="toggle">≡ 折叠日志</button>
@@ -118,7 +119,7 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'),
+  const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'), mipsEl = $('mips'),
         hintEl = $('hint'), countEl = $('logcount'), filterEl = $('filter'),
         errOnlyEl = $('erronly');
   const MAX_LINES = 4000;          // 日志环形上限,防内存爆
@@ -176,6 +177,14 @@
     // FPS:从游戏自带的 "touchHLE: ... FPS: N.NN" 日志解析
     const m = t.match(/FPS:\s*([\d.]+)/);
     if (m) fpsEl.textContent = 'FPS ' + Math.round(parseFloat(m[1]));
+    // MIPS:从解释器仪表 "[MIPS] N.N M instr/s" 解析(解释器吞吐)
+    const mm = t.match(/\[MIPS\]\s*([\d.]+)/);
+    if (mm) {
+      const v = parseFloat(mm[1]);
+      mipsEl.textContent = v.toFixed(1) + ' MIPS';
+      (window.__mips || (window.__mips = [])).push(v);   // 供无头 harness 读峰值
+      console.log(t);
+    }
     scheduleRender();
   }
 
