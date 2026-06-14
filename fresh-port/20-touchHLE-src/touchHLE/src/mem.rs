@@ -371,17 +371,36 @@ impl Mem {
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than
-    /// panicking on failure. Only for use by [crate::gdb::GdbServer].
+    /// panicking on failure. Used by [crate::gdb::GdbServer] and, crucially, as
+    /// the pure-Rust interpreter's per-instruction load/fetch primitive (so its
+    /// fast path matters on wasm/iOS).
     pub fn get_bytes_fallible(&self, addr: ConstVoidPtr, count: GuestUSize) -> Option<&[u8]> {
         if addr.to_bits() < self.null_segment_size {
             return None;
         }
-        self.bytes()
-            .get(addr.to_bits() as usize..)?
-            .get(..count as usize)
+        let start = addr.to_bits() as usize;
+        // [WASM 性能] guest 地址空间在 wasm 上固定在 [0, size_of::<Bytes>())(=1GiB:见 Bytes
+        // 定义 + VMAllocator 上界 MAIN_THREAD_STACK_LOW_END + BOGUS_ALLOC_THRESHOLD,栈也被
+        // mem 手术挪进窗口顶端)。做一次显式上界检查后 get_unchecked,省掉 .get().get() 的两次
+        // 切片边界检查(访存是逐指令热点)。越界仍返回 None(不 trap,与原 .get() 路径行为一致)。
+        // target-scoped:其余四平台(mac/win/linux/android/ios)保持原安全切片路径,零影响。
+        #[cfg(target_arch = "wasm32")]
+        {
+            let end = start.checked_add(count as usize)?;
+            if end <= std::mem::size_of::<Bytes>() {
+                Some(unsafe { self.bytes().get_unchecked(start..end) })
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.bytes().get(start..)?.get(..count as usize)
+        }
     }
     /// Special version of [Self::bytes_at_mut] that returns [None] rather than
-    /// panicking on failure. Only for use by [crate::gdb::GdbServer].
+    /// panicking on failure. Used by [crate::gdb::GdbServer] and the interpreter's
+    /// per-instruction store primitive (see [Self::get_bytes_fallible]).
     pub fn get_bytes_fallible_mut(
         &mut self,
         addr: ConstVoidPtr,
@@ -390,9 +409,21 @@ impl Mem {
         if addr.to_bits() < self.null_segment_size {
             return None;
         }
-        self.bytes_mut()
-            .get_mut(addr.to_bits() as usize..)?
-            .get_mut(..count as usize)
+        let start = addr.to_bits() as usize;
+        // [WASM 性能] 见 get_bytes_fallible:同样的「显式上界检查 + get_unchecked_mut」快路径。
+        #[cfg(target_arch = "wasm32")]
+        {
+            let end = start.checked_add(count as usize)?;
+            if end <= std::mem::size_of::<Bytes>() {
+                Some(unsafe { self.bytes_mut().get_unchecked_mut(start..end) })
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.bytes_mut().get_mut(start..)?.get_mut(..count as usize)
+        }
     }
 
     /// Get a slice for reading `count` bytes. This is the basic primitive for
