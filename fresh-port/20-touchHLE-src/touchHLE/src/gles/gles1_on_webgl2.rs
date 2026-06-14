@@ -1525,6 +1525,17 @@ impl GLES for GLES1OnWebGL2<'_> {
 
     // ── 清屏 ──
     unsafe fn Clear(&mut self, mask: GLbitfield) {
+        // ★地表黑根因修复:游戏庄园的「地表/草地」不是纹理 sprite,而是 -[VillageLayer init] 里设一次的
+        // glClearColor 草绿(74,166,57);每帧 drawScene 的 glClear 用的是【底层持久 clear-color 状态】。
+        // 但合成器(composition.rs)与 present_frame(present.rs)各自 ClearColor(0,0,0,1) 把【共享的底层
+        // WebGL2 clear-color】污染成黑(游戏与合成器虽是不同 GLES 上下文,但 emscripten 下共用同一个底层
+        // WebGL2 context、clear-color 是单一全局态)→ 游戏 glClear 清成黑 → 地表黑。修:每次 Clear 前用
+        // 本上下文 CPU 权威态 self.state.clear_color 把底层 clear-color 重申回去(游戏上下文里它=草绿,
+        // 合成器上下文里它=黑,各自正确)。仅 wasm 后端,五平台零回归。
+        if mask & gles11::COLOR_BUFFER_BIT != 0 {
+            let [r, g, b, a] = self.state.clear_color;
+            gl30::ClearColor(r, g, b, a);
+        }
         gl30::Clear(mask);
     }
     unsafe fn ClearColor(
