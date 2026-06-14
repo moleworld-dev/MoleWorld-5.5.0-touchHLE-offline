@@ -661,8 +661,12 @@ impl GLES1OnWebGL2<'_> {
 
     /// 把 *= other(右乘),等价固定管线的 glMultMatrix(current = current * m)。
     fn mult_current(&mut self, m: &Matrix<4>) {
+        // glMultMatrix(m):GL 语义是 current = current × m(数学)。Matrix::multiply 的约定是
+        // a.multiply(b) = b × a(见 matrix.rs),所以 current × m 要写成 m.multiply(current)。
+        // 原来写 top.multiply(m) = m × current(反了),单次 mult(× 单位)无碍,但多次 mult
+        // (cocos2d 每个节点的 push/translate/scale)会把变换叠错。
         let top = self.state.current_stack_top_mut();
-        *top = top.multiply(m);
+        *top = m.multiply(top);
     }
 
     // ── 定点数组转换:照搬 gles1_on_gl2,但输出到 float Vec(draw 时打进 VBO)──
@@ -748,6 +752,20 @@ impl GLES1OnWebGL2<'_> {
         }
         let mut plans: Vec<Plan> = Vec::new();
 
+        // ★ VBO 源数组(buffer_binding != 0):数据已在真 WebGL2 buffer 里,直接从那读,不走
+        // staging。cocos2d-iphone 用 VBO(交错 ccV3F_C4B_T2F)画 sprite——这条路径是带纹理绘制
+        // 能出来的关键。
+        struct VboPlan {
+            loc: GLuint,
+            size: GLint,
+            gl_type: GLenum,
+            normalized: GLboolean,
+            stride: GLsizei,
+            offset: *const GLvoid,
+            buffer: GLuint,
+        }
+        let mut vbo_plans: Vec<VboPlan> = Vec::new();
+
         // 处理顺序:VERTEX / COLOR / TEXCOORD。
         for (idx, loc) in [
             (ARRAY_VERTEX, LOC_POSITION),
@@ -799,14 +817,23 @@ impl GLES1OnWebGL2<'_> {
                     offset,
                 });
             } else {
-                // 数组源在 VBO 里:本后端首版不支持(把它打进 staging 需 MapBuffer),
-                // 直接禁用该 attrib(标题画面用 client 数组,不触发)。
-                gl30::DisableVertexAttribArray(loc);
-                continue;
+                // ★ 数组源在 guest VBO 里。GenBuffers/BindBuffer/BufferData 都已转发到真 WebGL2
+                // buffer,数据就在 arr.buffer_binding 里;arr.pointer 是 VBO 内字节偏移、arr.stride
+                // 是交错步长。直接从该 buffer 配 attrib(原来这里 disable → attrib 落到 WebGL2
+                // generic 默认 (0,0,0,1)=黑 + 顶点退化 → 带纹理绘制全黑的根因)。
+                vbo_plans.push(VboPlan {
+                    loc,
+                    size: arr.size,
+                    gl_type: arr.type_,
+                    normalized: color_needs_normalize(idx, arr.type_),
+                    stride: Self::array_stride_bytes(&arr) as GLsizei,
+                    offset: arr.pointer,
+                    buffer: arr.buffer_binding,
+                });
             }
         }
 
-        // 一次性把 staging 传进 VBO。
+        // 一次性把 staging 传进后端 staging VBO(此时 ARRAY_BUFFER 仍绑 self.vbo)。
         if !staging.is_empty() {
             gl30::BufferData(
                 gl30::ARRAY_BUFFER,
@@ -816,7 +843,7 @@ impl GLES1OnWebGL2<'_> {
             );
         }
 
-        // 配置每个 attrib(offset 现在是 VBO 内偏移)。
+        // 配置 staging 来源的 attrib(offset 现在是 staging VBO 内偏移)。
         for p in &plans {
             gl30::EnableVertexAttribArray(p.loc);
             gl30::VertexAttribPointer(
@@ -828,6 +855,15 @@ impl GLES1OnWebGL2<'_> {
                 p.offset as *const GLvoid,
             );
         }
+
+        // 配置 VBO 来源的 attrib:绑各自的 buffer 后 VertexAttribPointer(把该 buffer 记进 VAO)。
+        for p in &vbo_plans {
+            gl30::BindBuffer(gl30::ARRAY_BUFFER, p.buffer);
+            gl30::EnableVertexAttribArray(p.loc);
+            gl30::VertexAttribPointer(p.loc, p.size, p.gl_type, p.normalized, p.stride, p.offset);
+        }
+        // 恢复 ARRAY_BUFFER 绑回后端 staging VBO,避免影响后续状态。
+        gl30::BindBuffer(gl30::ARRAY_BUFFER, self.vbo);
     }
 
     /// 传 uniform + 绑纹理 + 应用固定功能硬件状态,然后 UseProgram。
@@ -835,11 +871,15 @@ impl GLES1OnWebGL2<'_> {
         let prog = self.program;
         gl30::UseProgram(prog.prog);
 
-        // u_mvp = projection * modelview
+        // u_mvp = projection * modelview。★注意 Matrix::multiply 的约定:a.multiply(b) 实际
+        // 返回数学上的 b × a(见 matrix.rs)。所以要得到 projection × modelview,必须写成
+        // modelview.multiply(projection)。原来写成 projection.multiply(modelview) = modelview ×
+        // projection(顺序反了)→ 单位矩阵(present quad)无所谓,但 cocos2d 的 perspective×lookat
+        // 被反乘 → 顶点落到屏幕外 → 全黑。这是带纹理绘制全黑的真正根因。
         let mvp = self
             .state
-            .top_projection()
-            .multiply(self.state.top_modelview());
+            .top_modelview()
+            .multiply(self.state.top_projection());
         gl30::UniformMatrix4fv(
             prog.loc_mvp,
             1,
@@ -1420,6 +1460,21 @@ impl GLES for GLES1OnWebGL2<'_> {
         indices: *const GLvoid,
     ) {
         if count <= 0 {
+            return;
+        }
+        // ★ 索引在 guest 的 element-array VBO 里(cocos2d-iphone 用 VBO 画 sprite):此时 indices
+        // 是 VBO 内字节偏移、不是 client 指针,绝不能当指针解引用读 max_index(会读到垃圾/崩)。
+        // 顶点数组同样都在 VBO(upload_arrays_and_setup 对 VBO 源数组不需要 vertex_count)。直接绑
+        // 该 EBO、以 offset 形式 DrawElements。这是 cocos2d 画面能出来的另一半关键(配 upload 的
+        // VBO 顶点数组支持)。
+        if self.state.element_array_buffer_binding != 0 {
+            self.upload_arrays_and_setup(0);
+            self.setup_draw_state();
+            gl30::BindBuffer(
+                gl30::ELEMENT_ARRAY_BUFFER,
+                self.state.element_array_buffer_binding,
+            );
+            gl30::DrawElements(mode, count, type_, indices);
             return;
         }
         // 找出最大索引,确定需要上传多少顶点。
