@@ -28,6 +28,12 @@ const CPSR_THUMB: u32 = 0x0000_0020;
 const CPSR_USER_MODE: u32 = 0x0000_0010;
 const PC: usize = 15;
 
+/// [WASM 性能仪表] 累计已执行的 guest 指令数。只在 `run_or_step` 的 **chunk 边界**
+/// 累加一次(非逐指令),开销可忽略;`environment::run()` 每秒读它算 MIPS。
+/// 只在 wasm 编入,五平台(mac/win/linux/android/ios)完全不引入此符号。
+#[cfg(target_arch = "wasm32")]
+pub static INSN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// CPU context for guest thread switches. Layout is the interpreter's own (only
 /// the interpreter reads it); when the dynarmic backend is also compiled (P1
 /// differential harness) this must be made bit-compatible with that backend's
@@ -473,15 +479,26 @@ impl InterpreterCpu {
     pub fn run_or_step(&mut self, mem: &mut Mem, ticks: Option<&mut u64>) -> CpuState {
         match ticks {
             None => self.step_one(mem),
-            Some(budget) => loop {
-                let st = self.step_one(mem);
-                *budget = budget.saturating_sub(1);
-                match st {
-                    CpuState::Normal if *budget > 0 => continue,
-                    CpuState::Normal => return CpuState::Normal,
-                    halt => return halt, // Svc / Error: return immediately
-                }
-            },
+            Some(budget) => {
+                // [WASM 性能仪表] 本 chunk 内执行的指令数,仅 wasm 计;循环末一次性原子加。
+                #[cfg(target_arch = "wasm32")]
+                let mut executed: u64 = 0;
+                let result = loop {
+                    let st = self.step_one(mem);
+                    *budget = budget.saturating_sub(1);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        executed += 1;
+                    }
+                    match st {
+                        CpuState::Normal if *budget > 0 => continue,
+                        other => break other, // Svc / Error / budget exhausted
+                    }
+                };
+                #[cfg(target_arch = "wasm32")]
+                INSN_COUNTER.fetch_add(executed, std::sync::atomic::Ordering::Relaxed);
+                result
+            }
         }
     }
 
@@ -533,9 +550,9 @@ impl InterpreterCpu {
             return CpuState::Svc(imm24);
         }
 
-        // [P1 debug] log first few instructions, and any jump into the stack
-        // region (control-flow bug) together with the PREVIOUS instruction (the
-        // culprit that wrote the bad PC).
+        // [P1 debug] heartbeat / trace 环形缓冲 / derail 检测。**逐指令热路径开销**,默认编译掉
+        // (只有 `interp_diag` feature 开时才编入)。调崩溃时 `--features interp_diag` 打开拿心跳/trace。
+        #[cfg(feature = "interp_diag")]
         {
             self.dbg_n = self.dbg_n.wrapping_add(1);
             let _n = self.dbg_n;

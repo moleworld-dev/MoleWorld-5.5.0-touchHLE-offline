@@ -1277,6 +1277,11 @@ impl Environment {
         // 让出一次(用 Instant 节流,避免每次迭代都付 asyncify 展开开销)。
         #[cfg(target_arch = "wasm32")]
         let mut last_yield = Instant::now();
+        // [WASM 性能仪表] 每秒报一次解释器吞吐(MIPS)。读全局计数器算增量,极廉价。
+        #[cfg(target_arch = "wasm32")]
+        let mut mips_t0 = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let mut mips_n0: u64 = 0;
         loop {
             #[cfg(target_arch = "wasm32")]
             {
@@ -1284,6 +1289,20 @@ impl Environment {
                     // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
                     unsafe { emscripten_sleep(0) };
                     last_yield = Instant::now();
+                }
+                let mips_dt = mips_t0.elapsed();
+                if mips_dt >= Duration::from_secs(1) {
+                    let n = crate::cpu::guest_insns_executed();
+                    let secs = mips_dt.as_secs_f64();
+                    let mips = (n - mips_n0) as f64 / secs / 1.0e6;
+                    echo!(
+                        "[MIPS] {:.1} M instr/s  (+{} insns / {:.2}s)",
+                        mips,
+                        n - mips_n0,
+                        secs
+                    );
+                    mips_t0 = Instant::now();
+                    mips_n0 = n;
                 }
             }
             if stepping {

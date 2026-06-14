@@ -53,6 +53,10 @@ static = ["sdl2/bundled", "sdl2/static-link", "touchHLE_openal_soft_wrapper/stat
 # iOS 无可执行内存→纯 Rust 解释器:--no-default-features --features static,cpu_interpreter
 cpu_dynarmic = ["dep:touchHLE_dynarmic_wrapper"]
 cpu_interpreter = []
+# 解释器逐指令诊断(HEARTBEAT 心跳 / trace 环形缓冲 / DERAIL 检测)。**默认关=性能优先**;
+# 调崩溃时 `--features cpu_interpreter,interp_diag` 打开拿心跳/trace。每指令热路径上的开销,
+# 关掉给 wasm release 解释器大幅提速。
+interp_diag = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

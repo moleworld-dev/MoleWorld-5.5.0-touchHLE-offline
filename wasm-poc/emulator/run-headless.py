@@ -194,6 +194,20 @@ def main():
                   f"css={info.get('cssw')}x{info.get('cssh')} preserveDrawingBuffer={info.get('preserve')}")
         except Exception as e:
             print(f"[harness] canvas info 失败: {e}")
+        # 解释器吞吐(MIPS):play.html 把每秒读数收进 window.__mips。打印全序列 + 峰值/中位。
+        try:
+            mips = page.evaluate("window.__mips || []") or []
+            if mips:
+                srt = sorted(mips)
+                peak = srt[-1]
+                med = srt[len(srt) // 2]
+                print(f"[harness] MIPS 读数({len(mips)} 个/秒): " +
+                      " ".join(f"{m:.1f}" for m in mips))
+                print(f"[harness] MIPS 峰值={peak:.1f}  中位={med:.1f}")
+            else:
+                print("[harness] 无 MIPS 读数(游戏未进入 CPU 稳态?)")
+        except Exception as e:
+            print(f"[harness] 取 MIPS 失败: {e}")
         # 从 emscripten MEMFS 读 /frame.ppm(present.rs 写的真实渲染帧),存成 PNG。
         try:
             b64 = page.evaluate(
