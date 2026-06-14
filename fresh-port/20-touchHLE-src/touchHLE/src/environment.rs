@@ -1293,7 +1293,12 @@ impl Environment {
                     // 早退,无副作用;桌面/iOS 不走此 reactor 分支,五平台零回归)。
                     // ★只重 present 上次合成好的纹理(纯 GL,不发 ObjC),不能调 recomposite——它会
                     // 发 ObjC 消息回弹 guest 代码、而此处无 guest CPU 上下文 → 崩(classes.rs:225)。
-                    crate::frameworks::core_animation::repaint_last_frame(&mut self);
+                    // [拖动闪烁修复] 仅在 guest 真卡(>=50ms 没出新帧)才 repaint 兜底防黑屏;活跃出帧期
+                    // (拖动)slow-path 已 force 合成出当前帧、canvas 本就新鲜,再 repaint 会把旧帧贴回来
+                    // 与新帧打拍 = 闪。50ms≈3 帧:流畅拖动全程抑制 repaint;启动页/等服务器(秒级停滞)照常兜底。
+                    if crate::frameworks::core_animation::present_clock::ms_since_last_present() >= 50 {
+                        crate::frameworks::core_animation::repaint_last_frame(&mut self);
+                    }
                     // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
                     unsafe { emscripten_sleep(0) };
                     last_yield = Instant::now();
