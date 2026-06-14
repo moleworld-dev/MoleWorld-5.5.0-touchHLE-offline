@@ -56,6 +56,37 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
 }
 
+/// [WASM 启动页闪烁修复] 安全地从主反应堆重绘最近一帧:只把上次合成好的纹理重新 present 到
+/// canvas,**不跑任何 ObjC**(present_frame 是纯 GL),故可在 guest 协程外、让出浏览器前安全调用。
+/// 背景:guest 慢时(如卡离线服务器、稳态 0.3 MIPS)其 run loop 罕调 recomposite → canvas 长时间
+/// 不刷新 → 浏览器在两次稀疏绘制之间合成到陈旧/被清空的黑 canvas → 画面与黑屏来回闪。让出前
+/// repaint 一次即可保 canvas 始终是最新合成帧。还没合成过(无缓存纹理)则跳过。
+/// 注:不能直接从反应堆调 recomposite_if_necessary——它会发 ObjC 消息(displayIfNeeded 等)可能
+/// 回弹到 guest 代码,而此处没有 guest CPU 上下文 → 崩(实测 classes.rs:225 "Could not get class name")。
+#[cfg(target_arch = "wasm32")]
+pub fn repaint_last_frame(env: &mut Environment) {
+    let Some((texture, _fb)) = env
+        .framework_state
+        .core_animation
+        .composition
+        .texture_framebuffer
+    else {
+        return;
+    };
+    let viewport = env.window().viewport();
+    let rotation = env.window().rotation_matrix();
+    let cursor = env.window().virtual_cursor_visible_at();
+    let default_fbo = env.window().default_framebuffer();
+    let window = env.window.as_mut().unwrap();
+    let mut gles = window.make_internal_gl_ctx_current();
+    unsafe {
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        present_frame(gles.as_mut(), viewport, rotation, cursor, default_fbo);
+    }
+    std::mem::drop(gles);
+    window.swap_window();
+}
+
 /// For use by `NSRunLoop`: call this 60 times per second. Composites the app's
 /// visible layers (i.e. UI) and presents it to the screen. Does nothing if
 /// composition isn't in use or it's too soon (the latter check is skipped if
