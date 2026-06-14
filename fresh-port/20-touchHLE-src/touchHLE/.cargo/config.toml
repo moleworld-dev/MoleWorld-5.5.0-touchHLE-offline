@@ -17,6 +17,14 @@ rustflags = [
   # rustc 1.96 还没有 -C ub-checks,只能整体关 debug-assertions(= release 对该类检查的行为)。
   # 拷贝运行时完全正确,关掉只是去掉误报。target-scoped 只作用 wasm,五平台零影响。
   "-C", "debug-assertions=off",
+  # [WASM 性能] 解释器是逐指令派发的紧循环,opt-level=3 的更激进内联/循环展开正中其工况
+  # ([profile.release] 只设了 lto+codegen-units,opt-level 仍是 release 默认的 2)。
+  # 用 rustflags 而非 [profile.release] opt-level,只作用 wasm,其余四平台保持各自 release 档。
+  "-C", "opt-level=3",
+  # [WASM 性能] 启用稳定 wasm 扩展:bulk-memory → 原生 memory.copy/fill(data_w_* 的
+  # copy_from_slice、IPA/Mach-O 大块拷贝提速);sign-ext → 原生 i32.extend8_s/16_s
+  # (解释器大量符号扩展:asr_c、有符号乘法、LDRSB/LDRSH)。两者所有现代浏览器都支持。
+  "-C", "target-feature=+bulk-memory,+sign-ext",
   "-C", "link-arg=-sUSE_SDL=2",
   "-C", "link-arg=-lopenal",
   "-C", "link-arg=-sMAX_WEBGL_VERSION=2",
@@ -25,7 +33,10 @@ rustflags = [
   "-C", "link-arg=-sALLOW_MEMORY_GROWTH=1",
   "-C", "link-arg=-sMAXIMUM_MEMORY=2147483648",
   "-C", "link-arg=-sEXIT_RUNTIME=0",
-  "-C", "link-arg=-sASSERTIONS=1",
+  # [WASM 性能] release 关 emscripten 运行期断言(栈溢出/对齐/malloc 完整性等),它们在
+  # 每次 asyncify 让出 + glue 边界都有开销。touchHLE 自己的 null_segment_size/get_bytes_fallible
+  # 检查仍在,安全网不变;调试期要排查再临时改回 1。
+  "-C", "link-arg=-sASSERTIONS=0",
   "-C", "link-arg=-sALLOW_TABLE_GROWTH=1",
   # [M1] emscripten fibers(guest 协程栈切换,替 corosensei)必需 ASYNCIFY 插桩。
   "-C", "link-arg=-sASYNCIFY=1",
