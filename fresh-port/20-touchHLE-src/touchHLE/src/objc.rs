@@ -71,7 +71,9 @@ pub struct ObjC {
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: HashMap<id, HostObjectEntry>,
+    /// [MoleWorld perf] FxHash:每条 msgSend 都按 receiver(u32 指针)查这张表拿 isa/host object;
+    /// 非密码学哈希足够(key 是内部指针、不面对攻击者),比 SipHash 快数倍。
+    objects: rustc_hash::FxHashMap<id, HostObjectEntry>,
 
     /// Known classes.
     ///
@@ -94,7 +96,7 @@ impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
             selectors: HashMap::new(),
-            objects: HashMap::new(),
+            objects: rustc_hash::FxHashMap::default(),
             classes: HashMap::new(),
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
