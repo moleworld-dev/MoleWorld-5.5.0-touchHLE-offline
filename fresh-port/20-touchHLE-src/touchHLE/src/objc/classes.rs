@@ -36,7 +36,9 @@ pub(super) struct ClassHostObject {
     pub(super) name: String,
     pub(super) is_metaclass: bool,
     pub(super) superclass: Class,
-    pub(super) methods: HashMap<SEL, IMP>,
+    // [MoleWorld perf] FxHash:每条 msgSend 沿超类链逐层查这张 SEL→IMP 表(最热的查找),
+    // 换非密码学哈希比 SipHash 快数倍。
+    pub(super) methods: rustc_hash::FxHashMap<SEL, IMP>,
     pub(super) guest_method_signatures: HashMap<SEL, ConstPtr<u8>>,
     /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
     /// (Alignment is used during ivar reconciliation.)
@@ -362,7 +364,7 @@ impl ClassHostObject {
             name: template.name.to_string(),
             is_metaclass,
             superclass,
-            methods: HashMap::from_iter(
+            methods: rustc_hash::FxHashMap::from_iter(
                 (if is_metaclass {
                     template.class_methods
                 } else {
@@ -404,7 +406,7 @@ impl ClassHostObject {
             name,
             is_metaclass,
             superclass,
-            methods: HashMap::new(),
+            methods: rustc_hash::FxHashMap::default(),
             guest_method_signatures: HashMap::new(),
             instance_start,
             instance_size,
