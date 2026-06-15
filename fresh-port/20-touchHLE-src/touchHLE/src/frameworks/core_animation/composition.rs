@@ -63,8 +63,45 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 /// repaint 一次即可保 canvas 始终是最新合成帧。还没合成过(无缓存纹理)则跳过。
 /// 注:不能直接从反应堆调 recomposite_if_necessary——它会发 ObjC 消息(displayIfNeeded 等)可能
 /// 回弹到 guest 代码,而此处没有 guest CPU 上下文 → 崩(实测 classes.rs:225 "Could not get class name")。
+/// [MoleWorld wasm perf] 上一帧 presentRenderbuffer 走了「直呈 fbo0」短路(跳过回读+重合成)的标志。
+/// 置位时 recomposite/repaint 都不要再画 fbo0(否则会用陈旧合成帧盖掉 cocos2d 刚直画的村庄)。
+#[cfg(target_arch = "wasm32")]
+pub static DIRECT_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [MoleWorld wasm perf] 是否有 UIKit 浮层(alert/HUD/文本输入等)叠加在游戏画面上。判据=可见图层树里
+/// 有任何带 UIKit 绘制内容(contents 图像 或 cg_context 位图)的层——游戏自身的 CAEAGLLayer 是 GL 层,
+/// 既无 contents 也无 cg_context,故稳态村庄返回 false=可直呈;弹窗/HUD/输入框出现则返回 true=回落合成。
+#[cfg(target_arch = "wasm32")]
+pub fn has_uikit_overlay(env: &mut Environment) -> bool {
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let mut roots = Vec::new();
+    for window in windows {
+        if !msg![env; window isHidden] {
+            let layer: id = msg![env; window layer];
+            roots.push(layer);
+        }
+    }
+    fn walk(objc: &ObjC, layer: id) -> bool {
+        let h = objc.borrow::<CALayerHostObject>(layer);
+        if h.hidden {
+            return false;
+        }
+        if h.contents != nil || h.cg_context.is_some() {
+            return true;
+        }
+        let subs = h.sublayers.clone();
+        drop(h);
+        subs.into_iter().any(|s| walk(objc, s))
+    }
+    roots.into_iter().any(|r| walk(&env.objc, r))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn repaint_last_frame(env: &mut Environment) {
+    // 直呈短路活跃时,canvas 已是 cocos2d 直画的村庄(preserveDrawingBuffer 保留),别用旧合成帧盖掉。
+    if DIRECT_PRESENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let Some((texture, _fb)) = env
         .framework_state
         .core_animation
@@ -94,6 +131,12 @@ pub fn repaint_last_frame(env: &mut Environment) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    // [MoleWorld wasm perf] 直呈短路活跃(无 UIKit 浮层、游戏直画 fbo0)→ 不合成,省下回读纹理上传+
+    // 全屏合成+present 的 round-trip(实测 readpixels 6%+recompose 16%=22% wall-clock)。
+    #[cfg(target_arch = "wasm32")]
+    if DIRECT_PRESENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let mut animation_state = animation::State::default();
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     if !windows.iter().any(|&window| !msg![env; window isHidden]) {

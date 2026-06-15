@@ -368,6 +368,27 @@ pub const CLASSES: ClassExports = objc_classes! {
             renderbuffer,
             drawable,
         );
+        // [MoleWorld wasm perf] 直呈短路:游戏已把村庄直画在 fbo0(canvas,cocos2d_render_fbo==0)且无 UIKit
+        // 浮层(alert/HUD/文本)需合成时,直接 swap_window 呈现 fbo0,跳过 glReadPixels 回读 + present_pixels +
+        // 合成器重新上传纹理+全屏合成+present 的整个 round-trip(实测省 readpixels 6%+recompose 16%=22% wall-clock,
+        // 且消除 glReadPixels 的强制 GPU 同步 stall)。有浮层/文本输入/强制合成时回落原 slow path。
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::sync::atomic::Ordering;
+            let can_direct = cocos2d_render_fbo == 0
+                && !crate::frameworks::core_animation::has_uikit_overlay(env)
+                && !crate::window::mole_text_input_active()
+                && !env.options.force_composition;
+            if can_direct {
+                crate::frameworks::core_animation::DIRECT_PRESENT.store(true, Ordering::Relaxed);
+                env.window.as_ref().unwrap().swap_window();
+                if let Some(sleep_for) = sleep_for {
+                    env.sleep(sleep_for);
+                }
+                return true;
+            }
+            crate::frameworks::core_animation::DIRECT_PRESENT.store(false, Ordering::Relaxed);
+        }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
         let (pixels_vec, width, height) = {
