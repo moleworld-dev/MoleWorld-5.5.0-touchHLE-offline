@@ -21,8 +21,6 @@ mod composition;
 pub use composition::recomposite_if_necessary;
 #[cfg(target_arch = "wasm32")]
 pub use composition::repaint_last_frame;
-#[cfg(target_arch = "wasm32")]
-pub use composition::present_clock;
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::time::CFTimeInterval;

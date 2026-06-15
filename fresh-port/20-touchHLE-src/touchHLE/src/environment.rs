@@ -1282,6 +1282,8 @@ impl Environment {
         let mut mips_t0 = Instant::now();
         #[cfg(target_arch = "wasm32")]
         let mut mips_n0: u64 = 0;
+        #[cfg(target_arch = "wasm32")]
+        let mut fps_f0: u64 = 0;
         loop {
             #[cfg(target_arch = "wasm32")]
             {
@@ -1293,12 +1295,9 @@ impl Environment {
                     // 早退,无副作用;桌面/iOS 不走此 reactor 分支,五平台零回归)。
                     // ★只重 present 上次合成好的纹理(纯 GL,不发 ObjC),不能调 recomposite——它会
                     // 发 ObjC 消息回弹 guest 代码、而此处无 guest CPU 上下文 → 崩(classes.rs:225)。
-                    // [拖动闪烁修复] 仅在 guest 真卡(>=50ms 没出新帧)才 repaint 兜底防黑屏;活跃出帧期
-                    // (拖动)slow-path 已 force 合成出当前帧、canvas 本就新鲜,再 repaint 会把旧帧贴回来
-                    // 与新帧打拍 = 闪。50ms≈3 帧:流畅拖动全程抑制 repaint;启动页/等服务器(秒级停滞)照常兜底。
-                    if crate::frameworks::core_animation::present_clock::ms_since_last_present() >= 50 {
-                        crate::frameworks::core_animation::repaint_last_frame(&mut self);
-                    }
+                    // 让出前无条件重 present 上次合成帧,保 canvas 始终新鲜(配合 play.html 的
+                    // preserveDrawingBuffer:true 双保险,彻底消除「黑缝」闪烁)。
+                    crate::frameworks::core_animation::repaint_last_frame(&mut self);
                     // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
                     unsafe { emscripten_sleep(0) };
                     last_yield = Instant::now();
@@ -1314,6 +1313,12 @@ impl Environment {
                         n - mips_n0,
                         secs
                     );
+                    // [渲染 FPS] always-on:每秒读 presentRenderbuffer 计数算游戏渲染帧率,echo 成
+                    // play.html 顶栏能解析的 "FPS: N.N"(不依赖 print_fps)。
+                    let frames = crate::frameworks::opengles::frames_presented();
+                    let fps = (frames - fps_f0) as f64 / secs;
+                    echo!("FPS: {:.1}", fps);
+                    fps_f0 = frames;
                     mips_t0 = Instant::now();
                     mips_n0 = n;
                 }

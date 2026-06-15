@@ -25,6 +25,15 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// [MoleWorld wasm] always-on 渲染帧计数:每次 presentRenderbuffer:(=cocos2d 一帧 swapBuffers)自增。
+/// 反应堆(environment.rs run())每秒读它算 FPS 并 echo,play.html 顶栏解析显示——不依赖 print_fps。
+#[cfg(target_arch = "wasm32")]
+pub static FRAMES_PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "wasm32")]
+pub fn frames_presented() -> u64 {
+    FRAMES_PRESENTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
 // Since these have the ABI of constant symbols rather than literal constants,
 // the values shouldn't matter, and haven't been checked against real iPhone OS.
@@ -264,6 +273,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)presentRenderbuffer:(NSUInteger)target {
     assert!(target == gles11::RENDERBUFFER_OES);
 
+    // [MoleWorld wasm] 渲染帧计数(顶栏 FPS,见 FRAMES_PRESENTED)。
+    #[cfg(target_arch = "wasm32")]
+    FRAMES_PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
     let sleep_for = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
@@ -375,13 +388,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             result
         };
         present_pixels(env, drawable, pixels_vec, width, height);
-        // [MoleWorld wasm 拖动闪烁修复] 立刻用【本帧刚存的】presented_pixels 同步合成上屏,消除合成器
-        // 「用上一帧 presented_pixels」的结构性 1 帧滞后(那是拖动时画面步进不均/闪的根因)。此处在
-        // guest CPU 上下文(presentRenderbuffer 经 msg_send 进来),可安全发 ObjC——与 repaint_last_frame
-        // 注释里「反应堆无 guest 上下文不能调 recomposite」不冲突。force=true 跳过 60Hz 节流;它会把
-        // recomposite_next 推到未来,run loop 里 force=false 的 recomposite 随后自然早退去重。
-        #[cfg(target_arch = "wasm32")]
-        crate::frameworks::core_animation::recomposite_if_necessary(env, true);
     }
 
     if let Some(sleep_for) = sleep_for {

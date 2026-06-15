@@ -118,6 +118,19 @@
 
 <script>
 (() => {
+  // [画面闪烁根治] WebGL 默认 preserveDrawingBuffer=false:浏览器每次合成后清 canvas;游戏稳态 ~15fps
+  // 而浏览器 ~60Hz,中间没有新 swap 的浏览器帧会合成到【被清空的黑 canvas】→ 黑帧穿插=闪来闪去。
+  // 强制 preserveDrawingBuffer:true 让 canvas 保留上一帧、两次 swap 之间不变黑(实测亮度大跳变 46→5)。
+  // 在 emscripten 创建 WebGL 上下文【之前】包一层 getContext 即可注入该属性。alpha:false=不透明 canvas。
+  (function () {
+    const orig = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+      if (type === 'webgl2' || type === 'webgl' || type === 'experimental-webgl') {
+        attrs = Object.assign({}, attrs, { preserveDrawingBuffer: true, alpha: false });
+      }
+      return orig.call(this, type, attrs);
+    };
+  })();
   const $ = (id) => document.getElementById(id);
   const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'), mipsEl = $('mips'),
         hintEl = $('hint'), countEl = $('logcount'), filterEl = $('filter'),
