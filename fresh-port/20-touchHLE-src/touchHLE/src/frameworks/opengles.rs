@@ -12,6 +12,9 @@
 mod eagl;
 mod gles_guest;
 
+#[cfg(target_arch = "wasm32")]
+pub use eagl::frames_presented;
+
 use touchHLE_gl_bindings::gles11::types::GLenum;
 
 use crate::mem::ConstPtr;

@@ -460,40 +460,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
     std::mem::drop(gles);
     window.swap_window();
-    // [MoleWorld wasm 拖动闪烁修复] 标记「刚出了一张新鲜合成帧」。反应堆据此抑制 repaint:活跃出帧期
-    // (拖动)间隔远 < 阈值 → 不再周期性把旧 texture_framebuffer 贴回去打拍;只在 guest 真卡(秒级无新帧,
-    // 如启动页/等服务器)才 repaint 兜底防黑屏。
-    #[cfg(target_arch = "wasm32")]
-    present_clock::mark_fresh_present();
 
     animation_state.update_started_and_finished_animations(env);
 
     new_recomposite_next
-}
-
-/// [MoleWorld wasm 拖动闪烁修复] 记录最近一次「真正出帧」(合成器 swap)的墙钟时刻,供反应堆判断
-/// 该不该 repaint。repaint 自己呈现的是旧帧,故【不】打戳——否则新鲜度门控永远不触发。
-#[cfg(target_arch = "wasm32")]
-pub mod present_clock {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::Instant;
-
-    static START: OnceLock<Instant> = OnceLock::new();
-    static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
-
-    fn now_ms() -> u64 {
-        START.get_or_init(Instant::now).elapsed().as_millis() as u64
-    }
-
-    pub fn mark_fresh_present() {
-        LAST_PRESENT_MS.store(now_ms(), Ordering::Relaxed);
-    }
-
-    /// 距上次「真正出帧」过了多少毫秒。
-    pub fn ms_since_last_present() -> u64 {
-        now_ms().saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed))
-    }
 }
 
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
