@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>摩尔庄园 · 浏览器版(touchHLE WASM)</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐹</text></svg>">
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3;
@@ -68,7 +69,7 @@
   }
   #logpane .lhead button:hover{color:var(--fg); background:#21262d}
   #log{
-    flex:1 1 auto; overflow-y:auto; padding:8px 10px; white-space:pre-wrap;
+    flex:1 1 auto; min-height:0; overflow-y:auto; padding:8px 10px; white-space:pre-wrap;
     word-break:break-word; font-size:12px;
   }
   #log .l{color:var(--dim)}
@@ -83,6 +84,58 @@
     border-radius:5px; padding:4px 8px; font:inherit; font-size:12px;
   }
   .filterbar label{display:flex; align-items:center; gap:4px; color:var(--dim); font-size:12px; cursor:pointer}
+  /* ── 存档管理面板(日志下,可折叠)── */
+  #savepane{
+    border-top:1px solid var(--border); flex:0 0 auto;
+    display:flex; flex-direction:column; min-height:0; background:var(--panel);
+  }
+  #savepane .shead{
+    display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;
+    user-select:none; flex:0 0 auto;
+  }
+  #savepane .shead:hover{background:#1c2128}
+  #savepane .shead .caret{display:inline-block; transition:transform .15s ease; color:var(--dim); width:12px}
+  #savepane.open .shead .caret{transform:rotate(90deg)}
+  #savepane .shead .st{font-weight:600}
+  #savepane .shead .spacer{flex:1}
+  #savepane .shead .sub{color:var(--dim); font-size:11px}
+  #savepane .sbody{display:none; flex-direction:column; gap:10px; padding:4px 10px 12px; overflow-y:auto; max-height:48vh}
+  #savepane.open .sbody{display:flex}
+  #savepane .sbody::-webkit-scrollbar{width:10px}
+  #savepane .sbody::-webkit-scrollbar-thumb{background:#30363d; border-radius:5px}
+  .sgrid{display:grid; grid-template-columns:1fr 1fr; gap:6px}
+  .sbtn{
+    background:#21262d; color:var(--fg); border:1px solid var(--border); border-radius:6px;
+    padding:7px 8px; cursor:pointer; font:inherit; font-size:12px; text-align:center;
+    display:flex; align-items:center; justify-content:center; gap:5px;
+  }
+  .sbtn:hover{background:#30363d}
+  .sbtn:disabled{opacity:.45; cursor:not-allowed}
+  .sbtn.danger{border-color:#6e2b2b}
+  .sbtn.danger:hover{background:#3d1d1d}
+  .sbtn.primary{border-color:#2ea043; background:#1a3322}
+  .sbtn.primary:hover{background:#22402a}
+  .srow{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--dim)}
+  .srow .sw{flex:1}
+  .stoggle{
+    display:flex; align-items:center; gap:6px; cursor:pointer; color:var(--fg); font-size:12px;
+  }
+  .sstatus{font-size:11px; color:var(--dim); line-height:1.6}
+  .sstatus b{color:var(--accent); font-weight:600}
+  .sstatus .warnv{color:var(--warn)}
+  .ssection-t{font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; margin-top:2px}
+  .sfiles{display:flex; flex-direction:column; gap:4px}
+  .sfile{border:1px solid var(--border); border-radius:6px; overflow:hidden}
+  .sfile .fh{display:flex; align-items:center; gap:8px; padding:5px 8px; cursor:pointer; font-size:12px}
+  .sfile .fh:hover{background:#1c2128}
+  .sfile .fh .fp{flex:1; word-break:break-all}
+  .sfile .fh .fsz{color:var(--dim); font-size:11px; white-space:nowrap}
+  .sfile .fh .ftag{font-size:10px; padding:1px 6px; border-radius:8px; background:#21262d; color:var(--dim)}
+  .sfile .fbody{display:none; border-top:1px solid var(--border); padding:6px 8px; background:#0d1117}
+  .sfile.open .fbody{display:block}
+  .sfile .fbody .kv{font-size:11px; color:var(--fg); margin-bottom:6px; white-space:pre-wrap; word-break:break-all}
+  .sfile .fbody .hex{font-size:11px; color:var(--dim); white-space:pre; overflow-x:auto; line-height:1.45}
+  .sempty{color:var(--dim); font-size:12px; padding:6px 0}
 </style>
 </head>
 <body>
@@ -113,6 +166,34 @@
       <label><input type="checkbox" id="erronly"> 只看错误</label>
     </div>
     <div id="log"></div>
+    <section id="savepane">
+      <div class="shead" id="stoggle">
+        <span class="caret">▶</span>
+        <span class="st">💾 存档管理</span>
+        <span class="spacer"></span>
+        <span class="sub" id="ssub">点击展开</span>
+      </div>
+      <div class="sbody">
+        <div class="sstatus" id="sstatus">读取存档状态…</div>
+        <div class="sgrid">
+          <button class="sbtn primary" id="sb-export" title="把当前存档(进度)下载成一个文件备份">⬇ 导出存档</button>
+          <button class="sbtn" id="sb-import" title="从备份文件恢复存档(会重启游戏)">⬆ 导入存档</button>
+          <button class="sbtn" id="sb-save" title="立即把当前进度写入浏览器持久化(刷新不丢)">💾 立即保存</button>
+          <button class="sbtn danger" id="sb-reset" title="清除持久化存档,恢复默认初始存档(会重启游戏)">↺ 恢复默认</button>
+          <button class="sbtn" id="sb-undo" title="从最近一次备份(重置/导入/覆盖前自动留存)恢复存档" disabled>↩ 撤销(恢复备份)</button>
+        </div>
+        <label class="stoggle" title="开启后游戏进度自动写入浏览器 IndexedDB,刷新页面不丢失">
+          <input type="checkbox" id="sb-auto" checked> 自动保存进度(刷新不丢失)
+        </label>
+        <div class="ssection-t">存档浏览</div>
+        <div class="srow">
+          <span class="sw" id="sbrowse-hint">展开后点「刷新」查看沙盒内存档文件</span>
+          <button class="sbtn" id="sb-browse" style="flex:0 0 auto; padding:4px 10px">🔄 刷新</button>
+        </div>
+        <div class="sfiles" id="sfiles"></div>
+      </div>
+      <input type="file" id="sb-file" accept=".molesave,.json,application/json" style="display:none">
+    </section>
   </aside>
 </main>
 
@@ -231,6 +312,273 @@
     statusEl.className = 'badge' + (cls ? ' ' + cls : '');
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  //  存档管理:IndexedDB 持久化 + 导入/导出/重置/浏览
+  //  wasm 版文件系统是 MEMFS(内存),刷新即丢——这里把沙盒里的存档文件镜像到
+  //  IndexedDB:页面加载时优先用它当种子(进度刷新不丢),并提供手动导入/导出/重置/浏览。
+  // ═══════════════════════════════════════════════════════════════════════
+  const SBOX = '/touchHLE_sandbox/com.taomee.MoleWorld';
+  // 默认种子文件名 → 沙盒相对路径(plist 落 Library/Preferences,其余落 Documents)
+  const SAVE_REL = (name) => name.endsWith('.plist')
+    ? 'Library/Preferences/' + name : 'Documents/' + name;
+
+  // ---- IndexedDB:存玩家存档镜像(key='player')----
+  const saveDB = {
+    _db: null,
+    open() {
+      if (this._db) return Promise.resolve(this._db);
+      return new Promise((res, rej) => {
+        const rq = indexedDB.open('moleworld-saves', 1);
+        rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+        rq.onsuccess = () => { this._db = rq.result; res(this._db); };
+        rq.onerror = () => rej(rq.error);
+      });
+    },
+    async get(key) {
+      const db = await this.open();
+      return new Promise((res, rej) => {
+        const rq = db.transaction('kv').objectStore('kv').get(key);
+        rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error);
+      });
+    },
+    async put(key, val) {
+      const db = await this.open();
+      return new Promise((res, rej) => {
+        const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(val, key);
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+    },
+    async del(key) {
+      const db = await this.open();
+      return new Promise((res, rej) => {
+        const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').delete(key);
+        tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+      });
+    },
+  };
+
+  // ---- 沙盒文件读写(运行时就绪后可用)----
+  const runtimeReady = () => !!(window.__runtimeReady && window.Module && Module.FS);
+  // 只把真实存档目录纳入持久化/导出/浏览:跳过 Library/Caches(SDK 缓存,会无界膨胀 + 缓存一变就
+  // 触发整包误存)和 tmp(引擎启动即清空,持久化纯浪费)。存档只在 Documents/ 与 Library/Preferences/。
+  const SAVE_DIR_RE = /^(Documents\/|Library\/Preferences\/)/;
+  function listSandboxFiles() {
+    const out = [];
+    if (!runtimeReady()) return out;
+    const FS = Module.FS;
+    (function walk(dir) {
+      let entries; try { entries = FS.readdir(dir); } catch (e) { return; }
+      for (const e of entries) {
+        if (e === '.' || e === '..') continue;
+        const p = dir + '/' + e;
+        let st; try { st = FS.stat(p); } catch (_) { continue; }
+        if (FS.isDir(st.mode)) walk(p);
+        else { const rel = p.slice(SBOX.length + 1);
+          if (SAVE_DIR_RE.test(rel)) { try { out.push({ path: rel, data: FS.readFile(p) }); } catch (_) {} } }
+      }
+    })(SBOX);
+    return out;
+  }
+
+  // ---- base64(导出文件用)/ 大小格式化 ----
+  function bytesToB64(u8) {
+    let s = ''; const C = 0x8000;
+    for (let i = 0; i < u8.length; i += C) s += String.fromCharCode.apply(null, u8.subarray(i, i + C));
+    return btoa(s);
+  }
+  function b64ToBytes(b64) {
+    const s = atob(b64), u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+    return u8;
+  }
+  const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB';
+  // 沙盒相对路径白名单:防导入的 .molesave 用 ../、绝对路径、反斜杠等逃出沙盒目录(MEMFS 里也不该越界)。
+  const safeRelPath = (p) => typeof p === 'string' && p.length > 0 && p.length < 256
+    && !p.startsWith('/') && !p.split('/').includes('..') && !p.includes('\\') && !p.includes('\0');
+
+  // ---- 持久化:把沙盒存档镜像进 IndexedDB ----
+  let lastSaveTime = 0, lastSaveSig = '', saveFailed = false;
+  // 内容指纹用 FNV-1a(不能只用 path+length:userinfo.dat 是定长 AES 块,等级/金币变了但字节数不变,
+  // 只比长度会漏存 → 刷新丢进度)。~15KB 全量哈希极廉价。
+  function fnv1a(u8) { let h = 0x811c9dc5; for (let i = 0; i < u8.length; i++) { h ^= u8[i]; h = (h * 0x01000193) >>> 0; } return h; }
+  const filesSig = (files) => files.map(f => f.path + ':' + f.data.length + ':' + fnv1a(f.data)).sort().join('|');
+  // 一份沙盒快照是否「像有效存档」:至少含非空 userinfo.dat(核心档)。空沙盒/半截写盘不该落盘覆盖好存档。
+  const snapshotValid = (files) => { const u = files.find(f => f.path.endsWith('userinfo.dat')); return !!(u && u.data.length > 16); };
+  async function persistNow(reason, force) {
+    if (!runtimeReady()) return false;
+    const files = listSandboxFiles();
+    if (!files.length || !snapshotValid(files)) return false;   // 空/缺核心档/半截:绝不覆盖已存进度
+    const sig = filesSig(files);
+    if (!force && sig === lastSaveSig) return false;            // 内容没变,不重复写
+    try {
+      const prev = await saveDB.get('player');
+      if (prev && prev.files && prev.files.length) {
+        const pT = prev.files.reduce((a, f) => a + f.data.length, 0);
+        const nT = files.reduce((a, f) => a + f.data.length, 0);
+        // 不退化守卫(仅自动保存):新快照文件更少 或 总字节腰斩 = 疑似游戏没加载好/写盘中间态,
+        // 拒绝用它覆盖玩家已存的好进度(手动「立即保存」可强制)。
+        if (!force && (files.length < prev.files.length || nT < pT * 0.5)) {
+          addLog('[存档] 跳过自动保存:当前沙盒疑似不完整,保护已存进度不被覆盖'); return false;
+        }
+        try { await saveDB.put('player.bak', prev); } catch (_) {}   // 覆盖前留一份回滚副本(可「撤销」)
+      }
+      await saveDB.put('player', { files, created: new Date().toISOString(), source: reason || 'auto' });
+      lastSaveSig = sig; lastSaveTime = Date.now(); saveFailed = false; refreshStatus(); updateBakBtn(); return true;
+    } catch (e) { saveFailed = true; addLog('[存档] 持久化失败(存储被拒/配额满?):' + e); refreshStatus(); return false; }
+  }
+
+  // ---- 状态行 ----
+  function refreshStatus() {
+    const el = $('sstatus'); if (!el) return;
+    const auto = $('sb-auto').checked;
+    const t = lastSaveTime ? new Date(lastSaveTime).toLocaleTimeString() : '尚未';
+    const files = runtimeReady() ? listSandboxFiles() : [];
+    const total = files.reduce((a, f) => a + f.data.length, 0);
+    const src = window.__saveSource || (window.__seeds === undefined ? '读取中…' : '默认种子');
+    el.innerHTML =
+      (saveFailed ? '<span class="warnv">⚠ 自动保存失败(存储被拒/配额满)— 请用「导出存档」手动备份!</span><br>' : '') +
+      '存档来源:<b>' + src + '</b>　自动保存:' + (auto ? '<b>开</b>' : '<span class="warnv">关</span>') +
+      '<br>当前沙盒:' + (files.length ? files.length + ' 文件 / ' + fmtSize(total) : '<span class="warnv">游戏未就绪</span>') +
+      '　上次保存:' + t;
+    $('ssub').textContent = files.length ? (files.length + ' 文件') : (auto ? '自动:开' : '自动:关');
+  }
+
+  // ---- 存档浏览(文件列表 + 摘要 + 十六进制)----
+  function printableStrings(u8, min, max) {
+    min = min || 4; max = max || 50; const res = []; let cur = '';
+    for (let i = 0; i < u8.length && res.length < max; i++) {
+      const c = u8[i];
+      if (c >= 0x20 && c < 0x7f) cur += String.fromCharCode(c);
+      else { if (cur.length >= min) res.push(cur); cur = ''; }
+    }
+    if (cur.length >= min && res.length < max) res.push(cur);
+    return res;
+  }
+  function hexDump(u8, n) {
+    n = Math.min(n || 256, u8.length); let out = '';
+    for (let i = 0; i < n; i += 16) {
+      let hex = '', asc = '';
+      for (let j = 0; j < 16; j++) {
+        if (i + j < n) { const b = u8[i + j]; hex += b.toString(16).padStart(2, '0') + ' ';
+          asc += (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.'; }
+        else hex += '   ';
+      }
+      out += i.toString(16).padStart(4, '0') + '  ' + hex + ' ' + asc + '\n';
+    }
+    if (u8.length > n) out += '… 共 ' + u8.length + ' 字节,仅显示前 ' + n + '\n';
+    return out;
+  }
+  function decodeFileMeta(path, u8) {
+    const head6 = u8.length >= 6 ? String.fromCharCode(u8[0], u8[1], u8[2], u8[3], u8[4], u8[5]) : '';
+    const isBplist = head6 === 'bplist';
+    if (path.endsWith('.plist'))
+      return { tag: isBplist ? 'bplist' : 'plist',
+        kv: 'NSUserDefaults(设置/账号标志:isEncrypt/userId 等)\n可读串:' + printableStrings(u8, 3, 24).join('  ') };
+    if (path.endsWith('map.dat'))
+      return { tag: isBplist ? 'bplist·明文' : '明文', kv: '庄园地图(建筑/装饰布局,明文 bplist)' };
+    if (path.endsWith('userinfo.dat'))
+      return { tag: 'AES 加密', kv: '玩家信息存档(等级/金币/贝壳/经验等;AES-128-ECB 加密,需游戏内解密)' };
+    return { tag: '二进制', kv: '' };
+  }
+  function renderBrowse() {
+    const box = $('sfiles'); if (!box) return;
+    if (!runtimeReady()) { box.innerHTML = '<div class="sempty">游戏还没就绪,进村后再刷新</div>'; return; }
+    const files = listSandboxFiles();
+    if (!files.length) { box.innerHTML = '<div class="sempty">沙盒里暂无存档文件</div>'; return; }
+    box.innerHTML = '';
+    for (const f of files) {
+      const meta = decodeFileMeta(f.path, f.data);
+      const el = document.createElement('div'); el.className = 'sfile';
+      el.innerHTML =
+        '<div class="fh"><span class="fp">' + escapeHtml(f.path) + '</span>' +
+        '<span class="ftag">' + meta.tag + '</span><span class="fsz">' + fmtSize(f.data.length) + '</span></div>' +
+        '<div class="fbody"><div class="kv">' + escapeHtml(meta.kv || '(无摘要)') + '</div>' +
+        '<div class="hex">' + escapeHtml(hexDump(f.data, 256)) + '</div></div>';
+      el.querySelector('.fh').onclick = () => el.classList.toggle('open');
+      box.appendChild(el);
+    }
+  }
+  function flash(btn, txt) { const old = btn.textContent; btn.textContent = txt; setTimeout(() => btn.textContent = old, 1200); }
+
+  // ---- 面板事件接线 ----
+  function setupSaveManager() {
+    $('stoggle').onclick = () => {
+      const p = $('savepane'); p.classList.toggle('open');
+      if (p.classList.contains('open')) { refreshStatus(); renderBrowse(); }
+    };
+    $('sb-export').onclick = () => {
+      if (!runtimeReady()) return alert('游戏还没就绪,进村后再导出');
+      const files = listSandboxFiles();
+      if (!files.length) return alert('当前没有可导出的存档');
+      const bundle = { format: 'moleworld-save', version: 1, created: new Date().toISOString(),
+        bundleId: 'com.taomee.MoleWorld',
+        files: files.map(f => ({ path: f.path, size: f.data.length, b64: bytesToB64(f.data) })) };
+      const blob = new Blob([JSON.stringify(bundle)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'moleworld-存档-' + new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19) + '.molesave';
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+      addLog('[存档] 已导出 ' + files.length + ' 个文件'); flash($('sb-export'), '✓ 已导出');
+    };
+    $('sb-import').onclick = () => $('sb-file').click();
+    $('sb-file').onchange = async (e) => {
+      const file = e.target.files[0]; if (!file) return; e.target.value = '';
+      try {
+        const bundle = JSON.parse(await file.text());
+        if (bundle.format !== 'moleworld-save' || !Array.isArray(bundle.files))
+          throw new Error('不是有效的摩尔庄园存档文件(.molesave)');
+        const files = bundle.files.map(f => ({ path: f.path, data: b64ToBytes(f.b64) }));
+        if (!files.length) throw new Error('存档为空');
+        if (files.length > 64) throw new Error('文件过多(' + files.length + ')');
+        if (files.some(f => !safeRelPath(f.path))) throw new Error('含非法文件路径');
+        const totalBytes = files.reduce((a, f) => a + f.data.length, 0);
+        if (totalBytes > 64 * 1048576) throw new Error('存档过大(' + fmtSize(totalBytes) + ')');
+        if (!confirm('导入存档「' + file.name + '」(' + files.length + ' 个文件 / ' + fmtSize(totalBytes) + ')?\n会覆盖当前进度并重启游戏。')) return;
+        try { const cur = await saveDB.get('player'); if (cur) await saveDB.put('player.bak', cur); } catch (_) {}
+        await saveDB.put('player', { files, created: bundle.created || new Date().toISOString(), source: '导入:' + file.name });
+        addLog('[存档] 已导入(旧档备份到 player.bak),重启游戏…'); location.reload();
+      } catch (err) { alert('导入失败:' + err.message); addLog('[存档] 导入失败:' + err); }
+    };
+    $('sb-save').onclick = async () => {
+      if (!runtimeReady()) return alert('游戏还没就绪');
+      const ok = await persistNow('手动', true);
+      addLog(ok ? '[存档] 已手动保存进度到浏览器' : '[存档] 保存失败(沙盒为空)');
+      if (ok) flash($('sb-save'), '✓ 已保存');
+    };
+    $('sb-reset').onclick = async () => {
+      if (!confirm('恢复默认存档?\n会清除浏览器里保存的进度、用初始存档重启游戏。\n旧档会留一份备份(可「撤销」找回);也建议先「导出存档」。')) return;
+      try { const cur = await saveDB.get('player'); if (cur) await saveDB.put('player.bak', cur); } catch (_) {}
+      await saveDB.del('player');
+      addLog('[存档] 已清除持久化存档(旧档备份到 player.bak),恢复默认并重启…'); location.reload();
+    };
+    $('sb-auto').onchange = () => {
+      localStorage.setItem('mole_autosave', $('sb-auto').checked ? '1' : '0');
+      refreshStatus(); addLog('[存档] 自动保存:' + ($('sb-auto').checked ? '开' : '关'));
+    };
+    $('sb-browse').onclick = renderBrowse;
+    $('sb-undo').onclick = async () => {
+      try {
+        const bak = await saveDB.get('player.bak');
+        if (!bak || !bak.files || !bak.files.length) return alert('没有可恢复的备份');
+        if (!confirm('从最近一次备份恢复存档?会覆盖当前进度并重启游戏。')) return;
+        await saveDB.put('player', bak);
+        addLog('[存档] 已从备份恢复,重启游戏…'); location.reload();
+      } catch (e) { alert('恢复备份失败:' + e); }
+    };
+    if (localStorage.getItem('mole_autosave') === '0') $('sb-auto').checked = false;
+    refreshStatus(); updateBakBtn();
+  }
+  async function updateBakBtn() {
+    const btn = $('sb-undo'); if (!btn) return;
+    try { const bak = await saveDB.get('player.bak'); btn.disabled = !(bak && bak.files && bak.files.length); }
+    catch (_) { btn.disabled = true; }
+  }
+  // 自动保存:定时 + 切到后台/隐藏时各存一次(刷新前的最后一道保险)
+  function startAutoPersist() {
+    setInterval(() => { if ($('sb-auto').checked) persistNow('auto'); }, 12000);
+    document.addEventListener('visibilitychange', () => { if (document.hidden && $('sb-auto').checked) persistNow('auto'); });
+  }
+
   // ── emscripten Module ──
   const CB = Date.now();
   window.Module = {
@@ -241,35 +589,39 @@
     print:    (t) => addLog(t),
     printErr: (t) => addLog(t),
     onAbort:  (w) => { setStatus('已崩溃', 'err'); addLog('ABORT: ' + w); },
-    onRuntimeInitialized: () => { setStatus('运行中', 'run'); hintEl.style.display = 'none'; },
+    onRuntimeInitialized: () => {
+      setStatus('运行中', 'run'); hintEl.style.display = 'none';
+      window.__runtimeReady = true; startAutoPersist(); refreshStatus();
+    },
     preRun: [function () {
       try {
         const d = new Uint8Array(window.__ipaBuf);
         Module.FS.writeFile('/MoleWorld.ipa', d);
         addLog('[launcher] IPA 已写入 MEMFS:' + d.length + ' 字节');
       } catch (e) { addLog('[launcher] 写 IPA 失败:' + e); }
-      // [离线种子存档] 把真实存档写进 touchHLE 的 wasm 沙盒,让离线 [GameData loadFromLocal] 读到
-      // 非空庄园(否则进村是空的、盖不住启动图)。沙盒根 = user_data_base_path()(wasm 上="."→CWD"/")
-      // /touchHLE_sandbox/<bundleid>/。userinfo/map 落 Documents、plist 落 Library/Preferences。
+      // [存档] 把存档写进 touchHLE 的 wasm 沙盒,让离线 [GameData loadFromLocal] 读到非空庄园
+      // (否则进村是空的、盖不住启动图)。__seeds = [[沙盒相对路径, 字节], ...]:优先 IndexedDB 里
+      // 的玩家进度(自动保存/导入),没有才是同目录默认种子(见下方加载逻辑)。沙盒根 =
+      // user_data_base_path()(wasm 上="."→CWD"/")/touchHLE_sandbox/<bundleid>/。
       try {
-        const SBOX = '/touchHLE_sandbox/com.taomee.MoleWorld';
-        const dest = (name) => name.endsWith('.plist')
-          ? SBOX + '/Library/Preferences/' + name
-          : SBOX + '/Documents/' + name;
         const seeds = window.__seeds || [];
         if (seeds.length) {
-          for (const [name, buf] of seeds) {
-            const path = dest(name);
+          for (const [relpath, buf] of seeds) {
+            // 纵深防御:写沙盒前再校验一次路径(挡住 IndexedDB 里可能残留的历史脏数据,防 ../ 逃逸覆盖 IPA/资源)
+            if (!safeRelPath(relpath)) { addLog('[launcher] 跳过非法存档路径:' + relpath); continue; }
+            const path = SBOX + '/' + relpath;
             Module.FS.mkdirTree(path.slice(0, path.lastIndexOf('/')));
-            Module.FS.writeFile(path, new Uint8Array(buf));
-            addLog('[launcher] 种子写入:' + path + ' (' + buf.byteLength + ' 字节)');
+            Module.FS.writeFile(path, buf instanceof Uint8Array ? buf : new Uint8Array(buf));
+            addLog('[launcher] 存档写入:' + path + ' (' + (buf.byteLength || buf.length) + ' 字节)');
           }
         } else {
-          addLog('[launcher] 无种子存档 → 进村为空');
+          addLog('[launcher] 无存档 → 进村为空');
         }
-      } catch (e) { addLog('[launcher] 写种子存档失败:' + e); }
+      } catch (e) { addLog('[launcher] 写存档失败:' + e); }
     }],
   };
+
+  setupSaveManager();   // 存档管理面板接线(DOM 已就绪;FS 操作会等运行时就绪)
 
   (async () => {
     addLog('[launcher] 页面加载 ' + new Date().toLocaleString());
@@ -285,12 +637,22 @@
       // 三件必须配套:userinfo 是加密的,但「是否加密」标志存在 NSUserDefaults 里——少了 plist,
       // GameSettings.isEncrypt=NO → loadUserInfoData 误判「本地存档损坏」弹框 + exit。
       window.__seeds = [];
-      for (const name of ['userinfo.dat', 'map.dat', 'com.taomee.MoleWorld.plist']) {
-        try {
-          const r = await fetch(name + '?cb=' + CB);
-          if (r.ok) { const buf = await r.arrayBuffer(); window.__seeds.push([name, buf]);
-            addLog('[launcher] 种子下载:' + name + ' ' + buf.byteLength + ' 字节'); }
-        } catch (e) { /* 无该种子,可接受 */ }
+      // 优先从 IndexedDB 恢复玩家存档(上次自动保存/导入的)→ 进度刷新不丢;没有才用同目录默认种子。
+      let persisted = null;
+      try { persisted = await saveDB.get('player'); } catch (_) {}
+      if (persisted && persisted.files && persisted.files.length) {
+        for (const f of persisted.files) window.__seeds.push([f.path, f.data]);
+        window.__saveSource = (persisted.source || '').startsWith('导入') ? persisted.source : '玩家进度';
+        addLog('[存档] 从浏览器恢复存档:' + persisted.files.length + ' 文件(' + (persisted.created || '') + ')');
+      } else {
+        window.__saveSource = '默认种子';
+        for (const name of ['userinfo.dat', 'map.dat', 'com.taomee.MoleWorld.plist']) {
+          try {
+            const r = await fetch(name + '?cb=' + CB);
+            if (r.ok) { const buf = await r.arrayBuffer(); window.__seeds.push([SAVE_REL(name), new Uint8Array(buf)]);
+              addLog('[launcher] 默认种子下载:' + name + ' ' + buf.byteLength + ' 字节'); }
+          } catch (e) { /* 无该种子,可接受 */ }
+        }
       }
     } catch (e) {
       setStatus('加载失败', 'err');
