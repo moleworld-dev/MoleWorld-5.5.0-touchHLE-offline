@@ -1535,6 +1535,13 @@ impl GLES for GLES1OnWebGL2<'_> {
         if mask & gles11::COLOR_BUFFER_BIT != 0 {
             let [r, g, b, a] = self.state.clear_color;
             gl30::ClearColor(r, g, b, a);
+            // [进村闪烁根治] 游戏每帧开头 glClear(开始画新一帧)→ fbo0 不再是完整帧。标记未完成,
+            // 反应堆此刻不得 emscripten_sleep 让出(否则浏览器会合成到"底图已画建筑没画"的半成品)。
+            // direct-present 完成本帧后 presentRenderbuffer 再置回 true。仅 wasm,direct-present 模式
+            // 下游戏只画 fbo0;合成模式不靠此标志(反应堆在 !DIRECT_PRESENT 时自由让出),桌面零回归。
+            #[cfg(target_arch = "wasm32")]
+            crate::frameworks::core_animation::FBO0_FRAME_COMPLETE
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         gl30::Clear(mask);
     }

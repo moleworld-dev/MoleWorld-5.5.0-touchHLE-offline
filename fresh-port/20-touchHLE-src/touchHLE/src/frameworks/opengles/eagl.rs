@@ -382,6 +382,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             if can_direct {
                 crate::frameworks::core_animation::DIRECT_PRESENT.store(true, Ordering::Relaxed);
                 env.window.as_ref().unwrap().swap_window();
+                // [进村闪烁根治] fbo0 现在是一帧完整画完的村庄(cocos2d 已 draw + 本次直呈),
+                // 标记完整,放行反应堆让出给浏览器合成(直到下帧 glClear 再置 false)。
+                crate::frameworks::core_animation::FBO0_FRAME_COMPLETE.store(true, Ordering::Relaxed);
                 if let Some(sleep_for) = sleep_for {
                     env.sleep(sleep_for);
                 }
