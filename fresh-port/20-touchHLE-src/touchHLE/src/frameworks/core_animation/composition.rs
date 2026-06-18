@@ -76,6 +76,16 @@ pub static DIRECT_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::At
 #[cfg(target_arch = "wasm32")]
 pub static FBO0_FRAME_COMPLETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// [MoleWorld wasm 进村闪烁根治·补洞B] 缓存的合成纹理 texture_framebuffer 是否「新鲜」。direct-present
+/// 活跃时合成器 recomposite 早退(本文件 recomposite_if_necessary 顶部),texture_framebuffer 不再更新 →
+/// 冻结在进村早期那张「有底图无建筑」帧。若此时偶发掉出 direct-present(某帧 has_uikit_overlay 瞬时 true →
+/// DIRECT_PRESENT 翻 false)而 recomposite 还没来得及刷新,反应堆的 repaint_last_frame 会把这张陈旧 base-map
+/// 盖上屏 → 开菜单等过渡瞬间单帧底图闪。本标志:进入 direct-present 置 false(纹理就此陈旧)、recomposite
+/// 真正重画 texture_framebuffer 时置 true;repaint_last_frame 只在 fresh 时才重呈,陈旧则跳过(保留 canvas
+/// 上一张完整村庄=preserveDrawingBuffer)。仅 wasm,桌面/iOS 零回归。
+#[cfg(target_arch = "wasm32")]
+pub static TEXTURE_FB_FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// [MoleWorld wasm perf] 是否有 UIKit 浮层(alert/HUD/文本输入等)叠加在游戏画面上。判据=可见图层树里
 /// 有任何带 UIKit 绘制内容(contents 图像 或 cg_context 位图)的层——游戏自身的 CAEAGLLayer 是 GL 层,
 /// 既无 contents 也无 cg_context,故稳态村庄返回 false=可直呈;弹窗/HUD/输入框出现则返回 true=回落合成。
@@ -108,6 +118,12 @@ pub fn has_uikit_overlay(env: &mut Environment) -> bool {
 pub fn repaint_last_frame(env: &mut Environment) {
     // 直呈短路活跃时,canvas 已是 cocos2d 直画的村庄(preserveDrawingBuffer 保留),别用旧合成帧盖掉。
     if DIRECT_PRESENT.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // [补洞B] texture_framebuffer 在 direct-present 期间被冻结成陈旧 base-map(recomposite 早退不更新);
+    // 掉出 direct-present 后、下一次 recomposite 刷新前,它仍陈旧 → 不要重呈(否则开菜单等过渡瞬间闪底图)。
+    // 跳过即保留 canvas 上一张完整村庄(preserveDrawingBuffer)。recomposite 刷新后置 fresh 再恢复重呈。
+    if !TEXTURE_FB_FRESH.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let Some((texture, _fb)) = env
@@ -143,6 +159,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // 全屏合成+present 的 round-trip(实测 readpixels 6%+recompose 16%=22% wall-clock)。
     #[cfg(target_arch = "wasm32")]
     if DIRECT_PRESENT.load(std::sync::atomic::Ordering::Relaxed) {
+        // [补洞B] 直呈期间合成器不更新 texture_framebuffer → 它就此陈旧(冻结在进村早期 base-map)。
+        // 标记不新鲜:万一这帧之后偶发掉出 direct-present,repaint_last_frame 在新合成帧到来前不会
+        // 把这张陈旧 base-map 盖上屏(开菜单/弹窗过渡瞬间不闪底图)。
+        TEXTURE_FB_FRESH.store(false, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     let mut animation_state = animation::State::default();
@@ -335,6 +355,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .core_animation
             .composition
             .texture_framebuffer = Some((texture, framebuffer));
+        // [补洞B] 合成器刚把当前真实图层树重画进 texture_framebuffer → 它现在是新鲜的完整帧,
+        // 允许 repaint_last_frame 重呈它(此函数下方还会真正 present_frame 到 canvas)。
+        #[cfg(target_arch = "wasm32")]
+        TEXTURE_FB_FRESH.store(true, std::sync::atomic::Ordering::Relaxed);
         texture
     };
 
