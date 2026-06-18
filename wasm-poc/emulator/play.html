@@ -183,7 +183,7 @@
         <div class="sstatus" id="sstatus">读取存档状态…</div>
         <div class="sgrid">
           <button class="sbtn primary" id="sb-export" title="把当前存档(进度)下载成一个文件备份">⬇ 导出存档</button>
-          <button class="sbtn" id="sb-import" title="从备份文件恢复存档(会重启游戏)">⬆ 导入存档</button>
+          <button class="sbtn" id="sb-import" title="导入存档:可选原版 userinfo.dat / map.dat / plist(可多选)或 .molesave 备份;只传 map/userinfo 时其余沿用当前存档。会重启游戏">⬆ 导入存档</button>
           <button class="sbtn" id="sb-save" title="立即把当前进度写入浏览器持久化(刷新不丢)">💾 立即保存</button>
           <button class="sbtn danger" id="sb-reset" title="清除持久化存档,恢复默认初始存档(会重启游戏)">↺ 恢复默认</button>
           <button class="sbtn" id="sb-undo" title="从最近一次备份(重置/导入/覆盖前自动留存)恢复存档" disabled>↩ 撤销(恢复备份)</button>
@@ -198,7 +198,7 @@
         </div>
         <div class="sfiles" id="sfiles"></div>
       </div>
-      <input type="file" id="sb-file" accept=".molesave,.json,application/json" style="display:none">
+      <input type="file" id="sb-file" accept=".molesave,.json,.dat,.plist" multiple style="display:none">
     </section>
   </aside>
 </main>
@@ -527,22 +527,52 @@
       addLog('[存档] 已导出 ' + files.length + ' 个文件'); flash($('sb-export'), '✓ 已导出');
     };
     $('sb-import').onclick = () => $('sb-file').click();
+    // 原版客户端存档文件名 → 沙盒相对路径(支持直接导入真机/原版 userinfo.dat / map.dat / plist)
+    const importRelFor = (name) => {
+      const n = name.toLowerCase();
+      if (n.endsWith('userinfo.dat')) return 'Documents/userinfo.dat';
+      if (n.endsWith('map.dat')) return 'Documents/map.dat';
+      if (n.endsWith('.plist')) return 'Library/Preferences/com.taomee.MoleWorld.plist';
+      return null;
+    };
     $('sb-file').onchange = async (e) => {
-      const file = e.target.files[0]; if (!file) return; e.target.value = '';
+      const picked = Array.from(e.target.files || []); if (!picked.length) return; e.target.value = '';
       try {
-        const bundle = JSON.parse(await file.text());
-        if (bundle.format !== 'moleworld-save' || !Array.isArray(bundle.files))
-          throw new Error('不是有效的摩尔庄园存档文件(.molesave)');
-        const files = bundle.files.map(f => ({ path: f.path, data: b64ToBytes(f.b64) }));
-        if (!files.length) throw new Error('存档为空');
-        if (files.length > 64) throw new Error('文件过多(' + files.length + ')');
-        if (files.some(f => !safeRelPath(f.path))) throw new Error('含非法文件路径');
-        const totalBytes = files.reduce((a, f) => a + f.data.length, 0);
-        if (totalBytes > 64 * 1048576) throw new Error('存档过大(' + fmtSize(totalBytes) + ')');
-        if (!confirm('导入存档「' + file.name + '」(' + files.length + ' 个文件 / ' + fmtSize(totalBytes) + ')?\n会覆盖当前进度并重启游戏。')) return;
+        const incoming = [], names = [];   // incoming: {path, data}
+        for (const file of picked) {
+          const lower = file.name.toLowerCase();
+          if (lower.endsWith('.molesave') || lower.endsWith('.json')) {
+            // 我们自己导出的 .molesave 包(JSON + base64)
+            const bundle = JSON.parse(await file.text());
+            if (bundle.format !== 'moleworld-save' || !Array.isArray(bundle.files))
+              throw new Error('「' + file.name + '」不是有效的 .molesave 包');
+            for (const f of bundle.files) {
+              if (!safeRelPath(f.path)) throw new Error('「' + file.name + '」含非法路径');
+              incoming.push({ path: f.path, data: b64ToBytes(f.b64) });
+            }
+            names.push(file.name);
+          } else {
+            // 原版客户端存档 .dat / .plist —— 按文件名映射到沙盒路径,直接导入
+            const rel = importRelFor(file.name);
+            if (!rel) throw new Error('不认识的存档文件「' + file.name + '」\n支持:userinfo.dat / map.dat / com.taomee.MoleWorld.plist / .molesave');
+            incoming.push({ path: rel, data: new Uint8Array(await file.arrayBuffer()) });
+            names.push(file.name);
+          }
+        }
+        if (!incoming.length) throw new Error('没有可导入的文件');
+        const totalBytes = incoming.reduce((a, f) => a + f.data.length, 0);
+        if (incoming.length > 64) throw new Error('文件过多');
+        if (totalBytes > 64 * 1048576) throw new Error('文件过大(' + fmtSize(totalBytes) + ')');
+        // ★叠加到当前存档:只提供 map/userinfo 时,plist 等其余文件保留现有(种子) → 三件套齐全可加载。
+        const base = runtimeReady() ? listSandboxFiles() : ((await saveDB.get('player'))?.files || []);
+        const byPath = new Map(base.map(f => [f.path, f.data]));
+        for (const f of incoming) byPath.set(f.path, f.data);
+        const merged = [...byPath.entries()].map(([path, data]) => ({ path, data }));
+        if (!merged.some(f => f.path.endsWith('userinfo.dat'))) throw new Error('导入后缺 userinfo.dat,无法加载');
+        if (!confirm('导入 ' + names.join(' + ') + '(' + fmtSize(totalBytes) + ')?\n会覆盖对应存档并重启游戏。\n(只传了 map/userinfo 的话,其余沿用当前存档)')) return;
         try { const cur = await saveDB.get('player'); if (cur) await saveDB.put('player.bak', cur); } catch (_) {}
-        await saveDB.put('player', { files, created: bundle.created || new Date().toISOString(), source: '导入:' + file.name });
-        addLog('[存档] 已导入(旧档备份到 player.bak),重启游戏…'); location.reload();
+        await saveDB.put('player', { files: merged, created: new Date().toISOString(), source: '导入:' + names.join(',') });
+        addLog('[存档] 已导入(' + names.join(', ') + '),旧档备份到 player.bak,重启游戏…'); location.reload();
       } catch (err) { alert('导入失败:' + err.message); addLog('[存档] 导入失败:' + err); }
     };
     $('sb-save').onclick = async () => {
