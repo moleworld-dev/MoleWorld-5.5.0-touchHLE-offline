@@ -527,21 +527,7 @@ impl Window {
             let out_x = (x + 0.5) * out_w as f32;
             let out_y = (y + 0.5) * out_h as f32;
             // Round to match touch precision of official devices.
-            let out = (out_x.round(), out_y.round());
-            // [MoleWorld TOUCHDIAG] 拖动错位回归排查:打印 输入(窗口坐标)→viewport→输出(游戏坐标)。
-            // 限频每 10 次一条。看 out 是否随 in 线性跟随、vp/yoff 是否异常。
-            {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
-                    log!(
-                        "[TOUCHDIAG] in=({:.0},{:.0}) vp=({},{},{},{}) yoff={} unrot=({},{}) -> out=({:.0},{:.0})",
-                        in_x, in_y, vx, vy, vw, vh,
-                        window.viewport_y_offset(), out_w, out_h, out.0, out.1
-                    );
-                }
-            }
-            out
+            (out_x.round(), out_y.round())
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
             let (_, _, vw, vh) = window.viewport();

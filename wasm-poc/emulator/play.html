@@ -131,6 +131,31 @@
       return orig.call(this, type, attrs);
     };
   })();
+  // [音频] 浏览器策略:AudioContext 创建即处于 suspended,必须在【用户手势之后】resume 才出声;
+  // emscripten 的 OpenAL/SDL 音频上下文同受此限(控制台原本恒报 "AudioContext was not allowed to
+  // start. It must be resumed after a user gesture")。包一层 AudioContext 构造收集所有实例,首次用户
+  // 交互(点/触/键)时全部 resume,游戏音乐/音效即可出声。在 emscripten 创建音频上下文之前装好。
+  (function () {
+    const Native = window.AudioContext || window.webkitAudioContext;
+    if (!Native) return;
+    const all = [];
+    const Patched = function (...args) {
+      const ctx = new Native(...args);
+      all.push(ctx);
+      return ctx;
+    };
+    Patched.prototype = Native.prototype;
+    window.AudioContext = Patched;
+    if (window.webkitAudioContext) window.webkitAudioContext = Patched;
+    const resumeAll = () => {
+      for (const c of all) {
+        if (c.state === 'suspended' && c.resume) c.resume().catch(() => {});
+      }
+    };
+    for (const ev of ['pointerdown', 'touchstart', 'keydown', 'click']) {
+      window.addEventListener(ev, resumeAll, { capture: true });
+    }
+  })();
   const $ = (id) => document.getElementById(id);
   const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'), mipsEl = $('mips'),
         hintEl = $('hint'), countEl = $('logcount'), filterEl = $('filter'),
