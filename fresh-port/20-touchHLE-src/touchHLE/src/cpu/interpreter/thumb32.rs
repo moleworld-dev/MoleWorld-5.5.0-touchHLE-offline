@@ -1079,6 +1079,33 @@ impl InterpreterCpu {
                         self.get_reg(rn).wrapping_add(v)
                     }
                 }
+                0b010 => {
+                    // SXTB16 (rn==15) / SXTAB16:两条独立 16 位通道,各取 rotated 的 byte0/byte2 符号扩展到 16 位
+                    // (摩尔庄园新手村渲染路径会用到;漏它 → uxtb16/sxtb16 panic、离线进默认村崩)。
+                    let b0 = Self::sign_extend(rotated & 0xff, 8) & 0xffff;
+                    let b2 = Self::sign_extend((rotated >> 16) & 0xff, 8) & 0xffff;
+                    if rn == 15 {
+                        (b2 << 16) | b0
+                    } else {
+                        let n = self.get_reg(rn);
+                        let lo = (n & 0xffff).wrapping_add(b0) & 0xffff;
+                        let hi = (n >> 16).wrapping_add(b2) & 0xffff;
+                        (hi << 16) | lo
+                    }
+                }
+                0b011 => {
+                    // UXTB16 (rn==15) / UXTAB16:两条独立 16 位通道,各取 rotated 的 byte0/byte2 零扩展到 16 位
+                    let b0 = rotated & 0xff;
+                    let b2 = (rotated >> 16) & 0xff;
+                    if rn == 15 {
+                        (b2 << 16) | b0
+                    } else {
+                        let n = self.get_reg(rn);
+                        let lo = (n & 0xffff).wrapping_add(b0) & 0xffff;
+                        let hi = (n >> 16).wrapping_add(b2) & 0xffff;
+                        (hi << 16) | lo
+                    }
+                }
                 _ => return None,
             };
             self.set_reg(rd, res);
