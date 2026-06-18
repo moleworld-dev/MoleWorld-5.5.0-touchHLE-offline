@@ -68,6 +68,14 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 #[cfg(target_arch = "wasm32")]
 pub static DIRECT_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// [MoleWorld wasm 进村闪烁根治] direct-present 模式下 cocos2d 把一帧直接画进 fbo0(=canvas 默认
+/// framebuffer,无双缓冲)。本标志=「fbo0 此刻是否一帧完整画完」:presentRenderbuffer 完成直呈后置 true,
+/// 游戏每帧开头 glClear(开始画新一帧)置 false。反应堆(environment.rs 主循环)只在 fbo0 完整时才
+/// emscripten_sleep 让浏览器合成,绝不在 cocos2d 一帧画到一半(底图已画、建筑还没画)时让出 →
+/// 根治"有底图无建筑"单帧闪(实证:浏览器原按纯 16ms 定时让出,~3% 概率撞上半成品帧)。
+#[cfg(target_arch = "wasm32")]
+pub static FBO0_FRAME_COMPLETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// [MoleWorld wasm perf] 是否有 UIKit 浮层(alert/HUD/文本输入等)叠加在游戏画面上。判据=可见图层树里
 /// 有任何带 UIKit 绘制内容(contents 图像 或 cg_context 位图)的层——游戏自身的 CAEAGLLayer 是 GL 层,
 /// 既无 contents 也无 cg_context,故稳态村庄返回 false=可直呈;弹窗/HUD/输入框出现则返回 true=回落合成。

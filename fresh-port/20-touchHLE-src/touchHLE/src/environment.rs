@@ -1297,10 +1297,26 @@ impl Environment {
                     // 发 ObjC 消息回弹 guest 代码、而此处无 guest CPU 上下文 → 崩(classes.rs:225)。
                     // 让出前无条件重 present 上次合成帧,保 canvas 始终新鲜(配合 play.html 的
                     // preserveDrawingBuffer:true 双保险,彻底消除「黑缝」闪烁)。
-                    crate::frameworks::core_animation::repaint_last_frame(&mut self);
-                    // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
-                    unsafe { emscripten_sleep(0) };
-                    last_yield = Instant::now();
+                    //
+                    // [★进村闪烁根治] 浏览器只在这里 emscripten_sleep 时才合成 canvas。direct-present
+                    // 模式下 cocos2d 把一帧直接画进 fbo0(=canvas 默认 framebuffer,无双缓冲),原来按
+                    // 纯 16ms 定时让出,有 ~3% 概率正好落在 cocos2d 一帧画到一半(glClear+底图已画、
+                    // 建筑还没画)时让出 → 浏览器合成到"有底图无建筑"的半成品帧 → 周期性单帧闪(实证
+                    // 录像 14/463 帧)。修:direct-present 模式只在 fbo0 是完整帧(FBO0_FRAME_COMPLETE:
+                    // glClear 置 false、直呈完成置 true)时才让出;合成模式 present 的本就是完整帧(原子
+                    // blit)可自由让出;超过 64ms 没让出则兜底让出以保浏览器响应(覆盖 stall/慢帧)。
+                    let direct = crate::frameworks::core_animation::DIRECT_PRESENT
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let fbo0_complete = crate::frameworks::core_animation::FBO0_FRAME_COMPLETE
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let stalled = last_yield.elapsed() >= Duration::from_millis(64);
+                    if !direct || fbo0_complete || stalled {
+                        crate::frameworks::core_animation::repaint_last_frame(&mut self);
+                        // SAFETY: emscripten 提供;此处在主上下文(非 fiber 内)调用。
+                        unsafe { emscripten_sleep(0) };
+                        last_yield = Instant::now();
+                    }
+                    // 否则:还在一帧中途,先不让出,继续跑 guest burst 等这帧画完(直呈)再让出。
                 }
                 let mips_dt = mips_t0.elapsed();
                 if mips_dt >= Duration::from_secs(1) {
