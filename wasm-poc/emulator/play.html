@@ -40,10 +40,16 @@
     flex:1 1 auto; min-width:0; display:flex; align-items:center; justify-content:center;
     background:#000; padding:10px; position:relative;
   }
-  /* canvas 内部分辨率 1024x768,这里等比缩放铺满左侧、保持 4:3 */
+  /* canvas 内部分辨率 1024x768(4:3)。★触摸精准 + 全屏不错位修复:不能用 width/height:100% +
+     object-fit:contain —— 那样 canvas【元素】填满 #stage(非 4:3),画面 letterbox 在元素框内部,
+     而 emscripten 把浏览器指针按【元素全框】线性映射到内部分辨率,框内黑边没被算进去 → 触摸坐标
+     整体偏移。改成让 canvas 元素本身恒为 4:3、取 #stage 内最大的 4:3 框居中(#stage 已 flex 居中),
+     元素框 == 画面 → emscripten 映射准确(触摸精准);全屏/退出时 #stage 变形,元素恒 4:3 也不错位。 */
   #canvas{
-    width:100% !important; height:100% !important;
-    object-fit:contain; background:#000; display:block;
+    width:auto !important; height:auto !important;
+    max-width:100% !important; max-height:100% !important;
+    aspect-ratio:4 / 3;
+    background:#000; display:block;
     image-rendering:auto;
   }
   #stage .hint{
@@ -138,7 +144,7 @@
   .sempty{color:var(--dim); font-size:12px; padding:6px 0}
 </style>
 </head>
-<body>
+<body class="log-collapsed">
 <header>
   <span class="title">🐹 摩尔庄园 · 浏览器版</span>
   <span class="badge" id="status">准备中…</span>
@@ -146,7 +152,7 @@
   <span class="badge" id="mips" title="解释器吞吐:每秒执行的 guest 指令数(百万)">— MIPS</span>
   <span class="spacer"></span>
   <button id="reload" title="重新加载页面重启游戏">↻ 重启</button>
-  <button id="toggle">≡ 折叠日志</button>
+  <button id="toggle">≡ 展开日志</button>
 </header>
 <main>
   <div id="stage">
