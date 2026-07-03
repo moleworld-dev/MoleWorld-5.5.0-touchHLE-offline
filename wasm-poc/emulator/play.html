@@ -56,6 +56,28 @@
     position:absolute; bottom:14px; left:0; right:0; text-align:center;
     color:var(--dim); font-size:12px; pointer-events:none;
   }
+  /* ── 启动画面(下载进度):盖在 canvas 上,运行时就绪后淡出 ── */
+  #splash{
+    position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:15px;
+    background:radial-gradient(circle at 50% 38%, #123048, #0d1117 72%);
+    transition:opacity .45s ease;
+  }
+  #splash.hide{opacity:0; pointer-events:none}
+  #splash .sp-logo{font-size:58px; line-height:1; animation:sp-bob 1.7s ease-in-out infinite}
+  @keyframes sp-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-11px)}}
+  #splash .sp-title{font-size:18px; font-weight:600; letter-spacing:1px; color:var(--fg)}
+  #splash .sp-bar{
+    width:min(72%,440px); height:11px; background:#1c2430; border:1px solid var(--border);
+    border-radius:7px; overflow:hidden;
+  }
+  #splash .sp-fill{
+    height:100%; width:0%; border-radius:7px;
+    background:linear-gradient(90deg,#2ea043,#3fb950); transition:width .25s ease;
+  }
+  #splash .sp-pct{font-size:14px; color:var(--accent); font-variant-numeric:tabular-nums; letter-spacing:.5px}
+  #splash .sp-note{font-size:12px; color:var(--dim); max-width:82%; text-align:center; line-height:1.7}
+  #splash .sp-note.err{color:var(--err)}
   /* ── 日志面板 ── */
   #logpane{
     flex:0 0 var(--logw); width:var(--logw); display:flex; flex-direction:column;
@@ -158,6 +180,13 @@
   <div id="stage">
     <canvas id="canvas" width="1024" height="768" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
     <div class="hint" id="hint">下载游戏数据中…(首次约 100MB,请稍候)</div>
+    <div id="splash">
+      <div class="sp-logo">🐹</div>
+      <div class="sp-title">摩尔庄园 · 浏览器版</div>
+      <div class="sp-bar"><div class="sp-fill" id="sp-fill"></div></div>
+      <div class="sp-pct" id="sp-pct">准备中…</div>
+      <div class="sp-note" id="sp-note">正在下载游戏数据(已启用压缩;再次访问将走缓存,秒开)</div>
+    </div>
   </div>
   <aside id="logpane">
     <div class="lhead">
@@ -616,7 +645,12 @@
   }
 
   // ── emscripten Module ──
+  // 缓存键分两档(部署时各自 sed 成固定串):
+  //   CB     = 引擎构建号 —— wasm/data/js/index/种子 用它,引擎每次更新就 bump,触发这些(共 ~27MB)重下。
+  //   IPA_CB = 游戏包(IPA)版本 —— IPA 是游戏本体美术/音频 97MB,内容极少变。给它独立 key,
+  //            引擎更新时【不】改 IPA_CB,返回用户的 97MB IPA 保持缓存、不重下(秒开的关键)。
   const CB = Date.now();
+  const IPA_CB = CB;
   window.Module = {
     canvas: $('canvas'),
     // 无参 → 走 app picker;指定 IPA + iPad 横屏右
@@ -627,6 +661,8 @@
     onAbort:  (w) => { setStatus('已崩溃', 'err'); addLog('ABORT: ' + w); },
     onRuntimeInitialized: () => {
       setStatus('运行中', 'run'); hintEl.style.display = 'none';
+      const sp = $('splash');
+      if (sp) { sp.classList.add('hide'); setTimeout(() => { sp.style.display = 'none'; }, 500); }
       window.__runtimeReady = true; startAutoPersist(); refreshStatus();
     },
     preRun: [function () {
@@ -659,44 +695,88 @@
 
   setupSaveManager();   // 存档管理面板接线(DOM 已就绪;FS 操作会等运行时就绪)
 
+  // ═══════════════════════════════════════════════════════════════════════
+  //  下载:三大件【并行流式】+ 启动画面进度条
+  //  旧版串行:await fetch(IPA 97MB) 全下完 → 才 fetch 种子 → 才 touchHLE.js(内部再各自
+  //  fetch .wasm/.data)。新版把 wasm/data/IPA 同时开下(共享带宽、去掉串行等待),下完把
+  //  wasm 交 Module.wasmBinary、data 交 Module.getPreloadedPackage、IPA 留 preRun 写 MEMFS,
+  //  touchHLE.js 就不再二次 fetch。进度分母用【解压后】字节:.wasm/.data 走 br/gzip,浏览器
+  //  透明解压,reader 读到的是解压后字节;IPA 是 zip 不再压缩读原始字节。故用解压后大小估算,
+  //  进度单调逼近 100%(略有估算,cap 99% 后 done 时补满)。
+  // ═══════════════════════════════════════════════════════════════════════
+  const DL = [
+    { key: 'wasm', url: 'touchHLE.wasm', cb: CB,     est:  8900000, set: (b) => { Module.wasmBinary = b; } },
+    { key: 'data', url: 'touchHLE.data', cb: CB,     est: 40000000, set: (b) => { window.__dataBuf = b; } },
+    { key: 'ipa',  url: 'MoleWorld.ipa', cb: IPA_CB, est: 97500000, set: (b) => { window.__ipaBuf = b; } },
+  ];
+  const DL_TOTAL = DL.reduce((a, d) => a + d.est, 0);
+  const got = Object.fromEntries(DL.map(d => [d.key, 0]));
+  function paintProgress() {
+    let sum = 0; for (const d of DL) sum += Math.min(got[d.key], d.est);
+    const pct = Math.min(99, Math.floor(sum / DL_TOTAL * 100));
+    const fill = $('sp-fill'), pctEl = $('sp-pct');
+    if (fill) fill.style.width = pct + '%';
+    if (pctEl) pctEl.textContent = pct + '%　·　' + (sum / 1048576).toFixed(0) + ' / ~' + Math.round(DL_TOTAL / 1048576) + ' MB';
+  }
+  async function streamFetch(d) {
+    const resp = await fetch(d.url + '?cb=' + (d.cb || CB));
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — ' + d.url);
+    if (!resp.body || !resp.body.getReader) {   // 老浏览器无流:整体读取
+      const buf = await resp.arrayBuffer(); got[d.key] = buf.byteLength; paintProgress(); d.set(buf);
+      addLog('[launcher] ' + d.key + ' 就绪(整体):' + buf.byteLength + ' 字节'); return;
+    }
+    const reader = resp.body.getReader();
+    const chunks = []; let n = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); n += value.length; got[d.key] = n; paintProgress();
+    }
+    const out = new Uint8Array(n); let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    d.set(out.buffer);
+    addLog('[launcher] ' + d.key + ' 就绪:' + n + ' 字节');
+  }
+  // 种子(小):优先 IndexedDB 玩家进度(自动保存/导入),否则同目录默认种子。三件套(userinfo.dat/
+  // map.dat/plist)必须配套——userinfo 是加密的,「是否加密」标志存 plist 里,少 plist 会误判存档损坏弹框 exit。
+  async function loadSeeds() {
+    window.__seeds = [];
+    let persisted = null;
+    try { persisted = await saveDB.get('player'); } catch (_) {}
+    if (persisted && persisted.files && persisted.files.length) {
+      for (const f of persisted.files) window.__seeds.push([f.path, f.data]);
+      window.__saveSource = (persisted.source || '').startsWith('导入') ? persisted.source : '玩家进度';
+      addLog('[存档] 从浏览器恢复存档:' + persisted.files.length + ' 文件(' + (persisted.created || '') + ')');
+    } else {
+      window.__saveSource = '默认种子';
+      for (const name of ['userinfo.dat', 'map.dat', 'com.taomee.MoleWorld.plist']) {
+        try {
+          const r = await fetch(name + '?cb=' + CB);
+          if (r.ok) { const buf = await r.arrayBuffer(); window.__seeds.push([SAVE_REL(name), new Uint8Array(buf)]);
+            addLog('[launcher] 默认种子下载:' + name + ' ' + buf.byteLength + ' 字节'); }
+        } catch (e) { /* 无该种子,可接受 */ }
+      }
+    }
+  }
+
   (async () => {
     addLog('[launcher] 页面加载 ' + new Date().toLocaleString());
     setStatus('下载游戏数据…');
     try {
-      const resp = await fetch('MoleWorld.ipa?cb=' + CB);
-      if (!resp.ok) throw new Error('HTTP ' + resp.status + '(MoleWorld.ipa 没放在同目录?)');
-      window.__ipaBuf = await resp.arrayBuffer();
-      addLog('[launcher] IPA 下载完成:' + window.__ipaBuf.byteLength + ' 字节');
-      // [离线种子存档] 同目录可选的真实存档,fetch 到内存留给 preRun 写进沙盒(没有就跳过,不影响启动)。
-      //   userinfo.dat / map.dat              → Documents/
-      //   com.taomee.MoleWorld.plist          → Library/Preferences/(NSUserDefaults:isEncrypt/EV130/userId…)
-      // 三件必须配套:userinfo 是加密的,但「是否加密」标志存在 NSUserDefaults 里——少了 plist,
-      // GameSettings.isEncrypt=NO → loadUserInfoData 误判「本地存档损坏」弹框 + exit。
-      window.__seeds = [];
-      // 优先从 IndexedDB 恢复玩家存档(上次自动保存/导入的)→ 进度刷新不丢;没有才用同目录默认种子。
-      let persisted = null;
-      try { persisted = await saveDB.get('player'); } catch (_) {}
-      if (persisted && persisted.files && persisted.files.length) {
-        for (const f of persisted.files) window.__seeds.push([f.path, f.data]);
-        window.__saveSource = (persisted.source || '').startsWith('导入') ? persisted.source : '玩家进度';
-        addLog('[存档] 从浏览器恢复存档:' + persisted.files.length + ' 文件(' + (persisted.created || '') + ')');
-      } else {
-        window.__saveSource = '默认种子';
-        for (const name of ['userinfo.dat', 'map.dat', 'com.taomee.MoleWorld.plist']) {
-          try {
-            const r = await fetch(name + '?cb=' + CB);
-            if (r.ok) { const buf = await r.arrayBuffer(); window.__seeds.push([SAVE_REL(name), new Uint8Array(buf)]);
-              addLog('[launcher] 默认种子下载:' + name + ' ' + buf.byteLength + ' 字节'); }
-          } catch (e) { /* 无该种子,可接受 */ }
-        }
-      }
+      await Promise.all([...DL.map(streamFetch), loadSeeds()]);
+      // emscripten 打包器直接用预取的 .data(否则它会自己再 fetch 一遍 touchHLE.data)
+      Module.getPreloadedPackage = () => window.__dataBuf;
+      addLog('[launcher] 全部资源就绪,启动模拟器');
     } catch (e) {
       setStatus('加载失败', 'err');
-      hintEl.textContent = '加载 MoleWorld.ipa 失败:' + e.message;
+      const note = $('sp-note'); if (note) { note.textContent = '下载失败:' + e.message + '(请刷新重试)'; note.classList.add('err'); }
       addLog('[launcher] ' + e); return;
     }
+    const fill = $('sp-fill'), pctEl = $('sp-pct'), note = $('sp-note');
+    if (fill) fill.style.width = '100%';
+    if (pctEl) pctEl.textContent = '100%　·　下载完成';
+    if (note) note.textContent = '正在初始化模拟器(首屏约十几秒)…';
     setStatus('启动模拟器…');
-    hintEl.textContent = '启动中…(debug 构建较慢,首屏可能要十几秒)';
     const s = document.createElement('script');
     s.src = 'touchHLE.js?cb=' + CB;
     s.onerror = () => { setStatus('加载失败', 'err'); addLog('[launcher] touchHLE.js 加载失败'); };
