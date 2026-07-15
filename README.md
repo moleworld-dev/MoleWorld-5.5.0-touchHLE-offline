@@ -63,7 +63,7 @@
 
 **支持平台**：macOS（Apple Silicon）、Windows x64、Linux x64、Android arm64 —— 这四个平台都提供**开箱即玩**的发布包（游戏已内置进包里，**点击即玩**，无需自己找 IPA）。iOS 原生版**移植进行中**(详见下文)。
 
-发布包从 GitHub Releases 页下载：<https://github.com/Shad0w23333/MoleWorld-5.5.0-touchHLE-offline/releases>
+发布包从 GitHub Releases 页下载：<https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/releases>
 
 ### 🟢 开箱即玩（下载即跑，已内置游戏）
 
