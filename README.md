@@ -1,5 +1,11 @@
 # 摩尔庄园HD 移动版 现代化离线移植（基于touchHLE）
 
+[![Release](https://img.shields.io/github/v/release/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline?include_prereleases&style=flat-square&color=2ea44f&label=下载)](https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/releases)
+[![Stars](https://img.shields.io/github/stars/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline?style=flat-square)](https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/stargazers)
+[![平台](https://img.shields.io/badge/平台-macOS_·_Windows_·_Linux_·_Android-4c8bf5?style=flat-square)](#)
+[![引擎 touchHLE](https://img.shields.io/badge/引擎-touchHLE-f28f1c?style=flat-square)](https://touchhle.org)
+[![License](https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square)](LICENSE)
+
 ![摩尔庄园 5.5.0 在 touchHLE 上离线运行（Apple Silicon Mac）](demo.png)
 
 把 2015 年已停运下架的《摩尔庄园移动版》（安卓叫《摩尔庄园豪华版》，**2D 平面模拟经营**，非现在的 3D 新版）的最后一个版本 **5.5.0（夏季海洋更新）**，通过 [touchHLE](https://touchhle.org)（Rust 写的 iOS 高层模拟器）**搬到 macOS / Windows / Linux / Android 等现代系统上离线游玩**（iOS 原生版移植进行中）。
