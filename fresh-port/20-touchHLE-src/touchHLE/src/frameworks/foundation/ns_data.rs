@@ -22,6 +22,10 @@ pub(super) struct NSDataHostObject {
 }
 impl HostObject for NSDataHostObject {}
 
+/// Diagnostic rate-limiter for getBytes:range: out-of-range logs (a garbage-count parser can hit it
+/// tens of thousands of times in one frame).
+static OVERRUN_LOG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -308,12 +312,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     // #[repr(packed)] field directly is an unaligned reference (rustc E0793).
     let (loc, rlen) = (range.location, range.length);
     if loc >= length || rlen > length - loc {
-        log!(
-            "[!] NSData getBytes:range: 越界(loc={} len={} data={}B)— 裁剪+补零不崩(贴近真机 NSRangeException)",
-            loc,
-            rlen,
-            length
-        );
+        // Rate-limit: a garbage-count parser can call this tens of thousands of times in one frame.
+        let n = OVERRUN_LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            log!(
+                "[!] NSData getBytes:range: 越界(loc={} len={} data={}B)— 裁剪+补零不崩(贴近真机 NSRangeException)",
+                loc,
+                rlen,
+                length
+            );
+        }
         env.mem.bytes_at_mut(buffer, rlen).fill(0);
         if loc < length {
             let avail = (length - loc).min(rlen);

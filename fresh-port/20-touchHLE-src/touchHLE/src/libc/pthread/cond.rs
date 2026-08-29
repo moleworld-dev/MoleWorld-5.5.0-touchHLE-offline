@@ -61,7 +61,13 @@ pub fn pthread_cond_init(
     cond: MutPtr<pthread_cond_t>,
     attr: ConstPtr<pthread_condattr_t>,
 ) -> i32 {
-    assert!(attr.is_null());
+    // [MoleKart] Mono initialises condition variables with a non-null condattr.
+    // pthread_condattr only carries clock-id / process-shared, neither of which
+    // this HLE condvar differentiates, so accept and ignore it rather than
+    // asserting null.
+    if !attr.is_null() {
+        log!("pthread_cond_init: ignoring non-null condattr {:?}", attr);
+    }
     let opaque = pthread_cond_t {
         magic: MAGIC_COND,
         _unused: [0; 6],

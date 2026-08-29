@@ -71,7 +71,9 @@ macro_rules! echo {
         {
             let formatted_str = format!($($arg)+);
 
-            #[cfg(target_os = "android")]
+            // [MoleWorld iOS] iOS 也走 SDL_Log → NSLog → 统一日志(Console.app 可见,
+            // 真机调试用);eprintln! 到 stderr 仍保留(无害冗余)。
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             {
                 sdl2::log::log(&formatted_str);
             }
@@ -82,14 +84,14 @@ macro_rules! echo {
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(formatted_str.as_bytes());
             let _ = log_file.write_all(b"\n");
-            // 每行强制落盘(Windows 上即 FlushFileBuffers):即便随后硬崩溃,
-            // 也能保住崩溃前最后一行日志,而不是被缓冲丢掉。
-            let _ = log_file.sync_data();
+            // [MoleWorld P0-C] 不再每行 fsync(sync_data)。write_all 已落到 OS 页缓存,进程崩溃
+            // (panic/段错误)不会丢日志——内核仍会把页缓存写回磁盘;fsync 只防断电/内核崩,对调试
+            // 日志没必要。而每行 fsync 在场景切换/进村时是毫秒级主线程 stall =「切场景卡一下」的真凶。
         }
     };
     () => {
         {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             {
                 sdl2::log::log("");
             }
@@ -99,7 +101,6 @@ macro_rules! echo {
             use std::io::Write;
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(b"\n");
-            let _ = log_file.sync_data();
         }
     }
 }

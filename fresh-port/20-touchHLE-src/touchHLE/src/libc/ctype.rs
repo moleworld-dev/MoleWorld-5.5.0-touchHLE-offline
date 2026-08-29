@@ -174,8 +174,26 @@ pub const CONSTANTS: ConstantExports = &[
     ),
 ];
 
+/// `__stack_chk_fail` — the -fstack-protector epilogue calls this when the
+/// stored canary doesn't match `__stack_chk_guard`. In an emulator we never
+/// actually smash the guest stack, so reaching here means EITHER a CPU-backend
+/// bug (a store/compare divergence corrupting the canary slot) OR a genuine
+/// guest issue. The function is `noreturn`, so returning leaves the caller in a
+/// corrupt state (it falls through past the call). Log loudly + dump the
+/// interpreter's recent-instruction trace so the divergent canary check is
+/// visible, then continue (best-effort; matches the old no-op behaviour).
+fn __stack_chk_fail(env: &mut Environment) {
+    echo!(
+        "[STACK-CHK-FAIL] canary mismatch! lr={:#010x} regs={:08x?}",
+        env.cpu.regs()[14],
+        env.cpu.regs()
+    );
+    env.cpu.dump_interp_trace();
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__tolower(_)),
     export_c_func!(__toupper(_)),
     export_c_func!(__maskrune(_, _)),
+    export_c_func!(__stack_chk_fail()),
 ];
