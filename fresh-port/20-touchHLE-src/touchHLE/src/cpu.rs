@@ -5,100 +5,133 @@
  */
 //! CPU emulation.
 //!
-//! Implemented using the C++ library dynarmic, which is a dynamic recompiler.
+//! Two interchangeable backends, selected at compile time by Cargo feature:
+//!  - `cpu_dynarmic` (default on desktop/Android): the C++ dynarmic JIT.
+//!  - `cpu_interpreter` (iOS): a pure-Rust ARMv7 interpreter. iOS 18.4+/TXM
+//!    forbids JIT for sideloaded apps even with a debugger (CS_DEBUGGED set,
+//!    JIT page execution still faults), so a software interpreter is the only
+//!    way to run on modern devices. See src/cpu/interpreter/.
 //!
 //! iPhone OS apps used either ARMv6 or ARMv7-A, which are both 32-bit ISAs.
 //! For the moment, only ARMv6 has been tested.
 
 use crate::abi::GuestFunction;
+#[allow(unused_imports)]
 use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
 
-// Import functions from C++
+// Import functions from C++ (dynarmic backend only).
+#[cfg(feature = "cpu_dynarmic")]
 use touchHLE_dynarmic_wrapper::*;
 
+#[cfg(feature = "cpu_interpreter")]
+mod interpreter;
+
 type VAddr = u32;
+
+/// State container used to swap CPU context on guest thread switches.
+/// dynarmic backend: the C++ context struct; interpreter backend: a pure-Rust
+/// `#[repr(C)]` equivalent.
+// When both backends are compiled (differential test build) the unified `Cpu`
+// uses the interpreter, so CpuContext must be the interpreter's too — keep this
+// in sync with the `inner`/method cfgs below. The dynarmic harness reads its
+// context via the raw FFI, not through this alias.
+#[cfg(feature = "cpu_interpreter")]
+pub type CpuContext = interpreter::CpuContext;
+#[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
 pub type CpuContext = touchHLE_DynarmicContext;
 
-fn touchHLE_cpu_read_impl<T: SafeRead + Default>(
-    mem: *mut touchHLE_Mem,
-    addr: VAddr,
-    error: *mut bool,
-) -> T {
-    // If a panic occurs (probably due to a null-pointer access), we can't let
-    // it keep unwinding as it will hit non-Rust stack frames (dynarmic).
-    // Instead we catch the unwind and then tell the C++ code a problem occurred
-    // so it can immediately halt CPU execution and then panic itself, now
-    // with only Rust stack frames to worry about and with CPU state information
-    // available that's useful for debugging.
-    //
-    // TODO: Disable this in debug mode? This relies on dynarmic's
-    // check_halt_on_memory_access option which surely has a significant
-    // performance impact.
-    //
-    // I'm not sure if this actually is unwind-safe, but considering
-    // the emulator will crash anyway, maybe this is okay.
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mem = unsafe { &mut *mem.cast::<Mem>() };
-        let ptr: ConstPtr<T> = Ptr::from_bits(addr);
-        mem.read(ptr)
-    }));
-    unsafe {
-        error.write(res.is_err());
+// ---- dynarmic memory-access callbacks (called from the C++ side) ----
+// Only needed by the dynarmic backend. `#[no_mangle]` keeps the exported symbol
+// names correct even though the items live inside a module.
+#[cfg(feature = "cpu_dynarmic")]
+mod dynarmic_callbacks {
+    use super::*;
+
+    fn touchHLE_cpu_read_impl<T: SafeRead + Default>(
+        mem: *mut touchHLE_Mem,
+        addr: VAddr,
+        error: *mut bool,
+    ) -> T {
+        // If a panic occurs (probably due to a null-pointer access), we can't let
+        // it keep unwinding as it will hit non-Rust stack frames (dynarmic).
+        // Instead we catch the unwind and then tell the C++ code a problem occurred
+        // so it can immediately halt CPU execution and then panic itself, now
+        // with only Rust stack frames to worry about and with CPU state information
+        // available that's useful for debugging.
+        //
+        // TODO: Disable this in debug mode? This relies on dynarmic's
+        // check_halt_on_memory_access option which surely has a significant
+        // performance impact.
+        //
+        // I'm not sure if this actually is unwind-safe, but considering
+        // the emulator will crash anyway, maybe this is okay.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mem = unsafe { &mut *mem.cast::<Mem>() };
+            let ptr: ConstPtr<T> = Ptr::from_bits(addr);
+            mem.read(ptr)
+        }));
+        unsafe {
+            error.write(res.is_err());
+        }
+        res.unwrap_or_default()
     }
-    res.unwrap_or_default()
-}
 
-fn touchHLE_cpu_write_impl<T: SafeWrite>(mem: *mut touchHLE_Mem, addr: VAddr, value: T) -> bool {
-    // See comments above about catch_unwind
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mem = unsafe { &mut *mem.cast::<Mem>() };
-        let ptr: MutPtr<T> = Ptr::from_bits(addr);
-        mem.write(ptr, value)
-    }));
-    res.is_err()
-}
+    fn touchHLE_cpu_write_impl<T: SafeWrite>(mem: *mut touchHLE_Mem, addr: VAddr, value: T) -> bool {
+        // See comments above about catch_unwind
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mem = unsafe { &mut *mem.cast::<Mem>() };
+            let ptr: MutPtr<T> = Ptr::from_bits(addr);
+            mem.write(ptr, value)
+        }));
+        res.is_err()
+    }
 
-// Export functions for use by C++
-#[no_mangle]
-extern "C" fn touchHLE_cpu_read_u8(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u8 {
-    touchHLE_cpu_read_impl(mem, addr, error)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_read_u16(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u16 {
-    touchHLE_cpu_read_impl(mem, addr, error)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_read_u32(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u32 {
-    touchHLE_cpu_read_impl(mem, addr, error)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_read_u64(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u64 {
-    touchHLE_cpu_read_impl(mem, addr, error)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_write_u8(mem: *mut touchHLE_Mem, addr: VAddr, value: u8) -> bool {
-    touchHLE_cpu_write_impl(mem, addr, value)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_write_u16(mem: *mut touchHLE_Mem, addr: VAddr, value: u16) -> bool {
-    touchHLE_cpu_write_impl(mem, addr, value)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_write_u32(mem: *mut touchHLE_Mem, addr: VAddr, value: u32) -> bool {
-    touchHLE_cpu_write_impl(mem, addr, value)
-}
-#[no_mangle]
-extern "C" fn touchHLE_cpu_write_u64(mem: *mut touchHLE_Mem, addr: VAddr, value: u64) -> bool {
-    touchHLE_cpu_write_impl(mem, addr, value)
+    // Export functions for use by C++
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_read_u8(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u8 {
+        touchHLE_cpu_read_impl(mem, addr, error)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_read_u16(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u16 {
+        touchHLE_cpu_read_impl(mem, addr, error)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_read_u32(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u32 {
+        touchHLE_cpu_read_impl(mem, addr, error)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_read_u64(mem: *mut touchHLE_Mem, addr: VAddr, error: *mut bool) -> u64 {
+        touchHLE_cpu_read_impl(mem, addr, error)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_write_u8(mem: *mut touchHLE_Mem, addr: VAddr, value: u8) -> bool {
+        touchHLE_cpu_write_impl(mem, addr, value)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_write_u16(mem: *mut touchHLE_Mem, addr: VAddr, value: u16) -> bool {
+        touchHLE_cpu_write_impl(mem, addr, value)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_write_u32(mem: *mut touchHLE_Mem, addr: VAddr, value: u32) -> bool {
+        touchHLE_cpu_write_impl(mem, addr, value)
+    }
+    #[no_mangle]
+    extern "C" fn touchHLE_cpu_write_u64(mem: *mut touchHLE_Mem, addr: VAddr, value: u64) -> bool {
+        touchHLE_cpu_write_impl(mem, addr, value)
+    }
 }
 
 pub struct Cpu {
+    #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
     dynarmic_wrapper: *mut touchHLE_DynarmicWrapper,
+    #[cfg(feature = "cpu_interpreter")]
+    inner: Box<interpreter::InterpreterCpu>,
     /// Copy of the direct memory access pointer used to check it has not
     /// changed. If this is null, direct memory access is not in use.
     direct_memory_access_ptr: *const std::ffi::c_void,
 }
 
+#[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
 impl Drop for Cpu {
     fn drop(&mut self) {
         unsafe { touchHLE_DynarmicWrapper_delete(self.dynarmic_wrapper) }
@@ -163,25 +196,42 @@ impl Cpu {
             .map_or(std::ptr::null_mut(), |mem| unsafe {
                 mem.direct_memory_access_ptr()
             });
-        let dynarmic_wrapper =
-            unsafe { touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count) };
-        Cpu {
-            dynarmic_wrapper,
-            direct_memory_access_ptr,
+
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
+        {
+            let dynarmic_wrapper =
+                unsafe { touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count) };
+            return Cpu {
+                dynarmic_wrapper,
+                direct_memory_access_ptr,
+            };
+        }
+        #[cfg(feature = "cpu_interpreter")]
+        {
+            return Cpu {
+                inner: interpreter::InterpreterCpu::new(null_page_count as u32),
+                direct_memory_access_ptr,
+            };
         }
     }
 
     pub fn regs(&self) -> &[u32; 16] {
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
         unsafe {
             let ptr = touchHLE_DynarmicWrapper_regs_const(self.dynarmic_wrapper);
-            &*(ptr as *const [u32; 16])
+            return &*(ptr as *const [u32; 16]);
         }
+        #[cfg(feature = "cpu_interpreter")]
+        return self.inner.regs();
     }
     pub fn regs_mut(&mut self) -> &mut [u32; 16] {
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
         unsafe {
             let ptr = touchHLE_DynarmicWrapper_regs_mut(self.dynarmic_wrapper);
-            &mut *(ptr as *mut [u32; 16])
+            return &mut *(ptr as *mut [u32; 16]);
         }
+        #[cfg(feature = "cpu_interpreter")]
+        return self.inner.regs_mut();
     }
 
     /// Dump the registers of the current cpu to the log output.
@@ -189,6 +239,13 @@ impl Cpu {
     pub fn dump_regs(&self) {
         let regs = self.regs();
         Self::echo_regs(regs);
+    }
+
+    /// [P1 debug] Dump the interpreter's recent-instruction ring buffer. No-op
+    /// on the dynarmic backend (it keeps no such trace).
+    pub fn dump_interp_trace(&self) {
+        #[cfg(feature = "cpu_interpreter")]
+        self.inner.dump_trace();
     }
 
     pub fn echo_regs(regs: &[u32; 16]) {
@@ -216,16 +273,29 @@ impl Cpu {
     }
 
     pub fn cpsr(&self) -> u32 {
-        unsafe { touchHLE_DynarmicWrapper_cpsr(self.dynarmic_wrapper) }
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
+        return unsafe { touchHLE_DynarmicWrapper_cpsr(self.dynarmic_wrapper) };
+        #[cfg(feature = "cpu_interpreter")]
+        return self.inner.cpsr();
     }
     pub fn set_cpsr(&mut self, cpsr: u32) {
-        unsafe { touchHLE_DynarmicWrapper_set_cpsr(self.dynarmic_wrapper, cpsr) }
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
+        unsafe {
+            touchHLE_DynarmicWrapper_set_cpsr(self.dynarmic_wrapper, cpsr)
+        }
+        #[cfg(feature = "cpu_interpreter")]
+        self.inner.set_cpsr(cpsr);
     }
 
     /// Swap the current state of the CPU (registers etc) with the state stored
     /// in the context object.
     pub fn swap_context(&mut self, context: &mut CpuContext) {
-        unsafe { touchHLE_DynarmicWrapper_swap_context(self.dynarmic_wrapper, context) }
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
+        unsafe {
+            touchHLE_DynarmicWrapper_swap_context(self.dynarmic_wrapper, context)
+        }
+        #[cfg(feature = "cpu_interpreter")]
+        self.inner.swap_context(context);
     }
 
     /// Get PC with the Thumb bit appropriately set.
@@ -257,13 +327,16 @@ impl Cpu {
         (old_pc, old_lr)
     }
 
-    /// Clear dynarmic's instruction cache for some range of addresses.
+    /// Clear the backend's instruction cache for some range of addresses.
     /// This is of interest to the dynamic linker, which will sometimes rewrite
     /// code.
     pub fn invalidate_cache_range(&mut self, base: VAddr, size: GuestUSize) {
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
         unsafe {
             touchHLE_DynarmicWrapper_invalidate_cache_range(self.dynarmic_wrapper, base, size)
         }
+        #[cfg(feature = "cpu_interpreter")]
+        self.inner.invalidate_cache_range(base, size);
     }
 
     /// Start CPU execution.
@@ -283,20 +356,26 @@ impl Cpu {
             assert!(self.direct_memory_access_ptr == unsafe { mem.direct_memory_access_ptr() });
         }
 
-        let res = unsafe {
-            touchHLE_DynarmicWrapper_run_or_step(
-                self.dynarmic_wrapper,
-                mem as *mut Mem as *mut touchHLE_Mem,
-                ticks,
-            )
-        };
-        match res {
-            -1 => CpuState::Normal,
-            -2 => CpuState::Error(CpuError::MemoryError),
-            -3 => CpuState::Error(CpuError::UndefinedInstruction),
-            -4 => CpuState::Error(CpuError::Breakpoint),
-            _ if res < -4 => panic!("Unexpected CPU execution result"),
-            svc => CpuState::Svc(svc as u32),
+        #[cfg(feature = "cpu_interpreter")]
+        return self.inner.run_or_step(mem, ticks);
+
+        #[cfg(all(feature = "cpu_dynarmic", not(feature = "cpu_interpreter")))]
+        {
+            let res = unsafe {
+                touchHLE_DynarmicWrapper_run_or_step(
+                    self.dynarmic_wrapper,
+                    mem as *mut Mem as *mut touchHLE_Mem,
+                    ticks,
+                )
+            };
+            match res {
+                -1 => CpuState::Normal,
+                -2 => CpuState::Error(CpuError::MemoryError),
+                -3 => CpuState::Error(CpuError::UndefinedInstruction),
+                -4 => CpuState::Error(CpuError::Breakpoint),
+                _ if res < -4 => panic!("Unexpected CPU execution result"),
+                svc => CpuState::Svc(svc as u32),
+            }
         }
     }
 }
