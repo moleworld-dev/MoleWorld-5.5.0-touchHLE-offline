@@ -76,10 +76,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)unarchiveObjectWithData:(id)data { // NSData *
+    let dlen: NSUInteger = if data == nil { 0 } else { msg![env; data length] };
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initForReadingWithData:data];
     let root_key = get_static_str(env, NSKeyedArchiveRootObjectKey);
     let result: id = msg![env; new decodeObjectForKey:root_key];
+    // DIAG (map.dat is the big one, ~11.7KB): is the unarchive result nil or a real dict?
+    if dlen > 4096 {
+        let cnt: i64 = if result == nil {
+            -1
+        } else {
+            let c: NSUInteger = msg![env; result count];
+            c as i64
+        };
+        log!("[MOLECHEAT] unarchiveObjectWithData: {}B -> count={}", dlen, cnt);
+    }
     autorelease(env, result)
 }
 
@@ -175,54 +186,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 // if the key is unknown.
 
 - (bool)decodeBoolForKey:(id)key { // NSString *
+    // [MoleWorld 容错] 真 Cocoa NSKeyedUnarchiver 对数值 key 做跨 NSNumber 类型强转;原版无脑
+    // as_boolean().unwrap() 在值存成 int/real 时会 panic(实测进岛解 island_map.dat 崩在
+    // decodeIntForKey: None.unwrap)。bool 也兜底:int/real 非0 即真,缺/异常回 false。
     get_value_to_decode_for_key(env, this, key)
-        .is_some_and(|value| value.as_boolean().unwrap())
+        .and_then(|value| coerce_int(value).map(|i| i != 0))
+        .unwrap_or(false)
 }
 
 - (f64)decodeDoubleForKey:(id)key { // NSString *
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0.0,
-        |value| value.as_real().unwrap()
-    )
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_real)
+        .unwrap_or(0.0)
 }
 
 - (f32)decodeFloatForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0.0,
-        |value| value.as_real().unwrap()
-    ) as f32
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_real)
+        .unwrap_or(0.0) as f32
 }
 
 - (NSInteger)decodeIntegerForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0,
-        |value| value.as_signed_integer().unwrap()
-    ).try_into().unwrap()
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_int)
+        .unwrap_or(0) as NSInteger
 }
 
 - (i32)decodeIntForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0,
-        |value| value.as_signed_integer().unwrap()
-    ).try_into().unwrap()
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_int)
+        .unwrap_or(0) as i32
 }
 
 - (i32)decodeInt32ForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0,
-        |value| value.as_signed_integer().unwrap()
-    ).try_into().unwrap()
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_int)
+        .unwrap_or(0) as i32
 }
 
 - (i64)decodeInt64ForKey:(id)key { // NSString *
-    get_value_to_decode_for_key(env, this, key).map_or(
-        0,
-        |value| value.as_signed_integer().unwrap()
-    )
+    get_value_to_decode_for_key(env, this, key)
+        .and_then(coerce_int)
+        .unwrap_or(0)
 }
 
 - (id)decodeObjectForKey:(id)key { // NSString*
@@ -298,6 +303,27 @@ fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -
     .as_dictionary()
     .unwrap();
     scope.get(&key)
+}
+
+/// [MoleWorld 容错] 把 plist::Value 跨数值类型强转为 i64。真 Cocoa NSKeyedUnarchiver 解 NSNumber
+/// 时不区分 int/real/bool 子类型(decodeIntForKey: 对存成 real 的值照样取整),我们要忠实复刻。
+/// ★修因(runtime 实测):一键进岛解 island_map.dat 时某 int 字段实际存成 real →
+/// 原 `as_signed_integer().unwrap()` 拿到 None panic(ns_keyed_unarchiver.rs:220)→ 进岛崩。
+/// 非数值(对象引用/字符串等)返 None,由调用方兜底默认值,绝不 panic。
+fn coerce_int(value: &Value) -> Option<i64> {
+    value
+        .as_signed_integer()
+        .or_else(|| value.as_unsigned_integer().map(|u| u as i64))
+        .or_else(|| value.as_real().map(|r| r as i64))
+        .or_else(|| value.as_boolean().map(|b| b as i64))
+}
+
+/// 同 [coerce_int],跨数值类型强转为 f64(int 存的值用 decodeDoubleForKey: 也能取)。
+fn coerce_real(value: &Value) -> Option<f64> {
+    value
+        .as_real()
+        .or_else(|| value.as_signed_integer().map(|i| i as f64))
+        .or_else(|| value.as_unsigned_integer().map(|u| u as f64))
 }
 
 /// The core of the implementation: unarchive something by its uid.
@@ -422,6 +448,16 @@ pub fn decode_current_array(env: &mut Environment, unarchiver: id) -> Vec<id> {
 pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id)> {
     let keys = keys_for_key(env, unarchiver, "NS.keys");
     let vals = keys_for_key(env, unarchiver, "NS.objects");
+    // DIAG: surface what the unarchiver actually reads for a big dict (the village map is the only
+    // large dict here). NS.keys==0 ⇒ the gunzip'd bplist's root dict is empty (server/gzip/body
+    // offset issue); NS.keys==N>0 but final count 0 ⇒ key/val unarchive or insert drops them.
+    if keys.len() > 8 {
+        eprintln!(
+            "[MOLECHEAT] decode_current_dict: NS.keys={} NS.objects={}",
+            keys.len(),
+            vals.len()
+        );
+    }
     log_dbg!("decode_current_dict: keys {:?}, vals {:?}", keys, vals);
 
     let keys: Vec<id> = keys
