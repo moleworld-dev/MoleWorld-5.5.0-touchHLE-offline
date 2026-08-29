@@ -58,7 +58,68 @@ fn getaddrinfo(
         return EAI_FAIL;
     }
 
-    assert!(node_name.is_null()); // TODO
+    // Online mode: client-side name resolution (node_name set). GCDAsyncSocket's
+    // lookup:host:port: calls getaddrinfo("host", "port", &hints); resolve it for real
+    // via the host resolver so hostnames like login.moleworld.net work (use the domain).
+    if !node_name.is_null() {
+        let host = match env.mem.cstr_at_utf8(node_name) {
+            Ok(h) => h.to_string(),
+            Err(_) => return EAI_FAIL,
+        };
+        let port: u16 = if serv_name.is_null() {
+            0
+        } else {
+            env.mem
+                .cstr_at_utf8(serv_name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+        let (socktype, protocol) = if hints.is_null() {
+            (SOCK_STREAM, IPPROTO_TCP)
+        } else {
+            let h = env.mem.read(hints);
+            let st = if h.ai_socktype == 0 { SOCK_STREAM } else { h.ai_socktype };
+            let pr = if h.ai_protocol == 0 { IPPROTO_TCP } else { h.ai_protocol };
+            (st, pr)
+        };
+        use std::net::{SocketAddr, ToSocketAddrs};
+        let v4 = match (host.as_str(), port).to_socket_addrs() {
+            Ok(it) => it
+                .filter_map(|a| match a {
+                    SocketAddr::V4(v4) => Some(v4),
+                    _ => None,
+                })
+                .next(),
+            Err(e) => {
+                log!("getaddrinfo(\"{}\":{}) resolve error: {}", host, port, e);
+                return EAI_FAIL;
+            }
+        };
+        let v4 = match v4 {
+            Some(v4) => v4,
+            None => {
+                log!("getaddrinfo(\"{}\":{}) -> no IPv4 address", host, port);
+                return EAI_FAIL;
+            }
+        };
+        let addr = sockaddr::from_ipv4_parts(v4.ip().octets(), port);
+        let tmp_addr = env.mem.alloc_and_write(addr);
+        let addr_info = addrinfo {
+            ai_flags: 0,
+            ai_family: AF_INET,
+            ai_socktype: socktype,
+            ai_protocol: protocol,
+            ai_addrlen: guest_size_of::<sockaddr>(),
+            ai_canonname: Ptr::null(),
+            ai_addr: tmp_addr,
+            ai_next: Ptr::null(),
+        };
+        let tmp_addr_info = env.mem.alloc_and_write(addr_info);
+        env.mem.write(res, tmp_addr_info);
+        log!("getaddrinfo resolved \"{}\":{} -> {}", host, port, v4.ip());
+        return 0;
+    }
 
     let hint = env.mem.read(hints);
     let ai_flags = hint.ai_flags;
