@@ -208,6 +208,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 let class = msg![env; responder class];
                 let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
+                let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
                 if !responder.is_null() && env.objc.class_is_subclass_of(class, ui_text_field_class)
                 {
                     match text_event {
@@ -221,11 +222,25 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                             ui_view::ui_control::ui_text_field::handle_return(env, responder)
                         }
                     }
+                } else if !responder.is_null()
+                    && env.objc.class_is_subclass_of(class, ui_text_view_class)
+                {
+                    // [MoleWorld] UITextView(留言板/漂流瓶/好友留言)的输入路由。
+                    match text_event {
+                        TextInputEvent::Text(text) => {
+                            ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                        }
+                        TextInputEvent::Backspace => {
+                            ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                        }
+                        TextInputEvent::Return => {
+                            ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                        }
+                    }
                 } else {
-                    // [MoleWorld 改名诊断] 收到文本输入但没有聚焦的 UITextField → 输入被丢弃。
-                    // 改名时若一直走这里,说明 becomeFirstResponder 没触发(tap 没命中输入框)。
+                    // [MoleWorld 改名诊断] 收到文本输入但没有聚焦的 UITextField/UITextView → 丢弃。
                     log!(
-                        "[改名诊断] 收到文本输入但 first_responder={:?} 不是 UITextField,输入被丢弃",
+                        "[改名诊断] 收到文本输入但 first_responder={:?} 不是输入框,输入被丢弃",
                         responder
                     );
                 }

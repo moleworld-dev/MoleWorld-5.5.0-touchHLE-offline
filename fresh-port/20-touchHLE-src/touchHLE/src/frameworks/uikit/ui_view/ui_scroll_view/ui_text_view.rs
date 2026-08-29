@@ -6,14 +6,12 @@
 //! `UITextView`.
 
 use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
-use crate::frameworks::core_graphics::cg_geometry::CGPointZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::foundation::{NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_color;
 use crate::frameworks::uikit::ui_font::{
-    break_lines_with_font, UILineBreakModeTailTruncation, UILineBreakModeWordWrap, UITextAlignment,
-    UITextAlignmentLeft,
+    break_lines_with_font, UILineBreakModeWordWrap, UITextAlignment, UITextAlignmentLeft,
 };
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::frameworks::uikit::ui_view::ui_control::ui_text_field::UIReturnKeyType;
@@ -69,7 +67,9 @@ impl Default for UITextViewHostObject {
     fn default() -> Self {
         UITextViewHostObject {
             superclass: Default::default(),
-            editable: false,
+            // iOS 的 UITextView.editable 默认 YES(游戏多半不显式设);touchHLE 原来默认 false
+            // 会让没设过 editable 的留言框拒绝 becomeFirstResponder → 输入不进。改为匹配 iOS。
+            editable: true,
             font: nil,
             text: nil,
             text_color: nil,
@@ -285,6 +285,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     todo_objc_setter!(this, types);
 }
 
+// [MoleWorld] 文本输入响应:touchHLE 原版 UITextView 没实现 becomeFirstResponder,点了不聚焦
+// (first_responder 仍 nil),留言板/漂流瓶/好友留言全部输入不进(handle_events 因 first_responder
+// 不是输入框就丢弃)。补上:可编辑时点中 → 成为第一响应者 + 开启文本输入(MOLE_TEXT_INPUT_ACTIVE
+// 同时让渲染切到 composition 路径,逐字符实时上屏);文本路由见 uikit.rs handle_events。
+- (())touchesBegan:(id)_touches
+         withEvent:(id)_event {
+    if env.objc.borrow::<UITextViewHostObject>(this).editable {
+        let _: bool = msg![env; this becomeFirstResponder];
+    }
+}
+
+- (bool)becomeFirstResponder {
+    if !env.objc.borrow::<UITextViewHostObject>(this).editable {
+        return false;
+    }
+    let curr: id = env.objc.borrow::<UITextViewHostObject>(this).text;
+    if curr == nil {
+        let empty = get_static_str(env, "");
+        () = msg![env; this setText:empty];
+    }
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let name = get_static_str(env, UITextViewTextDidBeginEditingNotification);
+    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
+    env.framework_state.uikit.ui_responder.first_responder = this;
+    env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
+    true
+}
+
+- (bool)resignFirstResponder {
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let name = get_static_str(env, UITextViewTextDidEndEditingNotification);
+    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
+    env.framework_state.uikit.ui_responder.first_responder = nil;
+    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
+    true
+}
+
 - (())drawRect:(CGRect)_rect {
     let bounds: CGRect = msg![env; this bounds];
     let context = UIGraphicsGetCurrentContext(env);
@@ -301,24 +338,65 @@ pub const CLASSES: ClassExports = objc_classes! {
     let (r, g, b, a) = ui_color::get_rgba(&env.objc, text_color);
     CGContextSetRGBFillColor(env, context, r, g, b, a);
 
-    let content_offset: CGPoint = msg![env; this contentOffset];
+    // [MoleWorld] 文字按图层滚动 origin(=contentOffset)锚定,与 displayIfNeeded 在 translate(-origin)
+    // 下清除的 {origin,size} 区域一致。原来锚在 CGPointZero + size 加 content_offset 膨胀,会让清除区域
+    // 和绘制区域错位 → 滚动(origin≠0)时每次 setText: 旧字符没被清掉 → 重叠累积(留言板/漂流瓶打字糊成
+    // 一团的真因)。size 用 bounds.size(不再加 offset),换行用 WordWrap(多行可编辑视图应当如此)。
     let rect = CGRect {
-        origin: CGPointZero,
-        // If size is not expanded by the offset,
-        // the text is rendered truncated.
-        size: CGSize {
-            width: bounds.size.width + content_offset.x,
-            height: bounds.size.height + content_offset.y,
-        }
+        origin: bounds.origin,
+        size: bounds.size,
     };
 
     log_dbg!("UItextView text rendering in rect {:?}", rect);
     let _size: CGSize = msg![env; text drawInRect:rect
                                          withFont:font
-                                    lineBreakMode:UILineBreakModeTailTruncation
+                                    lineBreakMode:UILineBreakModeWordWrap
                                         alignment:text_alignment];
 }
 
 @end
 
 };
+
+// [MoleWorld] UITextView 的文本输入处理(uikit.rs handle_events 对 first_responder 是 UITextView
+// 时调)。直接 append/删 text 字段再 setText:(内含 setNeedsDisplay → drawRect: 实时重绘)。
+pub fn handle_text(env: &mut Environment, text_view: id, text: String) {
+    let txt = from_rust_string(env, text);
+    let txt_len: NSUInteger = msg![env; txt length];
+    if txt_len == 0 {
+        release(env, txt);
+        return;
+    }
+    let mut curr: id = msg![env; text_view text];
+    if curr == nil {
+        curr = get_static_str(env, "");
+    }
+    let new_text: id = msg![env; curr stringByAppendingString:txt];
+    () = msg![env; text_view setText:new_text];
+    release(env, new_text);
+    release(env, txt);
+}
+
+pub fn handle_backspace(env: &mut Environment, text_view: id) {
+    let curr: id = msg![env; text_view text];
+    let len: NSUInteger = msg![env; curr length];
+    if len == 0 {
+        return;
+    }
+    let new_text: id = msg![env; curr substringToIndex:(len - 1)];
+    () = msg![env; text_view setText:new_text];
+    release(env, new_text);
+}
+
+pub fn handle_return(env: &mut Environment, text_view: id) {
+    // 多行 UITextView:回车插入换行。
+    let txt = from_rust_string(env, "\n".to_string());
+    let mut curr: id = msg![env; text_view text];
+    if curr == nil {
+        curr = get_static_str(env, "");
+    }
+    let new_text: id = msg![env; curr stringByAppendingString:txt];
+    () = msg![env; text_view setText:new_text];
+    release(env, new_text);
+    release(env, txt);
+}
