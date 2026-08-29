@@ -21,7 +21,9 @@
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
-use std::collections::HashMap;
+// [MoleWorld P1] FxHashMap (faster hash for the u32-keyed ObjC dispatch tables on the
+// per-message hot path; std HashMap's SipHash is DoS-resistant overkill for internal tables).
+use rustc_hash::FxHashMap;
 
 mod classes;
 mod messages;
@@ -66,23 +68,23 @@ pub type NSZonePtr = crate::mem::MutVoidPtr;
 /// Main type holding Objective-C runtime state.
 pub struct ObjC {
     /// Known selectors (interned method name strings).
-    selectors: HashMap<String, SEL>,
+    selectors: FxHashMap<String, SEL>,
 
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: HashMap<id, HostObjectEntry>,
+    objects: FxHashMap<id, HostObjectEntry>,
 
     /// Known classes.
     ///
     /// Look at the `isa` to get the metaclass for a class.
-    classes: HashMap<String, Class>,
+    classes: FxHashMap<String, Class>,
 
     /// Mutexes used in @synchronized blocks (objc_sync_enter/exit).
-    sync_mutexes: HashMap<id, MutexId>,
+    sync_mutexes: FxHashMap<id, MutexId>,
 
     /// Mutexes for running the +initialize function.
-    initializer_threads: HashMap<id, ThreadInitializer>,
+    initializer_threads: FxHashMap<id, ThreadInitializer>,
 
     /// Temporary storage for optional type information when sending a message.
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
@@ -93,11 +95,11 @@ pub struct ObjC {
 impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
-            selectors: HashMap::new(),
-            objects: HashMap::new(),
-            classes: HashMap::new(),
-            sync_mutexes: HashMap::new(),
-            initializer_threads: HashMap::new(),
+            selectors: FxHashMap::default(),
+            objects: FxHashMap::default(),
+            classes: FxHashMap::default(),
+            sync_mutexes: FxHashMap::default(),
+            initializer_threads: FxHashMap::default(),
             message_type_info: None,
         }
     }

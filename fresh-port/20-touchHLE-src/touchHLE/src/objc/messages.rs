@@ -41,7 +41,23 @@ pub(super) struct ThreadInitializer {
 }
 
 fn maybe_initialize_class(env: &mut Environment, receiver: id) {
-    let class_host_object = env.objc.get_host_object(receiver).unwrap();
+    let class_host_object = match env.objc.get_host_object(receiver) {
+        Some(o) => o,
+        None => {
+            // [P1 iOS interp debug] The "class" being messaged isn't a registered
+            // host object — almost always means a wrong value reached R0 as the
+            // receiver (e.g. the stack-guard sentinel 0xdead2a55). Dump the
+            // interpreter's recent-instruction trace so we can see which guest
+            // instruction produced the bad receiver, then panic as before.
+            echo!(
+                "[OBJC-BADRECV] maybe_initialize_class: receiver {:?} not a host object; regs R0..R3 = {:08x?}",
+                receiver,
+                &env.cpu.regs()[0..4]
+            );
+            env.cpu.dump_interp_trace();
+            panic!("maybe_initialize_class: receiver {:?} is not a registered object", receiver);
+        }
+    };
     let Some(&super::ClassHostObject {
         superclass,
         is_metaclass,
@@ -236,10 +252,17 @@ fn objc_msgSend_inner(
     // nothing when all cheats are off. intercept() may fully handle the call
     // (return) or tweak an argument register and let the real method run.
     if crate::mole_cheats::any_enabled() {
-        let class_name = env.objc.get_class_name(orig_class).to_string();
-        let sel_str = selector.as_str(&env.mem).to_string();
-        if crate::mole_cheats::intercept(env, &class_name, &sel_str) {
-            return;
+        // [MoleWorld P0-B] 先用借来的 &str(零分配)过粗筛:游戏每帧约 16000 条消息,99% 不命中任何
+        // hook,直接 bail——不付出下面两次 to_string 堆分配,也不进 intercept 的长比较链(每条消息省
+        // 2 次 malloc/free,显著降分配器压力/抖动)。只有命中白名单的少数消息才 to_string + 进 intercept。
+        let class_name = env.objc.get_class_name(orig_class);
+        let sel_str = selector.as_str(&env.mem);
+        if crate::mole_cheats::intercept_wants(class_name, sel_str) {
+            let class_owned = class_name.to_string();
+            let sel_owned = sel_str.to_string();
+            if crate::mole_cheats::intercept(env, &class_owned, &sel_owned) {
+                return;
+            }
         }
     }
     // [MoleWorld] Two functional short-circuits for offline play. Gated on the
