@@ -38,6 +38,23 @@ rm -rf "$STAGE"; mkdir -p "$STAGE"
 security cms -D -i "$PROF" > /tmp/prof.plist 2>/dev/null
 /usr/libexec/PlistBuddy -x -c "Print :Entitlements" /tmp/prof.plist > "$ENT" || { echo "✗ 抽 entitlements 失败"; exit 1; }
 
+# [游戏资源同步] .app 内嵌的 MoleWorld.ipa 是游戏本体(store zip,Payload/MoleWorld.app 结构,ios_entry 就地解),
+# 以前只换 touchHLE 二进制、从不重打它 → 仓库里新增/重打包的资源(宽屏底图 X_wide.png、重打包图集)上不了
+# 设备。这里若仓库 payload 里有比内嵌 IPA 更新的文件,就按 make-ios-ipa.sh 同样配方重打(剔除
+# .decoded.plist / .DS_Store / IDA 的 .i64)。
+GAME_APP="$TH/../../01-cracked/Payload/MoleWorld.app"
+INNER="$APP/MoleWorld.ipa"
+if [ -d "$GAME_APP" ] && { [ ! -f "$INNER" ] || [ -n "$(find "$GAME_APP" -newer "$INNER" -type f ! -name '*.i64' ! -name '.DS_Store' ! -name '*.decoded.plist' | head -1)" ]; }; then
+  echo "[3.5/5] 仓库 payload 比内嵌 MoleWorld.ipa 新 → 重打游戏本体"
+  GS=$(mktemp -d); mkdir -p "$GS/Payload"
+  cp -R "$GAME_APP" "$GS/Payload/MoleWorld.app"
+  find "$GS/Payload/MoleWorld.app" \( -name "*.decoded.plist" -o -name ".DS_Store" -o -name "*.i64" \) -delete || true
+  rm -f "$INNER"
+  ( cd "$GS" && zip -r -X -0 -q "$INNER" Payload )
+  rm -rf "$GS"
+  echo "    内嵌 IPA: $(du -h "$INNER" | cut -f1),含 _wide.png $(unzip -l "$INNER" | grep -c '_wide.png') 张"
+fi
+
 echo "[4/5] 换二进制 + 嵌 profile + 签名"
 cp "$EXE" "$APP/MoleWorldHD.thin"
 lipo -create "$APP/MoleWorldHD.thin" -output "$APP/MoleWorldHD" && rm -f "$APP/MoleWorldHD.thin"
