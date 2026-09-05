@@ -775,13 +775,32 @@ Type mismatch when sending message {} to {:?}!
             is_metaclass,
         }) = host_object.as_any().downcast_ref()
         {
-            log!(
-                "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                name,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                selector.as_str(&env.mem),
-            );
+            // [MoleWorld] 广告/统计/评分 SDK 的 fake class 是【有意 no-op 掉】的(TalkingData 统计、
+            // Flurry、iRate 评分弹窗、淘米广告墙…),它们每帧被调几十次,逐次打日志纯属噪音,会把
+            // 真正有价值的告警冲掉。这些类静默处理(行为不变,仍返回 nil);其余 fake class 照常打印。
+            const SILENT_FAKE_CLASSES: &[&str] = &[
+                "TDGAUtility",        // TalkingData 游戏统计
+                "TalkingData",
+                "TalkingDataGA",
+                "TaomeeAnalytics",    // 淘米自家统计
+                "Flurry",             // Flurry 统计
+                "iRate",              // App Store 评分弹窗
+                "AdWallsManager",     // 广告墙
+                "AdViewForMoleCart",  // 摩尔卡丁车跨游戏广告
+                "GADBannerView",      // Google AdMob
+                "GADRequest",
+                "GADInterstitial",
+                "AtomAdNetworkAdapter",
+            ];
+            if !SILENT_FAKE_CLASSES.contains(&name.as_str()) {
+                log!(
+                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
+                    name,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    selector.as_str(&env.mem),
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else {
