@@ -1061,6 +1061,34 @@ impl InterpreterCpu {
                         self.get_reg(rn).wrapping_add(v)
                     }
                 }
+                0b010 => {
+                    // SXTB16 (rn==15) / SXTAB16: 取 rotated 的 byte0、byte2,各符号扩展到
+                    // 16 位,分别放进结果的低/高半字;A 变体对每个半字做 16 位加法。
+                    let lo = Self::sign_extend(rotated & 0xff, 8);
+                    let hi = Self::sign_extend((rotated >> 16) & 0xff, 8);
+                    if rn == 15 {
+                        ((hi & 0xffff) << 16) | (lo & 0xffff)
+                    } else {
+                        let n = self.get_reg(rn);
+                        let rlo = (n & 0xffff).wrapping_add(lo) & 0xffff;
+                        let rhi = ((n >> 16) & 0xffff).wrapping_add(hi) & 0xffff;
+                        (rhi << 16) | rlo
+                    }
+                }
+                0b011 => {
+                    // UXTB16 (rn==15) / UXTAB16:byte0、byte2 各零扩展到 16 位,放进低/高半字;
+                    // A 变体对每个半字做 16 位加法。★摩尔头像/颜色处理用到这条,缺它会 panic/卡死。
+                    let lo = rotated & 0xff;
+                    let hi = (rotated >> 16) & 0xff;
+                    if rn == 15 {
+                        (hi << 16) | lo
+                    } else {
+                        let n = self.get_reg(rn);
+                        let rlo = (n & 0xffff).wrapping_add(lo) & 0xffff;
+                        let rhi = ((n >> 16) & 0xffff).wrapping_add(hi) & 0xffff;
+                        (rhi << 16) | rlo
+                    }
+                }
                 0b100 => {
                     // SXTB / SXTAB
                     let v = Self::sign_extend(rotated & 0xff, 8);
@@ -1750,6 +1778,13 @@ mod tests {
         chk("SXTH.W r0,r1", 0xfa0f_f081, r(&[(1, 0x0000_8000)]), 0);
         // SXTB.W with ROR #8 (rotate then extend): FA4F F091
         chk("SXTB.W r0,r1,ROR#8", 0xfa4f_f091, r(&[(1, 0x0000_8000)]), 0);
+        // 16-variants(摩尔头像颜色处理用到 UXTB16,之前未实现→panic/卡死)。
+        chk("UXTB16 r0,r1", 0xfa3f_f081, r(&[(1, 0xAABB_CCDD)]), 0);
+        chk("SXTB16 r0,r1", 0xfa2f_f081, r(&[(1, 0xAABB_CCDD)]), 0);
+        chk("UXTB16 r0,r1,ROR#8", 0xfa3f_f091, r(&[(1, 0x1122_3344)]), 0);
+        chk("SXTB16 r0,r1,ROR#16", 0xfa2f_f0a1, r(&[(1, 0x80FF_7F01)]), 0);
+        chk("UXTAB16 r0,r2,r1", 0xfa32_f081, r(&[(1, 0x00FF_00FF), (2, 0x0001_0002)]), 0);
+        chk("SXTAB16 r0,r2,r1", 0xfa22_f081, r(&[(1, 0x0080_0080), (2, 0x0010_0010)]), 0);
     }
 
     #[test]

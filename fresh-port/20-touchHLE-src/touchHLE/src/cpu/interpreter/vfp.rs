@@ -409,15 +409,29 @@ impl InterpreterCpu {
                 }
             }
             0b1100 | 0b1101 => {
-                // VCVT floating point -> integer. Source is Sm (sz=0) or Dm
-                // (sz=1); destination is always single reg Sd. opc2==1101 →
-                // signed, 1100 → unsigned. bit7 (e): 1 = round toward zero
-                // (VCVT), 0 = round per FPSCR (VCVTR) — we always trunc.
+                // VCVT/VCVTR floating point -> integer. Source is Sm (sz=0) or Dm
+                // (sz=1); destination is always single reg Sd. opc2==1101 → signed,
+                // 1100 → unsigned. bit7 (e): 1 = VCVT round-toward-zero;
+                // 0 = VCVTR round per FPSCR RMode(iOS 默认 RN=round-to-nearest-even)。
+                // ★原实现一律 trunc、无视 e:VCVTR 会把 0.99999→0、N.99999→N,可致好友场景取整"帧时长/
+                // 帧数"被算成 0 → AnimPlayer::updateDt 追帧循环永不退出(仅解释器 no-JIT,dynarmic 正确圆整)。
+                // 修:e==0 时按 FPSCR[23:22] RMode 预圆整,再交 fp_to_i32/u32(内部 trunc 对已取整值为 no-op,
+                // 且保留 NaN→0 / 饱和处理)。
                 let signed = opc2 == 0b1101;
                 let f = if dp {
                     self.get_d_f64(rm_d)
                 } else {
                     self.get_s_f32(rm_s) as f64
+                };
+                let f = if e == 1 {
+                    f // VCVT: 舍入到零,交给 fp_to_i32/u32 的 trunc
+                } else {
+                    match (self.fpscr >> 22) & 0b11 {
+                        0b00 => f.round_ties_even(), // RN(最近偶数,iOS 默认)
+                        0b01 => f.ceil(),            // RP(+∞)
+                        0b10 => f.floor(),           // RM(−∞)
+                        _ => f,                      // RZ(交给 trunc)
+                    }
                 };
                 let out = if signed {
                     fp_to_i32(f) as u32
@@ -470,8 +484,14 @@ impl InterpreterCpu {
             return Some(CpuState::Normal);
         }
 
-        // VMOV (core ↔ single-precision register): bits[27:21]==1110_000, bit20=op.
-        if a == 0b000 && (insn >> 8) & 0xf == 0b1010 && (insn >> 5) & 0b111 == 0 {
+        // VMOV (core ↔ single-precision register): A1 = `cond 1110 000 o Vn Rt 1010 N (0)(0) 1`.
+        // 判别位只应是 coproc bits[11:8]==1010 + bits[6:5]==00 (+ bit4==1)。**bit7 是 N**——单精度
+        // 寄存器号 Sn 的最低位(见下方 line 用 bit7 拼 n),【不是判别位】。原守卫用 `(insn>>5)&0b111==0`
+        // = bits[7:5]={N,0,0}==0,把 N 强钉成 0 → 只匹配偶数 S0/S2/…;奇数 S1/S3/…(N=1)守卫失败,
+        // 跌穿到下面 VMOV.32 标量车道守卫(它又漏校验 bits[11:8]),被当成 VMOV D16[x],Rt 执行 →
+        // 奇数 S 寄存器经"核心↔单精度"通道静默写/读错寄存器、值损坏(与前科 VMOV bug 同族)。
+        // 只在解释器出现(dynarmic 解码正确),正是"点好友仅 no-JIT 硬冻死"的根因。修:只查 bits[6:5]。
+        if a == 0b000 && (insn >> 8) & 0xf == 0b1010 && (insn >> 5) & 0b11 == 0 {
             let n = (((insn >> 16) & 0xf) << 1 | ((insn >> 7) & 1)) as usize; // Sn
             if l == 1 {
                 self.regs[rt] = self.get_sreg(n); // VMOV Rt, Sn
@@ -489,8 +509,15 @@ impl InterpreterCpu {
         {
             let dn = (((insn >> 7) & 1) << 4 | ((insn >> 16) & 0xf)) as usize; // (N:Vn)
             let lane = ((insn >> 21) & 1) as usize; // 32-bit form lane index
-            // 32-bit variant: bits[23]==0, bits[6:5]==00, bits[22]==0.
-            if (insn >> 23) & 1 == 0 && (insn >> 5) & 0b11 == 0 && (insn >> 22) & 1 == 0 {
+            // 32-bit variant: coproc bits[11:8]==1011, bits[23]==0, bits[6:5]==00, bits[22]==0.
+            // ★必须校验 bits[11:8]==1011:否则单精度 VMOV(核心↔Sn,coproc==1010)在上面守卫漏掉奇数
+            // 寄存器时会被本车道误吞成标量 VMOV.32(写错到 D16),即上方描述的损坏路径。加此校验后二者
+            // 严格分流(1010=单精度传输 / 1011=标量车道)。
+            if (insn >> 8) & 0xf == 0b1011
+                && (insn >> 23) & 1 == 0
+                && (insn >> 5) & 0b11 == 0
+                && (insn >> 22) & 1 == 0
+            {
                 if l == 1 {
                     // VMOV Rt, Dn[lane]
                     let d = self.get_dreg(dn);

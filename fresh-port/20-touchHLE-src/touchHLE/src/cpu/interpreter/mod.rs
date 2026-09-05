@@ -82,6 +82,27 @@ pub struct InterpreterCpu {
     dbg_n: u64,
     dbg_last_pc: u32,
     dbg_last_insn: u32,
+    /// [hang debug] CCNode::visit 入口探针:命中次数 + 最近 16 个被 visit 的节点指针环。
+    /// 卡死时 dump:环里反复出现同一批指针=循环遍历(cyclic/重复渲染),全是新指针=节点爆炸。
+    visit_n: u64,
+    visit_ring: [u32; 16],
+    /// [hang debug] 0x20cc7a(vcmpe.f32 s18,#0 处)浮点探针计数:看 s22/s18(尺寸/缩放)
+    /// 是不是真机上算成 0 或 NaN,从而 `bls` 走错分支导致死循环。
+    fprobe_n: u64,
+    /// [MoleWorld iOS] 实时对拍状态(仅诊断构建:两后端都编译)。保存上一条被武装指令的前态,
+    /// 在下一条 step 顶部与解释器后态比对(见 diff::live_check)。
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_pre_regs: [u32; 16],
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_pre_cpsr: u32,
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_pre_extregs: [u32; 64],
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_pre_fpscr: u32,
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_insn: u32,
+    #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+    diff_pending: bool,
     // P1: ITSTATE cache + PC->decoded-instruction cache.
 }
 
@@ -99,6 +120,21 @@ impl InterpreterCpu {
             dbg_n: 0,
             dbg_last_pc: 0,
             dbg_last_insn: 0,
+            visit_n: 0,
+            visit_ring: [0; 16],
+            fprobe_n: 0,
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_pre_regs: [0; 16],
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_pre_cpsr: 0,
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_pre_extregs: [0; 64],
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_pre_fpscr: 0,
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_insn: 0,
+            #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
+            diff_pending: false,
         })
     }
 
@@ -579,25 +615,251 @@ impl InterpreterCpu {
             }
         }
 
-        // [P1 debug] log first few instructions, and any jump into the stack
-        // region (control-flow bug) together with the PREVIOUS instruction (the
-        // culprit that wrote the bad PC).
-        // 逐指令开销(trace 环写 / dbg_n / heartbeat / DERAIL 检测)在 release 默认编译掉:
-        // 广谱启动每条指令都付这份固定开销,关掉是均匀提速。需要抓脱轨时开 interp_debug。
-        #[cfg(any(feature = "interp_debug", debug_assertions))]
+        // [MoleWorld iOS] 实时 lockstep 对拍(仅诊断构建:cpu_dynarmic+cpu_interpreter)。
+        // 被键武装后,对每条游戏代码区(0x100000–0x900000,排除纹理快路径 0x2e7102)的指令:
+        // 在【下一条 step 顶部】用 dynarmic 从上一条的前态重跑、与解释器后态比寄存器+标志位,
+        // 分歧打印 [LIVE-DIFF]——精准抓出 iOS-only 解释器算错的那一条。fresh dynarmic 每条很慢,
+        // 故只在武装+游戏区时跑;用户在好友界面按键武装、点丝尔特即可。
+        #[cfg(all(feature = "cpu_dynarmic", feature = "cpu_interpreter"))]
         {
-            self.dbg_n = self.dbg_n.wrapping_add(1);
-            let _n = self.dbg_n;
-            // [P1 debug] heartbeat: every ~4M instructions, print where the CPU
-            // is. A steady stream with the PC cycling in a small range means the
-            // guest is alive but spinning (a hang); the dumped trace then shows
-            // the loop body.
-            if _n & 0x003f_ffff == 0 {
-                echo!(
-                    "[HEARTBEAT] n={:#x} pc={:#010x} r4={:#x} itstate={:#04x} inIT={} z={}",
-                    _n, pc, self.regs[4], self.itstate(), self.in_it_block(), self.flag_z()
+            // 无 GUI 插桩的武装方式:每 ~1M 条指令探一次文件,`touch /tmp/touchHLE_diff_arm`
+            // 即武装、`rm` 即解除。用户在好友界面 touch 该文件、稍等一下再点丝尔特即可。
+            {
+                static CHK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if CHK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x000f_ffff == 0 {
+                    let armed = std::path::Path::new("/tmp/touchHLE_diff_arm").exists();
+                    diff::DIFF_ARMED.store(armed, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if self.diff_pending {
+                self.diff_pending = false;
+                let pre_regs = self.diff_pre_regs;
+                let pre_cpsr = self.diff_pre_cpsr;
+                let pre_extregs = self.diff_pre_extregs;
+                let pre_fpscr = self.diff_pre_fpscr;
+                let prev_insn = self.diff_insn;
+                let post_regs = self.regs;
+                let post_cpsr = self.cpsr();
+                let post_extregs = self.extregs;
+                let post_fpscr = self.fpscr;
+                diff::live_check(
+                    mem,
+                    &pre_regs,
+                    pre_cpsr,
+                    &pre_extregs,
+                    pre_fpscr,
+                    &post_regs,
+                    post_cpsr,
+                    &post_extregs,
+                    post_fpscr,
+                    prev_insn,
                 );
             }
+            if diff::DIFF_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+                && (0x0010_0000..0x0090_0000).contains(&pc)
+                && pc != 0x002e_7102
+            {
+                self.diff_pre_regs = self.regs;
+                self.diff_pre_cpsr = self.cpsr();
+                self.diff_pre_extregs = self.extregs;
+                self.diff_pre_fpscr = self.fpscr;
+                self.diff_insn = insn;
+                self.diff_pending = true;
+            }
+        }
+
+        // [MoleWorld iOS · P0 修复] 头像动画"追帧"死循环防护。
+        // AnimPlayer::updateDt:(0x20f4e4)有个追帧循环:
+        //   while timeAcc >= frameDuration { timeAcc -= frameDuration; 推进帧+建精灵; frameDuration = getDuration() }
+        // 终止唯一条件是 frameDuration > timeAcc。真机(原生 GLES1)下点好友渲染头像时,某帧的
+        // frameDuration([ASprite GetAFrameTime:aframe:] 经 getDuration)被取成 0:于是 timeAcc-=0
+        // 永不减小、timeAcc>=0 恒真 → 循环永不退出,每轮 wrap 帧并新建精灵 → 单个 drawScene 永不返回、
+        // 从不 present、精灵无限累积 → 整局冻死。桌面(GLES1-on-GL2)同一份解释器/数据不触发。
+        // 0 或负的"帧时长"语义上非法;在循环的两个比较点(0x20f540 入口、0x20f5d2 回边,均 r0=frameDuration、
+        // r1=timeAcc、r4=self、r5=timeAcc 的 ivar 偏移)把它钳到 ≥1,保证 timeAcc 每轮至少减 1、循环必然终止。
+        // 同时在入口把异常巨大的累积时间封顶(防 dt 爆炸的超长追帧),只丢弃一次积压(跳一帧动画,无害)。
+        // 命中范围极窄(仅该函数这两条指令),对其他指令/游戏零影响。这是 touchHLE 侧根因级防护,
+        // 编进所有构建,无需改 guest 二进制。
+        if pc & 0xffff_ff00 == 0x0020_f500 && (pc == 0x0020_f540 || pc == 0x0020_f5d2) {
+            if (self.regs[0] as i32) <= 0 {
+                self.regs[0] = 1; // frameDuration 钳到 ≥1
+            }
+            // 入口点:累积时间封顶(正常仅几个帧单位;>0x800 视为异常 dt 积压)。
+            if pc == 0x0020_f540 && self.regs[1] > 0x0000_0800 {
+                self.regs[1] = self.regs[0]; // timeAcc←frameDuration,循环只跑一轮即退出
+            }
+        }
+
+        // [hang debug] 轻量心跳:每 ~4M 条指令打印 CPU 当前位置(pc/lr/sp)。卡死时连续
+        // 心跳的 pc 会聚在一个小范围=循环体,配 lr 可定位到具体函数。只 +1 计数 +1 分支,
+        // ~1.05x(对比 interp_debug 的 ~40x,因为不写 trace 环、不做 DERAIL 检测)。
+        // 用 `--features interp_hb` 单开抓卡死,不拖慢正常 release。
+        #[cfg(any(feature = "interp_debug", feature = "interp_hb", debug_assertions))]
+        {
+            self.dbg_n = self.dbg_n.wrapping_add(1);
+            // [hang debug] 影子调用栈 = 穿透 objc 跳板还原 guest 真实调用链。
+            // 思路:每条指令跨步比对——若【上一条】把 LR 设成了"自己之后"(ppc+2/+4)且现在 pc 跳走了,
+            // 上一条就是 BL/BLX(调用)→ push 返回地址。控制流回到任一已 push 的返回地址(bx lr / pop pc /
+            // 甚至 msgSend 跳板续跑回调用点)→ pop。如此维护的栈条目全是【真·游戏代码返回地址】(不是
+            // 0x3000a000 跳板)。心跳时 dump:死循环期间多条心跳的【共同稳定底层帧】= 驱动那个 while 的函数链。
+            {
+                use std::cell::{Cell, RefCell};
+                thread_local! {
+                    static SH: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+                    static SH_PREVPC: Cell<u32> = const { Cell::new(0) };
+                    static SH_PREVLR: Cell<u32> = const { Cell::new(0) };
+                }
+                let ppc = SH_PREVPC.with(|c| c.replace(pc));
+                let _plr = SH_PREVLR.with(|c| c.replace(self.regs[14]));
+                // ★thumb 返回地址带 bit0=1(LR=(pc+len)|1),必须 &!1 再比,否则永远不命中=栈空。
+                let lr = self.regs[14] & !1u32;
+                // 上一条 = 调用(BL/BLX):LR 现在 = ppc 之后(ppc+2 或 ppc+4),且本条 pc 跳走了。
+                let seq = pc == ppc.wrapping_add(2) || pc == ppc.wrapping_add(4);
+                let lr_is_ret = lr == ppc.wrapping_add(2) || lr == ppc.wrapping_add(4);
+                if ppc != 0 && lr_is_ret && !seq {
+                    SH.with(|s| {
+                        let mut s = s.borrow_mut();
+                        if s.len() < 1024 {
+                            s.push(lr);
+                        }
+                    });
+                }
+                // 返回:控制回到某个已 push 的返回地址 → 弹出(可一次弹多层,处理跳板/longjmp)。
+                SH.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let mut hops = 0;
+                    while let Some(&top) = s.last() {
+                        if top == pc && hops < 64 {
+                            s.pop();
+                            hops += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                });
+                if self.dbg_n & 0x003f_ffff == 0 {
+                    let (depth, chain) = SH.with(|s| {
+                        let s = s.borrow();
+                        let depth = s.len();
+                        let chain = s
+                            .iter()
+                            .rev()
+                            .take(20)
+                            .map(|a| format!("{:#x}", a))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (depth, chain)
+                    });
+                    echo!("[SHADOW] pc={:#010x} depth={} chain={}", pc, depth, chain);
+                }
+            }
+            // [hang debug] CCNode::visit(0x2d30cc)入口探针:把 self(r0)塞进 16 槽环,
+            // 每 0x40000 次入口 dump 环 + 去重计数。uniq 小=反复 visit 同一批节点(cyclic/
+            // 重复渲染),uniq=16=每次都是新节点(树爆炸/不断新建)。直接判定死循环形态。
+            if pc == 0x002d_30cc {
+                let slot = (self.visit_n as usize) & 15;
+                self.visit_ring[slot] = self.regs[0];
+                self.visit_n = self.visit_n.wrapping_add(1);
+                if self.visit_n & 0x0003_ffff == 0 {
+                    let mut uniq = 0u32;
+                    for i in 0..16 {
+                        if !self.visit_ring[..i].contains(&self.visit_ring[i]) {
+                            uniq += 1;
+                        }
+                    }
+                    echo!(
+                        "[VISIT] n={:#x} uniq={}/16 ring={:08x?}",
+                        self.visit_n, uniq, self.visit_ring
+                    );
+                }
+            }
+            // [hang debug] 0x20cc7a 处 s22(0x20cc66 vcvt 出)与 s18(0x20cc76 vcvt 出)都已就绪,
+            // 正是两个 `vcmpe.f32 ...,#0` 尺寸守卫的操作数。真机上若为 0/NaN → bls 走错 → 卡死。
+            if pc == 0x0020_cc7a {
+                self.fprobe_n = self.fprobe_n.wrapping_add(1);
+                if self.fprobe_n & 0x0003_ffff == 0 {
+                    echo!(
+                        "[FPROBE] n={:#x} s22={}({:#010x}) s18={}({:#010x})",
+                        self.fprobe_n,
+                        f32::from_bits(self.extregs[22]),
+                        self.extregs[22],
+                        f32::from_bits(self.extregs[18]),
+                        self.extregs[18]
+                    );
+                }
+            }
+            // [hang debug] AnimPlayer::updateDt:(0x20f4e4)追帧循环探针。
+            // 0x20f540 = 进循环前的初始 cmp:r0=frameDuration(getDuration返回), r1=timeAcc,
+            //            r2=dt(本次帧增量), r4=self。一次性打印 → 看 dt 是否巨大、frameDuration 是否 0。
+            if pc == 0x0020_f540 {
+                echo!(
+                    "[ANIMDT] enter self={:#x} dt(r2)={} timeAcc(r1)={} frameDur(r0)={}",
+                    self.regs[4], self.regs[2] as i32, self.regs[1] as i32, self.regs[0] as i32
+                );
+            }
+            // 0x20f5d2 = 循环回边前的 cmp:r0=frameDuration(刚 getDuration), r1=timeAcc。
+            // 每 0x40000 次打印 → 看死循环里 frameDuration 是否恒 0、timeAcc 怎么变。
+            if pc == 0x0020_f5d2 {
+                self.fprobe_n = self.fprobe_n.wrapping_add(1);
+                if self.fprobe_n & 0x0003_ffff == 0 {
+                    echo!(
+                        "[ANIMLOOP] n={:#x} timeAcc(r1)={} frameDur(r0)={} curFrame?={:#x}",
+                        self.fprobe_n, self.regs[1] as i32, self.regs[0] as i32, self.regs[11]
+                    );
+                }
+            }
+            if self.dbg_n & 0x003f_ffff == 0 {
+                echo!(
+                    "[HEARTBEAT] n={:#x} pc={:#010x} lr={:#x} sp={:#x} r4={:#x} itstate={:#04x} inIT={} z={}",
+                    self.dbg_n, pc, self.regs[14], self.regs[13], self.regs[4],
+                    self.itstate(), self.in_it_block(), self.flag_z()
+                );
+                // [hang debug] 走 Apple ARM 帧指针(r7)链,打印返回地址栈。卡死时
+                // 多条心跳的栈外层(共同后缀)= 稳定调用路径 → 直接定位反复调用渲染的
+                // 驱动者函数(比单层 lr 强得多)。
+                let mut fp = self.regs[7];
+                let mut chain = String::new();
+                for _ in 0..24 {
+                    if fp < 0x1000 || (fp & 3) != 0 {
+                        break;
+                    }
+                    let Some(ret) = self.data_r_u32(mem, fp.wrapping_add(4)) else {
+                        break;
+                    };
+                    let Some(next) = self.data_r_u32(mem, fp) else {
+                        break;
+                    };
+                    chain.push_str(&format!(" {:#x}", ret));
+                    if next <= fp {
+                        break;
+                    }
+                    fp = next;
+                }
+                echo!("[STACK]{}", chain);
+                // [hang debug] r7 链全是 msgSend 跳板(0x3000a000)时没用。直接从 sp 往上扫
+                // 原始栈内存,挑落在 __text [0x4000,0x9c8000) 且 bit0=1(thumb 返回地址)的字
+                // = 真实调用链。多条心跳的共同返回地址 = 反复执行的循环驱动函数。
+                let mut scan = String::new();
+                let mut a = self.regs[13] & !3;
+                let top = a.wrapping_add(0xc00);
+                let mut found = 0;
+                while a < top && found < 32 {
+                    if let Some(w) = self.data_r_u32(mem, a) {
+                        if (0x4000..0x009c_8000).contains(&w) && (w & 1) == 1 {
+                            scan.push_str(&format!(" {:#x}", w));
+                            found += 1;
+                        }
+                    }
+                    a = a.wrapping_add(4);
+                }
+                echo!("[STACKSCAN]{}", scan);
+            }
+        }
+
+        // [P1 debug] log first few instructions, and any jump into the stack
+        // region (control-flow bug) together with the PREVIOUS instruction.
+        #[cfg(any(feature = "interp_debug", debug_assertions))]
+        {
             let lpc = self.dbg_last_pc;
             let linsn = self.dbg_last_insn;
             self.dbg_last_pc = pc;

@@ -27,3 +27,7 @@ fresh-port/30-oldver/v5.4.0/
 # ── 临时移开的嵌套 .git（push 后会恢复为 .git，永不收录）──
 # 不带尾斜杠 → 同时匹配目录(touchHLE/.git)和指针文件(vendor 子模块的 .git)
 **/.git__MOVED__
+
+# IDA 数据库 / 本地打包产物
+*.i64
+*-testflight.ipa
