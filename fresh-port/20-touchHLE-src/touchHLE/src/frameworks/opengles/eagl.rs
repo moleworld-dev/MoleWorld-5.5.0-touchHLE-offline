@@ -550,8 +550,12 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 unsafe fn present_renderbuffer(env: &mut Environment) {
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
+    // [MoleWorld 智能分辨率] 完整 drawable 尺寸,供 present_frame 的 --ambient-fill 环境补边。
+    let full_size = env.window.as_ref().unwrap().drawable_size();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定。
+    let window_default_fbo = env.window.as_ref().unwrap().default_framebuffer();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -608,6 +612,33 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         gles11::TEXTURE_MIN_FILTER,
         gles11::LINEAR as _,
     );
+    // [MoleWorld iOS 黑屏根治] 这条是【游戏真机主呈现路径】(EAGL fast path):把屏幕大小
+    // 的游戏 renderbuffer CopyTexImage2D 成一张纹理再画到屏幕。该纹理是 NPOT(960×640/
+    // 1024×768/自适配尺寸),原版只设了 MIN_FILTER、wrap 停在默认 GL_REPEAT。桌面 GL2.1
+    // (gles1_on_gl2)容忍 NPOT+REPEAT 故 Mac 一直正常;但【原生 iOS GLES1.1】对 NPOT 纹理
+    // 仅在 CLAMP_TO_EDGE+非 mipmap 过滤时才【完整】,否则纹理 texture-incomplete:即便
+    // GL_TEXTURE_2D 已 Enable、TEXTURE_BINDING_2D 非 0,采样也按『纹理被禁用』处理且【不报
+    // glError】→ REPLACE 环境下整块四边形纯黑。这正是真机『纹理有内容(读回非0)却 present 全黑、
+    // 纯色四边形却正常、glErr=0』的根因。composition.rs / window.rs(splash)早已为各自的 NPOT
+    // 纹理补了 CLAMP_TO_EDGE,唯独这条游戏主路径漏补。仅 iOS 加,Mac 保持 REPEAT 不回归。
+    #[cfg(target_os = "ios")]
+    {
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MAG_FILTER,
+            gles11::LINEAR as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+    }
 
     // Clean up the framebuffer object since we no longer need it.
     // This also sets the framebuffer bindings back to zero, so rendering
@@ -680,7 +711,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     // Draw the quad
     log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(gles, viewport, full_size, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
 
     // Clean up the texture
     gles.DeleteTextures(1, &texture);

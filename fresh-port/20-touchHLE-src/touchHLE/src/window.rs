@@ -42,11 +42,150 @@ impl std::fmt::Display for DeviceFamily {
 }
 impl DeviceFamily {
     pub fn portrait_size(&self) -> (u32, u32) {
+        // [MoleWorld 智能分辨率·测试分支] MOLE_GUEST_PORTRAIT=WxH 覆盖 guest 逻辑屏(点,portrait 维度)。
+        // 用途="物理满屏不黑边"折中:喂一个更宽的 winSize → 游戏世界场景(村庄/岛,checkBounding 读
+        // winSize)自然扩视野铺满 + winSize 相对 UI(底部菜单/弹窗)自动重锚;顶部 HUD 等写死坐标保持
+        // 老位(后续 targeted 重锚 + present 模糊填缝补)。★portrait 维度:landscape 时 size_for_orientation
+        // 交换宽高,故"加宽 landscape"=加大这里的 height(如 768x1366 → landscape 1366x768=16:9)。
+        // ui_screen bounds(guest winSize)与 window size 都走本函数 → 窗口自动匹配 guest 宽高比=无 letterbox。
+        // 仅 env 显式设置时生效;默认(不设)逐字节不变,零回归。
+        if let Some(sz) = guest_portrait_override() {
+            return sz;
+        }
+        // [MoleWorld 智能分辨率] 第二层:MOLE_FILL=1 时由 Window::new 按目标屏宽高比自动算的 guest 逻辑屏。
+        if let Some(&sz) = AUTO_PORTRAIT.get() {
+            return sz;
+        }
         match self {
             DeviceFamily::iPhone => (320, 480),
             DeviceFamily::iPad => (768, 1024),
         }
     }
+}
+
+/// [MoleWorld 智能分辨率] 自动适配(--fill-screen / MOLE_FILL)时,Window::new 按目标屏宽高比
+/// 算好的 guest portrait 逻辑屏。
+static AUTO_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+/// [MoleWorld 智能分辨率] CLI `--logical-size=WxH` 显式指定的 guest portrait 逻辑屏(点,已归一
+/// 成 portrait=(短,长))。优先级高于 env `MOLE_GUEST_PORTRAIT`。由 [apply_cli_resolution] 写入。
+static CLI_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+/// [MoleWorld 智能分辨率] CLI `--fill-screen` 开关(等价 MOLE_FILL=1,一等公民)。
+static CLI_FILL_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [MoleWorld 智能分辨率] CLI `--max-aspect=F` 覆盖(自动适配时 guest landscape 宽高比上限)。
+static CLI_MAX_ASPECT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+/// [MoleWorld 智能分辨率]「4:3 完美模式」环境补边开关(--ambient-fill)。present 据此:letterbox
+/// 空白处用【画面横向拉伸+压暗】填充代替黑边。默认关。
+static AMBIENT_FILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [MoleWorld 智能分辨率] 设置环境补边开关(Window::new 从 Options 应用一次)。
+pub fn set_ambient_fill(on: bool) {
+    AMBIENT_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+/// [MoleWorld 智能分辨率] present 查:是否启用环境补边。
+pub fn ambient_fill_active() -> bool {
+    AMBIENT_FILL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [MoleWorld 智能分辨率] 建窗前把 CLI 分辨率选项写进上面的模块静态量。之所以走静态量:
+/// [DeviceFamily::portrait_size] 挂在 DeviceFamily 上,且 ui_screen bounds / 窗口尺寸 / fs 宽图
+/// 重定向 / 触摸映射等多路消费者都拿不到 [Options],只能读全局。仅此一处写、建窗前调一次。
+pub fn apply_cli_resolution(
+    logical_size: Option<(u32, u32)>,
+    fill_screen: bool,
+    max_aspect: Option<f32>,
+) {
+    if let Some((w, h)) = logical_size {
+        if w != 0 && h != 0 {
+            // 归一成 portrait=(短边,长边),用户传 1366x768 或 768x1366 皆可。
+            let _ = CLI_PORTRAIT.set((w.min(h), w.max(h)));
+        }
+    }
+    if fill_screen {
+        CLI_FILL_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(a) = max_aspect {
+        let _ = CLI_MAX_ASPECT.set(a);
+    }
+}
+
+/// [MoleWorld 智能分辨率] 显式 guest portrait 逻辑屏覆盖:CLI `--logical-size` 优先,其次
+/// env `MOLE_GUEST_PORTRAIT=WxH`(portrait 点尺寸,仅解析一次)。
+fn guest_portrait_override() -> Option<(u32, u32)> {
+    if let Some(&sz) = CLI_PORTRAIT.get() {
+        return Some(sz);
+    }
+    static OVERRIDE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let s = std::env::var("MOLE_GUEST_PORTRAIT").ok()?;
+        let (w, h) = s.split_once('x')?;
+        let w: u32 = w.trim().parse().ok()?;
+        let h: u32 = h.trim().parse().ok()?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        log!(
+            "[MOLE-RES] guest 逻辑屏覆盖 MOLE_GUEST_PORTRAIT={}x{}(landscape={}x{})",
+            w,
+            h,
+            h,
+            w
+        );
+        Some((w, h))
+    })
+}
+
+/// [MoleWorld 智能分辨率] 是否请求自动铺屏适配(--fill-screen 或 MOLE_FILL=1)。
+fn fill_screen_requested() -> bool {
+    CLI_FILL_SCREEN.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("MOLE_FILL").map(|v| v != "0").unwrap_or(false)
+}
+
+/// [MoleWorld 智能分辨率] 自动适配时 guest landscape 宽高比上限。默认 2.4(≈21.6:9,覆盖
+/// 16:9 / 16:10 / 21:9 等主流桌面比例 → 零黑边);仅超宽屏(如 32:9)会被钳到此值、留极小
+/// pillarbox 以避免横向拉伸变形。可用 `--max-aspect=` 或 env MOLE_MAX_ASPECT 调,夹在 [4:3, 4.0]。
+fn fill_max_aspect() -> f32 {
+    CLI_MAX_ASPECT
+        .get()
+        .copied()
+        .or_else(|| {
+            std::env::var("MOLE_MAX_ASPECT")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(2.4)
+        .clamp(4.0 / 3.0, 4.0)
+}
+
+/// [MoleWorld 智能分辨率] 由目标屏长短边算 guest portrait 逻辑屏(FixedHeight Hor+):锁短边
+/// = base_short(iPad 768 / iPhone 320),长边按【钳制后的】屏宽高比缩放。比例夹在
+/// [4:3(游戏原生下限,更窄会裁掉为 1024 宽设计的内容), max_aspect]。返回 portrait 维度 (短,长)。
+fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
+    let raw = if short > 0 {
+        long as f32 / short as f32
+    } else {
+        4.0 / 3.0
+    };
+    let aspect = raw.clamp(4.0 / 3.0, fill_max_aspect());
+    let landscape_long = ((base_short as f32) * aspect).round() as u32;
+    (base_short, landscape_long)
+}
+
+/// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size/env,或自动 fill 已算出)。
+/// [Window::viewport] 据此:定制时走【等比缩放】(不变形,且 guest 比例≈屏比例故无黑边);默认
+/// (无定制)保持窗口模式自由拉伸铺满(零回归)。
+fn custom_guest_size_active() -> bool {
+    guest_portrait_override().is_some() || AUTO_PORTRAIT.get().is_some()
+}
+
+/// [MoleWorld 宽屏] 当前 guest 逻辑屏是否比 4:3 更宽(landscape 宽 > 1024)。
+/// portrait 覆盖 (W,H) → landscape (H,W),故 landscape 宽 = portrait 高。用于 fs 层在宽屏时
+/// 把整屏底图 `X.png` 透明重定向到宽版 `X_wide.png`(见 src/fs.rs lookup_node)。默认(无覆盖)
+/// = 4:3 → false → 不重定向,零回归。
+pub fn is_widescreen() -> bool {
+    let (_w, h) = guest_portrait_override()
+        .or_else(|| AUTO_PORTRAIT.get().copied())
+        .unwrap_or((0, 0));
+    h > 1024
 }
 impl TryFrom<u64> for DeviceFamily {
     type Error = ();
@@ -218,6 +357,14 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
 static MOLE_TEXT_INPUT_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// [MoleWorld] 文本输入是否激活。供 `find_fullscreen_eagl_layer` 查:编辑文本时强制走
+/// composition 合成路径(而非 fullscreen-EAGL 快路径),否则 UITextField/UILabel 逐字符
+/// 改了文字永远不上屏(快路径只 present 游戏 GL renderbuffer、不画 UIKit overlay,
+/// recomposite 又在 fullscreen-EAGL 处早退)→ 表现为"打字途中不显示、回车后才显示"。
+pub fn mole_text_input_active() -> bool {
+    MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
@@ -241,6 +388,13 @@ pub struct Window {
     lock_aspect: bool,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     splash_image: Option<Image>,
+    /// [MoleWorld iOS] SDL 窗口的默认 framebuffer。桌面/安卓=0;iOS=SDL 绑到 CAEAGLLayer 的
+    /// 非 0 viewFramebuffer。present_frame 绘制前绑定它。
+    default_framebuffer: crate::gles::gles11_raw::types::GLuint,
+    /// [MoleWorld iOS] internal_gl_ins context 的 viewRenderbuffer。iOS 的 SDL swap 走
+    /// [presentRenderbuffer:GL_RENDERBUFFER],呈现【当前绑定的 renderbuffer】;故 splash /
+    /// composition 在 swap 前必须把它绑回 GL_RENDERBUFFER,否则呈现到错误缓冲=黑屏。桌面/安卓=0。
+    default_renderbuffer: crate::gles::gles11_raw::types::GLuint,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
@@ -309,18 +463,52 @@ impl Window {
         let fullscreen = options.fullscreen;
         let lock_aspect = options.lock_aspect;
 
+        // [MoleWorld 智能分辨率] 建窗前把 CLI 分辨率选项(--logical-size / --fill-screen / --max-aspect)
+        // 写进模块静态量,供 portrait_size / fs 宽图重定向 / viewport 等多路消费者读取。
+        apply_cli_resolution(options.logical_size, options.fill_screen, options.max_aspect);
+        set_ambient_fill(options.ambient_fill);
+
+        // [MoleWorld 智能分辨率] --fill-screen / MOLE_FILL:按目标屏(主显示器/真机设备屏)宽高比
+        // 【自动】算 guest 逻辑屏,实现"物理满屏不黑边、不拉伸"——guest winSize 与屏幕同比例(钳制后)
+        // → 世界场景(村庄/岛)扩视野铺满 + winSize 相对 UI 自动重锚,无 letterbox。短边按 device-family
+        // 固定(iPad=768/iPhone=320),长边按屏宽高比缩放并夹在 [4:3, max_aspect](见 compute_fill_portrait)。
+        // 仅当未显式指定 guest 逻辑屏(--logical-size / MOLE_GUEST_PORTRAIT)时生效(显式优先)。结果存
+        // AUTO_PORTRAIT,供 portrait_size(ui_screen bounds + 窗口尺寸都走它)读取。默认(不请求)零回归。
+        if fill_screen_requested() && guest_portrait_override().is_none() {
+            if let Ok(db) = video_ctx.display_bounds(0) {
+                let (dw, dh) = db.size();
+                let (long, short) = if dw >= dh { (dw, dh) } else { (dh, dw) };
+                if short > 0 {
+                    let base_short = match device_family {
+                        DeviceFamily::iPad => 768u32,
+                        DeviceFamily::iPhone => 320u32,
+                    };
+                    let (pw, ph) = compute_fill_portrait(base_short, long, short);
+                    let _ = AUTO_PORTRAIT.set((pw, ph));
+                    log!(
+                        "[MOLE-RES] 自动铺屏适配:屏 {}x{} → guest 逻辑屏 portrait={}x{}(landscape={}x{}, 比例上限={:.3})",
+                        dw, dh, pw, ph, ph, pw, fill_max_aspect()
+                    );
+                }
+            }
+        }
+
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
             set_sdl2_orientation(device_orientation);
             let screen_size = video_ctx.display_bounds(0).unwrap().size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen()
-                .opengl()
-                .build()
-                .unwrap();
-            window
+            // [MoleWorld 智能分辨率·第三层] MOLE_HIDPI=1:iOS 开 allow_highdpi → SDL drawable_size 变
+            // 【设备原生像素】(否则真机上 drawable=点尺寸,游戏只画点分辨率再被 iOS 整屏上采样=糊)。
+            // viewport()/触摸映射全基于 drawable_size 自动跟随。仅 iOS/Android 全屏路径,Mac 走 else 窗口
+            // 路径不受影响(铁律:iOS 渲染改动不污染 Mac)。env 门控,默认不开,真机 opt-in 实测。
+            let mut wb = video_ctx.window(title, width, height);
+            wb.fullscreen().opengl();
+            if std::env::var("MOLE_HIDPI").map(|v| v != "0").unwrap_or(false) {
+                wb.allow_highdpi();
+                log!("[MOLE-RES] iOS HiDPI 开启(allow_highdpi):drawable=设备原生像素");
+            }
+            wb.build().unwrap()
         } else if fullscreen {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
             let window = video_ctx
@@ -397,6 +585,8 @@ impl Window {
             lock_aspect,
             internal_gl_ins: None,
             splash_image: launch_image,
+            default_framebuffer: 0,
+            default_renderbuffer: 0,
             device_family,
             device_orientation,
             controller_ctx,
@@ -422,8 +612,10 @@ impl Window {
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
         let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
+        let mut window_default_fbo: crate::gles::gles11_raw::types::GLuint = 0;
+        let mut window_default_rbo: crate::gles::gles11_raw::types::GLuint = 0;
         {
-            let gl_ctx = gl_ins.make_current(&mut window);
+            let mut gl_ctx = gl_ins.make_current(&mut window);
             let desc = unsafe { gl_ctx.driver_description() };
             log!("Driver info: {}", desc);
             // [MoleWorld] 缓存给「关于」页用(此刻上下文 current,glGetString 安全)。
@@ -431,7 +623,20 @@ impl Window {
             // [crash log] GPU 已缓存、游戏版本已在 main 缓存 → 输出一次完整运行诊断块,
             // 方便用户贴日志时一眼看清「什么机器 / 什么系统 / 什么版本」。
             echo!("{}", crate::mole_sysinfo::diag_block());
+            // [MoleWorld iOS] 此刻 SDL 刚 make_current、把窗口的 viewFramebuffer 留作当前绑定,
+            // 抓它作为窗口默认 framebuffer。桌面/安卓=0,iOS=CAEAGLLayer 的非 0 FBO。
+            let mut fbo: crate::gles::gles11_raw::types::GLint = 0;
+            let mut rbo: crate::gles::gles11_raw::types::GLint = 0;
+            unsafe {
+                gl_ctx.GetIntegerv(crate::gles::gles11_raw::FRAMEBUFFER_BINDING_OES, &mut fbo);
+                gl_ctx.GetIntegerv(crate::gles::gles11_raw::RENDERBUFFER_BINDING_OES, &mut rbo);
+            }
+            window_default_fbo = fbo as _;
+            window_default_rbo = rbo as _;
         }
+        window.default_framebuffer = window_default_fbo;
+        window.default_renderbuffer = window_default_rbo;
+        log!("[ios-present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
         window.internal_gl_ins = Some(gl_ins);
 
         if window.splash_image.is_some() {
@@ -483,7 +688,8 @@ impl Window {
             let out_x = (x + 0.5) * out_w as f32;
             let out_y = (y + 0.5) * out_h as f32;
             // Round to match touch precision of official devices.
-            (out_x.round(), out_y.round())
+            let out = (out_x.round(), out_y.round());
+            out
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
             let (_, _, vw, vh) = window.viewport();
@@ -563,11 +769,14 @@ impl Window {
                     self.virtual_accelerometer_last = Some((x, y, false));
                 }
                 // [MoleWorld] 窗口缩放事件:
-                // ① 锁比例(--lock-aspect):把【窗口本身】约束回 app 宽高比(4:3 / 3:2)——
-                //    用户拖大拖小时窗口始终保持游戏比例,画面自由拉伸铺满即【等比、不变形、
-                //    无黑边】(=用户要的"游戏随窗口同步等比缩放",而不是 letterbox 两条黑边)。
-                // ② macOS framebuffer y-offset 补偿(SDL/macOS 缩放后 framebuffer 取 max(新,旧)、
-                //    视口 y 轴错位),用最终 window.size()(点;未开 allow_highdpi)重算。
+                // ① 锁比例(仅显式 --lock-aspect):把【窗口本身】约束回 guest 宽高比,拖拽时窗口
+                //    始终保持游戏比例,自由铺满即等比不变形无黑边。★注意:这条走 set_size,而 macOS
+                //    上 set_size 会触发 framebuffer=max(新,旧) 怪癖 → 缩小窗口后 drawable 错乱、UI 错位;
+                //    故【不再】给 --fill-screen/--logical-size 等定制尺寸自动开这条(那会让"resize 后 UI
+                //    错位")。定制尺寸想要"无黑边完美填满"请用 --fullscreen(全屏无 resize/无 set_size/
+                //    无怪癖,guest 比例=屏比例 → 铺满不变形);windowed 定制尺寸走 viewport 自由铺满
+                //    (填满无黑边,仅当把窗口拖成很不同的比例时才轻微拉伸,不会 UI 错位)。
+                // ② macOS framebuffer y-offset 补偿(仅 --lock-aspect 的 set_size 路径需要)。
                 // push_back 那个 match 对 Window 事件走 `_ => continue` 不入队,故此处只做副作用。
                 E::Window {
                     win_event:
@@ -575,7 +784,13 @@ impl Window {
                         | sdl2::event::WindowEvent::Resized(w, h),
                     ..
                 } => {
-                    if self.lock_aspect && w > 0 && h > 0 {
+                    // 仅显式 --lock-aspect(且非全屏)才 set_size 锁窗口比例。
+                    if self.lock_aspect
+                        && !self.fullscreen
+                        && !Self::rotatable_fullscreen()
+                        && w > 0
+                        && h > 0
+                    {
                         let (app_w, app_h) = size_for_orientation(
                             self.device_family,
                             self.device_orientation,
@@ -1230,6 +1445,27 @@ impl Window {
 
         let gl_ctx = self.window.gl_create_context()?;
 
+        // [MoleWorld] macOS 26 的窗口服务器对【未同步上屏】的 GL 窗口(尤其独立 Space + 高频刷新)
+        // 会合成出闪烁(渲染内容平滑、上屏却闪)。MOLE_VSYNC 让 swap 同步到显示器刷新来消除:
+        // 1=VSync(同步),2=自适应撕裂同步(LateSwapTearing),其它/不设=保持原行为(Immediate)。
+        // env 门控、便于 A/B,不改默认行为(gl_create_context 后上下文已 current,可设 swap interval)。
+        if let Ok(mode) = std::env::var("MOLE_VSYNC") {
+            use sdl2::video::SwapInterval;
+            let (si, name) = match mode.as_str() {
+                "1" => (SwapInterval::VSync, "VSync"),
+                "2" => (SwapInterval::LateSwapTearing, "LateSwapTearing(自适应)"),
+                _ => (SwapInterval::Immediate, "Immediate"),
+            };
+            match self.video_ctx.gl_set_swap_interval(si) {
+                Ok(()) => {
+                    log!("[MoleWorld] gl_set_swap_interval={} 已应用 (MOLE_VSYNC={})", name, mode);
+                }
+                Err(e) => {
+                    log!("[MoleWorld] gl_set_swap_interval={} 失败: {}", name, e);
+                }
+            }
+        }
+
         Ok(GLContext(gl_ctx))
     }
 
@@ -1242,19 +1478,40 @@ impl Window {
         )
     }
 
-    /// [MoleWorld iOS] iOS 的 OpenGLES.framework 函数(glGetString 等)是直接链接进
-    /// 进程的符号,SDL_GL_GetProcAddress 对它们返回 NULL → gles11/gl21::load_with 拿到
-    /// 空指针、调用即段错误(实测在 PlayCover 上崩于 Window::new 的
-    /// driver_description → glGetString)。回退用 dlsym(RTLD_DEFAULT) 从进程已链接符号
-    /// 解析。桌面/Android 上 SDL 正常返回(addr 非空),此回退不触发,故无副作用。
+    /// [MoleWorld iOS] iOS 上的 GL 符号解析:**不信任 SDL_GL_GetProcAddress 的返回,一律
+    /// 优先从 OpenGLES.framework 解析。** 实测在 PlayCover / iOS-on-Mac 进程里,桌面
+    /// OpenGL.framework(libGL.dylib)被加载且导出同名 glGenTextures/glGetString:SDL 对
+    /// 一部分函数(如 glGenTextures)返回的正是【桌面 GL】的指针(addr 非空,它要 CGL/NSOpenGL
+    /// 上下文,而我们建的是 GLES/EAGLContext → 调用即崩),对另一些(如 glGetString)返回
+    /// NULL。所以「仅在 addr 为空时才回退」是不够的——glGenTextures 这种 addr 非空但指向桌面
+    /// GL 的会漏网。改为:只要 OpenGLES.framework 有该符号就用它(覆盖 SDL 的桌面指针),
+    /// OpenGLES 没有时才回落到 SDL 的 addr / RTLD_DEFAULT。仅编进 iOS target,桌面/Android
+    /// 走原生 SDL(返回 addr,本函数整体不参与)。
     fn gl_proc_ios_fallback(
         addr: *const std::ffi::c_void,
         procname: &str,
     ) -> *const std::ffi::c_void {
-        #[cfg(unix)]
-        if addr.is_null() {
-            if let Ok(cname) = std::ffi::CString::new(procname) {
-                let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+        #[cfg(target_os = "ios")]
+        if let Ok(cname) = std::ffi::CString::new(procname) {
+            unsafe {
+                // 优先从 OpenGLES.framework 专属 handle 解析(避开桌面 OpenGL.framework 同名符号)。
+                let gles_path = b"/System/Library/Frameworks/OpenGLES.framework/OpenGLES\0"
+                    .as_ptr() as *const libc::c_char;
+                let mut gles = libc::dlopen(gles_path, libc::RTLD_NOLOAD | libc::RTLD_LAZY);
+                if gles.is_null() {
+                    gles = libc::dlopen(gles_path, libc::RTLD_LAZY);
+                }
+                if !gles.is_null() {
+                    let sym = libc::dlsym(gles, cname.as_ptr());
+                    if !sym.is_null() {
+                        return sym as *const std::ffi::c_void;
+                    }
+                }
+                // OpenGLES 无该符号:SDL 的 addr 非空则用它,否则 RTLD_DEFAULT 兜底。
+                if !addr.is_null() {
+                    return addr;
+                }
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
                 if !sym.is_null() {
                     return sym as *const std::ffi::c_void;
                 }
@@ -1307,6 +1564,10 @@ impl Window {
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
 
         let image = self.splash_image.as_ref().unwrap();
+        let window_fbo = self.default_framebuffer();
+        let window_rbo = self.default_renderbuffer();
+        // [MoleWorld 智能分辨率] 完整 drawable 尺寸,供 present_frame 的 --ambient-fill。
+        let full_size = self.window.drawable_size();
 
         unsafe {
             let mut gl_ctx = self
@@ -1351,15 +1612,41 @@ impl Window {
                 gles11::TEXTURE_MAG_FILTER,
                 gles11::LINEAR as _,
             );
+            // [MoleWorld iOS] The splash texture is NPOT (image-sized). iOS
+            // native GLES1 requires CLAMP_TO_EDGE wrap for NPOT textures to be
+            // complete; the default GL_REPEAT leaves it incomplete and the
+            // textured present draws solid white (the "白色闪一下" the device
+            // shows). Harmless on desktop. See composition.rs for the full note.
+            // [MoleWorld] CLAMP only on iOS; Mac keeps REPEAT (default). present_frame on
+            // Mac rotates texcoords via the TEXTURE matrix outside [0,1] where REPEAT wraps
+            // correctly and CLAMP_TO_EDGE would smear the splash into vertical bands.
+            #[cfg(target_os = "ios")]
+            {
+                gl_ctx.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gl_ctx.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+            }
 
             log!("[splash] texture ready; calling present_frame (first GL draw / DrawArrays)");
             present_frame(
                 gl_ctx.as_mut(),
                 viewport,
+                full_size,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                window_fbo,
             );
             log!("[splash] present_frame returned OK");
+            // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer 契约)。
+            #[cfg(target_os = "ios")]
+            gl_ctx.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_rbo);
 
             gl_ctx.DeleteTextures(1, &texture);
         };
@@ -1373,6 +1660,16 @@ impl Window {
 
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
+    /// [MoleWorld iOS] 窗口的默认 framebuffer(见字段注释)。供 present_frame 绘制前绑定。
+    pub fn default_framebuffer(&self) -> crate::gles::gles11_raw::types::GLuint {
+        self.default_framebuffer
+    }
+
+    /// [MoleWorld iOS] 窗口的默认 viewRenderbuffer(见字段注释)。各 present 路径 swap 前绑回。
+    pub fn default_renderbuffer(&self) -> crate::gles::gles11_raw::types::GLuint {
+        self.default_renderbuffer
+    }
+
     pub fn swap_window(&self) {
         self.window.gl_swap_window();
     }
@@ -1462,6 +1759,12 @@ impl Window {
         )
     }
 
+    /// [MoleWorld 智能分辨率] 完整 drawable 尺寸(整个窗口/全屏区,像素)。present 传给
+    /// present_frame 判断 letterbox 空白、做 --ambient-fill 环境补边。
+    pub fn drawable_size(&self) -> (u32, u32) {
+        self.window.drawable_size()
+    }
+
     /// Get the region of the on-screen window (x, y, width, height) used to
     /// display the app content.
     ///
@@ -1472,16 +1775,22 @@ impl Window {
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
         let (screen_width, screen_height) = self.window.drawable_size();
 
-        // [MoleWorld] 窗口模式(非全屏)「自由拉伸」:画面铺满整个窗口、忽略宽高比
-        // (用户要的「自由调节适配屏幕拉伸」)。注意:默认固定尺寸窗口下 drawable 尺寸
-        // == app 原生尺寸,这里返回 (0,0,app_w,app_h),与旧行为完全一致 → 零回归;窗口被
-        // 拖动缩放后,drawable_size 跟着变,present 的 glViewport 与触摸映射(都基于
-        // viewport())自动跟随。全屏 / rotatable-fullscreen 仍走下面的等比 letterbox(保持
-        // 原状,不回归)。
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
-            // 窗口模式恒「自由拉伸铺满」。锁比例(--lock-aspect)不在这里做 letterbox(黑边
-            // 不优雅),而是在 resize 事件里把【窗口本身】约束成 app 宽高比 → 铺满即等比无
-            // 变形、无黑边(见 poll_for_events 的 E::Window 分支)。
+        // [MoleWorld] 「自由铺满」分支(返回整个 drawable,无 letterbox):
+        //   (a) 窗口模式 + 无定制 guest 逻辑屏 = 旧默认「自由调节适配屏幕拉伸」,drawable==app 原生
+        //       尺寸时逐字节等同旧行为 → 零回归;
+        //   (b) ★有定制 guest 逻辑屏时(--fill-screen / --logical-size / MOLE_FILL / MOLE_GUEST_PORTRAIT)
+        //       也走这里【无条件铺满、绝不 letterbox】——因为窗口已被 resize 事件钉死在 guest 比例
+        //       (见 poll_for_events 的 E::Window 分支,custom_guest_size_active() 触发锁比例),且 fullscreen
+        //       下 --fill-screen 的 guest 比例=屏比例 → 铺满即等比、不变形、【永远无黑边(连拖拽瞬间都不闪)】。
+        //       这是用户要的「无级调节、无黑边、不拉伸」:拖窗口=无级改大小、恒填满;换比例需重启由
+        //       --fill-screen 按新屏重算(cocos2d-iphone v1 无 reshape 派发,不能运行时改 guest 逻辑屏重排)。
+        // 仅【全屏/rotatable-fullscreen 且非定制尺寸】才落到下面的等比 letterbox(原生行为,不回归)。
+        // [MoleWorld 智能分辨率]「4:3 完美模式」--ambient-fill(仅对非定制尺寸=原生 4:3 生效):强制
+        // 走下面的等比 letterbox(不 free-stretch),这样窗口/全屏下 4:3 都居中不变形、露出 letterbox
+        // 空白供 present 做环境补边。定制尺寸(--fill-screen)永不 ambient(它本就铺满无空白)。
+        let custom = custom_guest_size_active();
+        let ambient = ambient_fill_active() && !custom;
+        if ((!self.fullscreen && !Self::rotatable_fullscreen()) || custom) && !ambient {
             return (0, 0, screen_width, screen_height);
         }
 
