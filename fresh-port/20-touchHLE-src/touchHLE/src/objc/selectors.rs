@@ -67,6 +67,11 @@ impl SEL {
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
+    /// Interned selector pointer as an integer (one canonical value per name) —
+    /// usable as a cheap identity key without resolving the string.
+    pub fn to_bits(self) -> u32 {
+        self.0.to_bits()
+    }
 }
 
 unsafe impl SafeRead for SEL {}
@@ -109,6 +114,13 @@ impl ObjC {
             // sync with the block. register_host_selector dedups against the
             // interned table, yielding each name's canonical SEL.
             const HOOK_SEL_NAMES: &[&str] = &[
+                // [MoleWorld iOS perf] 头像每帧冗余重建跳过(点好友卡死根治)。messages.rs
+                // 用它做廉价 selector 门,再比 orig_class==AnimPlayer 才进 anim_render_should_skip。
+                "render",
+                // 每帧 drawScene 入口复位头像重建预算(anim_render_reset_frame_budget)。
+                "drawScene",
+                // [P0 返回主村空村] 保护"地图数据字典"不被原地清空(见 messages.rs 的 removeAllObjects 钩子)。
+                "removeAllObjects",
                 "showNetWorkError",
                 "initWithCoder:",
                 "checkUpdates:",
@@ -137,15 +149,21 @@ impl ObjC {
                 "initPunchBox",
                 "initTapjoyRequestInAppDelegate",
             ];
-            let sels: Vec<SEL> = HOOK_SEL_NAMES
+            let mut sels: Vec<SEL> = HOOK_SEL_NAMES
                 .iter()
                 .map(|name| self.register_host_selector((*name).to_string(), mem))
                 .collect();
+            // [MoleWorld iOS · 性能] 排序后二分:村里每秒 94 万条消息,每条都过这道门,
+            // 线性扫描 ~30 项 → 二分 ~5 次比较。
+            sels.sort_by_key(|s| s.to_bits());
+            sels.dedup_by_key(|s| s.to_bits());
             self.mole_hook_sels = Some(sels);
         }
-        // SEL is a transparent ConstPtr<u8>; this is an integer comparison per
-        // element over a ~13-entry slice (the non-hook common case fails fast).
-        self.mole_hook_sels.as_ref().unwrap().contains(&sel)
+        self.mole_hook_sels
+            .as_ref()
+            .unwrap()
+            .binary_search_by_key(&sel.to_bits(), |s| s.to_bits())
+            .is_ok()
     }
 
     /// Register and deduplicate all the selectors of host classes.

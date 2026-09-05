@@ -178,6 +178,38 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
     }
 }
 
+/// [MoleWorld iOS · 性能] 沿超类链找到"选择子实现所在的类"。返回值语义与 `objc_msgSend_inner`
+/// 主循环一致:含该方法的 [ClassHostObject] 类 / 一个 [super::UnimplementedClass](让主循环按原逻辑
+/// 打日志并当 nil)/ 非类宿主对象(让主循环按原逻辑 panic)/ `nil`(整条链都没有)。
+fn resolve_class_for_selector(objc: &ObjC, orig_class: Class, selector: SEL, is_super2: bool) -> Class {
+    let mut class = orig_class;
+    let mut first = true;
+    loop {
+        if class == nil {
+            return nil;
+        }
+        let Some(host_object) = objc.get_host_object(class) else {
+            return class; // 主循环会 unwrap 失败/按原逻辑处理
+        };
+        if let Some(&super::ClassHostObject { superclass, ref methods, .. }) =
+            host_object.as_any().downcast_ref()
+        {
+            if is_super2 && first {
+                first = false;
+                class = superclass;
+                continue;
+            }
+            first = false;
+            if methods.contains_key(&selector) {
+                return class;
+            }
+            class = superclass;
+        } else {
+            return class; // UnimplementedClass 或意外类型:交给主循环
+        }
+    }
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -191,6 +223,17 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
 /// by the method implementation. We are relying on CallFromGuest not
 /// overwriting it.
 #[allow(non_snake_case)]
+/// [hang debug] 全局 msgSend 计数 + 最后出帧时的计数(见环形缓冲 dump)。
+pub static MSG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LAST_PRESENT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// present 时调用:记下当前 msgSend 计数,用于检测"出帧失速"死循环。
+pub fn note_present() {
+    LAST_PRESENT_N.store(
+        MSG_N.load(std::sync::atomic::Ordering::Relaxed),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn objc_msgSend_inner(
     env: &mut Environment,
     receiver: id,
@@ -198,6 +241,7 @@ fn objc_msgSend_inner(
     super2: Option<Class>,
     tolerate_type_mismatch: bool,
 ) {
+    crate::mole_perf::MSGSEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log_dbg!(
         "Dispatching {} for {:?}",
         selector.as_str(&env.mem),
@@ -247,15 +291,88 @@ fn objc_msgSend_inner(
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
+    // [MoleWorld] Same idea, but for a non-nil receiver whose isa has NO registered
+    // host object (an unresolvable / garbage "class"). The offline port fakes some
+    // class methods to return a non-nil sentinel that the game then messages as if it
+    // were a real object — seen crashing the 好友 (friend) screen. get_class_name
+    // (called just below for the cheat intercept, and by the dispatcher's
+    // "does not respond to selector" path) would `expect()`-panic
+    // ("Could not get class name!") on such a class. Treat it as a message to nil.
+    if env.objc.try_get_class_name(orig_class).is_none() {
+        log_dbg!(
+            "[(receiver {:?} with unresolvable class {:?}) {}] -> treating as nil (no-op)",
+            receiver,
+            orig_class,
+            selector.as_str(&env.mem)
+        );
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
+    // [hang debug] msgSend 环形缓冲 + 出帧失速触发 dump。每条 msgSend 记 (类指针,选择子指针)
+    // 进 512 环;present 时记下当前 msgSend 计数(note_present)。若 ~80 万次 msgSend 没出过帧
+    // = 死循环 → dump 环里最近 512 条(按时间序,不去重)→ 暴露好友面板入口 + 死循环体的真实
+    // 方法序列(穿透 objc 跳板,因为这是在派发处记的)。每个失速 episode 只 dump 一次。
+    #[cfg(any(feature = "interp_hb", debug_assertions))]
+    {
+        use std::cell::RefCell;
+        use std::sync::atomic::Ordering;
+        thread_local! {
+            static RING: RefCell<Vec<(u32, u32)>> = RefCell::new(Vec::new());
+            static RPOS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static DUMPED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        let n = MSG_N.fetch_add(1, Ordering::Relaxed);
+        RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() < 512 {
+                r.push((orig_class.to_bits(), selector.to_bits()));
+            } else {
+                let p = RPOS.with(|c| {
+                    let x = c.get();
+                    c.set((x + 1) % 512);
+                    x
+                });
+                r[p] = (orig_class.to_bits(), selector.to_bits());
+            }
+        });
+        if n & 0x0001_ffff == 0 {
+            let last_present = LAST_PRESENT_N.load(Ordering::Relaxed);
+            let stale = n.wrapping_sub(last_present);
+            let already = DUMPED_AT.with(|c| c.get());
+            if stale > 800_000 && last_present != already {
+                DUMPED_AT.with(|c| c.set(last_present));
+                let entries: Vec<(u32, u32)> = RING.with(|r| r.borrow().clone());
+                let start = RPOS.with(|c| c.get());
+                echo!("[MSGRING] >>> 出帧失速 {} 次msgSend无present,dump最近 {} 条(时间序):", stale, entries.len());
+                let len = entries.len();
+                for i in 0..len {
+                    let (cb, sb) = entries[(start + i) % len];
+                    let class_id: id = crate::mem::Ptr::from_bits(cb);
+                    let cls = env.objc.try_get_class_name(class_id).unwrap_or("?").to_string();
+                    let selp: crate::mem::ConstPtr<u8> = crate::mem::Ptr::from_bits(sb);
+                    let sel = env.mem.cstr_at_utf8(selp).unwrap_or("?").to_string();
+                    echo!("[MSGRING] {:03} [{} {}]", i, cls, sel);
+                }
+                echo!("[MSGRING] <<< end");
+            }
+        }
+    }
     // [MoleWorld] Debug-menu cheat toggles (free shop, multipliers, force VIP,
     // anti-cheat off). Gated by a cheap any_enabled() check so the hot path pays
     // nothing when all cheats are off. intercept() may fully handle the call
     // (return) or tweak an argument register and let the real method run.
     if crate::mole_cheats::any_enabled() {
-        let class_name = env.objc.get_class_name(orig_class).to_string();
-        let sel_str = selector.as_str(&env.mem).to_string();
-        if crate::mole_cheats::intercept(env, &class_name, &sel_str) {
-            return;
+        // [MoleWorld iOS · 性能] ★原本每条 objc 消息都做【两次堆分配 String】(类名 + 选择子)。
+        // any_enabled() 在本移植里恒为真(破解开关默认开),所以这是【每条消息】的固定成本,
+        // 在 60 万消息/秒量级下相当可观。改为:先用【已注册 SEL 指针的集合】做 O(1) 整数快判定,
+        // 只有可能命中 intercept 的选择子才付字符串化的代价。行为等价(intercept 的每条分支都是
+        // `sel == "..."` 形式,选择子不在集合里就不可能命中任何分支)。
+        if crate::mole_cheats::is_intercept_sel(&mut env.objc, &mut env.mem, selector) {
+            let class_name = env.objc.get_class_name(orig_class).to_string();
+            let sel_str = selector.as_str(&env.mem).to_string();
+            if crate::mole_cheats::intercept(env, &class_name, &sel_str) {
+                return;
+            }
         }
     }
     // [MoleWorld] Offline-play functional hooks. Gated on a cheap SELECTOR
@@ -272,6 +389,67 @@ fn objc_msgSend_inner(
     // [SCENE]/[FLOW]/[COCOS]/[TOUCHDISP] tracing probes that ran selector.as_str
     // + dozens of string compares on EVERY message were already removed.)
     let is_mole_hook = env.objc.is_mole_hook_sel(&mut env.mem, selector);
+    // [MoleWorld iOS perf · 点好友卡死根治] 跳过冗余的每帧头像 ASprite 重建。
+    // -[AnimManager updateTick:] 每帧无条件对每个 AnimInstance 发 "render" → -[AnimPlayer render]
+    // → -[ASprite PaintAFrame…] removeAllChildrenWithCleanup + 为该帧每个 module 新建 CCSprite。
+    // 动画帧每秒才变几次,却每显示帧都重建一份一模一样的 sprite = 纯浪费;JIT 桌面无感,无 JIT 的
+    // iOS 解释器上单帧 drawScene 跑不完 = present 冻结 = 卡死。这里:动画状态没变就跳过(不派发真
+    // IMP),帧一变就照常重建 → 视觉零差异、解释器从"冻结"变"流畅"。详见 mole_cheats::anim_render_should_skip。
+    // 用 selector 指针 + orig_class 指针双重快判定(都在 is_mole_hook 命中后才做,非 hook 选择子零成本),
+    // 放在 downcast 块之前,避免与下方 `name` 对 env.objc 的借用纠缠。
+    if is_mole_hook {
+        let render_sel = env
+            .objc
+            .register_host_selector("render".to_string(), &mut env.mem);
+        if selector == render_sel {
+            let ap_cls = env.objc.get_known_class("AnimPlayer", &mut env.mem);
+            if orig_class == ap_cls && crate::mole_cheats::anim_render_should_skip(env, receiver) {
+                env.cpu.regs_mut()[0] = 0;
+                return;
+            }
+        } else if {
+            // [MoleWorld iOS · P0 从好友村返回后主村只剩背景] 保护那份【地图数据字典】不被原地清空。
+            // 实测(纯读 host 字典 count):首次进村 -[GameManager loadMapFromData:] 拿到的字典 0x30017440
+            // count=7;从好友村返回时【同一个指针】count 变成 0 → -[GameManager
+            // loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 处命中 `count==0` 早退 → 直接调回调返回,
+            // 一个 loadMapObjects: 都不执行 → 地面/建筑/人物/村庄UI 全不加载,只剩背景装饰。
+            // 这里按【receiver 指针精确比对】吞掉对那一个字典的 removeAllObjects(只影响它,不动别的容器),
+            // 使返回时数据仍在 → 早退不再命中 → 走正常加载路径。仅离线生效。
+            let mapdata_ptr = crate::mole_cheats::MAPDATA_PTR
+                .load(std::sync::atomic::Ordering::Relaxed);
+            mapdata_ptr != 0
+                && receiver.to_bits() == mapdata_ptr
+                && !env.options.network_access
+                && selector
+                    == env
+                        .objc
+                        .register_host_selector("removeAllObjects".to_string(), &mut env.mem)
+        } {
+            use std::sync::atomic::{AtomicU32, Ordering as O2};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, O2::Relaxed);
+            if n < 4 {
+                log!(
+                    "[MOLECHEAT] 保护地图数据字典 {:?}:吞掉第 {} 次 removeAllObjects(防返回主村空村)",
+                    receiver, n
+                );
+            }
+            env.cpu.regs_mut()[0] = 0;
+            return;
+        } else {
+            // 每帧 drawScene 入口复位头像重建预算(早于本帧 updateTick→render 遍历)。不拦截,照常派发。
+            let draw_scene_sel = env
+                .objc
+                .register_host_selector("drawScene".to_string(), &mut env.mem);
+            if selector == draw_scene_sel {
+                // [性能观测] 每帧一次;内部 5 秒节流打一行 [PERF] 汇总。
+                crate::mole_perf::tick(env.objc.object_count());
+                crate::mole_cheats::anim_render_reset_frame_budget();
+                // [诊断] 每帧 drawScene 推进看门狗帧计数(证明 guest 还在出帧)。无条件,不依赖 island。
+                crate::mole_cheats::watchdog_frame();
+            }
+        }
+    }
     if let Some(ho) = env.objc.get_host_object(orig_class).filter(|_| is_mole_hook) {
         if let Some(&super::ClassHostObject { ref name, .. }) =
             ho.as_any().downcast_ref::<super::ClassHostObject>()
@@ -708,7 +886,26 @@ fn objc_msgSend_inner(
 
     // Traverse the chain of superclasses to find the method implementation.
 
-    let mut class = orig_class;
+    // [MoleWorld iOS · 性能] 方法解析缓存(见 ObjC::method_cache):村里每秒 94 万条消息,原来每条
+    // 都沿超类链逐级 get_host_object + methods.get(两次 SipHash/级,cocos2d 层级 3~6 级)。
+    // 现在:缓存命中 → 直接从"实现所在的类"开始,下面的循环第一轮就命中;未命中 → 走一遍链并回填。
+    let cache_key = (orig_class.to_bits(), selector.to_bits(), super2.is_some());
+    let resolved: Class = {
+        let epoch = super::methods::METHOD_TABLE_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if env.objc.method_cache_epoch != epoch {
+            env.objc.method_cache.clear();
+            env.objc.method_cache_epoch = epoch;
+        }
+        match env.objc.method_cache.get(&cache_key) {
+            Some(&c) => c,
+            None => {
+                let r = resolve_class_for_selector(&env.objc, orig_class, selector, super2.is_some());
+                env.objc.method_cache.insert(cache_key, r);
+                r
+            }
+        }
+    };
+    let mut class = resolved;
     loop {
         if class == nil {
             assert!(class != orig_class);
@@ -727,12 +924,37 @@ fn objc_msgSend_inner(
             // niceties) that would otherwise each crash boot, and keep going
             // toward the first frame. Essential gaps still surface as visibly
             // wrong behavior to investigate.
-            log!(
-                "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil).",
-                receiver,
-                name,
-                selector.as_str(&env.mem),
-            );
+            // [MoleWorld iOS · 性能] ★这条原本【完全不去重】,而每条 log! 都要 format + NSLog +
+            // write + fsync(见 log.rs)。只要有任何一个选择子每帧落空(实测 statusBarFrame 就是),
+            // 就是每帧一次 fsync —— 这是全进程唯一【没有上界】的每次调用开销。
+            // 改为按 (类名, 选择子) 去重:首次打全文,之后只累加计数、每 4096 次打一行汇总。
+            {
+                use std::collections::HashSet;
+                use std::sync::Mutex;
+                static SEEN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+                static SUPPRESSED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let sel_s = selector.as_str(&env.mem).to_string();
+                let first = {
+                    let mut g = match SEEN.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    g.get_or_insert_with(HashSet::new)
+                        .insert((name.to_string(), sel_s.clone()))
+                };
+                if first {
+                    log!(
+                        "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil). [此后同类只计数]",
+                        receiver, name, sel_s,
+                    );
+                } else {
+                    let n = SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 4096 == 0 {
+                        log!("(已静默 {} 次重复的 \"不响应选择子\" 警告)", n);
+                    }
+                }
+            }
             // [MoleWorld DIAG] Persist a de-duplicated list of every class+selector
             // that silently no-ops, so a normal play session leaves behind the full
             // set of missing methods to read from /tmp/mole_diag.log.

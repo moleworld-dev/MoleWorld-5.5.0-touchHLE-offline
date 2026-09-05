@@ -50,6 +50,20 @@ pub(super) struct DictionaryHostObject {
     pub(super) count: NSUInteger,
 }
 impl HostObject for DictionaryHostObject {}
+
+/// [MoleWorld iOS · 诊断] **纯读**:若 `obj` 是 host 实现的 NSDictionary/NSMutableDictionary,
+/// 返回它当前的 count;否则 None。
+///
+/// 关键:它【不发任何 ObjC 消息】——因此可以安全地在 `mole_cheats::intercept` 的【放行路径】
+/// (return false)里调用。用 `msg![env; obj count]` 会执行 guest 代码、冲掉待派发调用的参数
+/// 寄存器(踩过:主村整屏纯绿),而这个函数只做一次 host 侧 downcast 读取。
+pub fn host_dict_count(env: &Environment, obj: id) -> Option<NSUInteger> {
+    env.objc
+        .get_host_object(obj)?
+        .as_any()
+        .downcast_ref::<DictionaryHostObject>()
+        .map(|d| d.count)
+}
 impl DictionaryHostObject {
     pub(super) fn lookup(&self, env: &mut Environment, key: id) -> id {
         let hash: Hash = msg![env; key hash];

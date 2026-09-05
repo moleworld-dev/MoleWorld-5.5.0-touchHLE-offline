@@ -34,7 +34,9 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone)]
 pub(super) struct CALayerHostObject {
     /// Possibly nil, usually a UIView. This is a weak reference.
-    delegate: id,
+    /// pub(super):ca_eagl_layer 的 find_fullscreen_eagl_layer 需要用它反查 layer 背后的
+    /// UIView,以判断某个小浮层(如输入框)当前是否正在被编辑(见那里的"跳过未聚焦小浮层")。
+    pub(super) delegate: id,
     /// Sublayers in back-to-front order. These are strong references.
     pub(super) sublayers: Vec<id>,
     /// The superlayer. This is a weak reference.

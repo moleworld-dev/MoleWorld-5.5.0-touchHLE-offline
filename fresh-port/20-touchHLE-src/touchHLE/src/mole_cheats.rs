@@ -17,7 +17,8 @@ use crate::frameworks::core_graphics::cg_geometry::CGPoint;
 use crate::mem::{ConstPtr, MutPtr, Ptr};
 use crate::objc::{id, msg_send, nil, retain};
 use crate::Environment;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -149,6 +150,12 @@ static LAST_RTT_MS: AtomicU32 = AtomicU32::new(0);
 /// Diagnostic: last logged GameData.remoteMapData.mapdata.count (-99 = never read). Tells us
 /// whether the server's 1001 map unarchives to a non-empty dict in THIS unarchiver (#2).
 static LAST_MAP_COUNT: AtomicI32 = AtomicI32::new(-99);
+
+/// [MoleWorld iOS · P0 返回主村空村] 首次进村时 -[GameManager loadMapFromData:] 拿到的那个
+/// **地图数据字典**的 guest 指针(实测 0x30017440,count=7)。返回主村时同一个指针的 count 变成 0
+/// (被原地清空)→ -[GameManager loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 处
+/// `count==0` 早退 → 一个地图对象都不加载 → 只剩背景。记住它以便(a)追踪谁清空的、(b)拦住清空。
+pub static MAPDATA_PTR: AtomicU32 = AtomicU32::new(0);
 /// The HUD must NOT msg_send during the connect window (state 4/6) — doing so starved the run-loop
 /// and dropped the cf_stream Open event. STATE_IS_7 (set by the changeStateTo: hook) gates HUD
 /// startup to AFTER the connection is up; HUD_TIMER_SET latches a 1s self-rescheduling tick that
@@ -891,12 +898,17 @@ thread_local! {
 pub fn watchdog_frame() {
     WD_FRAME.fetch_add(1, O);
 }
+/// 供 environment.rs 的调度器层冻结转储器读取。
+pub fn watchdog_frame_count() -> u64 {
+    WD_FRAME.load(O)
+}
 
 /// 在 run_inner 每个 yield 点调用:若帧计数 >3 秒没推进(卡死),dump 死循环现场。
 pub fn watchdog_check(env: &mut Environment) {
-    // ★只在岛上(进岛窗口开 / 已在岛)才看门狗。ENABLE 现已默认 ON,若仍只 gate ENABLE,
-    // 主村/启动期任何正常的慢帧(首屏解码等)都会误报死循环。岛会话外一律早退。
-    if !(ISLAND_ENTER_WINDOW.load(O) > 0 || ON_ISLAND.load(O)) {
+    // [诊断·点好友卡死取证] 放开看门狗到全场景:watchdog_frame 现每帧 drawScene 无条件推进,正常帧都
+    // 秒级完成、WD_FRAME 持续增长 → 只有【单帧 drawScene 卡 >3s】才会触发 dump,不会误报正常慢帧。
+    // 只排除启动早期(<100 帧,首屏解码可能单帧较久)。点好友若真死循环,这里会 dump 出卡住的 PC/LR/回溯。
+    if WD_FRAME.load(O) < 100 {
         return;
     }
     let now = Instant::now();
@@ -1426,12 +1438,360 @@ fn update_debug_hud(env: &mut Environment, mimi: u32) {
     log!("[MOLECHEAT] 调试悬浮窗已创建(MOLE_HUD=0 可关)");
 }
 
+/// [MoleWorld iOS perf · 点好友卡死根治] 单个 AnimPlayer 两次"真重建"之间的最小 host 墙钟间隔
+/// (≈15fps/头像)。用【host 时间】而非 curFrame 判据 → 对解释器单帧耗时免疫(dt 死亡螺旋里
+/// curFrame 每帧都变也不会让它疯狂重建)。
+const ANIM_REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
+/// [MoleWorld iOS perf] 单个 drawScene 帧内允许的头像"真重建"数量【硬上限】。这是防冻结的关键:
+/// 无论好友村有多少头像、dt 多大,一帧最多重建这么多个,其余的沿用上一帧已建好的 sprite、留到后续
+/// 帧摊销 → 保证 drawScene 必然快速返回、必然出帧,不再"永不返回=冻死"。每帧在 drawScene 入口复位。
+const ANIM_REBUILD_BUDGET_PER_FRAME: u32 = 16;
+
+thread_local! {
+    /// [MoleWorld iOS perf · 点好友卡死根治] 每个 AnimPlayer 的:上次"真重建"时的动画状态快照
+    /// (m_parent, curAnim, curFrame, curFlags) + 上次真重建的 host 时刻。按 AnimPlayer 指针索引。
+    /// 见 [anim_render_should_skip]。
+    static ANIM_RENDER_SNAP: RefCell<HashMap<u32, ((u32, u32, u32, u32), Instant)>> =
+        RefCell::new(HashMap::new());
+    /// 本 drawScene 帧剩余的头像重建预算(在 drawScene 入口由 [anim_render_reset_frame_budget] 复位)。
+    static ANIM_REBUILD_BUDGET: Cell<u32> = const { Cell::new(ANIM_REBUILD_BUDGET_PER_FRAME) };
+}
+
+/// [MoleWorld iOS perf] 每帧(drawScene 入口)复位头像重建预算。由 objc/messages.rs 在派发
+/// `-[CCDirector drawScene]` 时调用,早于本帧的 updateTick→render 遍历。
+pub fn anim_render_reset_frame_budget() {
+    ANIM_REBUILD_BUDGET.with(|b| b.set(ANIM_REBUILD_BUDGET_PER_FRAME));
+}
+
+/// [MoleWorld iOS perf] 跳过冗余的每帧头像 ASprite 重建(★"点好友卡死"根治)。
+///
+/// 真因(IDA RE 5.5.0 armv7 + 影子调用栈交叉印证):每帧 `-[AnimManager updateTick:]`(0x20f9b0)
+/// 对 m_AnimInstList 里**每个** AnimInstance 无条件发 `render` → `-[AnimPlayer render]`(0x20f2f4)
+/// → `-[ASprite PaintAFrame…]`(0x20c894):先 `removeAllChildrenWithCleanup:` 清空 batchNode,
+/// 再 `PaintFrame` 循环为该帧每个 module 走 `PaintModule`(0x20cbf4)—— 每个 module **新建一个
+/// CCSprite**(`spriteWithBatchNode:rect:isStrech:` / `spriteWithFile:…` + setContentSize/Color/
+/// Opacity/Scale/Position/Flip)再 `addChild:`。好友村里几十个好友头像、每个 ASprite 十几~几十个
+/// module → 每帧 alloc/init/dealloc 数百个 CCSprite + 数千次 objc_msgSend。JIT 桌面无感;**无 JIT 的
+/// iOS 解释器上单帧 drawScene 永远跑不完 = 从不出帧 = present 冻结 = 点好友卡死**(桌面 on_gl2 同图
+/// 正常 → 长期被误判为"原生 GLES1 渲染特有",实为解释器算力差异)。
+///
+/// 而绝大多数重建是**冗余**的:动画帧(curFrame)每秒才推进几次,render 却每显示帧都重建一份一模
+/// 一样的 sprite。本函数返回 `true` 让 messages.rs 直接 `return` 不派发真 IMP(=跳过整次重建),`false`
+/// 则放行真重建。三层判据(任一命中即跳过):
+///   1. **同状态**:(m_parent,curAnim,curFrame,curFlags) 与上次真重建完全一致 → 内容不变,跳过。
+///   2. **host 时间节流**:距该头像上次真重建 < [ANIM_REBUILD_MIN_INTERVAL](≈66ms/≈15fps)→ 跳过。
+///      判据用【host 墙钟】而非 curFrame,故【对解释器算力免疫】:掉帧导致 dt 暴涨、curFrame 每帧都跳,
+///      也不会让它每帧重建(原快照版死穴)。
+///   3. **每帧硬预算**:本 drawScene 帧已重建满 [ANIM_REBUILD_BUDGET_PER_FRAME] 个 → 跳过(留到后续帧
+///      摊销)。这是【防冻结的硬保证】:无论多少头像、dt 多大,单帧重建量有上限 → drawScene 必然快速返回、
+///      必然出帧。首帧进好友村几十头像也不会一次性全建卡死。
+/// 只有"状态变了 且 距上次重建够久 且 本帧预算未满"才真重建。跳过时沿用 batchNode 里上一次建好的
+/// sprite(位移/父节点变换由 CCNode visit 处理,与子 sprite 是否重建无关)。视觉代价:真卡时头像动画
+/// 降到 ≤15fps 或延后一两帧刷新(有界、自愈),换来不冻结。在线/离线皆正确,不按 network_access 门控。
+///
+/// AnimPlayer ivar 偏移(IDA `_OBJC_IVAR_$_AnimPlayer.*`,5.5.0):m_pause@4 curFlags@16 curAnim@24
+/// curFrame@28 m_parent@64。
+pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
+    let base = receiver.to_bits();
+    if base == 0 {
+        return false;
+    }
+    let m_pause: u8 = env.mem.read(ConstPtr::<u8>::from_bits(base + 4));
+    let cur_anim: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 24));
+    let m_parent: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 64));
+    let cur_frame: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 28));
+    let cur_flags: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 16));
+    // 镜像 -[AnimPlayer render] 自身的前置守卫:暂停 / 无动画(curAnim<0)/ 无父节点时,真 render
+    // 本就只做廉价 early-return、不建任何 sprite —— 放行让它自己跑(不跳、不缓存)。
+    if m_pause != 0 || (cur_anim as i32) < 0 || m_parent == 0 {
+        return false;
+    }
+    let snap = (m_parent, cur_anim, cur_frame, cur_flags);
+    let now = Instant::now();
+    ANIM_RENDER_SNAP.with(|m| {
+        let mut map = m.borrow_mut();
+        // 跨场景累积的死指针上限保护:超阈值清空 → 后续帧各头像重建一次(无害,自愈)。
+        if map.len() >= 8192 {
+            map.clear();
+        }
+        if let Some(&(prev_snap, last_render)) = map.get(&base) {
+            if prev_snap == snap {
+                return true; // ① 同状态 → 跳过
+            }
+            if now.duration_since(last_render) < ANIM_REBUILD_MIN_INTERVAL {
+                return true; // ② host 时间节流 → 跳过(不更新快照,状态仍"待重建")
+            }
+        }
+        // 想真重建:③ 受本帧硬预算约束。
+        let budget = ANIM_REBUILD_BUDGET.with(|b| b.get());
+        if budget == 0 {
+            return true; // 本帧预算耗尽 → 跳过,留到下一帧(不更新快照)
+        }
+        ANIM_REBUILD_BUDGET.with(|b| b.set(budget - 1));
+        map.insert(base, (snap, now));
+        false // 真重建
+    })
+}
+
+/// [MoleWorld iOS · 性能] `intercept` 可能命中的**全部选择子**集合的 O(1) 快判定。
+///
+/// 背景:`objc_msgSend_inner` 原本对【每条消息】都把类名和选择子各堆分配一个 `String` 再交给
+/// `intercept` 做一长串 `strcmp`;而 `any_enabled()` 在本移植里恒为真,于是这是每条消息的固定成本
+/// (60 万消息/秒量级下相当可观)。
+///
+/// 选择子是**内部化**的(每个名字只有一个规范 SEL 指针),所以这里把 intercept 体内【所有像选择子的
+/// 字符串字面量】(覆盖 `sel == "..."`、`matches!(sel, ...)` 及其它写法;多收无害、漏收会让钩子静默失效——
+/// 2026-09-05 黄金岛卡死就是漏收了 matches! 里的选择子)一次性注册成 SEL,之后每条消息只做几十次**整数比较**;不在集合里的选择子
+/// 根本不可能命中 intercept 的任何分支,可以直接跳过字符串化。行为与原来完全等价。
+///
+/// ★ 新增/修改 intercept 里的 `sel == "..."` 分支时,必须同步更新这里的清单
+/// (否则那条 hook 会静默失效)。
+pub fn is_intercept_sel(objc: &mut crate::objc::ObjC, mem: &mut crate::mem::Mem, sel: crate::objc::SEL) -> bool {
+    use std::sync::OnceLock;
+    static NAMES: &[&str] = &[
+        "CheckUserInfoData:",
+        "addGold:",
+        "addShopItemsObject:",
+        "addVipGold:",
+        "addWorker:",
+        "addXp:",
+        "archivedDataWithRootObject:",
+        "autoLoginWithUserID:",
+        "availableWorkers",
+        "changeStateTo:withMessage:",
+        "check",
+        "checkBeyoundLeftCircleBeach:",
+        "checkCooltimeOver",
+        "checkInAlreadyUnlockList:",
+        "checkIsUnlockMusic:",
+        "checkIsVipUser",
+        "checkRequiredVipLevel:",
+        "checkUserinfoMd5:",
+        "count",
+        "cropWitherHandler:",
+        "curLevel",
+        "currentGameMode",
+        "currentProduceMoleNums",
+        "disconnect",
+        "drawScene",
+        "encryptCurLevel",
+        "endLoadCallBack",
+        "enterLoadingWithDelegate:nextSceneId:",
+        "enterNewIslands",
+        "entermainmenu",
+        "establishConnection",
+        "gameMode",
+        "generateDefaultMenuView",
+        "generateItemsView:",
+        "generateRandomRewardId",
+        "getAllObjectsListFromServerWithStartId:",
+        "getBuildTime:",
+        "getCurLevelCoolTime",
+        "getCurLevelCooltime:",
+        "getFriendsInfo",
+        "getGoldSpeedUpObjectMultiple",
+        "getLastCooldownTime",
+        "getLastGameCoolTime",
+        "getLevel",
+        "getLockType4Crop:",
+        "getLockType4CropWithId:",
+        "getLockType4Decorate:",
+        "getLockType4Gift:",
+        "getLockType4Object:",
+        "getLockType4ShopItem:shop:",
+        "getMatureTime",
+        "getNewProductsIds",
+        "getOutCoolTime",
+        "getRewardCoin:",
+        "getRewardXp:",
+        "getServerListWithServiceName:andDelegate:",
+        "getShopItemsIds:",
+        "getStoreItemsIdsByType:",
+        "getWitherTime",
+        "getXPSpeedUpObjectMultiple",
+        "gobackMainVillage",
+        "iMoleVillageAppDelegate",
+        "inRectOfAquaticAreaOrNot:",
+        "initWithItemsType:",
+        "isConnected",
+        "isHackData",
+        "isKindOfClass:",
+        "isNetworkReachable",
+        "isReachable",
+        "isShowVIPFunctionsButton:",
+        "isUnlockedItem:",
+        "loadFromLocal",
+        "loadMapFromData:",
+        "loadNewScene:",
+        "loadObjectsDataByType:",
+        "loadResourceItems",
+        "loadTarget",
+        "loginWithDeviceInfoAndUserIDInfoInSendType:",
+        "mainLoop",
+        "mapExtend",
+        "moleHudTick",
+        "numberOfCellsInTableView:",
+        "onButtonPlaySelected:",
+        "onGameDataInMainVillageUpdateSUCC",
+        "onServerListResult:",
+        "performSelector:withObject:afterDelay:",
+        "performSelectorOnMainThread:withObject:waitUntilDone:",
+        "popScene",
+        "replaceScene:",
+        "runWithScene:",
+        "saveMapData",
+        "sendAllBuffDataInNewSceneLoading",
+        "sendAllBufferDatas",
+        "sendPacket:commandId:",
+        "setCurrentProduceMoleNums:",
+        "setIsReachable:",
+        "setNextScene",
+        "setSocketFromStreamsAndReturnError:",
+        "setUserID:",
+        "sharedInstance",
+        "shellsNeeded",
+        "showCheatWarningMessage",
+        "showDifferentGameDataComparingView",
+        "showLoginView",
+        "showMessageOfDisableNonHDiPhone",
+        "showMultiLoginErrorMessageInNewScene",
+        "showNetConnectErrorMessageWithRetryButton",
+        "showNoNetConnectErrorMessage",
+        "showWithTarget:",
+        "showWithTarget:selector:",
+        "start",
+        "startGame",
+        "startGame:",
+        "state",
+        "storeDecorationsArray",
+        "table:cellAtIndex:",
+        "taomeePassword",
+        "totalRooms",
+        "totalWorkers",
+        "unlocked:",
+        "update:",
+        "updateGameDateForEnterNewSceneWithTarget:andCallback:",
+        "updateInfoToServer",
+        "updateLoading:",
+        "userInfoDataInNewScene",
+        "vipLevelWithNewType",
+        "vipValue",
+    ];
+    // 每个名字的规范 SEL 指针(整数),只解析一次。
+    thread_local! {
+        static SET: OnceLock<Vec<u32>> = const { OnceLock::new() };
+    }
+    SET.with(|cell| {
+        let v = cell.get_or_init(|| {
+            let mut v: Vec<u32> = NAMES
+                .iter()
+                .map(|n| objc.register_host_selector((*n).to_string(), mem).to_bits())
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        });
+        // 53 项线性扫描 → 二分(~6 次比较);每条 objc 消息都走这里。
+        v.binary_search(&sel.to_bits()).is_ok()
+    })
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 启动时 / 任一破解开关变更后,按当前开关状态把破解补丁写入或还原到模拟内存(香草基底)。
     // 写在最前面、只在 dirty 时跑一次:invalidate_cache_range 让 dynarmic 重新编译被改的指令。
     if CRACK_PATCHES_DIRTY.swap(false, O) {
         apply_crack_patches(env);
     }
+
+    // [MoleWorld iOS · P0 修复] 离线"发包风暴"死循环根治(★点好友/进好友村卡死的真因)。
+    // 离线下游戏仍调 sendPacket:commandId: 发网络包:残留缓冲/各联网界面里成百上千个包逐个发,
+    // 每包都被 encodeWithCoder: 深度序列化(touchHLE 归档器每步新建 NSMutableData、去重命不中→
+    // 不收敛),在一次 drawScene 的同步栈里刷成千上万次 = 永不返回 run-loop = 从不出帧(present 冻结)
+    // = 整局卡死(看门狗/心跳症状 CCNode visit 0x2d30cc、FriendVillageUnit/Map 渲染同源)。
+    // 已有掐断(下方)只在【进岛窗口/在岛】生效;主村点好友进好友村不在该窗口 → 风暴未被掐 → 卡死。
+    // 这里把它扩到【全程离线】:离线本就发不出包(无服务器),吞掉 = 空过且根治风暴;对在线
+    // (--allow-network-access)零影响(network_access 为真时不进此分支)。
+    if !env.options.network_access
+        && (sel == "sendPacket:commandId:"
+            || sel == "sendAllBufferDatas"
+            || sel == "sendAllBuffDataInNewSceneLoading")
+    {
+        return true;
+    }
+
+    // [MoleWorld iOS · P0 ★点好友卡死【真正根因,IDA 静态铁证 + 真机日志双证】]:
+    // -[FriendsVillageLayer getFriendsInfo](点好友后 showWithParent 用 scheduleSelector 触发)在
+    // isReachable==true 时:showLoadingLayer(弹 LoadingLayer 半透明遮罩 + [MBProgressHUD showHUDAddedTo:openGLView])
+    // + connect2Server + [NetworkManager getFriendsInfo:/getFriendsVIPInfo:/getIsHaveNewVisitor](发好友列表请求)。
+    // 那个 MBProgressHUD 加载转圈【只靠网络回包才 dismiss】。离线下回包永不到达(且请求已被上面 sendPacket 吞)→
+    // 加载遮罩永不消失、UIKit HUD 盖住全屏 CAEAGLLayer → find_fullscreen_eagl_layer 返 nil → present 跌入
+    // glReadPixels 慢路径 → 画面定格 = 用户看到的"点好友卡死"。★真相:guest 根本没冻,一直每帧出帧转圈
+    // (真机日志 [PRESENT] 持续涨到 10496、[ANIMDT] frameDur≠0、零 [WATCHDOG] 已铁证),不是 CPU 死循环、
+    // 也不是解释器指令算错。之所以"只在离线/仿佛只在 no-JIT":桌面若带 --allow-network-access 就真连服务器、
+    // 回包 dismiss 加载层,故长期被误判。
+    // 修:离线吞掉 getFriendsInfo(= 游戏自身"isReachable 为 false 即整段空过"的等价路径)→ 不弹会死等的加载
+    // 遮罩、不发注定无回的请求 → 好友村照常显示(离线自然无好友数据)、留在全屏快路径、可正常浏览/返回,不再冻。
+    // 在线(--allow-network-access)不进此分支,好友真连服务器正常拉列表,零影响。
+    // 同族修复:showLoadingLayer 是好友村真正卡死的元凶——它挂 LoadingLayer 半透明遮罩 + MBProgressHUD,
+    // 而 hideLoadingLayer 只在【网络回包】(onCommandReceived:/onStateChangedTo:)里触发。离线无回包 → 遮罩永驻、
+    // 盖住全屏 → present 跌慢路径 → 画面定格=用户看到的"卡死"。它被 getFriendsInfo / getRandomMapdata /
+    // onUnitTouched:(点好友村里的格子,含"我的村"入口)多处调用。离线吞掉它 = 一刀端掉所有路径的死等遮罩:
+    // 好友村能进(onEnter 三件套全本地:setBackground 读本地 friendFront.plist + updateUnits/UI4Friends → 空村可渲染),
+    // 点"我的村"格子能触发 goToHomeVillage(纯本地读档重建主村,不需网络)回到主村。离线 loading 本无意义,零副作用。
+    // ★注意:这里【只吞 getFriendsInfo】,不再吞 showLoadingLayer——后者是【地图分步加载的驱动器】,
+    // -[GameManager loadMapFromData:selector:mapData:forNPC:](0x2099c)在 0x20b28 处正是靠它启动
+    // 回主村的加载流程。之前连它一起吞,导致"从好友村返回后:背景画了,地面/建筑/人物和村庄UI全没加载"。
+    // 好友村卡死的真正修法是 ca_eagl_layer 的"跳过未聚焦小浮层"(留在全屏快路径),不需要吞加载层。
+    if !env.options.network_access
+        && class == "FriendsVillageLayer"
+        && sel == "getFriendsInfo"
+    {
+        static FRIEND_CUT_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !FRIEND_CUT_LOGGED.swap(true, O) {
+            log!(
+                "[MOLECHEAT] 离线:吞掉 FriendsVillageLayer.getFriendsInfo(不发注定无回的好友请求/不弹死等遮罩)"
+            );
+        }
+        return true;
+    }
+
+    // 注:曾在此全局吞掉 MBProgressHUD.showHUD*(为把好友村拉回快路径)。现已撤除——真正的修法是
+    // ca_eagl_layer::find_fullscreen_eagl_layer 跳过未聚焦的小浮层;而全局吞 HUD 有把游戏自身加载流程
+    // 一并掐断的风险(返回主村的分步加载正是由加载层驱动)。
+
+    // ★★ 血泪教训(勿再犯):intercept 在 objc_msgSend 真正派发【之前】被调用,此刻 guest 的调用
+    // 参数还活在 CPU 寄存器(r0-r3)里。若在这里对一个【打算放行(return false)】的消息做 msg_send
+    // 观测(哪怕只是读个 count),host 会去跑 guest 代码,把参数寄存器冲掉 → 放行后原方法拿到垃圾参数。
+    // 实测:曾在此对 loadMapFromData: 加"读 mapdata.count"的诊断 → 主村地图加载失败、整屏纯绿(HUD 正常)。
+    // 规则:intercept 里做 msg_send 只允许配 `return true`(吞掉该调用);要观测放行路径,另找安全时机
+    // (如帧边界、或在 host 实现的框架函数里),不要在派发前动寄存器。
+
+    // [MoleWorld iOS · P0 返回主村空村 · 修复的一半] 记住那份【地图数据字典】的指针。
+    // 首次进村走 -[GameManager loadMapFromData:](无 selector 版本),其 arg1(r2)就是完整的地图字典
+    // (实测 count=7)。记下它,messages.rs 便可按【指针精确比对】吞掉后续对这一个字典的
+    // removeAllObjects —— 因为 -[GameData loadMapData](0x79054)会"先清空再读 map.dat",而离线读档
+    // 失败时它永不回填(失败分支 resetUserGameData 的返回值被调用方丢弃),导致返回主村时
+    // -[GameManager loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 命中 `count==0` 早退 →
+    // 背景画了但一个 loadMapObjects 都不跑 = 只剩背景。详见 memory: moleworld-return-home-empty-solved。
+    // 纯读寄存器 + host 字典 count,不发任何消息(见下方血泪教训),放行路径安全。
+    if !env.options.network_access && sel == "loadMapFromData:" {
+        let r2 = env.cpu.regs()[2];
+        if let Some(n) = crate::frameworks::foundation::ns_dictionary::host_dict_count(
+            env,
+            crate::objc::id::from_bits(r2),
+        ) {
+            if n > 0 && MAPDATA_PTR.swap(r2, O) != r2 {
+                log!("[MOLECHEAT] 记住地图数据字典 {:#x}(count={}),将保护它不被清空", r2, n);
+            }
+        }
+    }
+
+    // ★★ 血泪教训(勿再犯):intercept 在 objc_msgSend 真正派发【之前】被调用,此刻 guest 的调用
+    // 参数还活在 CPU 寄存器(r0-r3)里。若在这里对一个【打算放行(return false)】的消息做 msg_send
+    // 观测(哪怕只是读个 count),host 会去跑 guest 代码,把参数寄存器冲掉 → 放行后原方法拿到垃圾参数。
+    // 实测:曾在此对 loadMapFromData: 加"读 mapdata.count"的诊断 → 主村地图加载失败、整屏纯绿(HUD 正常)。
+    // 规则:intercept 里做 msg_send 只允许配 `return true`(吞掉该调用);要观测放行路径,另找安全时机
+    // (如帧边界、或在 host 实现的框架函数里),不要在派发前动寄存器。
 
     // ===== ONLINE MODE:登录通行证绕过 + 米米号注入(全 gate 在 online_login_mimi) =====
     // 离线(默认)每条分支都是空过,单机路径逐字节不变。仅 --allow-network-access + MOLE_MIMI 时生效。

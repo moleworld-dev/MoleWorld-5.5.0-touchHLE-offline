@@ -6,7 +6,7 @@
 //! `CAEAGLLayer`.
 
 use super::ca_layer::CALayerHostObject;
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::objc::{id, msg, msg_class, nil, objc_classes, Class, ClassExports};
 use crate::Environment;
 
@@ -91,34 +91,103 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         let ssz = screen_bounds.size;
         let size_ok = (bsz.width == ssz.width && bsz.height == ssz.height)
             || (bsz.width == ssz.height && bsz.height == ssz.width);
+        // [MoleWorld iOS · 性能] 位置检查也要接受"旋转后的全屏层":上面已按"宽高互换"放行了横屏
+        // 1024×768 的层,但它的 position 是自己坐标系的中心 (512,384),而不是竖屏 UIScreen 的中心
+        // (384,512)。真机实测村里 12.5% 的帧([PRESENT] SLOW 45×64)就是在这里被判 nil 掉进慢路径
+        // (每帧 glReadPixels 整屏 + 3MB 重传),[FSLAYER-NIL] 打印全是 sizeok=true 而 pos=(512,384)。
+        // 修:位置与屏幕中心【或】与互换后的中心相等,都算全屏。
+        let pos = layer_host_obj.position;
+        let center = CGPoint { x: ssz.width / 2.0, y: ssz.height / 2.0 };
+        let center_swapped = CGPoint { x: ssz.height / 2.0, y: ssz.width / 2.0 };
+        let pos_ok = pos == center || pos == center_swapped;
         if !size_ok
             || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
             || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
-            || layer_host_obj.position
-                != (CGPoint {
-                    x: screen_bounds.size.width / 2.0,
-                    y: screen_bounds.size.height / 2.0,
-                })
+            || !pos_ok
             || layer_host_obj.hidden
             || layer_host_obj.opacity != 1.0
         {
+            // [MoleWorld iOS · 诊断] 好友村"卡死"= present 跌出全屏快路径、走每帧 glReadPixels 整屏回读的
+            // 慢合成路径(无 JIT 解释器上慢到 ~2-5fps = 假死)。这里打印【到底是哪个 layer、因为什么条件】
+            // 把快路径判没了,一次定位真正盖住全屏的那个 UIKit 层(HUD?广告 WebView?尺寸/透明度不符?)。
+            // 节流打印,避免刷屏。
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NIL_N: AtomicU64 = AtomicU64::new(0);
+                let n = NIL_N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n % 256 == 0 {
+                    // 复制出 packed 字段(不能直接借用 packed struct 的字段)
+                    let (bw, bh) = (bsz.width, bsz.height);
+                    let (sw, sh) = (ssz.width, ssz.height);
+                    let (box_, boy) = (
+                        layer_host_obj.bounds.origin.x,
+                        layer_host_obj.bounds.origin.y,
+                    );
+                    let (apx, apy) = (layer_host_obj.anchor_point.x, layer_host_obj.anchor_point.y);
+                    let (pox, poy) = (layer_host_obj.position.x, layer_host_obj.position.y);
+                    let (hid, op) = (layer_host_obj.hidden, layer_host_obj.opacity);
+                    let cls = env
+                        .objc
+                        .try_get_class_name(layer)
+                        .unwrap_or("?")
+                        .to_string();
+                    echo!(
+                        "[FSLAYER-NIL] n={} 顶层layer类={} bounds={}x{}@({},{}) screen={}x{} anchor=({},{}) pos=({},{}) hidden={} opacity={} sizeok={}",
+                        n, cls, bw, bh, box_, boy, sw, sh, apx, apy, pox, poy, hid, op, size_ok
+                    );
+                }
+            }
             return nil;
         }
 
-        if let Some(&next) = layer_host_obj.sublayers.last() {
+        // [MoleWorld iOS · P0 好友村卡死根治] 原逻辑"永远下降到最后一个子层",一旦界面在游戏
+        // 全屏 CAEAGLLayer 之上叠了任何【小的 UIKit 浮层】(实测真凶:好友界面那个 220x40 的
+        // "ID or Name" 搜索输入框 UITextField),下降就撞到它 → 尺寸不符 → 判定"没有全屏层" →
+        // present 跌进慢合成路径(每帧 glReadPixels 整屏回读+重传),无 JIT 解释器上直接慢到
+        // ~2-5fps = 用户看到的"点好友卡死"。
+        // 修:选择下一层时【跳过未被聚焦的小浮层】(面积 < 半屏且其 UIView 既不在编辑也不是第一
+        // 响应者),从而仍能识别底下的全屏 CAEAGLLayer、留在快路径。
+        // 取舍:被跳过的小浮层这一帧不参与合成(不显示)。但【正在输入的输入框不会被跳过】——
+        // 用户点进改名框时它是第一响应者/editing=true,照常走合成显示,打字所见即所得不受影响。
+        let subs: Vec<id> = layer_host_obj.sublayers.clone();
+        let mut next_layer: Option<id> = None;
+        for &cand in subs.iter().rev() {
+            if overlay_is_ignorable(env, cand, screen_bounds.size) {
+                continue;
+            }
+            next_layer = Some(cand);
+            break;
+        }
+        if let Some(next) = next_layer {
             layer = next;
         } else {
             break;
         }
     }
 
-    if !env.objc.borrow::<CALayerHostObject>(layer).opaque {
-        return nil;
-    }
-
-    let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
-    if !msg![env; layer isKindOfClass:ca_eagl_layer_class] {
-        return nil;
+    // [MoleWorld iOS · 诊断] 同上:另两条判 nil 的出口也打印,区分"顶层不透明度不符"与"顶层压根不是 CAEAGLLayer
+    // (=被某个 UIKit 覆盖层顶掉)"。后者正是好友村跌慢路径最可能的形态。
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TAIL_N: AtomicU64 = AtomicU64::new(0);
+        let opaque = env.objc.borrow::<CALayerHostObject>(layer).opaque;
+        let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
+        let is_eagl: bool = msg![env; layer isKindOfClass:ca_eagl_layer_class];
+        if !opaque || !is_eagl {
+            let n = TAIL_N.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 256 == 0 {
+                let cls = env
+                    .objc
+                    .try_get_class_name(layer)
+                    .unwrap_or("?")
+                    .to_string();
+                echo!(
+                    "[FSLAYER-NIL] n={} (尾判) 顶层layer类={} opaque={} isCAEAGLLayer={}",
+                    n, cls, opaque, is_eagl
+                );
+            }
+            return nil;
+        }
     }
 
     layer
@@ -144,4 +213,44 @@ pub fn present_pixels(env: &mut Environment, layer: id, pixels: Vec<u8>, width: 
     let host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
     host_obj.presented_pixels = Some((pixels, width, height));
     host_obj.gles_texture_is_up_to_date = false;
+}
+
+/// [MoleWorld iOS] 该子层是否是"可以在寻找全屏层时跳过的小浮层"。
+///
+/// 判据:(1) 面积明显小于半屏(全屏候选不可能这么小);(2) 它背后的 UIView 当前【不在编辑、也不是
+/// 第一响应者】——正在输入的控件必须参与合成,否则用户看不见自己打的字。
+/// 用途见 [find_fullscreen_eagl_layer] 里的说明(好友村"卡死"根治)。
+fn overlay_is_ignorable(env: &mut Environment, layer: id, screen: CGSize) -> bool {
+    let (size, delegate) = {
+        let o: &CALayerHostObject = env.objc.borrow(layer);
+        (o.bounds.size, o.delegate)
+    };
+    let screen_area = (screen.width * screen.height).abs();
+    if screen_area <= 0.0 {
+        return false;
+    }
+    if (size.width * size.height).abs() >= screen_area * 0.5 {
+        return false; // 够大,可能就是全屏层本身,不能跳过
+    }
+    if delegate != nil {
+        if env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "isEditing")
+        {
+            let editing: bool = msg![env; delegate isEditing];
+            if editing {
+                return false;
+            }
+        }
+        if env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "isFirstResponder")
+        {
+            let focused: bool = msg![env; delegate isFirstResponder];
+            if focused {
+                return false;
+            }
+        }
+    }
+    true
 }
