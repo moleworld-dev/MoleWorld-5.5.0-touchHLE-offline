@@ -732,7 +732,27 @@ impl Fs {
 
     /// Get the node at a given path, if it exists.
     fn lookup_node(&self, path: &GuestPath) -> Option<&FsNode> {
-        self.lookup_node_inner(&resolve_path(path, Some(&self.working_directory)))
+        let components = resolve_path(path, Some(&self.working_directory));
+        // [MoleWorld 宽屏] wide 模式下:整屏底图 `X.png` 若同目录存在宽版 `X_wide.png`(且自身非 _wide),
+        // 透明重定向到宽版 → open/is_file/贴图加载全用宽图(cocos2d 按贴图实际尺寸建 sprite,故宽贴图=宽 sprite
+        // 居中铺满宽屏)。宽版不存在→回落原图。4:3 默认 is_widescreen()=false,整块跳过、零开销零回归。
+        if crate::window::is_widescreen() {
+            if let Some((&last, parents)) = components.split_last() {
+                if let Some(stem) = last.strip_suffix(".png") {
+                    if !stem.ends_with("_wide") {
+                        let wide_last = format!("{stem}_wide.png");
+                        let mut wide: Vec<&str> = parents.to_vec();
+                        wide.push(wide_last.as_str());
+                        if let Some(n) = self.lookup_node_inner(&wide) {
+                            if matches!(n, FsNode::File { .. }) {
+                                return Some(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.lookup_node_inner(&components)
     }
 
     /// Get the parent of the node at a given path, if it exists, and return it
