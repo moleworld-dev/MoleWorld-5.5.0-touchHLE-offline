@@ -89,8 +89,12 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // screen (the renderbuffer is confirmed non-black, full game content).
         let bsz = layer_host_obj.bounds.size;
         let ssz = screen_bounds.size;
-        let size_ok = (bsz.width == ssz.width && bsz.height == ssz.height)
-            || (bsz.width == ssz.height && bsz.height == ssz.width);
+        // [MoleWorld iOS 宽屏] 尺寸/位置比较必须带容差:--fill-screen 算出的逻辑屏 1669×768 经 guest 的
+        // frame→bounds 浮点换算后是 1669×768.00006(4:3 的 1024/768 全是整数所以从没暴露),精确相等会把
+        // 真正的全屏层判成"不是全屏" → 100% 帧掉进慢合成路径(每帧整屏 5MB 重传,且铺屏模式下画出来是黑的)。
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let size_ok = (near(bsz.width, ssz.width) && near(bsz.height, ssz.height))
+            || (near(bsz.width, ssz.height) && near(bsz.height, ssz.width));
         // [MoleWorld iOS · 性能] 位置检查也要接受"旋转后的全屏层":上面已按"宽高互换"放行了横屏
         // 1024×768 的层,但它的 position 是自己坐标系的中心 (512,384),而不是竖屏 UIScreen 的中心
         // (384,512)。真机实测村里 12.5% 的帧([PRESENT] SLOW 45×64)就是在这里被判 nil 掉进慢路径
@@ -99,9 +103,11 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         let pos = layer_host_obj.position;
         let center = CGPoint { x: ssz.width / 2.0, y: ssz.height / 2.0 };
         let center_swapped = CGPoint { x: ssz.height / 2.0, y: ssz.width / 2.0 };
-        let pos_ok = pos == center || pos == center_swapped;
+        let pos_ok = (near(pos.x, center.x) && near(pos.y, center.y))
+            || (near(pos.x, center_swapped.x) && near(pos.y, center_swapped.y));
+        let origin = layer_host_obj.bounds.origin;
         if !size_ok
-            || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
+            || !(near(origin.x, 0.0) && near(origin.y, 0.0))
             || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
             || !pos_ok
             || layer_host_obj.hidden
