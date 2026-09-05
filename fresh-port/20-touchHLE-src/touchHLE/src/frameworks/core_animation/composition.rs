@@ -63,6 +63,10 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    // [MoleWorld iOS] No GL while truly backgrounded (iOS kills GPU-in-background).
+    if env.window.as_ref().map_or(false, |w| w.is_backgrounded()) {
+        return None;
+    }
     let mut animation_state = animation::State::default();
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     if !windows.iter().any(|&window| !msg![env; window isHidden]) {
@@ -739,6 +743,17 @@ unsafe fn upload_slice<T: SafeWrite>(
 }
 
 unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u32, u32)) {
+    // [MoleWorld iOS · 诊断] 标记"合成器整屏重传"这条 TexImage2D 来源。用于区分 [NPOT-FIX] 里
+    // 有多少来自 host 合成器(应 ≈60Hz 的零头)vs guest 自己 build 发起(主体)。合成器受 60Hz 门控,
+    // 一帧内不可能上千次,所以若 [NPOT-FIX] 一帧上千而 [COMP-UP] 很少,证明主体是 guest。
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COMP_UP_N: AtomicU64 = AtomicU64::new(0);
+        let n = COMP_UP_N.fetch_add(1, Ordering::Relaxed);
+        if n & 0x3f == 0 {
+            echo!("[COMP-UP] n={} {}x{}", n, dimensions.0, dimensions.1);
+        }
+    }
     gles.TexImage2D(
         gles11::TEXTURE_2D,
         0,

@@ -154,6 +154,16 @@ pub enum Event {
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
     AppWillResignActive,
+    /// [MoleWorld iOS] OS told touchHLE the app entered the TRUE background.
+    /// (iOS `applicationDidEnterBackground:`) GL is illegal until foreground.
+    AppDidEnterBackground,
+    /// [MoleWorld iOS] OS told touchHLE the app is about to return to foreground.
+    /// (iOS `applicationWillEnterForeground:`) Only fires after a true background.
+    AppWillEnterForeground,
+    /// [MoleWorld iOS] OS told touchHLE the app became active again.
+    /// (iOS `applicationDidBecomeActive:`) Fires for every resume, including
+    /// foreground overlays (Control Center) that never entered the background.
+    AppDidBecomeActive,
     /// OS has informed touchHLE it will soon terminate.
     /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
     AppWillTerminate,
@@ -229,6 +239,11 @@ pub struct Window {
     /// terminate).
     high_priority_event: Option<Event>,
     enable_event_polling: bool,
+    /// [MoleWorld iOS] True only between `applicationDidEnterBackground:` and the
+    /// next foreground event. While set, NO OpenGL ES may be issued (iOS kills
+    /// any app that touches the GPU in the true background). Foreground overlays
+    /// (Control Center / home-indicator) do NOT set this — they stay foreground.
+    backgrounded: bool,
     #[cfg(target_os = "macos")]
     max_height: u32,
     #[cfg(target_os = "macos")]
@@ -398,6 +413,7 @@ impl Window {
             last_polled: Instant::now() - Duration::from_secs(1),
             high_priority_event: None,
             enable_event_polling: true,
+            backgrounded: false,
             #[cfg(target_os = "macos")]
             max_height,
             #[cfg(target_os = "macos")]
@@ -814,22 +830,57 @@ impl Window {
                     }
                 }
                 E::AppWillEnterBackground { .. } => {
+                    // [MoleWorld iOS] SDL's "AppWillEnterBackground" is actually
+                    // iOS `applicationWillResignActive:` — it fires for ANY
+                    // resign-active, INCLUDING Control Center / home-indicator
+                    // overlays where the app stays foreground and never enters
+                    // the background. So this must NOT exit or gate GL; it only
+                    // means "pause". The TRUE background is a separate event
+                    // (AppDidEnterBackground) below.
                     log!("Received app-will-resign-active event.");
-                    assert!(self.high_priority_event.is_none());
-                    self.high_priority_event = Some(Event::AppWillResignActive);
-                    // For some reason, if we don't pause event polling, we will
-                    // never finish handling the event.
-                    // TODO: Add a mechanism for re-enabling polling, if at some
-                    // point we support returning touchHLE to the foreground.
-                    self.enable_event_polling = false;
-                    continue;
+                    // [MoleWorld iOS] 不再 assert:重负载帧(好友村等)单帧 drawScene 跑很久会饿死
+                    // 事件循环,iOS 的 resign→background 会在 pop_event 消费前接连到达;旧 assert 在
+                    // 第二个事件上 panic = 画面定格的"彻底冻死"。改为优先级语义:resign 不覆盖已挂起
+                    // 的更高优先级事件(background/terminate)。
+                    if self.high_priority_event.is_none() {
+                        self.high_priority_event = Some(Event::AppWillResignActive);
+                    }
+                    // `break` (not the old `continue` + permanent
+                    // `enable_event_polling=false` latch): exit the pump for THIS
+                    // call so the consumer (pop_event) delivers the high-priority
+                    // event before SDL's iOS path could re-block, but let the NEXT
+                    // poll pump again so we can still observe the following
+                    // foreground/background lifecycle events (needed to resume).
+                    break;
+                }
+                E::AppDidEnterBackground { .. } => {
+                    // [MoleWorld iOS] iOS `applicationDidEnterBackground:` — the
+                    // TRUE background. After this, ANY GL call kills the app
+                    // (0x8badf00d); handled by gating GL + delivering the message.
+                    log!("Received app-did-enter-background event.");
+                    // background 优先级高于 resign:直接覆盖(消费侧 pop_event 取最新状态即可)。不再 assert。
+                    self.high_priority_event = Some(Event::AppDidEnterBackground);
+                    break;
+                }
+                E::AppWillEnterForeground { .. } => {
+                    // [MoleWorld iOS] iOS `applicationWillEnterForeground:` —
+                    // leaving the background. Ungate GL + resume.
+                    log!("Received app-will-enter-foreground event.");
+                    Event::AppWillEnterForeground
+                }
+                E::AppDidEnterForeground { .. } => {
+                    // [MoleWorld iOS] SDL's "AppDidEnterForeground"
+                    // (SDL_APP_DIDENTERFOREGROUND) is iOS
+                    // `applicationDidBecomeActive:` — every resume (overlay
+                    // dismissal AND background return).
+                    log!("Received app-did-become-active event.");
+                    Event::AppDidBecomeActive
                 }
                 E::AppTerminating { .. } => {
                     log!("Received app-will-terminate event.");
-                    assert!(self.high_priority_event.is_none());
+                    // terminate 优先级最高:直接覆盖。不再 assert。
                     self.high_priority_event = Some(Event::AppWillTerminate);
-                    self.enable_event_polling = false;
-                    continue;
+                    break;
                 }
                 E::FingerUp {
                     timestamp,
@@ -985,6 +1036,22 @@ impl Window {
         self.high_priority_event
             .take()
             .or_else(|| self.event_queue.pop_front())
+    }
+
+    /// [MoleWorld iOS · P0] Host-side peek (does NOT consume): is a background /
+    /// terminate high-priority event pending but not yet processed by the guest?
+    ///
+    /// The guest only gates GL on its OWN `-[UIApplication did_enter_background]`,
+    /// which runs between guest frames (NSRunLoop iteration). During a heavy frame
+    /// the guest can't reach that, so if iOS backgrounds us mid-frame, any later
+    /// present/GL call touches the GPU on a backgrounded surface → 0x8badf00d kill.
+    /// `Environment::run` peeks this at each tick-batch boundary and gates GL host-
+    /// side immediately, without waiting for the guest to consume the event.
+    pub fn background_or_terminate_pending(&self) -> bool {
+        matches!(
+            self.high_priority_event,
+            Some(Event::AppDidEnterBackground) | Some(Event::AppWillTerminate)
+        )
     }
 
     fn controller_added(&mut self, joystick_idx: u32) {
@@ -1493,7 +1560,31 @@ impl Window {
         self.default_renderbuffer
     }
 
+    /// [MoleWorld iOS] See the `backgrounded` field. While true, every GL /
+    /// present path must early-out so we never touch the GPU in the true
+    /// background (iOS kills any app that does).
+    pub fn is_backgrounded(&self) -> bool {
+        self.backgrounded
+    }
+    pub fn set_backgrounded(&mut self, value: bool) {
+        crate::mole_watchdog::BACKGROUNDED.store(value, std::sync::atomic::Ordering::Relaxed);
+        if self.backgrounded != value {
+            log!(
+                "[MoleWorld iOS] backgrounded = {} (GL gate {})",
+                value,
+                if value { "ON" } else { "OFF" }
+            );
+        }
+        self.backgrounded = value;
+    }
+
     pub fn swap_window(&self) {
+        // [MoleWorld iOS] Never flush to the GPU while truly backgrounded — a
+        // background present is a guaranteed 0x8badf00d kill by iOS. (Backstop;
+        // the present entry points already early-out before emitting any GL.)
+        if self.backgrounded {
+            return;
+        }
         self.window.gl_swap_window();
     }
 

@@ -173,24 +173,55 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                 ui_touch::handle_event(env, event)
             }
+            // [MoleWorld iOS] On iOS, losing focus (Control Center, home-indicator,
+            // notification) or going to the background must PAUSE — not kill — the
+            // running game. Desktop/Android keep the old exit-on-resign behavior
+            // (they don't drive the background/foreground lifecycle events below).
+            #[cfg(target_os = "ios")]
             Event::AppWillResignActive => {
-                // Getting this event means touchHLE is becoming inactive, e.g.
-                // due to switching apps. The obvious way to handle this would
-                // be to just send `applicationWillResignActive:` to the
-                // UIApplicationDelegate. However:
-                // - touchHLE's event loop can't handle an inactive app well
-                //   right now. For example, audio isn't paused.
-                // - touchHLE's event loop can't handle the subsequent
-                //   termination of an app right now: it doesn't manage to send
-                //   the `applicationWillTerminate:` message in time. This can
-                //   mean loss of data!
-                // Therefore, for the moment we will simulate the early iOS
-                // behavior where switching app usually resulted in termination.
-                // We can usually handle this in time, so there won't be data
-                // loss, nor problems with background resource usage or audio.
-                // TODO: Handle this better.
+                // iOS `applicationWillResignActive:` — fires for ANY focus loss,
+                // including foreground overlays (Control Center). The game saves +
+                // pauses CCDirector in its own handler. Do NOT exit and do NOT gate
+                // GL (still foreground → GL legal). A true background, if it
+                // follows, arrives as AppDidEnterBackground.
+                log!("Handling app-will-resign-active: pausing (game saves + pauses).");
+                ui_application::resign_active(env);
+            }
+            #[cfg(not(target_os = "ios"))]
+            Event::AppWillResignActive => {
+                // Desktop/Android can't yet run an inactive app well, so simulate
+                // early-iOS "switching away = terminate" (exit() saves first, so no
+                // data loss).
                 log!("Handling app-will-resign-active event: exiting.");
                 ui_application::exit(env);
+            }
+            #[cfg(target_os = "ios")]
+            Event::AppDidEnterBackground => {
+                // iOS `applicationDidEnterBackground:` — TRUE background. After this,
+                // any GL call kills us; gate GL first, then deliver the message (the
+                // game calls `stopAnimation`).
+                log!("Handling app-did-enter-background: gating GL, suspending render.");
+                ui_application::did_enter_background(env);
+            }
+            #[cfg(target_os = "ios")]
+            Event::AppWillEnterForeground => {
+                // iOS `applicationWillEnterForeground:` — leaving background. Ungate
+                // GL first (legal again) so `startAnimation` renders, then deliver.
+                log!("Handling app-will-enter-foreground: ungating GL, resuming render.");
+                ui_application::will_enter_foreground(env);
+            }
+            #[cfg(target_os = "ios")]
+            Event::AppDidBecomeActive => {
+                // iOS `applicationDidBecomeActive:` — every resume (overlay dismissal
+                // AND background return). Resume + clear the gate (idempotent).
+                log!("Handling app-did-become-active: resuming game.");
+                ui_application::did_become_active(env);
+            }
+            #[cfg(not(target_os = "ios"))]
+            Event::AppDidEnterBackground
+            | Event::AppWillEnterForeground
+            | Event::AppDidBecomeActive => {
+                // These lifecycle transitions are only driven on iOS.
             }
             Event::AppWillTerminate => {
                 log!("Handling app-will-terminate event.");

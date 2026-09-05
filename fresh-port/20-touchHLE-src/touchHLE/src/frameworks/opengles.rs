@@ -10,7 +10,7 @@
 //! topic.
 
 mod eagl;
-mod gles_guest;
+pub(crate) mod gles_guest;
 
 use touchHLE_gl_bindings::gles11::types::GLenum;
 

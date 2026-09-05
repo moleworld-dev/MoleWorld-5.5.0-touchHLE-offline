@@ -457,6 +457,117 @@ pub(super) fn exit(env: &mut Environment) {
     std::process::exit(0);
 }
 
+/// [MoleWorld iOS] iOS `applicationWillResignActive:` — the app lost focus
+/// (Control Center, home-indicator, notification, or about to background). Tell
+/// the guest to pause + save, WITHOUT exiting and WITHOUT gating GL (we're still
+/// foreground; GL is legal). If this becomes a true background,
+/// [did_enter_background] follows.
+#[cfg(target_os = "ios")]
+pub(super) fn resign_active(env: &mut Environment) {
+    // Don't message the fake app-picker bundle: its game singletons don't exist.
+    if env.is_app_picker {
+        return;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+
+    // Flush NSUserDefaults now (the game also saves in its own handler; this
+    // matches the old exit() behavior so a later OS kill can't lose data).
+    let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+    let _: bool = msg![env; user_defaults synchronize];
+
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationWillResignActive:")
+    {
+        () = msg![env; delegate applicationWillResignActive:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationWillResignActiveNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// [MoleWorld iOS] iOS `applicationDidEnterBackground:` — the TRUE background.
+/// Gate GL FIRST (so neither this delivery nor anything after touches the GPU),
+/// then deliver the message (the game calls `stopAnimation`). iOS kills any app
+/// that issues GL after this returns.
+#[cfg(target_os = "ios")]
+pub(super) fn did_enter_background(env: &mut Environment) {
+    if let Some(window) = env.window.as_mut() {
+        window.set_backgrounded(true);
+    }
+    if env.is_app_picker {
+        return;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
+    {
+        () = msg![env; delegate applicationDidEnterBackground:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// [MoleWorld iOS] iOS `applicationWillEnterForeground:` — leaving the
+/// background. Clear the GL gate FIRST (GL legal again) so the game's
+/// `startAnimation` render path works, then deliver the message.
+#[cfg(target_os = "ios")]
+pub(super) fn will_enter_foreground(env: &mut Environment) {
+    if let Some(window) = env.window.as_mut() {
+        window.set_backgrounded(false);
+    }
+    if env.is_app_picker {
+        return;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationWillEnterForeground:")
+    {
+        () = msg![env; delegate applicationWillEnterForeground:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationWillEnterForegroundNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// [MoleWorld iOS] iOS `applicationDidBecomeActive:` — every resume (overlay
+/// dismissal AND background return). Ensure the GL gate is clear (idempotent),
+/// then tell the guest to resume.
+#[cfg(target_os = "ios")]
+pub(super) fn did_become_active(env: &mut Environment) {
+    if let Some(window) = env.window.as_mut() {
+        window.set_backgrounded(false);
+    }
+    if env.is_app_picker {
+        return;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationDidBecomeActive:")
+    {
+        () = msg![env; delegate applicationDidBecomeActive:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationDidBecomeActiveNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
 /// App life-cycle notifications
 const UIApplicationDidFinishLaunchingNotification: &str =
     "UIApplicationDidFinishLaunchingNotification";
