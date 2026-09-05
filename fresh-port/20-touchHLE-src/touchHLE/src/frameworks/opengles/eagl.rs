@@ -610,6 +610,8 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     }
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
+    // [MoleWorld 智能分辨率] 完整 drawable 尺寸,供 present_frame 的 --ambient-fill 环境补边。
+    let full_size = env.window.as_ref().unwrap().drawable_size();
     // [MoleWorld iOS] cocos2d 的横屏游戏自己已经把场景渲染成横屏正向(它的 EAGL renderbuffer
     // 就是 1024×768 横屏),iPhone 也横握,所以不能再叠加 device 方向的旋转;否则
     // window.rotation_matrix()(LandscapeRight=+90°)会把画面再转 90° = 横躺。改用 identity 直接
@@ -714,6 +716,11 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     {
         gles.TexParameteri(
             gles11::TEXTURE_2D,
+            gles11::TEXTURE_MAG_FILTER,
+            gles11::LINEAR as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
             gles11::TEXTURE_WRAP_S,
             gles11::CLAMP_TO_EDGE as _,
         );
@@ -796,7 +803,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     // Draw the quad
     log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
+    present_frame(gles, viewport, full_size, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
 
     // [MoleWorld iOS · 性能] 不再每帧删除 present 纹理——它被 PRESENT_TEX 缓存下来供下一帧复用
     // (尺寸变化或上下文重建时会在上面重建)。这样每帧省掉一次驱动侧的纹理分配+释放。

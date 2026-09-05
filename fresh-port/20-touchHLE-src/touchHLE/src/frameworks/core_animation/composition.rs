@@ -145,6 +145,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().viewport(),
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
+        env.window().drawable_size(), // [MoleWorld] full_size,供 --ambient-fill
     );
     // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定;
     // 以及 viewRenderbuffer,swap 前绑回 GL_RENDERBUFFER。
@@ -398,6 +399,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         present_frame(
             gles.as_mut(),
             present_frame_args.0,
+            present_frame_args.3, // full_size
             present_frame_args.1,
             present_frame_args.2,
             window_default_fbo,

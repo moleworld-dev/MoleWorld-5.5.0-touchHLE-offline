@@ -47,6 +47,10 @@ impl FpsCounter {
 pub unsafe fn present_frame(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
+    // [MoleWorld 智能分辨率] 完整 drawable 尺寸(窗口全区)。当 --ambient-fill 且 viewport 小于它
+    // (等比居中留 letterbox)时,空白处用【画面拉伸+压暗】填充代替黑边。传 viewport 的宽高即等于
+    // 「无补边」(letterbox=0 时本就无空白)。
+    full_size: (u32, u32),
     rotation_matrix: Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     // [MoleWorld iOS] 窗口的默认 framebuffer:桌面/安卓=0(=窗口);iOS=SDL 绑到 CAEAGLLayer
@@ -82,6 +86,17 @@ pub unsafe fn present_frame(
     ];
     gles.EnableClientState(gles11::VERTEX_ARRAY);
     gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
+    // [MoleWorld iOS] 把纹理单元锁回 0:present 用单元 0 的纹理采样,texcoord 客户端数组也
+    // 必须设到单元 0。游戏/合成器可能把 GL_ACTIVE_TEXTURE / GL_CLIENT_ACTIVE_TEXTURE 停在
+    // 别的单元;那样 present 的 TexCoordPointer+EnableClientState(TEXTURE_COORD_ARRAY) 会落到
+    // 错误单元,而采样用的单元 0 没有 texcoord 数组 → 该单元 texcoord 取默认 (0,0) → 整块四
+    // 边形采样到纹理 (0,0) 角(合成 RT 的角是 Clear 的黑)→ 纯黑。原生 iOS GLES1 严格按单元
+    // 取数,桌面 gl2 翻译层凑巧不受影响(故 Mac 正常)。仅 iOS。
+    #[cfg(target_os = "ios")]
+    {
+        gles.ActiveTexture(gles11::TEXTURE0);
+        gles.ClientActiveTexture(gles11::TEXTURE0);
+    }
     #[allow(unused_mut)]
     let mut tex_coords: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
     gles.MatrixMode(gles11::TEXTURE);
@@ -112,7 +127,61 @@ pub unsafe fn present_frame(
     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
     gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
     gles.Enable(gles11::TEXTURE_2D);
+
+    // [MoleWorld 智能分辨率·环境补边] --ambient-fill:等比居中留了 letterbox 空白时,先把画面
+    // 拉伸铺满整个 drawable(ambient 亮底)+ 压一层半透明黑,再在中间画锐利正片 → 两侧不是黑边
+    // 而是画面本身的柔和横向延伸(视频播放器 ambilight 风)。复用主绘制的 vertices/texcoord/rotation。
+    let ambient = crate::window::ambient_fill_active()
+        && (viewport.2 < full_size.0 || viewport.3 < full_size.1);
+    if ambient {
+        // ① 亮底:NDC 全屏四边形 + viewport=整个 drawable → 4:3 画面横向拉伸填满两侧。
+        gles.Viewport(0, 0, full_size.0 as _, full_size.1 as _);
+        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        // ② 压暗:整屏叠半透明黑(关纹理,顶点色直出),让中间正片更突出。
+        gles.Disable(gles11::TEXTURE_2D);
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Enable(gles11::BLEND);
+        gles.BlendFunc(gles11::SRC_ALPHA, gles11::ONE_MINUS_SRC_ALPHA);
+        gles.Color4f(0.0, 0.0, 0.0, 0.42);
+        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        // ③ 复原状态,给中间画锐利、不变形的正片(会覆盖被压暗的中心区)。
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+        gles.Disable(gles11::BLEND);
+        gles.Enable(gles11::TEXTURE_2D);
+        gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Viewport(
+            viewport.0 as _,
+            viewport.1 as _,
+            viewport.2 as _,
+            viewport.3 as _,
+        );
+    }
+
     gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+    // [MoleWorld iOS 三角定位诊断·临时] 主纹理四边形之上叠两个角块:
+    //  左上=纯品红实心(不采样纹理)→ 验证 present 上屏是否通;
+    //  右上=纹理四边形但 texcoord 全硬编码 (0.5,0.5)(采样纹理正中)→ 若它出图而主四边形黑,
+    //        说明【主四边形的客户端 texcoord 数组没被应用】(采样到角落黑);若它也黑则是纹理采样本身坏。
+    #[cfg(target_os = "ios")]
+    {
+        // 左上品红
+        gles.Disable(gles11::TEXTURE_2D);
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Color4f(1.0, 0.0, 1.0, 1.0);
+        let mv: [f32; 12] = [-1.0, 0.3, -1.0, 1.0, -0.3, 0.3, -0.3, 0.3, -1.0, 1.0, -0.3, 1.0];
+        gles.VertexPointer(2, gles11::FLOAT, 0, mv.as_ptr() as *const GLvoid);
+        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        // 右上:纹理,texcoord 硬编码采样中心 (0.5,0.5)
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+        gles.Enable(gles11::TEXTURE_2D);
+        gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+        let cv: [f32; 12] = [0.3, 0.3, 0.3, 1.0, 1.0, 0.3, 1.0, 0.3, 0.3, 1.0, 1.0, 1.0];
+        let ct: [f32; 12] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        gles.VertexPointer(2, gles11::FLOAT, 0, cv.as_ptr() as *const GLvoid);
+        gles.TexCoordPointer(2, gles11::FLOAT, 0, ct.as_ptr() as *const GLvoid);
+        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    }
     // clean this up so we don't need to worry about it in e.g. Core Animation
     gles.LoadIdentity();
 

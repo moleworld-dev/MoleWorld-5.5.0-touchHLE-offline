@@ -32,6 +32,34 @@ View options:
 
         This is a natural number that is at least 1.
 
+    --fill-screen
+        [MoleWorld] Adapt the app's logical screen to your display's aspect
+        ratio ("FixedHeight Hor+"): the short side stays fixed (iPad 768 /
+        iPhone 320 points) while the long side scales to match your monitor,
+        so world scenes reveal more content and the app fills the screen with
+        no black bars and no stretching. The aspect ratio is clamped to
+        [4:3, --max-aspect] (default max 2.4 ≈ 21.6:9), which covers 16:9,
+        16:10 and 21:9 with zero bars; only ultra-wide displays (e.g. 32:9)
+        get a small pillarbox to avoid horizontal distortion.
+
+        Ignored if --logical-size is given (that takes precedence). Combine
+        with --fullscreen for a true borderless fill. Equivalent to the
+        MOLE_FILL=1 environment variable.
+
+    --logical-size=WxH
+        [MoleWorld] Explicitly set the app's logical screen size in points,
+        e.g. --logical-size=1366x768. You may pass either orientation
+        (1366x768 or 768x1366); it is normalized internally. This overrides
+        --fill-screen and the MOLE_GUEST_PORTRAIT environment variable, and
+        makes the viewport scale the output while preserving this aspect ratio
+        (no stretching).
+
+    --max-aspect=F
+        [MoleWorld] Upper bound on the app's landscape aspect ratio used by
+        --fill-screen (default 2.4). Clamped to [1.333, 4.0]. Raise it for
+        ultra-wide monitors if you prefer more width over a small pillarbox.
+        Equivalent to the MOLE_MAX_ASPECT environment variable.
+
 Device options:
     --device-family=...
         Specifies which device family should be emulated: iPhone or iPad.

@@ -40,6 +40,19 @@ pub struct Options {
     pub scale_hack: NonZeroU32,
     /// [MoleWorld] 窗口模式锁定宽高比(等比 letterbox 黑边);默认 false=自由拉伸铺满。
     pub lock_aspect: bool,
+    /// [MoleWorld 智能分辨率] `--logical-size=WxH`:显式指定 guest 逻辑屏(点)。传 1366x768 或
+    /// 768x1366 皆可,内部归一成 portrait=(短,长)。None=不覆盖。见 window::apply_cli_resolution。
+    pub logical_size: Option<(u32, u32)>,
+    /// [MoleWorld 智能分辨率] `--fill-screen`:按目标屏宽高比自动算 guest 逻辑屏(FixedHeight Hor+),
+    /// 物理满屏不黑边、不拉伸。等价 env MOLE_FILL=1。默认 false=零回归。
+    pub fill_screen: bool,
+    /// [MoleWorld 智能分辨率] `--max-aspect=F`:自动适配时 guest landscape 宽高比上限(默认 2.4)。
+    /// 夹在 [4:3, 4.0]。None=用默认。仅超宽屏会被钳(留极小 pillarbox 防变形)。
+    pub max_aspect: Option<f32>,
+    /// [MoleWorld 智能分辨率]「4:3 完美模式」环境补边:`--ambient-fill`。guest 保持原生 4:3(所有
+    /// UI 场景像素级完美、零错位),在宽屏上等比居中,letterbox 空白处不留黑边,而用【画面本身
+    /// 横向拉伸+压暗】填充(视频播放器 ambient 风)。默认 false=原生 letterbox 黑边。
+    pub ambient_fill: bool,
     pub deadzone: f32,
     pub analog_stick_tilt_controls: bool,
     pub x_tilt_range: f32,
@@ -74,6 +87,10 @@ impl Default for Options {
             initial_orientation: DeviceOrientation::Portrait,
             scale_hack: NonZeroU32::new(1).unwrap(),
             lock_aspect: false,
+            logical_size: None,
+            fill_screen: false,
+            max_aspect: None,
+            ambient_fill: false,
             analog_stick_tilt_controls: true,
             deadzone: 0.1,
             x_tilt_range: 60.0,
@@ -136,6 +153,38 @@ impl Options {
         } else if arg == "--lock-aspect" {
             // [MoleWorld] 窗口锁定宽高比:窗口模式改为等比 letterbox(四周黑边),不自由拉伸。
             self.lock_aspect = true;
+        } else if arg == "--fill-screen" {
+            // [MoleWorld 智能分辨率] 按目标屏宽高比自动铺满(FixedHeight Hor+),不黑边不拉伸。
+            self.fill_screen = true;
+        } else if arg == "--ambient-fill" {
+            // [MoleWorld 智能分辨率]「4:3 完美模式」:等比居中 + 环境延伸补边(代替黑边)。
+            self.ambient_fill = true;
+        } else if let Some(value) = arg.strip_prefix("--logical-size=") {
+            // [MoleWorld 智能分辨率] 显式 guest 逻辑屏。WxH,传 1366x768 或 768x1366 皆可。
+            let (w, h) = value
+                .split_once('x')
+                .ok_or_else(|| "--logical-size= expects WxH (e.g. 1366x768)".to_string())?;
+            let w: u32 = w
+                .trim()
+                .parse()
+                .map_err(|_| "Invalid width for --logical-size=".to_string())?;
+            let h: u32 = h
+                .trim()
+                .parse()
+                .map_err(|_| "Invalid height for --logical-size=".to_string())?;
+            if w == 0 || h == 0 {
+                return Err("--logical-size= dimensions must be greater than 0".to_string());
+            }
+            self.logical_size = Some((w, h));
+        } else if let Some(value) = arg.strip_prefix("--max-aspect=") {
+            // [MoleWorld 智能分辨率] 自动适配时 guest landscape 宽高比上限(夹在 [4:3, 4.0])。
+            let a: f32 = value
+                .trim()
+                .parse()
+                .ok()
+                .filter(|v: &f32| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| "Invalid value for --max-aspect=".to_string())?;
+            self.max_aspect = Some(a);
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
