@@ -30,4 +30,6 @@ echo ""
 # 进入 touchHLE 目录运行(用绝对路径指向 .app)
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
 cd "$TOUCHHLE_DIR" || exit 1
+# ★强制 mapExtend=0x1F 防拖地图闪。离线无服务器修不了本地坏存档(mapExtend=6),只能客户端兜底。设 MOLE_FIX_MAPEXTEND=0 可关。
+export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"
 exec ./target/release/touchHLE "$APP_ABS" --landscape-right --device-family=ipad

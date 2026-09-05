@@ -25,4 +25,4 @@ echo ""
 
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
 cd "$TOUCHHLE_DIR" || exit 1
-exec ./target/release/touchHLE "$APP_ABS" --landscape-right --device-family=iphone --lock-aspect
+exec ./target/release/touchHLE "$APP_ABS" --landscape-left --device-family=iphone --lock-aspect
