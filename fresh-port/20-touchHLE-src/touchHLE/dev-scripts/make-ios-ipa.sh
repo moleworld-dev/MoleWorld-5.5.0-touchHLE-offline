@@ -66,7 +66,11 @@ find "_game_stage/Payload/MoleWorld.app" \( -name "*.decoded.plist" -o -name ".D
 rm -rf _game_stage
 
 # 4) 图标(从 512x512 干净 PNG 缩放出 iOS 各档)
+# [MoleWorld iOS] iPhone 16 Pro Max 等现代机型是 @3x,必须有 AppIcon60x60@3x.png(180px),
+# 否则 springboard 找不到对应密度的图标 → 拿 @2x 缩放或显示空白/默认图标(图标"有时显示不正常")。
 sips -z 120 120 "$ICON_SRC" --out "$APP/AppIcon60x60@2x.png"        >/dev/null
+sips -z 180 180 "$ICON_SRC" --out "$APP/AppIcon60x60@3x.png"        >/dev/null
+sips -z 76  76  "$ICON_SRC" --out "$APP/AppIcon76x76~ipad.png"      >/dev/null
 sips -z 152 152 "$ICON_SRC" --out "$APP/AppIcon76x76@2x~ipad.png"   >/dev/null
 sips -z 167 167 "$ICON_SRC" --out "$APP/AppIcon83.5x83.5@2x~ipad.png" >/dev/null
 sips -z 1024 1024 "$ICON_SRC" --out "$APP/AppIcon1024.png"          >/dev/null

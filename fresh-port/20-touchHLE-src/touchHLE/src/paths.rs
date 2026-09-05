@@ -73,25 +73,59 @@ pub struct ResourceFile {
 }
 impl ResourceFile {
     pub fn open(path: &str) -> Result<Self, String> {
-        Ok(Self {
-            // On Android, these resources are included as "assets" within the
-            // APK. We access them via SDL2's wrapper of Android's assets API.
-            #[cfg(target_os = "android")]
-            file: sdl2::rwops::RWops::from_file(path, "r")?,
+        // On Android, these resources are included as "assets" within the APK.
+        // We access them via SDL2's wrapper of Android's assets API.
+        #[cfg(target_os = "android")]
+        let file = sdl2::rwops::RWops::from_file(path, "r")?;
 
-            // On other OSes, resources are accessed as ordinary files.
-            #[cfg(not(target_os = "android"))]
-            file: {
-                let base_path = get_macos_bundled_resources_path();
-                // When not in a bundle, look in the current directory.
-                let path = base_path.as_deref().unwrap_or(Path::new(".")).join(path);
-                std::fs::File::open(path).map_err(|e| e.to_string())?
-            },
-        })
+        // On other OSes, resources are accessed as ordinary files.
+        #[cfg(not(target_os = "android"))]
+        let file = {
+            let base_path = get_macos_bundled_resources_path();
+            // When not in a bundle, look in the current directory.
+            let base = base_path.as_deref().unwrap_or(Path::new("."));
+            match std::fs::File::open(base.join(path)) {
+                Ok(f) => f,
+                // [MoleWorld iOS] App Store 不允许 bundle 里有松散 .dylib(guest 库会触发
+                // ITMS-90171「不允许独立库」/ 90209「段对齐」)。所以 TestFlight 包把这些
+                // guest 库打进 touchHLE_dylibs.zip(上传校验不扫 zip 内部),松散文件就不存在
+                // 了——这里按 basename 从该 zip 提取到可写临时目录再打开。开发侧载仍带松散
+                // 文件(命中上面的 Ok),此回退不触发,无回归。
+                Err(e) => {
+                    if path.starts_with(DYLIBS_DIR) {
+                        open_from_dylibs_zip(base, path).ok_or_else(|| e.to_string())?
+                    } else {
+                        return Err(e.to_string());
+                    }
+                }
+            }
+        };
+        Ok(Self { file })
     }
     pub fn get(&mut self) -> &mut (impl Read + Seek) {
         &mut self.file
     }
+}
+
+/// [MoleWorld iOS] 从 bundle 根的 touchHLE_dylibs.zip 里按 basename 提取一个 guest 动态库
+/// 到可写临时目录并打开(见 ResourceFile::open 的注释)。提取结果缓存,后续直接复用。
+#[cfg(not(target_os = "android"))]
+fn open_from_dylibs_zip(base: &Path, path: &str) -> Option<std::fs::File> {
+    let name = Path::new(path).file_name()?.to_str()?;
+    let cache = std::env::temp_dir().join("touchHLE_dylibs").join(name);
+    if cache.is_file() {
+        return std::fs::File::open(&cache).ok();
+    }
+    let zip_file = std::fs::File::open(base.join("touchHLE_dylibs.zip")).ok()?;
+    let mut archive = zip::ZipArchive::new(zip_file).ok()?;
+    let mut entry = archive.by_name(name).ok()?;
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf).ok()?;
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    std::fs::write(&cache, &buf).ok()?;
+    std::fs::File::open(&cache).ok()
 }
 impl std::fmt::Debug for ResourceFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
@@ -192,6 +226,10 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
         let path = path
             .to_str()
             .ok_or_else(|| "User data directory path is not UTF-8".to_string())?;
+        // [MoleWorld iOS] iOS 把 /var 软链到 /private/var;canonicalize() 把路径解析成
+        // /private/var/mobile/...,但 Files app 的 shareddocuments:// 期望不带 /private 前缀的
+        // 真实路径,否则 openURL 静默失败(SDL error 为空)。去掉 /private 前缀再拼 URL。
+        let path = path.strip_prefix("/private").unwrap_or(path);
         Ok(format!("shareddocuments://{path}"))
     } else {
         let path = user_data_base_path()

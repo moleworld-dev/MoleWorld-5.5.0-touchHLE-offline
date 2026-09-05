@@ -303,6 +303,24 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
             .push(Dictionary::new().into());
         let len = host_object.plist["$objects"].as_array().unwrap().len();
         let new_uid = Uid::new(len as u64 - 1);
+        // ★[MoleWorld iOS · P0 修复] 先登记 UID,再递归 encodeWithCoder。
+        // 原代码在 encodeWithCoder(递归编码本对象引用的其它对象)之后才 insert already_archived,
+        // 于是遇到【循环引用图】(cocos2d CCNode 的 parent↔child、共享子节点等)时,递归回到本对象
+        // → already_archived 里还没它 → 重新编码 → 再递归 → 无限递归归档、永不收敛 = 点好友进好友村
+        // 时游戏 archivedDataWithRootObject: 归档村状态卡死(看门狗/心跳症状 CCNode visit 0x2d30cc 同源)。
+        // 标准 NSKeyedArchiver 就是"先占位 UID 再编码引用",环引用即解析为该 UID 而不重复编码 → 收敛。
+        // retain 同步前移:防对象指针在递归期间被回收复用而令 already_archived 误命中(原 359-366 注释场景)。
+        if object != class {
+            retain(env, object);
+            env.objc
+                .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
+                .retained_objects
+                .push(object);
+        }
+        env.objc
+            .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
+            .already_archived
+            .insert(object, new_uid);
         if object == class {
             // If the class selector returns itself, we're encoding a Class
             let mut classname = None;
@@ -356,23 +374,7 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
                 .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
                 .current_key = previous_key;
         }
-        // Keep this archived instance alive until the archiver is deallocated.
-        // -[UserInfoData encodeWithCoder:] allocs a temporary wrapper container
-        // per field (npcs / achieveUnlock / attributeValue), encodes it, then
-        // releases it; the next field's wrapper would otherwise reuse the
-        // just-freed guest address and false-hit `already_archived`, collapsing
-        // the three distinct fields into one object and corrupting the save.
-        // Retaining prevents the address from being recycled mid-archive.
-        // Classes (object == class) are not refcounted instances; skip them.
-        if object != class {
-            retain(env, object);
-            env.objc
-                .borrow_mut::<NSKeyedArchiverHostObject>(archiver)
-                .retained_objects
-                .push(object);
-        }
-        let host_object = env.objc.borrow_mut::<NSKeyedArchiverHostObject>(archiver);
-        host_object.already_archived.insert(object, new_uid);
+        // (retain + already_archived 登记已前移到 encodeWithCoder 之前,见上方 P0 修复。)
         new_uid
     }
 }

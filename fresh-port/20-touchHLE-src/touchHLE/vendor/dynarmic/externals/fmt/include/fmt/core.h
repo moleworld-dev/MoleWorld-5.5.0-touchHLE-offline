@@ -224,8 +224,12 @@
       (defined(__cpp_consteval) &&                               \
        (!FMT_MSC_VERSION || _MSC_FULL_VER >= 193030704))
 // consteval is broken in MSVC before VS2022 and Apple clang before 14.
-#    define FMT_CONSTEVAL consteval
-#    define FMT_HAS_CONSTEVAL
+// [MoleWorld iOS] AppleClang 21 (Xcode 26.5) 对 consteval 更严格,拒绝旧 fmt 10.1 的
+// basic_format_string consteval 构造("not a constant expression")。强制退到 fmt 的
+// "不支持 consteval"路径(FMT_CONSTEVAL 留空、不定义 FMT_HAS_CONSTEVAL),仅为让桌面
+// 差分诊断构建能编出 dynarmic;格式串改运行期检查,功能不受影响。
+#    define FMT_CONSTEVAL
+//   define FMT_HAS_CONSTEVAL
 #  else
 #    define FMT_CONSTEVAL
 #  endif

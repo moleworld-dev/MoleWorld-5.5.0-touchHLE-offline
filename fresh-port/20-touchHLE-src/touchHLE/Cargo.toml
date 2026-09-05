@@ -47,6 +47,10 @@ cpu_interpreter = []
 # release 默认【关】以消除每条指令的固定开销(显著提速)。抓脱轨/挂起时:
 #   --features static,cpu_interpreter,interp_debug
 interp_debug = []
+# 只开轻量心跳(打印 pc/lr/sp,不写 trace 环、不做 DERAIL),~1.05x 而非 interp_debug 的
+# ~40x。专门用来 release 速度下抓"卡死"现场(连续心跳 pc 聚成循环体):
+#   --features static,cpu_interpreter,interp_hb
+interp_hb = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
