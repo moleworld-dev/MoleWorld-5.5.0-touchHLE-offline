@@ -519,9 +519,14 @@ impl Window {
             // 路径不受影响(铁律:iOS 渲染改动不污染 Mac)。env 门控,默认不开,真机 opt-in 实测。
             let mut wb = video_ctx.window(title, width, height);
             wb.fullscreen().opengl();
-            if std::env::var("MOLE_HIDPI").map(|v| v != "0").unwrap_or(false) {
+            // [MoleWorld iOS 对齐] 真机默认开高 DPI(原生像素呈现,画面清晰;见 5e2c481),MOLE_HIDPI=0 可关;
+            // 其它平台保持 env opt-in。iOS 没有环境变量,若沿用 env 门控会退回点分辨率=糊(cherry-pick 回归)。
+            let hidpi = std::env::var("MOLE_HIDPI")
+                .map(|v| v != "0")
+                .unwrap_or(cfg!(target_os = "ios"));
+            if hidpi {
                 wb.allow_highdpi();
-                log!("[MOLE-RES] iOS HiDPI 开启(allow_highdpi):drawable=设备原生像素");
+                log!("[MOLE-RES] HiDPI 开启(allow_highdpi):drawable=设备原生像素");
             }
             wb.build().unwrap()
         } else if fullscreen {

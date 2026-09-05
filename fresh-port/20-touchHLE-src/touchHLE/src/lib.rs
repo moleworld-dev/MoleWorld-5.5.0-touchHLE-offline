@@ -189,6 +189,11 @@ pub fn ios_entry() {
         game.to_string_lossy().into_owned(),
         String::from("--landscape-right"),
         String::from("--device-family=ipad"),
+        // [MoleWorld iOS 宽屏适配] 对齐桌面「启动摩尔庄园-宽屏.command」:按真机屏幕比例自动算 guest 逻辑屏
+        // (FixedHeight Hor+,短边锁 768、长边随屏比、钳在 [4:3, 2.4])→ iPhone 全面屏铺满无黑边、不拉伸;
+        // 世界场景多显示海洋,整屏底图走 X_wide.png 重定向,UI 场景由 UI43(宽屏自动开)按 4:3 原设计居中。
+        // iPad(4:3)算出来仍是 1024x768,逐字节等同原路径。
+        String::from("--fill-screen"),
     ];
     match main(args.into_iter()) {
         Ok(_) => echo!("touchHLE finished"),

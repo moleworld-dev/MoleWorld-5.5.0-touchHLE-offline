@@ -1175,7 +1175,13 @@ fn apply_crack_patches(env: &mut Environment) {
 fn fix_mapextend_on() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("MOLE_FIX_MAPEXTEND").is_some())
+    // [MoleWorld iOS 对齐] 桌面启动器已把 MOLE_FIX_MAPEXTEND 默认置 1(强制 mapExtend=0x1F 防拖地图闪,
+    // 离线无服务器修不了坏存档只能客户端兜底);iOS 没有启动器/环境变量 → 这里默认开,MOLE_FIX_MAPEXTEND=0 可关。
+    *V.get_or_init(|| {
+        std::env::var("MOLE_FIX_MAPEXTEND")
+            .map(|v| v != "0")
+            .unwrap_or(cfg!(target_os = "ios"))
+    })
 }
 
 /// Cheap gate so the hot message path pays nothing when all cheats are off.
@@ -2083,7 +2089,13 @@ fn ui43_on_add_child(env: &mut Environment) {
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] MOLE_UI43=1 是否开启(winSize 返回 1024x768)。仅解析一次。
 fn ui43_mode() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("MOLE_UI43").map(|v| v != "0").unwrap_or(false))
+    // [MoleWorld iOS 对齐] 桌面靠启动器 export MOLE_UI43=1;iOS 没有环境变量,改为【宽屏(--fill-screen
+    // 算出的 guest 逻辑屏比 4:3 宽)时自动开】,MOLE_UI43=0 可关、=1 可强开。4:3 下 UI43 本就无事可做。
+    *S.get_or_init(|| {
+        std::env::var("MOLE_UI43")
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| crate::window::is_widescreen())
+    })
 }
 
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
