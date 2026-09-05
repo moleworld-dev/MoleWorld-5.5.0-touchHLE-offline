@@ -1234,6 +1234,11 @@ impl Environment {
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
     pub fn run(mut self) {
+        // [MoleWorld iOS · 冻结转储器] 宿主线程层看门狗(见 mole_watchdog.rs)。
+        {
+            use std::os::unix::io::AsRawFd;
+            crate::mole_watchdog::start(crate::log::get_log_file().as_raw_fd());
+        }
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
@@ -1328,6 +1333,13 @@ impl Environment {
                 // thread, lest every single callback call pay this cost.
                 if let Some(ref mut window) = self.window {
                     window.poll_for_events(&self.options);
+                    // [MoleWorld iOS · P0] host 后台兜底:长帧(如首次进好友村)中途被 iOS 切后台时,
+                    // guest 的 -[UIApplication did_enter_background] 要等到帧间 NSRunLoop 迭代才跑,期间
+                    // 任何 present/GL 触 GPU = 0x8badf00d 被杀。这里在 tick 批次边界一看到后台/终止事件就
+                    // host 侧立即 gate GL,不等 guest。幂等:guest 稍后处理同一事件无副作用。
+                    if window.background_or_terminate_pending() && !window.is_backgrounded() {
+                        window.set_backgrounded(true);
+                    }
                 }
                 let curr_thread_block = self.threads[self.current_thread].blocked_by.clone();
                 if stepping || matches!(curr_thread_block, ThreadBlock::WaitingForDebugger(_)) {
@@ -1599,6 +1611,7 @@ impl Environment {
             // [MoleWorld] 死循环看门狗:进岛卡死时(guest 死循环、drawScene 帧停)在此 dump
             // PC/回溯。仅 ENABLE_NEWSCENE_ISLAND 开时生效,常态零开销。
             crate::mole_cheats::watchdog_check(self);
+            crate::mole_watchdog::note_host_progress();
             self.yield_thread(ThreadBlock::NotBlocked);
         }
     }
@@ -1646,11 +1659,88 @@ impl Environment {
     /// This also handles all the required bookkeeping (unlocking mutexes,
     /// decrementing semaphores, setting the thread to be unblocked, etc.).
     /// It is not required that the thread is switched to immediately.
+    /// [MoleWorld iOS · 冻结转储器 · 调度器层] 主线程 >8s 没出帧(且前台)时,打出每个 guest 线程阻塞在
+    /// 什么原语上 + 主线程保存的寄存器与 FP 回溯链。限频 5s。零稳态开销(只在调用点触发)。
+    fn dump_stall_state(&mut self, why: &str) {
+        use std::cell::Cell;
+        thread_local! {
+            static SEEN: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
+            static LAST_DUMP: Cell<Option<Instant>> = const { Cell::new(None) };
+        }
+        if self.window.as_ref().map(|w| w.is_backgrounded()).unwrap_or(false) {
+            return;
+        }
+        let frame = crate::mole_cheats::watchdog_frame_count();
+        if frame < 100 {
+            return;
+        }
+        let now = Instant::now();
+        let (seen_frame, seen_at) = SEEN.with(|c| c.get());
+        if seen_frame != frame || seen_at.is_none() {
+            SEEN.with(|c| c.set((frame, Some(now))));
+            return;
+        }
+        let stalled = now.duration_since(seen_at.unwrap());
+        if stalled.as_secs() < 8 {
+            return;
+        }
+        let ok = LAST_DUMP.with(|c| match c.get() {
+            Some(t) if now.duration_since(t).as_secs() < 5 => false,
+            _ => {
+                c.set(Some(now));
+                true
+            }
+        });
+        if !ok {
+            return;
+        }
+        log!(
+            "[STALL] {} — 主线程已 {}s 没出帧(frame={}),current_thread={}",
+            why,
+            stalled.as_secs(),
+            frame,
+            self.current_thread
+        );
+        for (i, t) in self.threads.iter().enumerate() {
+            log!("[STALL]   thread {}: active={} blocked_by={:?}", i, t.active, t.blocked_by);
+        }
+        #[cfg(feature = "cpu_interpreter")]
+        {
+            let regs: [u32; 16] = if self.current_thread == 0 {
+                *self.cpu.regs()
+            } else if let Some(ctx) = self.threads[0].guest_context.as_ref() {
+                ctx.regs
+            } else {
+                [0; 16]
+            };
+            log!(
+                "[STALL]   main: PC=0x{:08x} LR=0x{:08x} SP=0x{:08x} FP=0x{:08x} R0=0x{:08x} R1=0x{:08x}",
+                regs[15], regs[14], regs[13], regs[crate::abi::FRAME_POINTER], regs[0], regs[1]
+            );
+            let mut fp = regs[crate::abi::FRAME_POINTER];
+            let mut bt = String::new();
+            for _ in 0..12 {
+                if fp < 0x10000 || fp & 3 != 0 {
+                    break;
+                }
+                let saved_lr: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp + 4));
+                bt.push_str(&format!(" 0x{:08x}", saved_lr));
+                let next_fp: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp));
+                if next_fp <= fp {
+                    break;
+                }
+                fp = next_fp;
+            }
+            log!("[STALL]   main 回溯(LR链):{}", bt);
+        }
+    }
+
     fn schedule_next_thread(&mut self) -> ThreadId {
         // GDB can allow schedule_next_thread to be called twice in a row -
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
         loop {
+            crate::mole_watchdog::note_host_progress();
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
             let mut next_awakening: Option<Instant> = None;
@@ -1791,7 +1881,11 @@ impl Environment {
             if let Some(next_awakening) = next_awakening {
                 let duration = next_awakening.duration_since(Instant::now());
                 log_dbg!("All threads blocked/asleep, sleeping for {:?}.", duration);
-                std::thread::sleep(duration);
+                // [MoleWorld iOS · 冻结转储器] 协作式死锁在这里表现为"永远睡/永远轮询":主线程阻塞在
+                // 一个永远不会被唤醒的原语上(离线死等网络线程的信号),其它线程只是周期性睡眠。
+                // 把单次睡眠钳到 ≤1s,保证下面的转储能周期性跑到;转储自身有"8s 无帧 + 5s 限频"门。
+                self.dump_stall_state("all-threads-blocked");
+                std::thread::sleep(duration.min(Duration::from_secs(1)));
                 // Try again, there should be some thread awake now (or
                 // there will be soon, since timing is approximate).
                 continue;
@@ -1800,6 +1894,7 @@ impl Environment {
                 // blocked on another thread waiting for a deferred return,
                 // it could.
                 // TODO: handle a thread waiting on condition with a timeout
+                self.dump_stall_state("deadlock-panic");
                 panic!("No active threads, program has deadlocked!");
             }
         }
