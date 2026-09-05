@@ -36,7 +36,7 @@ pub(super) struct ClassHostObject {
     pub(super) name: String,
     pub(super) is_metaclass: bool,
     pub(super) superclass: Class,
-    pub(super) methods: HashMap<SEL, IMP>,
+    pub(super) methods: crate::fxhash::FxHashMap<SEL, IMP>,
     pub(super) guest_method_signatures: HashMap<SEL, ConstPtr<u8>>,
     /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
     /// (Alignment is used during ivar reconciliation.)
@@ -362,7 +362,7 @@ impl ClassHostObject {
             name: template.name.to_string(),
             is_metaclass,
             superclass,
-            methods: HashMap::from_iter(
+            methods: crate::fxhash::FxHashMap::from_iter(
                 (if is_metaclass {
                     template.class_methods
                 } else {
@@ -404,7 +404,7 @@ impl ClassHostObject {
             name,
             is_metaclass,
             superclass,
-            methods: HashMap::new(),
+            methods: crate::fxhash::FxHashMap::default(),
             guest_method_signatures: HashMap::new(),
             instance_start,
             instance_size,

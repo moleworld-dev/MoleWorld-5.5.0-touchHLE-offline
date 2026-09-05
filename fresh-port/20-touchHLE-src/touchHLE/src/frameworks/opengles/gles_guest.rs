@@ -61,10 +61,29 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
 ///
 /// In case of missing EAGL context for a current thread,
 /// returns a default value.
+// [MoleWorld iOS · 性能] guest 侧 GL 状态的 host 影子跟踪。
+// 背景(真机实测,村里每帧 1247 次 draw):原实现在【每次】glDrawArrays 前 GetBooleanv(FOG)、
+// 【每次】gl*Pointer 前 GetIntegerv(ARRAY_BUFFER_BINDING)——每精灵 4 次驱动往返,而 GLES1→Metal
+// 的翻译层每次调用都不便宜,这些"注入"占了每精灵 GL 调用的三分之一以上。
+// 这些状态只会被 guest 通过 glEnable/glDisable/glBindBuffer/glDeleteBuffers 改动,所以在入口处
+// 记一份影子即可;上下文切换(+[EAGLContext setCurrentContext:])把缓冲区绑定置"未知",下次用到时
+// 回退查一次 GL 再重新缓存,不同上下文各自的绑定不会串。
+thread_local! {
+    static FOG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (ARRAY_BUFFER 绑定, ELEMENT_ARRAY_BUFFER 绑定);None = 未知(需查 GL)。
+    static BUF_BINDINGS: std::cell::Cell<Option<(GLuint, GLuint)>> = const { std::cell::Cell::new(Some((0, 0))) };
+}
+/// 由 +[EAGLContext setCurrentContext:] 调用:guest 切换了上下文,影子绑定不再可信。
+pub fn on_guest_context_switch() {
+    BUF_BINDINGS.with(|c| c.set(None));
+    FOG_ENABLED.with(|c| c.set(false));
+}
+
 fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem) -> U,
 {
+    crate::mole_perf::GLCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if env
         .framework_state
         .opengles
@@ -103,6 +122,7 @@ fn with_ctx_and_mem_no_skip<T, U>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem) -> U,
 {
+    crate::mole_perf::GLCALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut gles = super::sync_context(
         &mut env.framework_state.opengles,
         &mut env.objc,
@@ -154,6 +174,9 @@ fn glGetError(env: &mut Environment) -> GLenum {
     })
 }
 fn glEnable(env: &mut Environment, cap: GLenum) {
+    if cap == gles11::FOG {
+        FOG_ENABLED.with(|c| c.set(true));
+    }
     with_ctx_and_mem(env, |gles, _mem| {
         unsafe { gles.Enable(cap) };
     });
@@ -162,6 +185,9 @@ fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
+    if cap == gles11::FOG {
+        FOG_ENABLED.with(|c| c.set(false));
+    }
     with_ctx_and_mem(env, |gles, _mem| {
         unsafe { gles.Disable(cap) };
     });
@@ -547,6 +573,23 @@ fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
     })
 }
 fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>) {
+    // GL 语义:删除当前绑定的缓冲区 → 该绑定变为 0。同步影子。
+    if n > 0 {
+        let n_usize: GuestUSize = n.try_into().unwrap();
+        let ids: Vec<GLuint> = env.mem.bytes_at(buffers.cast(), n_usize * 4)
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        BUF_BINDINGS.with(|c| {
+            if let Some((mut a, mut e)) = c.get() {
+                for id in ids {
+                    if a == id { a = 0; }
+                    if e == id { e = 0; }
+                }
+                c.set(Some((a, e)));
+            }
+        });
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let buffers = mem.ptr_at(buffers, n_usize);
@@ -554,6 +597,15 @@ fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>)
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
+    BUF_BINDINGS.with(|c| {
+        if let Some((a, e)) = c.get() {
+            match target {
+                gles11::ARRAY_BUFFER => c.set(Some((buffer, e))),
+                gles11::ELEMENT_ARRAY_BUFFER => c.set(Some((a, buffer))),
+                _ => {}
+            }
+        }
+    });
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.BindBuffer(target, buffer) })
 }
 fn glBufferData(
@@ -630,8 +682,21 @@ unsafe fn translate_pointer_or_offset_to_host(
     pointer_or_offset: ConstVoidPtr,
     which_binding: GLenum,
 ) -> *const GLvoid {
-    let mut buffer_binding = 0;
-    gles.GetIntegerv(which_binding, &mut buffer_binding);
+    // 影子绑定命中则省一次 GetIntegerv 驱动往返;未知(刚切换上下文)则查一次并回填。
+    let cached = BUF_BINDINGS.with(|c| c.get());
+    let buffer_binding: GLint = match cached {
+        Some((a, e)) => {
+            if which_binding == gles11::ARRAY_BUFFER_BINDING { a as GLint } else { e as GLint }
+        }
+        None => {
+            let mut a: GLint = 0;
+            let mut e: GLint = 0;
+            gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut a);
+            gles.GetIntegerv(gles11::ELEMENT_ARRAY_BUFFER_BINDING, &mut e);
+            BUF_BINDINGS.with(|c| c.set(Some((a as GLuint, e as GLuint))));
+            if which_binding == gles11::ARRAY_BUFFER_BINDING { a } else { e }
+        }
+    };
     if buffer_binding != 0 {
         let offset = pointer_or_offset.to_bits();
         offset as usize as *const _
@@ -1451,6 +1516,10 @@ fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
 /// It prevents divisions by zero in levels where fog is used and both
 /// values are set to 10000.
 unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
+    // 影子跟踪:雾没开就直接返回,省掉每次 draw 一次 GetBooleanv 驱动往返(2D 游戏几乎永远不开雾)。
+    if !FOG_ENABLED.with(|c| c.get()) {
+        return None;
+    }
     let mut fogEnabled: GLboolean = 0;
     gles.GetBooleanv(gles11::FOG, &mut fogEnabled);
     if fogEnabled != 0 {

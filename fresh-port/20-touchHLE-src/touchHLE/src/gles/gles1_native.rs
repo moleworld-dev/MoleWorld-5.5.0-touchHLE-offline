@@ -18,8 +18,45 @@ use super::gles_generic::GLES;
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::marker::PhantomData;
+
+// [MoleWorld iOS · P0 修复] 原生 OpenGL ES 1.1 NPOT 纹理完整性兼容层。
+// 依据 Khronos ES1.1 §3.7.10 + Apple GL_APPLE_texture_2D_limited_npot:iOS GLES1 上 NPOT
+// (非2的幂)纹理只有在 wrap=CLAMP_TO_EDGE 且 min filter 非 mipmap 时才"完整",否则不完整,
+// 采样恒返回 (0,0,0,1)/被视为纹理禁用。桌面 GLES1-on-GL2 跑在桌面 GL2.1(核心支持 NPOT)
+// 故无此问题——这正是"同一份解释器/数据、只真机卡好友村"的根因:好友村/头像的 NPOT 纹理在真机
+// 不完整 → 渲染层画不出 → 反复重画+精灵累积 → 单帧 drawScene 永不结束 → 卡死。本兼容层只改
+// NPOT 纹理(POT 零影响,主村正常),把它们强制成 limited-NPOT 合法配置。
+thread_local! {
+    static NPOT_TEX: RefCell<HashSet<GLuint>> = RefCell::new(HashSet::new());
+    static ACTIVE_UNIT: Cell<usize> = const { Cell::new(0) };
+    static BOUND_2D: RefCell<[GLuint; 8]> = const { RefCell::new([0u32; 8]) };
+    /// [MoleWorld iOS · 性能] BOUND_2D 是否可信。上下文切换(make_current 真正切换时)置 false:
+    /// 合成器与游戏是两个 GL 上下文却共用这份线程本地跟踪,不复位就会把"另一个上下文里已绑定的同名
+    /// 纹理"误判为冗余而跳过绑定 → 画错纹理。
+    static BIND_CACHE_VALID: Cell<bool> = const { Cell::new(false) };
+    static NPOT_LOG_N: Cell<u64> = const { Cell::new(0) };
+}
+fn tex_is_npot(w: GLsizei, h: GLsizei) -> bool {
+    let (w, h) = (w as u32, h as u32);
+    w > 0 && h > 0 && ((w & (w - 1)) != 0 || (h & (h - 1)) != 0)
+}
+fn cur_bound_2d() -> GLuint {
+    let u = ACTIVE_UNIT.with(|c| c.get()).min(7);
+    BOUND_2D.with(|b| b.borrow()[u])
+}
+fn is_mipmap_min_filter(p: GLint) -> bool {
+    matches!(
+        p as GLenum,
+        gles11::NEAREST_MIPMAP_NEAREST
+            | gles11::LINEAR_MIPMAP_NEAREST
+            | gles11::NEAREST_MIPMAP_LINEAR
+            | gles11::LINEAR_MIPMAP_LINEAR
+    )
+}
 
 pub struct GLES1NativeContext {
     gl_ctx: GLContext,
@@ -52,6 +89,7 @@ impl GLESContext for GLES1NativeContext {
         }
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
+        BIND_CACHE_VALID.with(|v| v.set(false));
         Box::new(GLES1Native {
             _gl_lifetime: PhantomData,
         })
@@ -71,6 +109,7 @@ impl GLESContext for GLES1NativeContext {
         make_current_fn(&self.gl_ctx);
         gles11::load_with(loader_fn);
         self.is_loaded = true;
+        BIND_CACHE_VALID.with(|v| v.set(false));
         Box::new(GLES1Native {
             _gl_lifetime: PhantomData,
         })
@@ -406,6 +445,7 @@ impl GLES for GLES1Native<'_> {
 
     // Drawing
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
+        crate::mole_perf::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         gles11::DrawArrays(mode, first, count)
     }
     unsafe fn DrawElements(
@@ -415,6 +455,7 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         indices: *const GLvoid,
     ) {
+        crate::mole_perf::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         gles11::DrawElements(mode, count, type_, indices)
     }
 
@@ -470,18 +511,69 @@ impl GLES for GLES1Native<'_> {
         gles11::GenTextures(n, textures)
     }
     unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint) {
+        if n > 0 && !textures.is_null() {
+            for i in 0..n as isize {
+                let t = *textures.offset(i);
+                crate::mole_perf::note_delete_texture(t);
+                // GL 语义:删除当前绑定的纹理 → 该单元绑定变为 0。跟踪表同步,否则名字复用后会被误判冗余。
+                BOUND_2D.with(|b| {
+                    for slot in b.borrow_mut().iter_mut() {
+                        if *slot == t {
+                            *slot = 0;
+                        }
+                    }
+                });
+            }
+            NPOT_TEX.with(|s| {
+                let mut set = s.borrow_mut();
+                for i in 0..n as isize {
+                    set.remove(&*textures.offset(i));
+                }
+            });
+        }
         gles11::DeleteTextures(n, textures)
     }
     unsafe fn ActiveTexture(&mut self, texture: GLenum) {
+        if texture >= gles11::TEXTURE0 {
+            ACTIVE_UNIT.with(|c| c.set((texture - gles11::TEXTURE0) as usize));
+        }
         gles11::ActiveTexture(texture)
     }
     unsafe fn IsTexture(&mut self, texture: GLuint) -> GLboolean {
         gles11::IsTexture(texture)
     }
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
+        crate::mole_perf::BINDTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if target == gles11::TEXTURE_2D {
+            let u = ACTIVE_UNIT.with(|c| c.get()).min(7);
+            // [MoleWorld iOS · 性能] 冗余绑定消除:村里每帧 ~1240 次 BindTexture(每精灵一次),其中
+            // 连续同图集的精灵是重复绑定。GLES1→Metal 每次调用都要过驱动翻译层,跳过即净赚。
+            // 仅当跟踪可信(未跨上下文)且目标纹理已是当前绑定时跳过。
+            let same = BIND_CACHE_VALID.with(|v| v.get()) && BOUND_2D.with(|b| b.borrow()[u] == texture);
+            if same {
+                crate::mole_perf::BINDTEX_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            BOUND_2D.with(|b| b.borrow_mut()[u] = texture);
+            BIND_CACHE_VALID.with(|v| v.set(true));
+        }
         gles11::BindTexture(target, texture)
     }
-    unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint) {
+    unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, mut param: GLint) {
+        // NPOT 纹理:游戏若设 REPEAT/ mipmap-min-filter 会让它在原生 GLES1 不完整 → 强制改成
+        // CLAMP_TO_EDGE / LINEAR(limited-NPOT 合法配置)。只影响 NPOT,POT 纹理原样放行。
+        if target == gles11::TEXTURE_2D {
+            let tex = cur_bound_2d();
+            if tex != 0 && NPOT_TEX.with(|s| s.borrow().contains(&tex)) {
+                if (pname == gles11::TEXTURE_WRAP_S || pname == gles11::TEXTURE_WRAP_T)
+                    && param as GLenum == gles11::REPEAT
+                {
+                    param = gles11::CLAMP_TO_EDGE as GLint;
+                } else if pname == gles11::TEXTURE_MIN_FILTER && is_mipmap_min_filter(param) {
+                    param = gles11::LINEAR as GLint;
+                }
+            }
+        }
         gles11::TexParameteri(target, pname, param)
     }
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat) {
@@ -511,6 +603,14 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        if level == 0 {
+            let mut bound: GLint = 0;
+            gles11::GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut bound);
+            crate::mole_perf::note_teximage(
+                bound as u32,
+                crate::mole_perf::tex_bytes(width, height, format, type_),
+            );
+        }
         if format == gles11::BGRA_EXT {
             // This is needed in order to avoid white screen issue on Android!
             // As per BGRA extension specs
@@ -531,7 +631,55 @@ impl GLES for GLES1Native<'_> {
             format,
             type_,
             pixels,
-        )
+        );
+        // [MoleWorld iOS · P0 修复] NPOT 纹理完整性:上传后若是 NPOT,记入集合并立刻强制
+        // CLAMP_TO_EDGE + 非 mipmap min filter,使其在原生 GLES1 上"完整"可采样。POT 纹理
+        // 不动(主村正常)。TexParameteri 里对该集合的纹理也会持续钳制(防游戏之后再设 REPEAT)。
+        if target == gles11::TEXTURE_2D && level == 0 {
+            let tex = cur_bound_2d();
+            if tex != 0 {
+                if tex_is_npot(width, height) {
+                    NPOT_TEX.with(|s| {
+                        s.borrow_mut().insert(tex);
+                    });
+                    gles11::TexParameteri(
+                        gles11::TEXTURE_2D,
+                        gles11::TEXTURE_WRAP_S,
+                        gles11::CLAMP_TO_EDGE as GLint,
+                    );
+                    gles11::TexParameteri(
+                        gles11::TEXTURE_2D,
+                        gles11::TEXTURE_WRAP_T,
+                        gles11::CLAMP_TO_EDGE as GLint,
+                    );
+                    let mut mf: GLint = 0;
+                    gles11::GetTexParameteriv(
+                        gles11::TEXTURE_2D,
+                        gles11::TEXTURE_MIN_FILTER,
+                        &mut mf,
+                    );
+                    if is_mipmap_min_filter(mf) {
+                        gles11::TexParameteri(
+                            gles11::TEXTURE_2D,
+                            gles11::TEXTURE_MIN_FILTER,
+                            gles11::LINEAR as GLint,
+                        );
+                    }
+                    let n = NPOT_LOG_N.with(|c| {
+                        let v = c.get();
+                        c.set(v + 1);
+                        v
+                    });
+                    if n < 12 || n & 0x3f == 0 {
+                        echo!("[NPOT-FIX] tex={} {}x{} -> CLAMP_TO_EDGE (n={})", tex, width, height, n);
+                    }
+                } else {
+                    NPOT_TEX.with(|s| {
+                        s.borrow_mut().remove(&tex);
+                    });
+                }
+            }
+        }
     }
     unsafe fn TexSubImage2D(
         &mut self,
@@ -545,6 +693,7 @@ impl GLES for GLES1Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        crate::mole_perf::TEXSUBIMAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         gles11::TexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, type_, pixels,
         )
@@ -560,6 +709,16 @@ impl GLES for GLES1Native<'_> {
         image_size: GLsizei,
         data: *const GLvoid,
     ) {
+        crate::mole_perf::COMPRESSED_TEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if level == 0 {
+            let mut bound: GLint = 0;
+            gles11::GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut bound);
+            // 压缩纹理按解压后 RGBA 记(它在本实现里会被软解成 RGBA 上传)
+            crate::mole_perf::note_teximage(
+                bound as u32,
+                (width.max(0) as u64) * (height.max(0) as u64) * 4,
+            );
+        }
         let data = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), image_size as usize) };
         // IMG_texture_compression_pvrtc (only on Imagination/Apple GPUs)
         // TODO: It would be more efficient to use hardware decoding where

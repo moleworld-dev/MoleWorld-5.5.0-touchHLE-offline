@@ -34,7 +34,7 @@ mod synchronization;
 pub use classes::{objc_classes, Class, ClassExports, ClassTemplate};
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, msg_super,
-    objc_super, release, retain,
+    note_present, objc_super, release, retain,
 };
 pub use methods::{HostIMP, IMP};
 pub use objects::{
@@ -71,7 +71,12 @@ pub struct ObjC {
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: HashMap<id, HostObjectEntry>,
+    objects: crate::fxhash::FxHashMap<id, HostObjectEntry>,
+    /// [MoleWorld iOS · 性能] 方法解析缓存:(起始类, 选择子, 是否 objc_msgSendSuper2) → 实现所在的类
+    /// (nil = 整条链都没有)。派发时先查它,命中即省掉沿超类链逐级查表。`method_cache_epoch` 与
+    /// [crate::objc::methods::METHOD_TABLE_EPOCH] 不一致时整表作废(方法表有变动,只发生在加载期)。
+    pub(super) method_cache: crate::fxhash::FxHashMap<(u32, u32, bool), Class>,
+    pub(super) method_cache_epoch: u32,
 
     /// Known classes.
     ///
@@ -98,10 +103,16 @@ pub struct ObjC {
 }
 
 impl ObjC {
+    /// [性能观测] 当前活着的 objc 对象数(host 侧对象表大小)。
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
     pub fn new() -> ObjC {
         ObjC {
             selectors: HashMap::new(),
-            objects: HashMap::new(),
+            objects: crate::fxhash::FxHashMap::default(),
+            method_cache: crate::fxhash::FxHashMap::default(),
+            method_cache_epoch: 0,
             classes: HashMap::new(),
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),

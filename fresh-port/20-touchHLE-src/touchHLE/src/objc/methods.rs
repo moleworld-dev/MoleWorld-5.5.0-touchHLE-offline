@@ -24,6 +24,9 @@ use std::any::TypeId;
 /// "guest methods" (functions in the guest app). Either way, the function needs
 /// to conform to the same ABI: [id] and [SEL] must be its first two parameters.
 #[allow(clippy::upper_case_acronyms)]
+/// 方法表版本号:任何 `methods` 插入都递增,派发端据此作废缓存。
+pub static METHOD_TABLE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 pub enum IMP {
     Host(&'static dyn HostIMP),
     Guest(GuestIMP),
@@ -117,6 +120,8 @@ impl ClassHostObject {
         mem: &Mem,
         objc: &mut ObjC,
     ) {
+        // 方法表变动 → 派发端的方法缓存整表作废(见 ObjC::method_cache)。
+        METHOD_TABLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let method_list_t { entsize, count } = mem.read(method_list_ptr);
         assert!(entsize >= guest_size_of::<method_t>());
 

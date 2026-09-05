@@ -59,6 +59,13 @@ const kEAGLRenderingAPIOpenGLES2: EAGLRenderingAPI = 2;
 #[allow(dead_code)]
 const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 
+/// [MoleWorld iOS · 性能] 跨帧复用的 present 纹理:(纹理名, 宽, 高)。
+/// 见 `present_renderbuffer` 里的说明——避免每帧向 GL 驱动申请/销毁一张全屏纹理。
+thread_local! {
+    static PRESENT_TEX: std::cell::Cell<(GLuint, GLsizei, GLsizei)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
 pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
     /// Mapping of OpenGL ES renderbuffer names to `EAGLDrawable` instances
@@ -91,6 +98,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.framework_state.opengles.current_ctx_for_thread(env.current_thread).unwrap_or(nil)
 }
 + (bool)setCurrentContext:(id)context { // EAGLContext*
+    // [MoleWorld iOS · 性能] guest 切换上下文 → gles_guest 的影子 GL 状态失效。
+    super::gles_guest::on_guest_context_switch();
     retain(env, context);
 
     let current_ctx = env.framework_state.opengles.current_ctx_for_thread(env.current_thread);
@@ -264,6 +273,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)presentRenderbuffer:(NSUInteger)target {
     assert!(target == gles11::RENDERBUFFER_OES);
 
+    // [MoleWorld iOS] If truly backgrounded, issue NO GL and present nothing —
+    // any GPU touch here is an instant iOS kill (0x8badf00d). Report success so
+    // the guest's render loop proceeds normally; we just drop the frame until the
+    // app returns to the foreground.
+    if env.window.as_ref().map_or(false, |w| w.is_backgrounded()) {
+        return true;
+    }
+
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
     let sleep_for = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
@@ -302,6 +319,25 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     };
 
+    // [MoleWorld iOS · 诊断] present 双计数:每次 presentRenderbuffer: 都自增(快/慢路径都算),
+    // 与"只在快路径自增"的 [FRAME] 对比。[PRESENT] 仍涨而 [FRAME] 停 ⇒ guest 没冻死、只是跌出了
+    // 全屏 CAEAGLLayer 快路径(顶层被 HUD/遮罩盖住);两者都停 ⇒ guest 真卡在一次 drawScene(CPU 死循环)。
+    // 慢路径顺带打出 fullscreen/ drawable 图层归属,坐实是否被覆盖层挤出快路径。
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PRES_ALL_N: AtomicU64 = AtomicU64::new(0);
+        let n = PRES_ALL_N.fetch_add(1, Ordering::Relaxed);
+        if n & 0x3f == 0 {
+            if drawable == fullscreen_layer {
+                echo!("[PRESENT] n={} fast", n);
+            } else {
+                echo!(
+                    "[PRESENT] n={} SLOW fullscreen={:?} drawable={:?}",
+                    n, fullscreen_layer, drawable
+                );
+            }
+        }
+    }
     // We're presenting to the opaque CAEAGLLayer that covers the screen.
     // We can use the fast path where we skip composition and present directly.
     if drawable == fullscreen_layer {
@@ -548,6 +584,30 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
 unsafe fn present_renderbuffer(env: &mut Environment) {
+    // [MoleWorld iOS · 诊断] 轻量出帧计数,【release 也开】(不带 cfg 门)。卡死时从设备日志看这条:
+    // [FRAME] 仍在增长 = 每帧还在出帧(渲染慢/内存压力,非单帧 CPU 死循环);停滞 = guest 卡在一次
+    // drawScene 从不返回 present(CPU 死循环)。用于决定性区分"CPU 死循环 vs OOM"。开销:每帧一次
+    // 原子自增 + 每 256 帧一行日志,可忽略。
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FRAME_N: AtomicU64 = AtomicU64::new(0);
+        let n = FRAME_N.fetch_add(1, Ordering::Relaxed);
+        if n & 0xff == 0 {
+            echo!("[FRAME] n={}", n);
+        }
+    }
+    // [hang debug] present 计数:卡死期间 [PRESENT] 持续增长=每帧仍在出帧(渲染慢/UI卡,非CPU死循环);
+    // 停滞=guest 卡在一次 drawScene 从不返回到 present(CPU 死循环)。决定性区分两种假设。
+    #[cfg(any(feature = "interp_hb", debug_assertions))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PRES_N: AtomicU64 = AtomicU64::new(0);
+        let n = PRES_N.fetch_add(1, Ordering::Relaxed);
+        crate::objc::note_present();
+        if n & 0x1f == 0 {
+            echo!("[PRESENT] n={}", n);
+        }
+    }
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
     // [MoleWorld iOS] cocos2d 的横屏游戏自己已经把场景渲染成横屏正向(它的 EAGL renderbuffer
@@ -599,22 +659,43 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         renderbuffer,
     );
 
-    // Create a texture with a copy of the pixels in the framebuffer
-    let mut texture: GLuint = 0;
-    gles.GenTextures(1, &mut texture);
-    gles.BindTexture(gles11::TEXTURE_2D, texture);
-    gles.CopyTexImage2D(
-        gles11::TEXTURE_2D,
-        0,
-        // RGBA: the source renderbuffer is RGBA8, so RGBA stays within the GLES
-        // glCopyTexImage2D format-superset rule (and is safe on desktop too).
-        gles11::RGBA as _,
-        0,
-        0,
-        width,
-        height,
-        0,
-    );
+    // [MoleWorld iOS · 性能] **复用 present 纹理,不再每帧新建/销毁**。
+    // 实测(iOS cpu_resource 微采样):31/35 采样的叶子落在 OpenGLES→GLEngine→AGXMetal,即 CPU 主要
+    // 烧在 GL 驱动上;而这里原本【每帧】GenTextures + CopyTexImage2D(会重新分配纹理存储)+ 3×TexParameteri
+    // + DeleteTextures —— 在 GLES1→Metal 的翻译层里等于每帧向驱动申请并销毁一张全屏纹理,非常贵。
+    // 改为:尺寸不变就复用同一张纹理 + CopyTexSubImage2D(只拷像素、不重分配存储、参数只设一次);
+    // 尺寸变化(旋转/分辨率变更)或纹理失效(上下文重建)时才重建。
+    let (mut texture, cached_w, cached_h) = PRESENT_TEX.with(|c| c.get());
+    let reusable = texture != 0
+        && cached_w == width
+        && cached_h == height
+        && gles.IsTexture(texture) == gles11::TRUE;
+    if reusable {
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        // 只更新像素,不重新分配存储(比 CopyTexImage2D 便宜得多)。
+        gles.CopyTexSubImage2D(gles11::TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+    } else {
+        if texture != 0 {
+            gles.DeleteTextures(1, &texture);
+        }
+        texture = 0;
+        gles.GenTextures(1, &mut texture);
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.CopyTexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            // RGBA: the source renderbuffer is RGBA8, so RGBA stays within the GLES
+            // glCopyTexImage2D format-superset rule (and is safe on desktop too).
+            gles11::RGBA as _,
+            0,
+            0,
+            width,
+            height,
+            0,
+        );
+        PRESENT_TEX.with(|c| c.set((texture, width, height)));
+    }
+    if !reusable {
     // The texture will not have any mip levels so we must ensure the filter
     // does not use them, else rendering will fail.
     gles.TexParameteri(
@@ -642,6 +723,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
             gles11::CLAMP_TO_EDGE as _,
         );
     }
+    } // end `if !reusable`(纹理参数只在新建时设一次)
 
     // Clean up the framebuffer object since we no longer need it.
     // This also sets the framebuffer bindings back to zero, so rendering
@@ -716,8 +798,8 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
     present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
 
-    // Clean up the texture
-    gles.DeleteTextures(1, &texture);
+    // [MoleWorld iOS · 性能] 不再每帧删除 present 纹理——它被 PRESENT_TEX 缓存下来供下一帧复用
+    // (尺寸变化或上下文重建时会在上面重建)。这样每帧省掉一次驱动侧的纹理分配+释放。
 
     // Restore all the state saved before rendering
     for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {

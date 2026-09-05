@@ -66,6 +66,14 @@ macro_rules! log_once {
 /// touchHLE output that isn't coming from the app itself.
 ///
 /// Prefer use [log] or [log_dbg] for errors and warnings during emulation.
+/// [MoleWorld iOS · 性能] 是否逐行 fsync 日志。默认 **否**(每行 fsync 在真机上 0.1~2ms,
+/// 日志一多就成为可观的 CPU/IO 开销)。设 `MOLE_LOG_SYNC=1` 可恢复逐行落盘,用于抓硬崩现场。
+pub fn log_sync_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MOLE_LOG_SYNC").is_some())
+}
+
 macro_rules! echo {
     ($($arg:tt)+) => {
         {
@@ -84,9 +92,12 @@ macro_rules! echo {
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(formatted_str.as_bytes());
             let _ = log_file.write_all(b"\n");
-            // 每行强制落盘(Windows 上即 FlushFileBuffers):即便随后硬崩溃,
-            // 也能保住崩溃前最后一行日志,而不是被缓冲丢掉。
-            let _ = log_file.sync_data();
+            // [MoleWorld iOS · 性能] 原本【每行都 sync_data()】(真机 NVMe 一次 fsync 0.1~2ms)。
+            // 日志量一大就直接吃掉可观 CPU/IO。默认改为不逐行落盘(write_all 已进内核页缓存,
+            // 进程崩溃也不会丢——只有内核崩溃才会),需要抓硬崩现场时用 MOLE_LOG_SYNC=1 恢复逐行同步。
+            if $crate::log::log_sync_enabled() {
+                let _ = log_file.sync_data();
+            }
         }
     };
     () => {
@@ -101,7 +112,9 @@ macro_rules! echo {
             use std::io::Write;
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(b"\n");
-            let _ = log_file.sync_data();
+            if $crate::log::log_sync_enabled() {
+                let _ = log_file.sync_data();
+            }
         }
     }
 }
