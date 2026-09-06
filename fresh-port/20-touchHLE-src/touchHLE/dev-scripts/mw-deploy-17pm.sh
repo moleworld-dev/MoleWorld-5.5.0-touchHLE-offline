@@ -68,7 +68,9 @@ lipo -create "$APP/MoleWorldHD.thin" -output "$APP/MoleWorldHD" && rm -f "$APP/M
 # app 自己的日志根本来不及写,真凭据在 systemCrashLogs 的 .ips 里)。SDL2 的 UIKit 后端没适配 UIScene,
 # 所以用 Xcode(iOS27 SDK)编出来的二进制必崩。修法:把 LC_BUILD_VERSION 的 sdk 声明降到 18.0(<26)
 # 即可让系统按旧 SDK app 放行,无需改 SDL2。必须在 codesign【之前】做(vtool 会使签名失效)。
-vtool -set-build-version 2 13.0 18.0 -replace -output "$APP/MoleWorldHD.patched" "$APP/MoleWorldHD" >/dev/null 2>&1 \
+# MW_VTOOL_SDK 可覆盖(默认 18.0):用来实测 iOS 27 的 UIScene 门槛到底卡在哪个 sdk 值——
+# App Store Connect 又要求上传包 sdk>=26,两个要求冲突时必须先知道确切边界。
+vtool -set-build-version 2 13.0 "${MW_VTOOL_SDK:-18.0}" -replace -output "$APP/MoleWorldHD.patched" "$APP/MoleWorldHD" >/dev/null 2>&1 \
   && mv "$APP/MoleWorldHD.patched" "$APP/MoleWorldHD" \
   || echo "(警告: vtool 降 SDK 失败,iOS27 上可能秒退)"
 chmod +x "$APP/MoleWorldHD"

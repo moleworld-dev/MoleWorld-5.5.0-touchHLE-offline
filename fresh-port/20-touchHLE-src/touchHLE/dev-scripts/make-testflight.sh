@@ -199,19 +199,31 @@ security cms -D -i "$PROFILE" > "$STAGE/profile.plist"
   /usr/libexec/PlistBuddy -c "Add :get-task-allow bool false" "$STAGE/entitlements.plist"
 echo "  entitlements: application-identifier=$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$STAGE/entitlements.plist" 2>/dev/null), get-task-allow=$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$STAGE/entitlements.plist")"
 
-# ---- 6.5) 降 LC_BUILD_VERSION 的 sdk 声明(★必须在 codesign 之前:vtool 会让签名失效)----
-# iOS 27 强制 UIScene 生命周期:凡"链接的 SDK >= 26"且未采用 UIScene 的 app,一启动就被
-# __UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption trap 掉(EXC_BREAKPOINT 秒退)。
-# SDL2 的 UIKit 后端没适配 UIScene,所以用 iOS26/27 SDK 编出来的二进制在 iOS 27 上必崩。
-# 把 sdk 声明降到 18.0(<26)即可让系统按旧 SDK app 放行。开发侧载脚本 mw-deploy-17pm.sh 早就这么做了,
-# 发布链漏了这一步 → 2026-09-06 上传的 202609062212 在 iOS 27 上装了就秒退,只能作废重传。
-if vtool -set-build-version 2 13.0 18.0 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1; then
-	mv "$APP/$APPNAME.patched" "$APP/$APPNAME"
-	chmod +x "$APP/$APPNAME"
-	echo "✓ LC_BUILD_VERSION sdk 已降到 18.0(iOS 27 UIScene 兼容):$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -n 's/^ *sdk /sdk /p' | head -1)"
-else
-	echo "✗ vtool 降 SDK 失败——iOS 27 上会秒退,不要上传这个包"; exit 1
+# ---- 6.5) 校准 LC_BUILD_VERSION 的 sdk 声明(★必须在 codesign 之前:vtool 会让签名失效)----
+# 这个值被【两个方向】同时夹住,只有 [26.0, 27.0) 这个窗口能同时满足:
+#   · 下界:App Store Connect 拒收 sdk < 26 的包(altool 报 90725「必须用 iOS 26 或更新的 SDK 构建」)。
+#     所以开发侧载用的 18.0(mw-deploy-17pm.sh)在这里【传不上去】。
+#   · 上界:iOS 27 强制 UIScene——凡 sdk >= 27 且未适配 scene 生命周期的 app 一启动就被
+#     __UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption trap 掉(EXC_BREAKPOINT 秒退),
+#     而 SDL2(本仓 2.26.4)完全没有 scene 支持。
+#     ★真机实测(17PM / iOS 27.0):sdk=26.5 存活并正常渲染,sdk=27.0 秒退 ⇒ 门槛在 27,不在 26。
+# 正确做法是【用正式版 Xcode 编译】,链接器自然打上 26.x;xcode-select 指向 Xcode-beta 时会打上 27.0,
+# 此时下面兜底降到 26.5。顺带一提:DTXcode 等元数据也必须来自正式版 Xcode,否则外部测试提交会被
+# 「此构建版本使用的是 Beta 版 Xcode」挡下(见脚本头部用法里的 DEVELOPER_DIR)。
+SDK_DECL="$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -nE 's/^ *sdk ([0-9.]+).*/\1/p' | head -1)"
+SDK_MAJOR="${SDK_DECL%%.*}"
+if [ -z "$SDK_DECL" ]; then
+	echo "✗ 读不出 LC_BUILD_VERSION,拒绝出包"; exit 1
+elif [ "$SDK_MAJOR" -ge 27 ]; then
+	echo "  sdk 声明 $SDK_DECL >= 27(iOS 27 会 UIScene trap)→ 降到 26.5"
+	vtool -set-build-version 2 13.0 26.5 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1 \
+	  && mv "$APP/$APPNAME.patched" "$APP/$APPNAME" && chmod +x "$APP/$APPNAME" \
+	  || { echo "✗ vtool 降 SDK 失败"; exit 1; }
+elif [ "$SDK_MAJOR" -lt 26 ]; then
+	echo "✗ sdk 声明 $SDK_DECL < 26,App Store Connect 会以 90725 拒收。"
+	echo "  请用正式版 Xcode 26.x 重新编译(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)。"; exit 1
 fi
+echo "✓ LC_BUILD_VERSION:$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -nE 's/^ *(minos|sdk) /\1=/p' | tr '\n' ' ')"
 
 # ---- 7) 嵌 profile + 发布签名 ----
 cp "$PROFILE" "$APP/embedded.mobileprovision"
