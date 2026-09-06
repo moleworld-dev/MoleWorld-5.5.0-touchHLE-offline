@@ -199,6 +199,20 @@ security cms -D -i "$PROFILE" > "$STAGE/profile.plist"
   /usr/libexec/PlistBuddy -c "Add :get-task-allow bool false" "$STAGE/entitlements.plist"
 echo "  entitlements: application-identifier=$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$STAGE/entitlements.plist" 2>/dev/null), get-task-allow=$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$STAGE/entitlements.plist")"
 
+# ---- 6.5) 降 LC_BUILD_VERSION 的 sdk 声明(★必须在 codesign 之前:vtool 会让签名失效)----
+# iOS 27 强制 UIScene 生命周期:凡"链接的 SDK >= 26"且未采用 UIScene 的 app,一启动就被
+# __UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption trap 掉(EXC_BREAKPOINT 秒退)。
+# SDL2 的 UIKit 后端没适配 UIScene,所以用 iOS26/27 SDK 编出来的二进制在 iOS 27 上必崩。
+# 把 sdk 声明降到 18.0(<26)即可让系统按旧 SDK app 放行。开发侧载脚本 mw-deploy-17pm.sh 早就这么做了,
+# 发布链漏了这一步 → 2026-09-06 上传的 202609062212 在 iOS 27 上装了就秒退,只能作废重传。
+if vtool -set-build-version 2 13.0 18.0 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1; then
+	mv "$APP/$APPNAME.patched" "$APP/$APPNAME"
+	chmod +x "$APP/$APPNAME"
+	echo "✓ LC_BUILD_VERSION sdk 已降到 18.0(iOS 27 UIScene 兼容):$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -n 's/^ *sdk /sdk /p' | head -1)"
+else
+	echo "✗ vtool 降 SDK 失败——iOS 27 上会秒退,不要上传这个包"; exit 1
+fi
+
 # ---- 7) 嵌 profile + 发布签名 ----
 cp "$PROFILE" "$APP/embedded.mobileprovision"
 # guest dylib 先各自签(Mach-O,bundle 校验要求有签名)
