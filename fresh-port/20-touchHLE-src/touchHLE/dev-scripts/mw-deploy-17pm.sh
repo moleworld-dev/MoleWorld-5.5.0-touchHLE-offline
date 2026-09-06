@@ -44,16 +44,21 @@ security cms -D -i "$PROF" > /tmp/prof.plist 2>/dev/null
 # .decoded.plist / .DS_Store / IDA 的 .i64)。
 GAME_APP="$TH/../../01-cracked/Payload/MoleWorld.app"
 INNER="$APP/MoleWorld.ipa"
-if [ -d "$GAME_APP" ] && { [ ! -f "$INNER" ] || [ -n "$(find "$GAME_APP" -newer "$INNER" -type f ! -name '*.i64' ! -name '.DS_Store' ! -name '*.decoded.plist' | head -1)" ]; }; then
-  echo "[3.5/5] 仓库 payload 比内嵌 MoleWorld.ipa 新 → 重打游戏本体"
+# ★重打结果必须缓存在 staging 之外:staging 每次都 rm -rf 重解,拿 $INNER 的时间戳当基准的话,
+#   基准永远是母 IPA 里的旧时间 → 每次部署都要 cp -R 整个 payload 再 zip 一遍(几百 MB、几十秒),
+#   而重打好的东西下一次又被删掉。缓存放 target/(已 gitignore),只有仓库 payload 真的更新才重打。
+CACHE="$TH/target/mw-inner-game.ipa"
+if [ -d "$GAME_APP" ] && { [ ! -f "$CACHE" ] || [ -n "$(find "$GAME_APP" -newer "$CACHE" -type f ! -name '*.i64' ! -name '.DS_Store' ! -name '*.decoded.plist' | head -1)" ]; }; then
+  echo "[3.5/5] 仓库 payload 比缓存新 → 重打游戏本体(store zip,配方同 make-ios-ipa.sh)"
   GS=$(mktemp -d); mkdir -p "$GS/Payload"
   cp -R "$GAME_APP" "$GS/Payload/MoleWorld.app"
   find "$GS/Payload/MoleWorld.app" \( -name "*.decoded.plist" -o -name ".DS_Store" -o -name "*.i64" \) -delete || true
-  rm -f "$INNER"
-  ( cd "$GS" && zip -r -X -0 -q "$INNER" Payload )
+  rm -f "$CACHE"
+  ( cd "$GS" && zip -r -X -0 -q "$CACHE" Payload )
   rm -rf "$GS"
-  echo "    内嵌 IPA: $(du -h "$INNER" | cut -f1),含 _wide.png $(unzip -l "$INNER" | grep -c '_wide.png') 张"
+  echo "    内嵌 IPA: $(du -h "$CACHE" | cut -f1),含 _wide.png $(unzip -l "$CACHE" | grep -c '_wide.png') 张"
 fi
+[ -f "$CACHE" ] && cp -f "$CACHE" "$INNER"
 
 echo "[4/5] 换二进制 + 嵌 profile + 签名"
 cp "$EXE" "$APP/MoleWorldHD.thin"

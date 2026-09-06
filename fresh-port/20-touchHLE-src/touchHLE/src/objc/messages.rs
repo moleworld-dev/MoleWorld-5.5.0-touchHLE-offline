@@ -367,6 +367,14 @@ fn objc_msgSend_inner(
         // 在 60 万消息/秒量级下相当可观。改为:先用【已注册 SEL 指针的集合】做 O(1) 整数快判定,
         // 只有可能命中 intercept 的选择子才付字符串化的代价。行为等价(intercept 的每条分支都是
         // `sel == "..."` 形式,选择子不在集合里就不可能命中任何分支)。
+        // [MoleWorld 宽屏适配·热路径] 虚拟世界换算(已右移根层的 position/setPosition:、已右移 UIKit
+        // 子视图的 frame/setFrame:、白名单代码的触摸/世界坐标换算、dealloc 除名):SEL 指针快判定、零分配,
+        // 没有任何登记对象时只付一次原子读。★`message_type_info.is_some()` = 本条消息由**宿主** msg_send
+        // 发出(宿主 msg_send 设置它、guest 派发恒为 None):宿主发起时 LR 是陈旧的 main 返回地址,不能拿来
+        // 判定"谁在问",且宿主必须看到真实坐标。
+        if crate::mole_cheats::intercept_fast(env, selector, message_type_info.is_some()) {
+            return;
+        }
         if crate::mole_cheats::is_intercept_sel(&mut env.objc, &mut env.mem, selector) {
             let class_name = env.objc.get_class_name(orig_class).to_string();
             let sel_str = selector.as_str(&env.mem).to_string();

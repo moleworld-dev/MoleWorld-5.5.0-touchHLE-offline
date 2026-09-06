@@ -13,7 +13,7 @@
 //! without dispatching) or modifies an argument register in place and returns
 //! `false` (the real method then runs with the tweaked argument).
 
-use crate::frameworks::core_graphics::cg_geometry::{CGPoint, CGSize};
+use crate::frameworks::core_graphics::cg_geometry::{CGPoint, CGRect, CGSize};
 use crate::mem::{ConstPtr, MutPtr, Ptr};
 use crate::objc::{id, msg_send, nil, retain, SEL};
 use crate::Environment;
@@ -1556,9 +1556,11 @@ pub fn is_intercept_sel(objc: &mut crate::objc::ObjC, mem: &mut crate::mem::Mem,
     use std::sync::OnceLock;
     static NAMES: &[&str] = &[
         "CheckUserInfoData:",
+        "OnLoginOk",
         "addChild:",
         "addChild:z:",
         "addChild:z:tag:",
+        "addSubview:",
         "addGold:",
         "addShopItemsObject:",
         "addVipGold:",
@@ -1710,36 +1712,105 @@ pub fn is_intercept_sel(objc: &mut crate::objc::ObjC, mem: &mut crate::mem::Mem,
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] 喂给白名单 UI 的原生设计尺寸(iPad landscape 4:3)。
 const UI43_W: f32 = 1024.0;
 const UI43_H: f32 = 768.0;
-/// [MoleWorld 宽屏适配·居中偏移] "根层已处理"标记:处理后把根层 contentSize.width 设为 真实宽+0.5。
-/// 为什么不能用"宽==真实宽":CCLayer 基类 init 自带 contentSize=winSize,而 cocos2d 内部类不在白名单
-/// → 拿到真实宽 1188,任何没自己 setContentSize: 的 UI 层一出生就是 1188,会被误判"已处理"
-/// (实证:NewStyleStoreMenuView 构造期被当已就绪根层处理子节点,挂树后又整体 +82 → 2×;
-/// QuestLayer/RewardLayer 等弹窗 onEnter 被误判 done 直接跳过没居中)。
-/// 小数 .5 是对象自身特征,不受地址复用影响;CCLayerColor 色块宽 0.5px 差异不可见。
-const UI43_MARK: f32 = 0.5;
-fn ui43_marked(w: f32, real_w: f32) -> bool {
-    (w - (real_w + UI43_MARK)).abs() < 0.01
-}
-/// [MoleWorld 宽屏适配·居中偏移] 已处理过的 (根层指针, 子节点指针)。同一根层会话内同一子节点只平移一次——
-/// 既挡 cocos2d addChild: → addChild:z: → addChild:z:tag: 调用链的连续重复触发,也挡"同一对象被
-/// removeChild 后再 addChild"(商店刷新物品区就是这样:加 A、加 B、再重新加 A)。根层重新进场
-/// (contentSize 还是 1024 = 新会话)时清掉该根层的记录;超过上限整体清空防止无限增长。
-/// ★锁绝不跨 msg_send 持有(msg_send → intercept → 本 hook 会重入 → 死锁)。
-static UI43_DONE: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
-fn ui43_done_mark(root: u32, child: u32) -> bool {
-    // 返回 true = 首次(已记录,可处理);false = 已处理过,跳过。
-    let mut d = UI43_DONE.lock().unwrap();
-    if d.iter().any(|&(r, c)| r == root && c == child) {
+/// [MoleWorld 宽屏适配·居中偏移 v2 · 根层整体右移] 已右移的 UI 根层(对象指针)登记表。
+///
+/// ★为什么从 v1"子节点逐个 +off"改成 v2"根层自身 position.x += off":
+/// v1 让根层自己的坐标系与其子节点错开 off——根层代码拿 convertToGL/硬编码矩形做命中判断、把子节点
+/// 摆到触摸点(小游戏鱼钩/放置)全部偏 322pt;商店 MenuView/ItemsView 的 ccTouchBegan 用
+/// (0,0,winSize.w=1024,582) 触摸带对【真实】世界坐标做判定,把右 1/3 面板整个拒掉(反汇编 0x3b76b4
+/// 实证)。这就是 iOS 上"触摸映射抽风"的真因。v2 下根层及整棵子树保持原 1024 设计坐标(=虚拟世界),
+/// 只在【白名单代码与真实世界的交界处】做 ±off 换算——全部集中在 [intercept_fast] 里按 SEL 指针
+/// 快判定(零分配,没有任何登记对象时只付一次原子读):
+///   · 触摸/世界坐标进入白名单代码:locationInView:/previousLocationInView:/convertToWorldSpace(AR): 的
+///     结果 x−off(按调用者 LR 落在白名单类代码段判定,见 [UI43_CODE_RANGES]);
+///   · 白名单代码交出世界坐标:convertToNodeSpace(AR):/convertToUI: 的入参 x+off;
+///   · 根层自身 position/setPosition:(任何 guest 调用者,含 CCMoveTo 等动作)getter −off / setter +off,
+///     游戏侧永远看到虚拟坐标,cocos2d 内部变换直读 position_ ivar 拿真实值;
+///   · 挂到 EAGLView 上的 UIKit 子视图(输入框/网页/好友表)见 [UI43_VIEWS]。
+/// cocos2d 自己的命中(CCMenu itemForTouch / convertTouchToNodeSpace / 表格)走真实坐标 + 真实变换,天然正确。
+///
+/// ★宿主发起的消息一律不换算(`from_host`):touchHLE 的宿主 `msg_send` 走 CallFromHost,同样把参数写进
+/// r0–r3(所以读寄存器对两种来源都成立),但**不会更新 LR**——run loop 里 LR 是陈旧的 main 返回地址
+/// (guest 调 UIApplicationMain 时留下的),按它查白名单会把 UIControl/UIScrollView 宿主实现里的
+/// `[touch locationInView:]` 误判成"白名单代码在问"而错扣 322 → UIButton 的 TouchUpInside 变成
+/// TouchUpOutside。判据取 `message_type_info.is_some()`:由宿主 `msg_send` 设置,guest 派发时恒为 None
+/// (见 objc/messages.rs)。本模块所有"转发真方法"都是宿主 msg_send,因此天然不会自我递归。
+/// 登记表以对象指针为键,dealloc 时移除 → 地址复用不会误判;★锁绝不跨 msg_send 持有。
+static UI43_ROOTS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// 登记表长度镜像(无锁快判定)。
+static UI43_ROOTS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn ui43_root_contains(p: u32) -> bool {
+    if UI43_ROOTS_LEN.load(O) == 0 {
         return false;
     }
-    if d.len() > 4096 {
-        d.clear();
-    }
-    d.push((root, child));
-    true
+    UI43_ROOTS.lock().unwrap().contains(&p)
 }
-fn ui43_done_reset_root(root: u32) {
-    UI43_DONE.lock().unwrap().retain(|&(r, _)| r != root);
+fn ui43_root_add(p: u32) {
+    let mut v = UI43_ROOTS.lock().unwrap();
+    if !v.contains(&p) {
+        v.push(p);
+    }
+    UI43_ROOTS_LEN.store(v.len(), O);
+}
+fn ui43_root_remove(p: u32) {
+    let mut v = UI43_ROOTS.lock().unwrap();
+    v.retain(|&x| x != p);
+    UI43_ROOTS_LEN.store(v.len(), O);
+}
+
+/// [MoleWorld 宽屏适配·居中偏移 v2 · UIKit 子视图] 已右移的 UIKit 子视图(对象指针)登记表。
+///
+/// 13 个白名单面板(留言/送礼留言/漂流瓶/公告板/邀请好友/注册/改昵称/海底寻宝/邀请码/活动码/帮助网页/
+/// 乌鸦祭司)把 UITextField/UITextView/UIWebView 按 **1024 设计坐标**直接 addSubview 到
+/// `[[CCDirector sharedDirector] openGLView]`;好友/消息/搜索三张 UITableView 由非白名单的
+/// ManagerViewController 添加,但 frame 是白名单 VC 用(被虚拟成 1024 的)winSize 算的。这些视图不在
+/// cocos 节点树里,根层右移后会与自己的面板底图错开 off,而且 UIKit 命中测试先于 EAGLView →
+/// "看得见的输入框点不着、点旁边空白反而激活输入"。
+/// 故:添加到 EAGLView 且 frame 完全落在设计区 [0,1024] 内的子视图 → frame.x += off 并登记;登记后
+/// setFrame: 入参 +off、frame 返回 −off(只对 guest),键盘避让等游戏侧改位置的代码继续按设计坐标工作。
+/// 坐标同向的依据:EAGLView 的 bounds 是横屏 1669×768(UIKit 旋转变换),cocos 走 convertToGL 的
+/// Portrait 分支 (x, H−y),故 UIKit 视图 x 与 GL 世界 x 同向同尺度,+off 与根层右移一致。
+static UI43_VIEWS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static UI43_VIEWS_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn ui43_view_contains(p: u32) -> bool {
+    if UI43_VIEWS_LEN.load(O) == 0 {
+        return false;
+    }
+    UI43_VIEWS.lock().unwrap().contains(&p)
+}
+fn ui43_view_add(p: u32) {
+    let mut v = UI43_VIEWS.lock().unwrap();
+    if !v.contains(&p) {
+        v.push(p);
+    }
+    UI43_VIEWS_LEN.store(v.len(), O);
+}
+fn ui43_view_remove(p: u32) {
+    let mut v = UI43_VIEWS.lock().unwrap();
+    v.retain(|&x| x != p);
+    UI43_VIEWS_LEN.store(v.len(), O);
+}
+
+/// [MoleWorld 宽屏适配·重入保护] 正在转发真方法的 **guest 线程**位图。`from_host` 已经挡住了本模块
+/// 自己的全部转发(都是宿主 msg_send),这里是防御性兜底:万一某条路径以 guest 身份重入,递归转发会爆栈。
+/// ★不能用 thread_local:guest 线程是同一 OS 线程上的协程(environment.rs 的 corosensei::Coroutine),
+/// 转发中途 run_inner 会 yield 给别的 guest 线程,OS 线程级标志会让那条线程误判"正在转发"而静默跳过
+/// 一次换算(症状 = 偶发单次错位 322 且无日志)。
+static UI43_INNER: AtomicU64 = AtomicU64::new(0);
+fn ui43_inner_bit(env: &Environment) -> u64 {
+    1u64 << ((env.current_thread as u64) & 63)
+}
+fn ui43_inner_active(env: &Environment) -> bool {
+    UI43_INNER.load(O) & ui43_inner_bit(env) != 0
+}
+fn ui43_inner<R>(env: &mut Environment, f: impl FnOnce(&mut Environment) -> R) -> R {
+    let bit = ui43_inner_bit(env);
+    let was_set = UI43_INNER.fetch_or(bit, O) & bit != 0;
+    let r = f(env);
+    if !was_set {
+        UI43_INNER.fetch_and(!bit, O);
+    }
+    r
 }
 
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] 需要「按 4:3 原设计布局」的 `[CCDirector winSize]` 调用点
@@ -1838,6 +1909,48 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "WaterTowerRewardView", "XmasMainLayer",
 ];
 
+/// [MoleWorld 宽屏适配·虚拟世界换算] 白名单 UI 类(含其子类,按父类链 ≤6 层)全部方法的代码地址区间
+/// (已合并、升序、[start,end)),离线生成:dev-scripts 的生成器直接遍历 __objc_classlist /
+/// __objc_catlist 的 class_ro_t.baseMethods 拿到 imp→类.方法 的精确归属,再用 LC_FUNCTION_STARTS
+/// 截断每个方法的结尾(191 类 3306 方法 → 100 段)。
+/// ★两个必须踩住的坑:①不能靠 `otool -ov` 文本行的大小写猜类名(会把 app delegate 的方法记到
+/// CommonChristmasFatherGiftLayer 名下);②不能拿"下一个 imp"当方法结尾,那会把方法之间的非 ObjC
+/// 代码(含 `main` @0xe890)吞进区间——宿主发消息时 LR 正是 main 里 `blx _UIApplicationMain` 的返回
+/// 地址,一旦落在区间内就会把 UIKit 控件的触摸坐标也错扣 off。生成后自检:LC_FUNCTION_STARTS 里
+/// 落在区间内的非白名单函数起点必须为 0。
+/// 调用者 LR 落在区间内 = "白名单代码在问",此时触摸/世界坐标要按虚拟世界 ±off 换算。
+const UI43_CODE_RANGES: &[(u32, u32)] = &[
+    (0xb2c0, 0xe890), (0xa70fc, 0xa7eb8), (0xc06c8, 0xc5a30), (0xc92a4, 0xcbda8),
+    (0xde4cc, 0xdf040), (0xf2298, 0xf32b8), (0xfbb64, 0xfbd88), (0xfc628, 0x1001d4),
+    (0x10fdd0, 0x111858), (0x1118b0, 0x112234), (0x123804, 0x123d9c), (0x128844, 0x12ad80),
+    (0x12d698, 0x12dda0), (0x133e4c, 0x1430c0), (0x1444a0, 0x147050), (0x14ce50, 0x151580),
+    (0x152b50, 0x1596f8), (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17e0ac, 0x180b54),
+    (0x180c6c, 0x182f90), (0x186500, 0x18c7e8), (0x18cb90, 0x1900f8), (0x190998, 0x193e24),
+    (0x19c330, 0x19cf10), (0x1a2448, 0x1a3ef8), (0x1a66a8, 0x1a8e58), (0x1ab468, 0x1ae628),
+    (0x1ae6d8, 0x1af850), (0x1b10e4, 0x1b35ec), (0x1b3f58, 0x1b89dc), (0x1baef0, 0x1bd7fc),
+    (0x1cce58, 0x1d4480), (0x1e60b0, 0x1e7814), (0x1eb158, 0x1ef3c4), (0x1efd78, 0x1f49ac),
+    (0x1fe968, 0x203124), (0x210a10, 0x212ec8), (0x212f7c, 0x218dec), (0x233040, 0x23669c),
+    (0x23f050, 0x2401c8), (0x246be8, 0x24a58c), (0x24a618, 0x250a60), (0x2552a8, 0x2573b8),
+    (0x27a92c, 0x27dc40), (0x2c0640, 0x2c3394), (0x2d9ce0, 0x2da998), (0x2ec868, 0x2edf60),
+    (0x2f67b4, 0x2f6b90), (0x2f8058, 0x2f8a20), (0x3012d8, 0x3029d4), (0x30b920, 0x30cc74),
+    (0x30f3a8, 0x310548), (0x3105d4, 0x318c98), (0x323b08, 0x326828), (0x32b660, 0x32e130),
+    (0x32ff58, 0x331298), (0x331700, 0x332c88), (0x3334c0, 0x333f78), (0x336388, 0x339c00),
+    (0x339c90, 0x33f69c), (0x3435f4, 0x345fcc), (0x352d60, 0x353fb0), (0x35645c, 0x3573f8),
+    (0x358310, 0x35e040), (0x36a144, 0x36a584), (0x3700cc, 0x371028), (0x371088, 0x374028),
+    (0x375e78, 0x378800), (0x379578, 0x37aac4), (0x37ae84, 0x37cadc), (0x37dd08, 0x37f930),
+    (0x37fa18, 0x381138), (0x392ba8, 0x396c68), (0x396e98, 0x39da08), (0x3a0010, 0x3a19b4),
+    (0x3a3e58, 0x3a50b8), (0x3a8938, 0x3aba8c), (0x3ae4e0, 0x3b2cc8), (0x3b4130, 0x3b90f4),
+    (0x3b9130, 0x3be850), (0x3c1400, 0x3ca780), (0x3ca988, 0x3d8b40), (0x3da020, 0x3db924),
+    (0x3dc180, 0x3dd244), (0x3df49c, 0x3e0418), (0x3e1038, 0x3e300c), (0x3e39ac, 0x3e702c),
+    (0x3ece50, 0x3ed52c), (0x3edd00, 0x3f6a10), (0x3f6e84, 0x3fff5c), (0x4000a0, 0x4017c8),
+    (0x4019a8, 0x413914), (0x4146e8, 0x414d54), (0x4151c4, 0x41592c), (0x416570, 0x41dc20),
+    (0x41dce0, 0x4229e8), (0x428e88, 0x42f488), (0x4317b4, 0x432ca4), (0x433f28, 0x43aff4),
+];
+fn ui43_lr_in_wl(lr: u32) -> bool {
+    let i = UI43_CODE_RANGES.partition_point(|&(s, _)| s <= lr);
+    i > 0 && lr < UI43_CODE_RANGES[i - 1].1
+}
+
 /// [MoleWorld 宽屏适配·居中偏移] 4:3 虚拟窗口整体右移量 = (真实 landscape 宽 − 1024) / 2。
 /// 1188 宽 → 82pt;原生 4:3(1024)→ 0(不偏移)。
 fn ui43_offset_x(env: &Environment) -> f32 {
@@ -1890,7 +2003,6 @@ struct Ui43Sels {
     pos: SEL,
     set_pos: SEL,
     cs: SEL,
-    set_cs: SEL,
     ap: SEL,
     sx: SEL,
     set_sx: SEL,
@@ -1898,6 +2010,7 @@ struct Ui43Sels {
     count: SEL,
     oai: SEL,
     parent: SEL,
+    rel_ap: SEL,
 }
 fn ui43_sels(env: &mut Environment) -> Ui43Sels {
     let mut r = |n: &str| env.objc.register_host_selector(n.to_string(), &mut env.mem);
@@ -1905,7 +2018,6 @@ fn ui43_sels(env: &mut Environment) -> Ui43Sels {
         pos: r("position"),
         set_pos: r("setPosition:"),
         cs: r("contentSize"),
-        set_cs: r("setContentSize:"),
         ap: r("anchorPoint"),
         sx: r("scaleX"),
         set_sx: r("setScaleX:"),
@@ -1913,14 +2025,16 @@ fn ui43_sels(env: &mut Environment) -> Ui43Sels {
         count: r("count"),
         oai: r("objectAtIndex:"),
         parent: r("parent"),
+        rel_ap: r("isRelativeAnchorPoint"),
     }
 }
 
-/// [MoleWorld 宽屏适配·诊断] MOLE_UI43_DEBUG=1 才输出 [UI43] 逐节点日志(默认关:正常游玩一次
-/// 会产生上百行,会把真正有价值的告警冲掉;排查布局问题时再开)。
+/// [MoleWorld 宽屏适配·诊断] [UI43] 逐节点日志:MOLE_UI43_DEBUG=1 开、=0 关。
+/// **iOS 真机默认开**(没有环境变量,而 v2 虚拟世界方案仍在验收期;量很小:面板进场/铺底/子视图右移
+/// 各一行,坐标换算前 40 次 + 之后每 200 次一行)。桌面默认关。验收结束后把 iOS 也改回默认关。
 fn ui43_debug() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("MOLE_UI43_DEBUG").map(|v| v != "0").unwrap_or(false))
+    *S.get_or_init(|| std::env::var("MOLE_UI43_DEBUG").map(|v| v != "0").unwrap_or(cfg!(target_os = "ios")))
 }
 
 /// [MoleWorld 宽屏适配·诊断] 对象的运行时类名(nil → "nil")。
@@ -1935,61 +2049,112 @@ fn ui43_cls_name(env: &Environment, obj: id) -> String {
     env.objc.get_class_name(cls).to_string()
 }
 
-/// [MoleWorld 宽屏适配·居中偏移] 处理"UI 根层的一个直接子节点":
-///   · 非白名单、且是 **无子节点的叶子** CCSprite/CCLayerColor、且有效宽 ≥900 = 全宽背景 → `setScaleX:` 横向
-///     拉伸到真实宽并按 anchorPoint 归位(木纹/面板底图拉 16% 肉眼不可见);
-///   · 其余(按钮/表格/文字/白名单子层等一切容器)→ 只 +offset 平移居中,绝不拉伸(防表格/子层内容变形)。
-fn ui43_process_child(env: &mut Environment, ch: id, off: f32, real_w: f32, s: &Ui43Sels) {
-    if ch == nil {
+/// [MoleWorld 宽屏适配·居中偏移 v2] 全宽背景铺满:非白名单、**无子节点的叶子** CCSprite/CCLayerColor、
+/// 有效宽 ≥900 = 整屏底图 → `setScaleX:` 横向拉到真实宽(木纹/面板底图拉 16% 肉眼不可见),并把
+/// **左边缘**放到根层局部坐标 −off(根层已右移 off,对应世界 x=0)。其余子节点一律不动:它们在根层
+/// 局部坐标里就是原 1024 设计坐标,随根层整体右移即居中。
+///
+/// ★左边缘公式必须按 cocos2d 的 `nodeToParentTransform`(0x2d3910 实证)推:
+///   · 相对锚点(CCSprite 默认 YES): T(pos)·S·T(−a)        → left = pos.x − ap.x·real_w
+///   · 非相对锚点(CCLayer/CCLayerColor 默认 NO): T(+a)·T(pos)·S·T(−a) → left = pos.x + ap.x·(cs.w − real_w)
+/// 即**非相对锚点也照样绕锚点缩放**,只是多了一次 +a 预平移。初版把它当成"position 就是左边"
+/// (nx = −off),于是 1024 宽、锚点 0.5 的半透明遮罩(RewardLayer/ReceiveGiftLayer/DiscountInfoLayer
+/// 的 `[CCLayerColor layerWithColor:width:winSize.width height:]`)被推到 −645,屏幕右侧 322pt 不被遮罩。
+/// 两个分支都只依赖 ap/cs/real_w/off,与当前 position 无关 ⇒ 幂等,addChild 链重复触发无害。
+fn ui43_stretch_child(env: &mut Environment, ch: id, off: f32, real_w: f32, s: &Ui43Sels) {
+    if ch == nil || ui43_class_hit(env, ch) {
+        return;
+    }
+    if !(ui43_is_kind(env, ch, "CCSprite") || ui43_is_kind(env, ch, "CCLayerColor")) {
+        return;
+    }
+    let cs: CGSize = msg_send(env, (ch, s.cs));
+    let sx: f32 = msg_send(env, (ch, s.sx));
+    let kids: id = msg_send(env, (ch, s.children));
+    let nkids: crate::mem::GuestUSize = if kids == nil {
+        0
+    } else {
+        msg_send(env, (kids, s.count))
+    };
+    if !(cs.width * sx >= 900.0 && cs.width > 1.0 && nkids == 0) {
         return;
     }
     let pos: CGPoint = msg_send(env, (ch, s.pos));
-    let whitelisted = ui43_class_hit(env, ch);
-    let cname = ui43_cls_name(env, ch);
-    if !whitelisted && (ui43_is_kind(env, ch, "CCSprite") || ui43_is_kind(env, ch, "CCLayerColor")) {
-        let cs: CGSize = msg_send(env, (ch, s.cs));
-        let sx: f32 = msg_send(env, (ch, s.sx));
-        let kids: id = msg_send(env, (ch, s.children));
-        let nkids: crate::mem::GuestUSize = if kids == nil {
-            0
-        } else {
-            msg_send(env, (kids, s.count))
-        };
-        if cs.width * sx >= 900.0 && cs.width > 1.0 && nkids == 0 {
-            let ap: CGPoint = msg_send(env, (ch, s.ap));
-            let _: () = msg_send(env, (ch, s.set_sx, real_w / cs.width));
-            let _: () = msg_send(env, (ch, s.set_pos, CGPoint { x: ap.x * real_w, y: pos.y }));
-            let (cw, px, py, apx) = (cs.width, pos.x, pos.y, ap.x);
-            if ui43_debug() { log!(
-                "[UI43]     child {} STRETCH w={} sx={}→{} pos=({},{})→({},{})",
-                cname, cw, sx, real_w / cw, px, py, apx * real_w, py
-            ); }
-            return;
-        }
+    let ap: CGPoint = msg_send(env, (ch, s.ap));
+    let rel: bool = msg_send(env, (ch, s.rel_ap));
+    let nx = if rel {
+        ap.x * real_w - off
+    } else {
+        ap.x * (real_w - cs.width) - off
+    };
+    let _: () = msg_send(env, (ch, s.set_sx, real_w / cs.width));
+    let _: () = msg_send(env, (ch, s.set_pos, CGPoint { x: nx, y: pos.y }));
+    if ui43_debug() {
+        let cname = ui43_cls_name(env, ch);
+        let (cw, px, py) = (cs.width, pos.x, pos.y);
+        log!(
+            "[UI43]     child {} STRETCH w={} sx={}→{} pos=({},{})→({},{}) rel={}",
+            cname, cw, sx, real_w / cw, px, py, nx, py, rel
+        );
     }
-    let _: () = msg_send(env, (ch, s.set_pos, CGPoint { x: pos.x + off, y: pos.y }));
-    let (px, py) = (pos.x, pos.y);
-    if ui43_debug() { log!(
-        "[UI43]     child {} OFFSET wl={} pos=({},{})→({},{})",
-        cname, whitelisted, px, py, px + off, py
-    ); }
 }
 
-/// [MoleWorld 宽屏适配·居中偏移] `onEnter` 拦截:白名单 UI **根层**(父节点不在白名单)进场时做
-/// "4:3 虚拟窗口居中 + 底铺满"。
-///
-/// 商店实证结构(NewStyleStoreMainLayer init 反汇编):根层是 **CCLayerColor**(`initWithColor:` +
-/// `setContentSize:winSize` = 纯色遮罩底),子节点有 `storeback.png`(1024 宽顶部木条)、`storeBackBoard.png`
-/// (游戏自己 `setScaleX:` 拉伸的背板)、按钮/表格等;**物品区 ItemsView 与底部详情面板是 onEnter 之后才
-/// `addChild` 进来的**(showItemsViewWithType:)。结尾还调 `scaleImageForIPhone5:` ×2 +
-/// `adjustPositionForIPhone5:`——淘米当年就是靠"拉伸背景图 + 平移子节点"适配 iPhone5,只是 iPad 被
-/// `isIpad` 门挡死。本模块 = 它的通用复刻:
-///   ① 根层**不动位置**,contentSize 拉到真实宽 → 纯色底铺满整屏;
-///   ② 进场时已有的子节点逐个交给 [ui43_process_child](拉伸背景 / 平移其余);
-///   ③ **之后再 addChild 进来的子节点由 [ui43_on_add_child] 当场处理**(接住迟到的 ItemsView/详情面板)。
-/// 幂等:处理后根层 contentSize.width==真实宽,再次 onEnter 直接跳过;嵌套的白名单子层(父在白名单)
-/// 在自己的 onEnter 什么都不做——它已作为父层的 child 被平移过,其内部子节点随之整体移动,不再单独处理。
-/// msg_send 会 clobber r0–r3,本拦截在真方法之前、之后放行,故保存/恢复。
+/// [MoleWorld 宽屏适配·居中偏移 v2] CCLayerColor 根层的色块四边形:根层右移后,自身 (0,0)-(w,h) 的色块
+/// 只盖世界 [off, off+w];直接改写 ivar `squareVertices_` 的 x 分量为局部 [−off, real_w−off] = 整屏铺满,
+/// 不动 contentSize(游戏侧读到的仍是设计尺寸)。布局按 `-[CCLayerColor setContentSize:]` 反汇编
+/// (0x2cd690)实证:v[i] = (x@+8i, y@+8i+4),只写 v1.x/v2.y/v3.x/v3.y,值 = 点 × CC_CONTENT_SCALE_FACTOR。
+/// ★缩放因子从**纵向** v2.y/contentSize.height 反推:我们从不改 y 分量,所以本函数幂等
+/// (用横向反推的话第二次会拿被自己改过的 x 当基准,把色块越推越偏)。
+fn ui43_extend_color_quad(env: &mut Environment, obj: id, off: f32, real_w: f32, s: &Ui43Sels) {
+    let name = "squareVertices_".to_string();
+    let Some(iv) = env.objc.object_lookup_ivar(&env.mem, obj, &name) else {
+        return;
+    };
+    let base: MutPtr<f32> = iv.cast();
+    let cs: CGSize = msg_send(env, (obj, s.cs));
+    let cur_h: f32 = env.mem.read(base + 5); // v[2].y = contentSize.height × scale
+    let scale = if cs.height > 1.0 && cur_h > 1.0 {
+        cur_h / cs.height
+    } else {
+        1.0
+    };
+    let x0 = -off * scale;
+    let x1 = (real_w - off) * scale;
+    env.mem.write(base, x0);
+    env.mem.write(base + 4, x0);
+    env.mem.write(base + 2, x1);
+    env.mem.write(base + 6, x1);
+    if ui43_debug() {
+        let cw = cs.width;
+        log!("[UI43]     root CCLayerColor quad x: [{}..{}] (scale={}, cs.w={})", x0, x1, scale, cw);
+    }
+}
+
+/// [MoleWorld 宽屏适配·居中偏移 v2] 祖先链里有没有"已经右移过"的层。
+/// ★不能只看直接父节点:cocos2d 的 onEnter 是自顶向下派发(`-[CCNode onEnter]` 先被发给自己、
+/// 方法体里再 `makeObjectsPerformSelector:@selector(onEnter)` 给孩子),所以根层总是先登记;但白名单层
+/// 可能挂在一个**非白名单容器**下面(实证:SpringPoemMainLayer → CCClipZoneLayer(非白名单)→ 三个
+/// SpringPoemPageLayer(白名单);ActivityBulletinLayer 把 DailySignLayer 加到自己的背板 ivar 节点上),
+/// 只看直接父节点会把它们当成新根层再右移一次(+322 画到屏外)并把它们的 position 也虚拟化。
+fn ui43_has_shifted_ancestor(env: &mut Environment, node: id, s: &Ui43Sels) -> bool {
+    let mut p: id = msg_send(env, (node, s.parent));
+    for _ in 0..32 {
+        if p == nil {
+            return false;
+        }
+        if ui43_root_contains(p.to_bits()) || ui43_class_hit(env, p) {
+            return true;
+        }
+        p = msg_send(env, (p, s.parent));
+    }
+    false
+}
+
+/// [MoleWorld 宽屏适配·居中偏移 v2] `onEnter` 拦截:白名单 UI **根层**(祖先链里没有已右移的层)进场 →
+/// 自身 position.x += off(整棵子树居中)+ 登记 + 铺底(CCLayerColor 四边形外扩 / 全宽背景子节点拉伸)。
+/// 已登记的根层重新进场只补一次色块外扩(游戏可能中途 setContentSize: 把四边形缩回设计宽);
+/// 嵌套白名单子层什么都不做——它已随祖先整体右移。
+/// 本拦截在真方法之前、之后放行;msg_send 会 clobber r0–r3,故保存/恢复。
 fn ui43_center_on_enter(env: &mut Environment) {
     let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
     if !ui43_class_hit(env, recv) {
@@ -2000,6 +2165,7 @@ fn ui43_center_on_enter(env: &mut Environment) {
         return;
     }
     let real_w = UI43_W + off * 2.0;
+    let rb = recv.to_bits();
     let saved = [
         env.cpu.regs()[0],
         env.cpu.regs()[1],
@@ -2007,50 +2173,54 @@ fn ui43_center_on_enter(env: &mut Environment) {
         env.cpu.regs()[3],
     ];
     let s = ui43_sels(env);
-    let parent: id = msg_send(env, (recv, s.parent));
-    let self_pos: CGPoint = msg_send(env, (recv, s.pos));
-    let root_cs0: CGSize = msg_send(env, (recv, s.cs));
-    let pwl = ui43_class_hit(env, parent);
-    let (spx, spy, cw0, ch0) = (self_pos.x, self_pos.y, root_cs0.width, root_cs0.height);
-    let marked = ui43_marked(cw0, real_w);
-    if ui43_debug() { log!(
-        "[UI43] onEnter {} @{:#x} parent={} pos=({},{}) cs=({},{}) → {}",
-        ui43_cls_name(env, recv), recv.to_bits(), ui43_cls_name(env, parent),
-        spx, spy, cw0, ch0,
-        if pwl { "NESTED(skip)" } else if marked { "ROOT(done)" } else { "ROOT-PASS" }
-    ); }
-    if !pwl {
-        let root_cs: CGSize = msg_send(env, (recv, s.cs));
-        if !marked {
-            let rb = recv.to_bits();
-            ui43_done_reset_root(rb); // 新会话:清掉该根层的旧记录
-            let h = if root_cs.height > 1.0 { root_cs.height } else { UI43_H };
-            // 宽设为 真实宽+0.5 = 同时完成"底铺满"与"已处理"标记。
-            let _: () = msg_send(env, (recv, s.set_cs, CGSize { width: real_w + UI43_MARK, height: h }));
-            let children: id = msg_send(env, (recv, s.children));
-            if children != nil {
-                let n: crate::mem::GuestUSize = msg_send(env, (children, s.count));
-                for i in 0..n {
-                    let ch: id = msg_send(env, (children, s.oai, i));
-                    if ch != nil && ui43_done_mark(rb, ch.to_bits()) {
-                        ui43_process_child(env, ch, off, real_w, &s);
-                    }
+    let already = ui43_root_contains(rb);
+    let nested = !already && ui43_has_shifted_ancestor(env, recv, &s);
+    if !already && !nested {
+        let pos: CGPoint = msg_send(env, (recv, s.pos));
+        let np = CGPoint { x: pos.x + off, y: pos.y };
+        ui43_inner(env, |env| {
+            let _: () = msg_send(env, (recv, s.set_pos, np));
+        });
+        ui43_root_add(rb);
+    }
+    if !nested && ui43_is_kind(env, recv, "CCLayerColor") {
+        ui43_extend_color_quad(env, recv, off, real_w, &s);
+    }
+    if !already && !nested {
+        let children: id = msg_send(env, (recv, s.children));
+        if children != nil {
+            let n: crate::mem::GuestUSize = msg_send(env, (children, s.count));
+            for i in 0..n {
+                let ch: id = msg_send(env, (children, s.oai, i));
+                if ch != nil {
+                    ui43_stretch_child(env, ch, off, real_w, &s);
                 }
             }
         }
+    }
+    if ui43_debug() {
+        let cn = ui43_cls_name(env, recv);
+        let parent: id = msg_send(env, (recv, s.parent));
+        let pn = ui43_cls_name(env, parent);
+        log!(
+            "[UI43] onEnter {} @{:#x} parent={} → {}",
+            cn, rb, pn,
+            if nested { "NESTED(skip)" } else if already { "ROOT(done)" } else { "ROOT-SHIFT" }
+        );
     }
     for (i, v) in saved.iter().enumerate() {
         env.cpu.regs_mut()[i] = *v;
     }
 }
 
-/// [MoleWorld 宽屏适配·居中偏移] `addChild:` / `addChild:z:` / `addChild:z:tag:` 拦截(r0=父, r2=子):
-/// 父是**已处理过的 UI 根层**(白名单 + 父之父不在白名单 + contentSize 已==真实宽)→ 对迟到的新子节点
-/// 当场做 [ui43_process_child]。根层 init 期间的 addChild(contentSize 还是 1024)自然跳过,留给 onEnter 一并处理。
+/// [MoleWorld 宽屏适配·居中偏移 v2] `addChild:` / `addChild:z:` / `addChild:z:tag:` 拦截(r0=父, r2=子):
+/// 父是**已右移根层** → 迟到的全宽背景子节点当场拉伸铺满;普通子节点不用管(局部坐标 = 设计坐标,
+/// 随根层整体居中)。[ui43_stretch_child] 写的是绝对值(幂等),所以 addChild 链一次添加触发 2~3 次无害,
+/// 不需要 (根,子) 去重表——那种表按裸指针记,子节点释放后地址被新背景复用会让新背景永远拉不开。
 fn ui43_on_add_child(env: &mut Environment) {
     let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
     let child: id = Ptr::from_bits(env.cpu.regs()[2]);
-    if child == nil || !ui43_class_hit(env, recv) {
+    if child == nil || !ui43_root_contains(recv.to_bits()) {
         return;
     }
     let off = ui43_offset_x(env);
@@ -2065,24 +2235,258 @@ fn ui43_on_add_child(env: &mut Environment) {
         env.cpu.regs()[3],
     ];
     let s = ui43_sels(env);
-    let parent: id = msg_send(env, (recv, s.parent));
-    let root_cs: CGSize = msg_send(env, (recv, s.cs));
-    let attached = parent != nil; // 构造期(未挂树)一律不动:子节点由 onEnter 根层遍历或作为整体被父层平移
-    let pwl = ui43_class_hit(env, parent);
-    let cw = root_cs.width;
-    let ready = ui43_marked(cw, real_w);
-    let fresh = if attached && !pwl && ready { ui43_done_mark(recv.to_bits(), child.to_bits()) } else { false };
-    if ui43_debug() { log!(
-        "[UI43] addChild {} ← {} @{:#x} (recv.parent={} cs.w={}) → {}",
-        ui43_cls_name(env, recv), ui43_cls_name(env, child), child.to_bits(),
-        ui43_cls_name(env, parent), cw,
-        if !attached { "recv-detached(skip)" } else if pwl { "recv-is-nested(skip)" } else if !ready { "root-not-ready(skip)" } else if !fresh { "dup(skip)" } else { "PROCESS" }
-    ); }
-    if attached && !pwl && ready && fresh {
-        ui43_process_child(env, child, off, real_w, &s);
+    ui43_stretch_child(env, child, off, real_w, &s);
+    for (i, v) in saved.iter().enumerate() {
+        env.cpu.regs_mut()[i] = *v;
+    }
+}
+
+/// [MoleWorld 宽屏适配·居中偏移 v2 · UIKit 子视图] `addSubview:` 拦截(r0=父 view, r2=子 view)。
+/// 见 [UI43_VIEWS]:挂到 EAGLView 上、且 frame 完全落在 1024 设计区内的子视图 → x += off 并登记。
+/// 按真实 winSize 布局的全屏视图(HUD/整屏网页)不落在设计区里,天然不动。
+fn ui43_on_add_subview(env: &mut Environment) {
+    let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
+    let child: id = Ptr::from_bits(env.cpu.regs()[2]);
+    if child == nil || recv == nil || ui43_view_contains(child.to_bits()) {
+        return;
+    }
+    let off = ui43_offset_x(env);
+    if off < 1.0 || !ui43_is_kind(env, recv, "EAGLView") {
+        return;
+    }
+    let saved = [
+        env.cpu.regs()[0],
+        env.cpu.regs()[1],
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+    ];
+    let sel_frame = env.objc.register_host_selector("frame".to_string(), &mut env.mem);
+    let sel_set_frame = env.objc.register_host_selector("setFrame:".to_string(), &mut env.mem);
+    let f: CGRect = msg_send(env, (child, sel_frame));
+    let (x, w) = (f.origin.x, f.size.width);
+    if w > 0.0 && x >= -1.0 && x + w <= UI43_W + 1.0 {
+        let nf = CGRect {
+            origin: CGPoint { x: x + off, y: f.origin.y },
+            size: f.size,
+        };
+        let _: () = msg_send(env, (child, sel_set_frame, nf));
+        ui43_view_add(child.to_bits());
+        if ui43_debug() {
+            let cn = ui43_cls_name(env, child);
+            log!("[UI43] addSubview {} @{:#x} frame.x {}→{} (w={})", cn, child.to_bits(), x, x + off, w);
+        }
+    } else if ui43_debug() {
+        let cn = ui43_cls_name(env, child);
+        log!("[UI43] addSubview {} @{:#x} SKIP(非设计区) frame=({},{})", cn, child.to_bits(), x, w);
     }
     for (i, v) in saved.iter().enumerate() {
         env.cpu.regs_mut()[i] = *v;
+    }
+}
+
+/// [MoleWorld 宽屏适配·虚拟世界换算] stret 消息的 CGPoint 入参:r0=返回缓冲区, r1=self, r2=sel,
+/// r3=点.x(位模式), [sp]=点.y。
+fn ui43_point_arg(env: &Environment, regs: &[u32; 16]) -> CGPoint {
+    let y: f32 = env.mem.read(ConstPtr::<f32>::from_bits(regs[13]));
+    CGPoint { x: f32::from_bits(regs[3]), y }
+}
+
+/// [MoleWorld 宽屏适配·热路径] 虚拟世界换算用到的全部选择子的 SEL 指针(只解析一次,零分配)。
+#[derive(Clone, Copy)]
+struct Ui43FastSels {
+    pos: u32,
+    set_pos: u32,
+    dealloc: u32,
+    frame: u32,
+    set_frame: u32,
+    loc_in_view: u32,
+    prev_loc_in_view: u32,
+    to_world: u32,
+    to_world_ar: u32,
+    to_node: u32,
+    to_node_ar: u32,
+    to_ui: u32,
+}
+fn ui43_fast_sels(env: &mut Environment) -> Ui43FastSels {
+    thread_local! {
+        static SELS: std::cell::OnceCell<Ui43FastSels> = const { std::cell::OnceCell::new() };
+    }
+    SELS.with(|c| {
+        *c.get_or_init(|| {
+            let mut r = |n: &str| {
+                env.objc
+                    .register_host_selector(n.to_string(), &mut env.mem)
+                    .to_bits()
+            };
+            Ui43FastSels {
+                pos: r("position"),
+                set_pos: r("setPosition:"),
+                dealloc: r("dealloc"),
+                frame: r("frame"),
+                set_frame: r("setFrame:"),
+                loc_in_view: r("locationInView:"),
+                prev_loc_in_view: r("previousLocationInView:"),
+                to_world: r("convertToWorldSpace:"),
+                to_world_ar: r("convertToWorldSpaceAR:"),
+                to_node: r("convertToNodeSpace:"),
+                to_node_ar: r("convertToNodeSpaceAR:"),
+                to_ui: r("convertToUI:"),
+            }
+        })
+    })
+}
+
+/// [MoleWorld 宽屏适配·热路径] 虚拟世界换算的 SEL 指针快判定,在 `is_intercept_sel` 字符串化之前调用。
+/// 没有任何登记对象时只付一次原子读;命中选择子之后才去读寄存器。`from_host` 见 [UI43_ROOTS] 注释。
+/// 返回 true = 消息已在宿主侧完成(不再派发)。
+pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool {
+    if UI43_ROOTS_LEN.load(O) == 0 && UI43_VIEWS_LEN.load(O) == 0 {
+        return false;
+    }
+    let s = ui43_fast_sels(env);
+    let sb = sel.to_bits();
+    // ① dealloc:按对象指针清登记表。guest 的 release 和宿主的 release 都会走到这里,
+    //    所以不看 from_host;对象一旦释放就必须除名,否则地址复用会张冠李戴。
+    if sb == s.dealloc {
+        let p = env.cpu.regs()[0];
+        if ui43_root_contains(p) {
+            ui43_root_remove(p);
+            if ui43_debug() {
+                log!("[UI43] root dealloc @{:#x}", p);
+            }
+        }
+        if ui43_view_contains(p) {
+            ui43_view_remove(p);
+        }
+        return false;
+    }
+    // 宿主发起 / 本模块正在转发:一律看真实坐标。
+    if from_host || ui43_inner_active(env) {
+        return false;
+    }
+    let kind = if sb == s.pos {
+        1
+    } else if sb == s.set_pos {
+        2
+    } else if sb == s.frame {
+        3
+    } else if sb == s.set_frame {
+        4
+    } else if sb == s.loc_in_view || sb == s.prev_loc_in_view {
+        5
+    } else if sb == s.to_world || sb == s.to_world_ar {
+        6
+    } else if sb == s.to_node || sb == s.to_node_ar || sb == s.to_ui {
+        7
+    } else {
+        0
+    };
+    if kind == 0 {
+        return false;
+    }
+    let off = ui43_offset_x(env);
+    if off < 1.0 {
+        return false;
+    }
+    let regs = *env.cpu.regs();
+    match kind {
+        // 已右移根层的 position(stret:r0=缓冲区, r1=self)
+        1 => {
+            if !ui43_root_contains(regs[1]) {
+                return false;
+            }
+            let recv: id = Ptr::from_bits(regs[1]);
+            let mut p: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel)));
+            p.x -= off;
+            env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), p);
+            true
+        }
+        // 已右移根层的 setPosition:(r0=self, r2=x, r3=y)
+        2 => {
+            if !ui43_root_contains(regs[0]) {
+                return false;
+            }
+            let recv: id = Ptr::from_bits(regs[0]);
+            let p = CGPoint {
+                x: f32::from_bits(regs[2]) + off,
+                y: f32::from_bits(regs[3]),
+            };
+            ui43_inner(env, |env| {
+                let _: () = msg_send(env, (recv, sel, p));
+            });
+            true
+        }
+        // 已右移 UIKit 子视图的 frame(stret:r0=缓冲区, r1=self)
+        3 => {
+            if !ui43_view_contains(regs[1]) {
+                return false;
+            }
+            let recv: id = Ptr::from_bits(regs[1]);
+            let mut f: CGRect = ui43_inner(env, |env| msg_send(env, (recv, sel)));
+            f.origin.x -= off;
+            env.mem.write(MutPtr::<CGRect>::from_bits(regs[0]), f);
+            true
+        }
+        // 已右移 UIKit 子视图的 setFrame:(r0=self, r2=x, r3=y, [sp]=w, [sp+4]=h)
+        4 => {
+            if !ui43_view_contains(regs[0]) {
+                return false;
+            }
+            let recv: id = Ptr::from_bits(regs[0]);
+            let w: f32 = env.mem.read(ConstPtr::<f32>::from_bits(regs[13]));
+            let h: f32 = env.mem.read(ConstPtr::<f32>::from_bits(regs[13] + 4));
+            let f = CGRect {
+                origin: CGPoint {
+                    x: f32::from_bits(regs[2]) + off,
+                    y: f32::from_bits(regs[3]),
+                },
+                size: CGSize { width: w, height: h },
+            };
+            ui43_inner(env, |env| {
+                let _: () = msg_send(env, (recv, sel, f));
+            });
+            true
+        }
+        // 坐标换算:只在【白名单代码在问】且确实有根层被右移过时才动
+        _ => {
+            if UI43_ROOTS_LEN.load(O) == 0 || !ui43_lr_in_wl(env.cpu.regs()[14] & !1u32) {
+                return false;
+            }
+            let recv: id = Ptr::from_bits(regs[1]);
+            let out: CGPoint = match kind {
+                5 => {
+                    let view: id = Ptr::from_bits(regs[3]);
+                    let mut p: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, view)));
+                    // view==nil 返回窗口(竖屏)坐标,横轴不在 x 上,不动。
+                    if view != nil {
+                        p.x -= off;
+                    }
+                    p
+                }
+                6 => {
+                    let p = ui43_point_arg(env, &regs);
+                    let mut q: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, p)));
+                    q.x -= off;
+                    q
+                }
+                _ => {
+                    let mut p = ui43_point_arg(env, &regs);
+                    p.x += off;
+                    ui43_inner(env, |env| msg_send(env, (recv, sel, p)))
+                }
+            };
+            env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), out);
+            if ui43_debug() {
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, O);
+                if n < 40 || n % 200 == 0 {
+                    let (ox, oy) = (out.x, out.y);
+                    let lr = env.cpu.regs()[14] & !1u32;
+                    log!("[UI43] conv#{} kind={} lr={:#x} → ({:.0},{:.0})", n, kind, lr, ox, oy);
+                }
+            }
+            true
+        }
     }
 }
 
@@ -2111,12 +2515,58 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // ★ABI:CGSize(两个 CGFloat=f32)>4 字节 → objc_msgSend_stret,r0=返回缓冲区指针(r1=self)。
     // touchHLE 的 intercept 挂在 objc_msgSend_inner(messages.rs:260),stret 与普通 msgSend 同源,
     // 故这里直接把 8 字节写进 r0 缓冲区即可完成"返回"。
-    // 【本版=最小验证】无条件全局 4:3(世界场景也会退回 4:3,失去 Hor+),仅用于验证"UI 是否因此归位";
-    // 验证通过后改为按调用者 LR/类白名单区分(世界场景 VillageLayer/MoveLayer/CameraLayer 等返回真实
-    // 宽尺寸,UI 类返回 4:3)。默认关(未设 env)=零影响。
+    // 现版:按调用者 LR 白名单区分——UI 类的 240 处调用点拿 4:3,世界场景相机/边界、贴边 HUD、全屏画面、
+    // cocos2d 内部拿真实宽度(世界 Hor+ 不受影响)。开关见 [ui43_mode]:iOS 宽屏时自动开。
     if sel == "winSize" && ui43_mode() {
         // 调用者返回地址(Thumb blx: LR = 调用点+4+1;查表前清 Thumb 位)。
         let lr = env.cpu.regs()[14] & !1u32;
+        // [MoleWorld 宽屏适配·启动第一屏「一半白一半黑」根治] cocos2d 的 winSize 是**缓存 ivar**
+        // (winSizeInPoints_,写于 setOpenGLView: / reshapeProjection:)。在 touchHLE 上,guest 建
+        // EAGLView 时窗口还是【竖屏】bounds(768×1669),横屏 bounds 要等视图控制器旋转后才更新;
+        // 而 iMoleVillageAppDelegate 的启动序列是 setOpenGLView:(0xf5a8)→ setDeviceOrientation:
+        // Portrait(0xf63e)→ runWithScene:(0xf8ba),**首个场景在旋转之前就构造完了**。
+        // 实测(真机 [WINSIZE] 日志):前 5 次 winSize 返回 (768,1669) 竖屏,第 6 次起才是 (1669,768);
+        // 而第 3 次的调用者正是 TaomeeLogoLayer::init(0x3c0c32)——它把背景 CCScale9Sprite 的
+        // preferredSize 设成竖屏 768×1669、logo 摆到 (384,834),在横屏 1669×768 画布上就只剩左下
+        // 768×768 一块白,logo 整个在屏幕上方之外 = 用户看到的「50/50 黑白」。后面的场景因为 ivar
+        // 已更新所以一直是对的,所以只有【启动第一屏】坏。
+        // 修法:缓存值是竖屏(高>宽)时直接返回对调后的横屏尺寸。本游戏 Info.plist 只支持横屏,
+        // 竖屏 winSize 在任何时候都是错的;cocos2d 稍后把 ivar 更新成横屏后本分支自然不再命中。
+        // ★纯 ivar 读,不发消息、不碰 r0–r3(见 touchhle-intercept-register-clobber)。
+        // ★闩:ivar 一旦变成横屏就永不回头(游戏只支持横屏、touchHLE 运行期不旋转),之后每次
+        // winSize 只付一次原子读,不再做 ivar 查找——winSize 每帧被调多次,属热路径。
+        static WINSIZE_STALE: AtomicBool = AtomicBool::new(true);
+        if WINSIZE_STALE.load(O) {
+            let recv: id = Ptr::from_bits(env.cpu.regs()[1]);
+            let cached = env
+                .objc
+                .object_lookup_ivar(&env.mem, recv, &"winSizeInPoints_".to_string())
+                .map(|p| {
+                    let f: MutPtr<f32> = p.cast();
+                    (env.mem.read(f), env.mem.read(f + 1))
+                });
+            if let Some((cw, ch)) = cached {
+                if ch > cw + 1.0 {
+                    let (rw, rh) = if UI43_CALLSITES.binary_search(&lr).is_ok() {
+                        (UI43_W, UI43_H)
+                    } else {
+                        (ch, cw)
+                    };
+                    let buf = env.cpu.regs()[0];
+                    env.mem.write(Ptr::from_bits(buf), rw);
+                    env.mem.write(Ptr::from_bits(buf + 4), rh);
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let n = N.fetch_add(1, O);
+                    if n < 12 {
+                        log!(
+                            "[UI43] winSize 竖屏缓存修正 #{n} lr={lr:#x} ({cw},{ch}) → ({rw},{rh})"
+                        );
+                    }
+                    return true;
+                }
+                WINSIZE_STALE.store(false, O);
+            }
+        }
         // 数组按地址升序生成 → 二分查找(winSize 每帧被调多次,避免 240 项线性扫描)。
         if UI43_CALLSITES.binary_search(&lr).is_ok() {
             let buf = env.cpu.regs()[0];
@@ -2137,9 +2587,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         ui43_center_on_enter(env);
         return false;
     }
-    // [MoleWorld 宽屏适配·居中偏移] 已处理根层收到迟到子节点 → 当场居中/拉伸(见 ui43_on_add_child)。
+    // [MoleWorld 宽屏适配·居中偏移 v2] 已右移根层收到迟到的全宽背景子节点 → 当场拉伸铺满(见 ui43_on_add_child)。
     if ui43_mode() && (sel == "addChild:" || sel == "addChild:z:" || sel == "addChild:z:tag:") {
         ui43_on_add_child(env);
+        return false;
+    }
+    // [MoleWorld 宽屏适配·居中偏移 v2 · UIKit 子视图] 挂到 EAGLView 上的输入框/网页/好友表随根层右移。
+    if ui43_mode() && sel == "addSubview:" {
+        ui43_on_add_subview(env);
         return false;
     }
 

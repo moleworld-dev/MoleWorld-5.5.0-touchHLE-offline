@@ -121,11 +121,13 @@ static SEQ_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// the developer can `Read` it as an image and see the game. Cheap enough at
 /// ~1-2 dumps/sec; glReadPixels is the only real cost.
 pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u32, u32)) {
-    if !diag_enabled() {
-        return;
-    }
     let (x, y, w, h) = viewport;
     if w == 0 || h == 0 {
+        return;
+    }
+    #[cfg(target_os = "ios")]
+    ios_shot(gles, x, y, w, h);
+    if !diag_enabled() {
         return;
     }
     // [MoleWorld DIAG] MOLE_FRAMESEQ=1: dump EVERY presented frame to a rolling numbered sequence
@@ -153,6 +155,43 @@ pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u
     }
     #[cfg(not(target_os = "ios"))]
     crate::debug::dump_framebuffer(FRAME_PATH, x, y, w, h, gles);
+}
+
+/// [MoleWorld iOS · 真机取景器] 真机既没有环境变量(开不了 MOLE_DIAG),系统截屏又要另装一个签名
+/// agent。改成**文件触发**(和 mole_profile_now 剖析器同一套路):容器 `Documents/` 里放一个
+/// `mole_shot_now`(内容任意)→ 开发者立刻拿到接下来 8 帧的画面。
+///
+/// 触发后每 15 帧转储一张 `mole_shot_NN.ppm` 到 Documents(devicectl 可拉),拍满 8 张自动停。
+/// **启动前就把触发文件放好,第 0 帧正是 splash**,所以启动画面也能拍到。
+/// 空闲开销:每 60 帧一次文件 metadata 探测;拍摄时每张一次 glReadPixels——★在设备的 TBDR GPU 上
+/// 这会 resolve+discard 掉随后要 present 的 renderbuffer,被拍的那一帧屏幕上会闪一下黑,
+/// **文件里的内容是对的**(见 diag_enabled 里的同款告诫)。诊断用途可以接受。
+#[cfg(target_os = "ios")]
+fn ios_shot(gles: &mut dyn crate::gles::GLES, x: u32, y: u32, w: u32, h: u32) {
+    static LEFT: AtomicU32 = AtomicU32::new(0);
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    static POLL: AtomicU32 = AtomicU32::new(0);
+    let n = POLL.fetch_add(1, Ordering::Relaxed);
+    if LEFT.load(Ordering::Relaxed) == 0 {
+        if n % 60 != 0 {
+            return;
+        }
+        let trig = crate::paths::user_data_base_path().join("mole_shot_now");
+        if !trig.exists() {
+            return;
+        }
+        let _ = std::fs::remove_file(&trig);
+        SEQ.store(0, Ordering::Relaxed);
+        LEFT.store(8, Ordering::Relaxed);
+        log!("[SHOT] 收到取景请求:接下来 8 帧转储到 Documents/mole_shot_NN.ppm");
+    } else if n % 15 != 0 {
+        return;
+    }
+    let k = SEQ.fetch_add(1, Ordering::Relaxed);
+    LEFT.fetch_sub(1, Ordering::Relaxed);
+    let path = crate::paths::user_data_base_path().join(format!("mole_shot_{k:02}.ppm"));
+    crate::debug::dump_framebuffer(&path.to_string_lossy(), x, y, w, h, gles);
+    log!("[SHOT] #{} {}x{} @({},{}) → {}", k, w, h, x, y, path.display());
 }
 
 /// One synthetic touch step. Down and Up are returned on consecutive calls so a
