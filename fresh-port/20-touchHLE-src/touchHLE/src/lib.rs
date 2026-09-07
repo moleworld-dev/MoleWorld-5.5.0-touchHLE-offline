@@ -185,6 +185,7 @@ pub fn ios_entry() {
 
     // [MoleWorld iOS · JIT 探针] 让设备自己回答「能不能拿到可执行内存」,别再引用旧结论(见 mole_jitprobe)。
     crate::mole_jitprobe::probe();
+    crate::mole_perf::init_guest_measure();
 
     let base = sdl2::filesystem::base_path().unwrap_or_else(|_| String::from("./"));
     let game = std::path::Path::new(&base).join("MoleWorld.ipa");

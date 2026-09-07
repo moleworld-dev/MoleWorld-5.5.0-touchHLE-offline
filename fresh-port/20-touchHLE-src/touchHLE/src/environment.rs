@@ -1593,9 +1593,20 @@ impl Environment {
                 .remaining_ticks
                 .is_none_or(|remaining_ticks| remaining_ticks > 0)
             {
+                // [MoleWorld · 性能取证] 只把【执行 guest 指令】这一段计时,宿主框架/objc 派发/GL 都在计时之外。
+                // 得到的占比 = 换成无限快的 JIT 最多能省掉的比例(见 mole_perf::GUEST_NS)。
+                let measure = crate::mole_perf::MEASURE_GUEST
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let t0 = measure.then(std::time::Instant::now);
                 let state = self
                     .cpu
                     .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
+                if let Some(t0) = t0 {
+                    crate::mole_perf::GUEST_NS.fetch_add(
+                        t0.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
 
                 match self.handle_cpu_state(state) {
                     ThreadNextAction::Continue => {}

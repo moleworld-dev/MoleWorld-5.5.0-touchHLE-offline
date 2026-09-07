@@ -32,6 +32,23 @@ pub static TEX_BYTES_UPLOADED: AtomicU64 = AtomicU64::new(0);
 /// 当前存活纹理字节估算(上传加、删除减;删除时用最后一次上传该 id 的大小)。
 pub static TEX_BYTES_LIVE: AtomicU64 = AtomicU64::new(0);
 pub static MSGSEND: AtomicU64 = AtomicU64::new(0);
+/// [MoleWorld iOS · JIT 值不值得的判据] 花在**执行 guest ARM 指令**上的纳秒累计
+/// (即 `Cpu::run_or_step` 内部;宿主框架实现、objc 派发、GL 驱动都不在内)。
+/// 它除以墙钟就是「解释器占比」——也就是**换成一个无限快的 JIT 最多能省掉的比例**(Amdahl 上限)。
+/// 自身开销:每次 run_or_step 两次 Instant::now(),实测量级约 1%,已知并接受。
+pub static GUEST_NS: AtomicU64 = AtomicU64::new(0);
+/// ★默认**关闭**:计时本身有代价——run_or_step 在每次 SVC(每个宿主函数调用,不只是 objc 消息)返回一次,
+/// 每秒被调数百万次,两次 Instant::now() 实测把 60fps 压到 42fps。所以只在需要取证时开:
+/// 容器里放 `Documents/mole_cpu_share` → 下次启动生效。常态成本 = 每次调用一次 relaxed 原子读。
+pub static MEASURE_GUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 启动时读一次触发文件。
+pub fn init_guest_measure() {
+    let on = crate::paths::user_data_base_path().join("mole_cpu_share").exists();
+    MEASURE_GUEST.store(on, Relaxed);
+    if on {
+        log!("[PERF] guest 指令占比测量已开启(会拖慢约三成,仅用于取证)");
+    }
+}
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 /// 纹理 id → 最近一次上传的字节数(供 DeleteTextures 扣减)。只在 GL 线程访问。
@@ -143,7 +160,7 @@ pub fn tick(objc_objects: usize) {
     use std::sync::Mutex;
     use std::time::Instant;
     FRAMES.fetch_add(1, Relaxed);
-    static LAST: Mutex<Option<(Instant, [u64; 9])>> = Mutex::new(None);
+    static LAST: Mutex<Option<(Instant, [u64; 10])>> = Mutex::new(None);
     let now = Instant::now();
     let cur = [
         FRAMES.load(Relaxed),
@@ -155,6 +172,7 @@ pub fn tick(objc_objects: usize) {
         TEXSUBIMAGE.load(Relaxed),
         GLCALLS.load(Relaxed),
         BINDTEX_SKIPPED.load(Relaxed),
+        GUEST_NS.load(Relaxed),
     ];
     let mut g = match LAST.lock() {
         Ok(g) => g,
@@ -175,8 +193,15 @@ pub fn tick(objc_objects: usize) {
     let mem = vm_info_mb()
         .map(|(f, i, c, e)| format!("footprint={f:.0}MB internal={i:.0} compressed={c:.0} external={e:.0}"))
         .unwrap_or_else(|| "mem=n/a".into());
+    // guest 指令执行占墙钟的比例 = 完美 JIT 的收益上限
+    let guest_pct = (cur[9] - prev[9]) as f64 / (dt * 1e9) * 100.0;
+    let guest_txt = if MEASURE_GUEST.load(Relaxed) {
+        format!(" | guest指令={guest_pct:.1}%(JIT收益上限)")
+    } else {
+        String::new()
+    };
     echo!(
-        "[PERF] fps={fps:.1} | 每帧: gl={:.0} draw={:.0} texImg={:.1} texSub={:.1} cmpTex={:.1} bindTex={:.0}(跳过{:.0}) msg={:.0} | 每秒 msg={:.0} | 纹理上传累计={:.0}MB 存活≈{:.0}MB | objc对象={} | {mem}",
+        "[PERF] fps={fps:.1}{guest_txt} | 每帧: gl={:.0} draw={:.0} texImg={:.1} texSub={:.1} cmpTex={:.1} bindTex={:.0}(跳过{:.0}) msg={:.0} | 每秒 msg={:.0} | 纹理上传累计={:.0}MB 存活≈{:.0}MB | objc对象={} | {mem}",
         per_s(7) / fps.max(0.01),
         per_s(1) / fps.max(0.01),
         per_s(2) / fps.max(0.01),
