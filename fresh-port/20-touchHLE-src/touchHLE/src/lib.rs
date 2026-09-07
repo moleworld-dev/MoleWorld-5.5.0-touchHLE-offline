@@ -49,6 +49,7 @@ mod mole_cheats;
 mod mole_diag;
 pub mod mole_perf;
 pub mod fxhash;
+pub mod mole_jitprobe;
 pub mod mole_watchdog;
 mod mole_menu;
 mod mole_sysinfo;
@@ -181,6 +182,9 @@ pub fn ios_entry() {
             echo!("Panic: {}", payload);
         }
     }));
+
+    // [MoleWorld iOS · JIT 探针] 让设备自己回答「能不能拿到可执行内存」,别再引用旧结论(见 mole_jitprobe)。
+    crate::mole_jitprobe::probe();
 
     let base = sdl2::filesystem::base_path().unwrap_or_else(|_| String::from("./"));
     let game = std::path::Path::new(&base).join("MoleWorld.ipa");
