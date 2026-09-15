@@ -26,12 +26,150 @@ use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// [MoleWorld] 递归卫:`-[UserInfoData initWithCoder:]` 的离线贝壳还原拦截内部要再调用
 /// 一次真正的 `initWithCoder:`(让原方法把存档各字段解出来),那一次必须落到正常派发、
 /// 不能再被本拦截截走,否则无限递归。进入拦截前置 true,放行原方法后置回 false。
 static MOLE_IN_UID_INITCODER: AtomicBool = AtomicBool::new(false);
+
+/// [扫描修 2026-09-15] F10-5:兼容性兜底告警(does not respond / faked class / unimplemented class)
+/// 按 (类别, 类, 选择子) 去重:同一组合只在第一次返回 true(调用方 log!),之后返回 false(调用方走
+/// log_dbg!)。原来每次调用都 log!,同一个缺失方法反复刷屏,把真正有价值的告警冲掉。
+/// 只在这些冷路径上调用,不影响 objc_msgSend 热路径;键存 64 位哈希、不分配字符串,集合大小 =
+/// 缺失方法个数(几十个)。哈希碰撞的代价只是某条告警降为 log_dbg!,没有功能影响。
+fn first_compat_warning(kind: &str, class: &str, sel: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+        std::sync::Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (kind, class, sel).hash(&mut hasher);
+    let key = hasher.finish();
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get_or_insert_with(Default::default).insert(key)
+}
+
+/// [复核修 2026-09-15] R3-1:选择子跟踪([TRACE])限流。
+/// 根因:F7-12 的跟踪对每条命中消息同步 log! 一行(stderr + 写日志文件),mole_dev::trace_filter_matches
+/// 的注释写明「限流由调用方负责」,调用方就是 objc_msgSend_inner,但这里原来没做。被跟踪类每帧都会收到
+/// visit/transform/draw/update: 等消息,实测 touchHLE_log.txt 28392 行里 28252 行是 [TRACE],既冲掉真正的
+/// 告警,又在 objc_msgSend 热路径和 drawScene 帧栈上同步写文件拖慢帧率。
+/// 做法:按宿主单调时钟的整秒分窗,每窗最多打印 TRACE_LINES_PER_SEC 行,超出的只计数;进入新窗口后的第一条
+/// 命中消息先补一行上一窗口的丢弃数。只用原子变量,无锁、无分配(除首次初始化时钟基准外)。
+/// 只在「跟踪开启且规则命中」时才调用:跟踪关闭时 objc_msgSend 路径与原来一样,只有 trace_on() 那一次原子读。
+/// [复核修 2026-09-15] R3-1 返修①(稀有消息不再被整批丢掉):原先整秒额度全局共用,每帧重复的
+/// visit/transform/draw/sortAllChildren/tag 先把它用完——实测 touchHLE_log.txt 里相邻两条
+/// ActionCenterLayer visit 之间有 1905 处正好隔 11 行,即稳态每帧 11 行,60FPS 约 660 行/秒,约 0.3 秒就用完
+/// 200 条;点开活动中心时那批偶发消息(日志 792-846 行:NetworkManager isReachable/isConnected、setShowForecast:、
+/// displayUILayer、ActivityForecastLayer 初始化链)落在同一秒剩下的时间里就一行不打,而这正是排查「签到页
+/// isReachable/isConnected 漏放行 LR」要找的信息。现在「本秒内第一次出现的 (类, 选择子, 调用方 LR)」不占全局
+/// 额度、直接打印(另设 TRACE_FIRST_SEEN_PER_SEC 上限,防宽泛的 *片段 规则失控),重复出现的才占 200 条额度。
+/// 键里带 LR 而不只是 (类, 选择子):同一批里同一个选择子常从不同调用点发出(isOpen lr=0x1b877 / lr=0x59b81、
+/// init lr=0x2d2629 / lr=0x3ece79),各打一行正好是定位调用点要的;每帧消息的调用点是固定的几个,不会多出多少行。
+/// 不做去重,打印出来的每一行仍带 recv/lr。「本秒见过」集合是 TRACE_SEEN_WORDS 个 u64 组成的原子位图,开新窗口
+/// 时整体清零:不分配、不加锁、不读字符串内容。哈希碰撞只会让某个新组合被当成重复、改走全局额度(额度没用完
+/// 照样打印),不会反过来让重复消息绕过额度——每个位每秒最多放行一次,没有两组合互相覆盖导致反复放行的问题。
+/// [复核修 2026-09-15] R3-1 返修②(缺口立刻可见):原先丢弃数只在「下一秒第一条命中」时补报;超限那一秒里
+/// 跟踪被关掉(mole_dev::toggle_trace 不清算)或游戏 panic,日志就停在第 200 行,读日志的人会误以为那就是最后
+/// 一次调用。现在每个窗口第一次丢弃时立刻打一行「已达上限」提示,每窗最多多一行。
+/// guest 线程都在同一个宿主线程上轮转执行,这几个原子量之间没有真正的并发;即使将来有,最坏也只是计数略有
+/// 偏差,不影响正确性。
+const TRACE_LINES_PER_SEC: u32 = 200;
+/// [复核修 2026-09-15] R3-1 返修①:每秒「首次出现的 (类, 选择子, 调用方 LR)」绕过全局额度打印的上限。
+/// 正常的类名/类名.选择子 规则每秒不同组合只有几十个(整份 28252 行跟踪日志从头到尾一共才 238 个),
+/// 这个上限只拦宽泛的 *片段 规则;超出后新组合改走全局额度。
+const TRACE_FIRST_SEEN_PER_SEC: u32 = 500;
+/// [复核修 2026-09-15] R3-1 返修①:「本秒见过的组合」位图位数取对数(2^13 = 8192 位 = 128 个 u64,共 1KB)。
+/// 本秒已有 k 个不同组合时,一个新组合被误判为重复的概率约 k/8192。
+const TRACE_SEEN_BITS_LOG2: u32 = 13;
+const TRACE_SEEN_WORDS: usize = 1 << (TRACE_SEEN_BITS_LOG2 - 6);
+static TRACE_SEEN: [AtomicU64; TRACE_SEEN_WORDS] = [const { AtomicU64::new(0) }; TRACE_SEEN_WORDS];
+/// 当前窗口的秒号(进程内单调时钟,从 1 起算;0 = 还没开过窗口)。
+static TRACE_WINDOW_SEC: AtomicU64 = AtomicU64::new(0);
+/// 当前窗口占全局额度打印的 [TRACE] 行数(不含「首次出现」旁路打印的行)。
+static TRACE_WINDOW_PRINTED: AtomicU32 = AtomicU32::new(0);
+/// [复核修 2026-09-15] R3-1 返修①:当前窗口走「首次出现」旁路打印的行数。
+static TRACE_WINDOW_FIRST_SEEN: AtomicU32 = AtomicU32::new(0);
+/// 当前窗口因超限被丢弃的命中条数。
+static TRACE_WINDOW_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// [复核修 2026-09-15] R3-1 返修①:把 (类, 选择子, 调用方 LR) 压成 64 位键,只做整数运算。
+/// 类与 LR 都是 32 位 guest 地址;SEL 的内部字段在 objc::selectors 里是私有的,这里取不到,改用 as_str 借来的
+/// 宿主指针——选择子已唯一化,guest 内存是一整块固定映射,同一个选择子的字符串地址不变。不读字符串内容。
+/// 乘奇数常数在 2^64 下是双射,第二轮乘法让高位依赖全部输入位(trace_rate_admit 取高位当位图下标)。
+fn trace_pair_key(class: Class, sel_str: &str, lr: u32) -> u64 {
+    let class_lr = (class.to_bits() as u64) | ((lr as u64) << 32);
+    (class_lr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (sel_str.as_ptr() as usize as u64))
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// [复核修 2026-09-15] R3-1 返修②:限流判定结果。原先用 Option 只能区分「打印/不打印」,
+/// 没法告诉调用方「本窗口刚开始丢弃」,缺口要等下一秒才看得见。
+enum TraceAdmit {
+    /// 打印本条。dropped > 0 表示刚结束的那个窗口丢弃了 dropped 条、该窗口开始于 age_secs 秒前,调用方先补一行汇报。
+    Print { dropped: u32, age_secs: u64 },
+    /// 本窗口第一次超限:本条计入丢弃,调用方立刻打一行「已达上限」提示(每个窗口最多一次)。
+    FirstDrop,
+    /// 超限:只计数,不打印。
+    Drop,
+}
+
+/// [复核修 2026-09-15] R3-1:限流判定。`key` 由 trace_pair_key 算出,只用来判断本秒是否第一次出现。
+/// 开新窗口时各计数清零,新窗口的第一条要么走「首次出现」旁路(位图刚清空,必然命中),要么走全局额度
+/// (已打印数为 0,必然有额度),两条路都返回 Print,所以上一窗口的丢弃汇报总是和一条允许打印的消息一起返回,不会丢。
+fn trace_rate_admit(key: u64) -> TraceAdmit {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // 秒号 +1,保证与初始值 0 不同:第一次命中一定会开出新窗口。
+    let now_sec = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1;
+    let window_sec = TRACE_WINDOW_SEC.load(Ordering::Relaxed);
+    let mut prev_dropped = 0u32;
+    let mut prev_age_secs = 0u64;
+    if window_sec != now_sec {
+        TRACE_WINDOW_SEC.store(now_sec, Ordering::Relaxed);
+        TRACE_WINDOW_PRINTED.store(0, Ordering::Relaxed);
+        TRACE_WINDOW_FIRST_SEEN.store(0, Ordering::Relaxed);
+        // 每秒最多一次,128 次原子写。
+        for word in TRACE_SEEN.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+        prev_dropped = TRACE_WINDOW_DROPPED.swap(0, Ordering::Relaxed);
+        prev_age_secs = now_sec.saturating_sub(window_sec);
+    }
+    // 返修①:本秒第一次出现的组合不占全局额度。旁路额度用完后不再置位,新组合直接走下面的全局额度。
+    let first_seen = TRACE_WINDOW_FIRST_SEEN.load(Ordering::Relaxed);
+    if first_seen < TRACE_FIRST_SEEN_PER_SEC {
+        let bit = (key >> (64 - TRACE_SEEN_BITS_LOG2)) as usize;
+        let mask = 1u64 << (bit & 63);
+        let before = TRACE_SEEN[bit >> 6].fetch_or(mask, Ordering::Relaxed);
+        if before & mask == 0 {
+            TRACE_WINDOW_FIRST_SEEN.store(first_seen + 1, Ordering::Relaxed);
+            return TraceAdmit::Print {
+                dropped: prev_dropped,
+                age_secs: prev_age_secs,
+            };
+        }
+    }
+    let printed = TRACE_WINDOW_PRINTED.load(Ordering::Relaxed);
+    if printed < TRACE_LINES_PER_SEC {
+        TRACE_WINDOW_PRINTED.store(printed + 1, Ordering::Relaxed);
+        TraceAdmit::Print {
+            dropped: prev_dropped,
+            age_secs: prev_age_secs,
+        }
+    } else {
+        let dropped = TRACE_WINDOW_DROPPED.load(Ordering::Relaxed);
+        TRACE_WINDOW_DROPPED.store(dropped.saturating_add(1), Ordering::Relaxed);
+        // 返修②:丢弃数由 0 变 1 = 本窗口第一次超限,让调用方立刻留痕。
+        if dropped == 0 {
+            TraceAdmit::FirstDrop
+        } else {
+            TraceAdmit::Drop
+        }
+    }
+}
 
 pub(super) struct ThreadInitializer {
     mutex: MutPtr<pthread_mutex_t>,
@@ -251,13 +389,54 @@ fn objc_msgSend_inner(
     // anti-cheat off). Gated by a cheap any_enabled() check so the hot path pays
     // nothing when all cheats are off. intercept() may fully handle the call
     // (return) or tweak an argument register and let the real method run.
-    if crate::mole_cheats::any_enabled() {
+    // [扫描修 2026-09-15] F7-12:选择子跟踪(开发工具)。类名/选择子字符串在这里统一取一次,供跟踪与
+    // 作弊钩子粗筛共用。跟踪判断放在 any_enabled 总闸之前、intercept_wants 之外:既不依赖作弊总闸,
+    // 也不会把被跟踪的类误送进 intercept、破坏它的白名单不变量。trace_on() 只读原子变量,关闭时这里
+    // 只多一次分支判断;get_class_name / as_str 都是借用,整条路径不产生任何字符串分配。
+    let trace_on = crate::mole_dev::trace_on();
+    let cheats_on = crate::mole_cheats::any_enabled();
+    if trace_on || cheats_on {
         // [MoleWorld P0-B] 先用借来的 &str(零分配)过粗筛:游戏每帧约 16000 条消息,99% 不命中任何
         // hook,直接 bail——不付出下面两次 to_string 堆分配,也不进 intercept 的长比较链(每条消息省
         // 2 次 malloc/free,显著降分配器压力/抖动)。只有命中白名单的少数消息才 to_string + 进 intercept。
         let class_name = env.objc.get_class_name(orig_class);
         let sel_str = selector.as_str(&env.mem);
-        if crate::mole_cheats::intercept_wants(class_name, sel_str) {
+        if trace_on && crate::mole_dev::trace_filter_matches(class_name, sel_str) {
+            // [复核修 2026-09-15] R3-1:命中后先过每秒限流(见 trace_rate_admit),超限的只计数不打印;
+            // 进入新的一秒时先补一行上一窗口的丢弃数,再打印本条。
+            // [复核修 2026-09-15] R3-1 返修:本秒首次出现的 (类, 选择子, 调用方 LR) 不占额度照常打印;
+            // 每个窗口第一次丢弃时立刻打一行提示,跟踪被关掉或崩溃时也看得出后面有截断。
+            let lr = env.cpu.regs()[crate::cpu::Cpu::LR];
+            match trace_rate_admit(trace_pair_key(orig_class, sel_str, lr)) {
+                TraceAdmit::Print { dropped, age_secs } => {
+                    if dropped > 0 {
+                        log!(
+                            "[TRACE] 限流:{} 秒前开始的那 1 秒内另有 {} 条命中未打印(重复命中上限 {} 条/秒)",
+                            age_secs,
+                            dropped,
+                            TRACE_LINES_PER_SEC
+                        );
+                    }
+                    // 格式:[TRACE] 类 选择子 接收者地址 调用方LR(LR = 调用点 + 4,Thumb 代码带最低位 1)。
+                    log!(
+                        "[TRACE] {} {} recv={:?} lr={:#x}",
+                        class_name,
+                        sel_str,
+                        receiver,
+                        lr
+                    );
+                }
+                TraceAdmit::FirstDrop => {
+                    log!(
+                        "[TRACE] 限流:本秒重复命中已达上限 {} 条,之后的重复命中只计数(下一秒开头汇总);本秒首次出现的 类+选择子+调用点 仍照常打印(每秒最多 {} 条)",
+                        TRACE_LINES_PER_SEC,
+                        TRACE_FIRST_SEEN_PER_SEC
+                    );
+                }
+                TraceAdmit::Drop => {}
+            }
+        }
+        if cheats_on && crate::mole_cheats::intercept_wants(class_name, sel_str) {
             let class_owned = class_name.to_string();
             let sel_owned = sel_str.to_string();
             if crate::mole_cheats::intercept(env, &class_owned, &sel_owned) {
@@ -453,6 +632,37 @@ fn objc_msgSend_inner(
                 if let Some(sel) = env.objc.lookup_selector("replaceByLoadingScene") {
                     let recv = receiver;
                     drop(message_type_info);
+                    // [深扫修 2026-09-12] 补回原版在这里做的版本记录写入(0x1905b0-0x190616):
+                    // 本地版本号大于 newVersionRecord 时先 setNewVersionRecord: + saveSettings,
+                    // 然后才决定弹不弹介绍层。只吞介绍层不补写的话 newVersionRecord 永远是 0,
+                    // -[GameSettings loadSettings]@0x185890 每次启动都把 isNightEffectOff 强制置 1,
+                    // 玩家在选项里打开的夜晚效果重启即丢。
+                    if let (Some(sh_mgr), Some(get_ver), Some(sh_inst), Some(nvr), Some(set_nvr), Some(save)) = (
+                        env.objc.lookup_selector("sharedManager"),
+                        env.objc.lookup_selector("getLocalVersion"),
+                        env.objc.lookup_selector("sharedInstance"),
+                        env.objc.lookup_selector("newVersionRecord"),
+                        env.objc.lookup_selector("setNewVersionRecord:"),
+                        env.objc.lookup_selector("saveSettings"),
+                    ) {
+                        let wm_cls = env.objc.get_known_class("WrapperManager", &mut env.mem);
+                        let gs_cls = env.objc.get_known_class("GameSettings", &mut env.mem);
+                        let wm: id = crate::objc::msg_send(env, (wm_cls, sh_mgr));
+                        let gs: id = crate::objc::msg_send(env, (gs_cls, sh_inst));
+                        if wm != nil && gs != nil {
+                            let local: u32 = crate::objc::msg_send(env, (wm, get_ver));
+                            let record: u32 = crate::objc::msg_send(env, (gs, nvr));
+                            if record < local {
+                                let _: () = crate::objc::msg_send(env, (gs, set_nvr, local));
+                                let _: () = crate::objc::msg_send(env, (gs, save));
+                                log!(
+                                    "[深扫修] 跳过新功能介绍层,补写 newVersionRecord {:#x} → {:#x}(夜晚效果开关从此按玩家设置读取)",
+                                    record,
+                                    local
+                                );
+                            }
+                        }
+                    }
                     () = crate::objc::msg_send(env, (recv, sel));
                     return;
                 }
@@ -508,6 +718,12 @@ fn objc_msgSend_inner(
                         "[SHELLHOOK] granted {} shells (pack idx {}, offline IAP bypass)",
                         amount, pack_idx
                     );
+                    // [扫描修 2026-09-15] F2-1:这个钩子吞掉了原版 IAP 流程,原版「充值成功」的副作用
+                    // (-[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]@0x7f3bc:gamedataFlag |= 0x20/0x10、
+                    // unlockItem:16283 都教授等)离线永远不会发生。只在贝壳确实发放成功(gd != nil)后交给
+                    // mole_items 补齐。它内部会发宿主 msg_send、可能改写 r0-r3,所以放在最终写回返回寄存器
+                    // 之前调用;onBuyVIPGold: 返回 void,下面统一把 r0/r1 清零,寄存器最终状态与原来一致。
+                    crate::mole_items::on_shells_purchased(env);
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
@@ -669,16 +885,28 @@ fn objc_msgSend_inner(
             // niceties) that would otherwise each crash boot, and keep going
             // toward the first frame. Essential gaps still surface as visibly
             // wrong behavior to investigate.
-            log!(
-                "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil).",
-                receiver,
-                name,
-                selector.as_str(&env.mem),
-            );
+            // [扫描修 2026-09-15] F10-5:selector.as_str 只求值一次(原来 3 次,每次都要在客体内存里
+            // 逐字节找字符串结尾);同一 (类, 选择子) 只在第一次 log!,之后降为 log_dbg!。
+            let sel_str = selector.as_str(&env.mem);
+            if first_compat_warning("does-not-respond", &name, sel_str) {
+                log!(
+                    "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil). [repeats of this class+selector go to log_dbg]",
+                    receiver,
+                    name,
+                    sel_str,
+                );
+            } else {
+                log_dbg!(
+                    "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil).",
+                    receiver,
+                    name,
+                    sel_str,
+                );
+            }
             // [MoleWorld DIAG] Persist a de-duplicated list of every class+selector
             // that silently no-ops, so a normal play session leaves behind the full
             // set of missing methods to read from /tmp/mole_diag.log.
-            crate::mole_diag::log_unique(&name, selector.as_str(&env.mem));
+            crate::mole_diag::log_unique(&name, sel_str);
             let _ = super2;
             // MoleWorld offline port: a guest class whose superclass chain
             // doesn't reach a real -initWithCoder: (some TMMapData* saved-map
@@ -686,7 +914,7 @@ fn objc_msgSend_inner(
             // exactly as -[NSObject initWithCoder:] does. Returning nil instead
             // made every decoded saved-map object (buildings, farmland,
             // decorations) come back nil and vanish from a reloaded village.
-            if selector.as_str(&env.mem) == "initWithCoder:" {
+            if sel_str == "initWithCoder:" {
                 env.cpu.regs_mut()[0] = receiver.to_bits();
                 env.cpu.regs_mut()[1] = 0;
                 return;
@@ -761,13 +989,25 @@ Type mismatch when sending message {} to {:?}!
             // JSONKit's runtime-created JKArray/JKDictionary). Behave as if the
             // message went to nil so the game keeps booting toward the first
             // frame instead of crashing the emulator.
-            log!(
-                "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil).",
-                name,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                selector.as_str(&env.mem),
-            );
+            // [扫描修 2026-09-15] F10-5:同 does-not-respond,按 (类, 选择子) 去重,首次 log!、之后 log_dbg!。
+            let sel_str = selector.as_str(&env.mem);
+            if first_compat_warning("unimplemented-class", name, sel_str) {
+                log!(
+                    "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil). [repeats of this class+selector go to log_dbg]",
+                    name,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_str,
+                );
+            } else {
+                log_dbg!(
+                    "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil).",
+                    name,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_str,
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else if let Some(&super::FakeClass {
@@ -791,15 +1031,32 @@ Type mismatch when sending message {} to {:?}!
                 "GADRequest",
                 "GADInterstitial",
                 "AtomAdNetworkAdapter",
+                // [扫描修 2026-09-15] F10-5:淘米统计 SDK 自带的 SSKeychain,classes.rs 有意把它 fake 掉
+                // (没有真钥匙串,离线也不要统计)。一轮启动 19 行 passwordForService:account: /
+                // setPassword:forService:account: 全是它。账号菜单模式的 allAccounts 空数组桩在
+                // mole_cheats::intercept 里、先于这里执行,不受影响。将来若给它做真钥匙串桩,记得移出名单。
+                "TMA_SSKeychain",
             ];
             if !SILENT_FAKE_CLASSES.contains(&name.as_str()) {
-                log!(
-                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                    name,
-                    class,
-                    if is_metaclass { "class" } else { "instance" },
-                    selector.as_str(&env.mem),
-                );
+                // [扫描修 2026-09-15] F10-5:其余 fake class 按 (类, 选择子) 去重,首次 log!、之后 log_dbg!。
+                let sel_str = selector.as_str(&env.mem);
+                if first_compat_warning("faked-class", name, sel_str) {
+                    log!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil. [repeats of this class+selector go to log_dbg]",
+                        name,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_str,
+                    );
+                } else {
+                    log_dbg!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
+                        name,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_str,
+                    );
+                }
             }
             env.cpu.regs_mut()[0..2].fill(0);
             return;

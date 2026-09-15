@@ -60,6 +60,10 @@ impl GuestRet for SEL {
 }
 
 impl SEL {
+    /// [扫描修 2026-09-15] 空选择子(NULL SEL),用于给 guest 方法传"无回调选择子"之类的参数。
+    pub const fn null() -> Self {
+        SEL(ConstPtr::null())
+    }
     pub fn as_str(self, mem: &Mem) -> &str {
         // selectors are probably always UTF-8 but this hasn't been verified
         mem.cstr_at_utf8(self.0).unwrap()

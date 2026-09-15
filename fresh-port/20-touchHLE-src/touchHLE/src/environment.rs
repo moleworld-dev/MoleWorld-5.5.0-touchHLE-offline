@@ -455,6 +455,8 @@ impl Environment {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 env.with_yielder(yielder, move |env| {
                     echo!("CPU emulation begins now.");
+                    // [扫描修 2026-09-15] 这里曾有 iOS 专属 csops 代码签名标志探针(查 CS_DEBUGGED 判断真机
+                    // 能否跑 JIT);iOS 线已定走纯 Rust 解释器,探针只剩一行无用日志,已删除,勿复活。
                     // Some apps use the stack inside the static initializer.
                     // While properly behaving apps should be fine, some app
                     // will try to poke the top of the stack, so we'll give
@@ -1706,7 +1708,10 @@ impl Environment {
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex);
                             return thread_id;
                         } else if let Some(deadline) = deadline {
-                            let time = SystemTime::now()
+                            // [扫描修 2026-09-15] deadline 是 guest 传给 pthread_cond_timedwait 的绝对时刻
+                            // (CLOCK_REALTIME 语义,由 guest 的 gettimeofday/time 算出,已含时间旅行偏移),
+                            // 必须用同一虚拟墙钟比较,否则偏移 N 小时后超时等待要多等 N 小时。偏移为 0 时不变。
+                            let time = crate::libc::time::guest_wall_clock_now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap();
                             if deadline <= time {

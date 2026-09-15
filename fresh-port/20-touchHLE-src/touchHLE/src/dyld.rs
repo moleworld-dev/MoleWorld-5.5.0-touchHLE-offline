@@ -537,8 +537,14 @@ impl Dyld {
         }
         // Collecting unhandled relocations for the same symbol onto one line
         // makes the log output much less spammy.
+        // [扫描修 2026-09-15] F10-4:一轮启动这里 135 行 + 下面 non-lazy 132 行(同一批 CFNetwork/UTType/
+        // MPMoviePlayer 通知/NSHTTPCookie* 等未实现常量,各打一行)占整份日志 40%,把真正的告警冲到中间。
+        // 逐条(带地址)降为 log_dbg!,每个二进制末尾各汇总一行「个数 + 排好序的符号名清单」,
+        // 排查缺失符号时仍能直接看到名字。
+        let mut unhandled_relocation_names: Vec<&str> = unhandled_relocations.keys().copied().collect();
+        unhandled_relocation_names.sort_unstable();
         for (name, addrs) in unhandled_relocations {
-            log!(
+            log_dbg!(
                 "Warning: unhandled external relocation {:?} in {:?} at {}",
                 name,
                 bin.name,
@@ -547,6 +553,14 @@ impl Dyld {
                     .map(|addr| format!("{addr:#x}"))
                     .collect::<Vec<String>>()
                     .join(", "),
+            );
+        }
+        if !unhandled_relocation_names.is_empty() {
+            log!(
+                "Warning: {} unhandled external relocations in {:?} (addresses: enable log_dbg for touchHLE::dyld): {:?}",
+                unhandled_relocation_names.len(),
+                bin.name,
+                unhandled_relocation_names
             );
         }
 
@@ -559,6 +573,8 @@ impl Dyld {
         assert!(entry_size == 4);
         assert!(ptrs.size % entry_size == 0);
         let ptr_count = ptrs.size / entry_size;
+        // [扫描修 2026-09-15] F10-4:收集未处理的 non-lazy 符号名,循环后汇总一行。
+        let mut unhandled_non_lazy_symbols: Vec<&str> = Vec::new();
         'ptr_loop: for i in 0..ptr_count {
             let Some(symbol) = info.indirect_undef_symbols[i as usize].as_deref() else {
                 continue;
@@ -599,11 +615,22 @@ impl Dyld {
                 continue;
             }
 
-            log!(
+            log_dbg!(
                 "Warning: unhandled non-lazy symbol {:?} at {:?} in \"{}\"",
                 symbol,
                 ptr_ptr,
                 bin.name
+            );
+            unhandled_non_lazy_symbols.push(symbol);
+        }
+        if !unhandled_non_lazy_symbols.is_empty() {
+            unhandled_non_lazy_symbols.sort_unstable();
+            unhandled_non_lazy_symbols.dedup();
+            log!(
+                "Warning: {} unhandled non-lazy symbols in \"{}\" (addresses: enable log_dbg for touchHLE::dyld): {:?}",
+                unhandled_non_lazy_symbols.len(),
+                bin.name,
+                unhandled_non_lazy_symbols
             );
         }
 

@@ -482,7 +482,10 @@ fn substitute_classes(
         // its keychain queries no-ops — it also dodges the unbound Security.framework
         // kSec* constants (null-deref in -[TMA_SSKeychain _queryForService:account:])
         // and a known 124k-iteration spin in +[TMA_SSKeychain allAccounts].
-        || name == "TMA_SSKeychain"
+        // [扫描修 2026-09-15] MOLE_REAL_KEYCHAIN=1 时不 fake,改走 security.rs 的钥匙串持久化真跑 SSKeychain
+        // (试验开关,默认关 = 行为不变)。
+        || (name == "TMA_SSKeychain"
+            && std::env::var("MOLE_REAL_KEYCHAIN").as_deref() != Ok("1"))
         // TaomeeAnalytics: TaoMee's analytics SDK (startSession/logEvent/event/
         // uploadAllArchivedData/setLogServerUrl…). Pure analytics, all network.
         // Its -startSession: fires an ASIHTTPRequest to a now-dead server, which
@@ -525,7 +528,10 @@ fn substitute_classes(
         assert!(name == metaclass_name);
     }
 
-    log!(
+    // [扫描修 2026-09-15] F10-5:能走到这里的全是上面白名单里的广告/统计/社交 SDK 类(ADC*/Flurry*/
+    // AdWalls*/PB*/Tapjoy*/TDGA*…),一轮启动 127 行逐类 Note 纯属噪音。逐类降为 log_dbg!,
+    // register_bin_classes 结束时汇总打一行计数。
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -678,11 +684,14 @@ impl ObjC {
 
         assert!(list.size % 4 == 0);
         let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
+        // [扫描修 2026-09-15] F10-5:统计被替换成 fake class 的 SDK 类个数,循环后汇总一行。
+        let mut fake_class_count: usize = 0;
         for i in 0..(list.size / 4) {
             let class = mem.read(base + i);
             let metaclass = Self::read_isa(class, mem);
 
             let name = if let Some(fakes) = substitute_classes(mem, class, metaclass) {
+                fake_class_count += 1;
                 let (class_host_object, metaclass_host_object) = fakes;
 
                 assert!(class_host_object.name == metaclass_host_object.name);
@@ -708,6 +717,12 @@ impl ObjC {
             };
 
             self.classes.insert(name.to_string(), class);
+        }
+        if fake_class_count > 0 {
+            log!(
+                "Note: substituted fake classes for {} ad/analytics/social SDK classes to improve compatibility (per-class list: enable log_dbg for touchHLE::objc::classes)",
+                fake_class_count
+            );
         }
 
         let mut queue = VecDeque::<Class>::new();
