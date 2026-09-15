@@ -3931,6 +3931,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
                 | "addChild:z:"
                 | "addChild:z:tag:"
         ))
+        // [同步 iOS 2026-09-16] 启动第一屏竖屏 winSize 修正:不论是否开 UI43,只在缓存可能还是竖屏时放行(闩住后一次原子读)。
+        || (sel == "winSize" && WINSIZE_STALE.load(O))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -3940,6 +3942,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] 喂给白名单 UI 的原生设计尺寸(iPad landscape 4:3)。
 const UI43_W: f32 = 1024.0;
 const UI43_H: f32 = 768.0;
+/// [同步 iOS 2026-09-16] cocos2d 缓存的 winSize 是否可能仍是启动时的竖屏值(见 intercept 里「启动第一屏」臂)。
+/// 一旦读到横屏就置 false,之后 winSize 在默认模式下不再进 intercept。
+static WINSIZE_STALE: AtomicBool = AtomicBool::new(true);
 /// [MoleWorld 宽屏适配·居中偏移] "根层已处理"标记:处理后把根层 contentSize.width 设为 真实宽+0.5。
 /// 为什么不能用"宽==真实宽":CCLayer 基类 init 自带 contentSize=winSize,而 cocos2d 内部类不在白名单
 /// → 拿到真实宽 1188,任何没自己 setContentSize: 的 UI 层一出生就是 1188,会被误判"已处理"
@@ -4479,6 +4484,48 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 【本版=最小验证】无条件全局 4:3(世界场景也会退回 4:3,失去 Hor+),仅用于验证"UI 是否因此归位";
     // 验证通过后改为按调用者 LR/类白名单区分(世界场景 VillageLayer/MoveLayer/CameraLayer 等返回真实
     // 宽尺寸,UI 类返回 4:3)。默认关(未设 env)=零影响。
+    // [同步 iOS 2026-09-16] 启动第一屏(淘米游戏 logo)「右侧黑边 / 一半白一半黑」根治,移植自 iOS 分支 8bc7046,
+    // 桌面 4:3 默认模式同样适用(无头实测:4:3 下前两帧右侧 22% 全黑,之后正常)。
+    // cocos2d 的 winSize 是缓存 ivar(winSizeInPoints_,写于 setOpenGLView:/reshapeProjection:)。touchHLE 上 guest
+    // 建 EAGLView 时窗口还是【竖屏】bounds(4:3 为 768×1024,--fill-screen 为 768×长边),横屏 bounds 要等旋转后
+    // 才更新;而 iMoleVillageAppDelegate 的启动序列是 setOpenGLView:(0xf5a8)→ setDeviceOrientation:(0xf63e)
+    // → runWithScene:(0xf8ba),首个场景 TaomeeLogoLayer::init(0x3c0c32)在旋转之前就按竖屏宽度布局了
+    // 白底和 logo → 横屏画布右侧露黑。本游戏 Info.plist 只支持横屏,竖屏 winSize 任何时候都是错的:
+    // 缓存值高>宽时直接返回对调后的横屏尺寸(UI43 开且调用点在白名单时返回 4:3 设计尺寸);ivar 一旦变成横屏
+    // 就闩住,之后 winSize 只付一次原子读。纯 ivar 读,不发消息、不碰 r0-r3 以外的状态。
+    if sel == "winSize" && WINSIZE_STALE.load(O) {
+        let recv: id = Ptr::from_bits(env.cpu.regs()[1]);
+        let cached = env
+            .objc
+            .object_lookup_ivar(&env.mem, recv, &"winSizeInPoints_".to_string())
+            .map(|p| {
+                let f: MutPtr<f32> = p.cast();
+                (env.mem.read(f), env.mem.read(f + 1))
+            });
+        match cached {
+            Some((cw, ch)) if ch > cw + 1.0 => {
+                let lr = env.cpu.regs()[14] & !1u32;
+                let (rw, rh) = if ui43_mode() && UI43_CALLSITES.binary_search(&lr).is_ok() {
+                    (UI43_W, UI43_H)
+                } else {
+                    (ch, cw)
+                };
+                let buf = env.cpu.regs()[0];
+                let w: MutPtr<f32> = Ptr::from_bits(buf);
+                let h: MutPtr<f32> = Ptr::from_bits(buf + 4);
+                env.mem.write(w, rw);
+                env.mem.write(h, rh);
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, O);
+                if n < 12 {
+                    log!("[启动第一屏] winSize 竖屏缓存修正 #{n} lr={lr:#x} ({cw},{ch}) → ({rw},{rh})");
+                }
+                return true;
+            }
+            // 已经是横屏,或拿不到这个 ivar(不是 CCDirector):闩住,以后不再查。
+            _ => WINSIZE_STALE.store(false, O),
+        }
+    }
     if sel == "winSize" && ui43_mode() {
         // 调用者返回地址(Thumb blx: LR = 调用点+4+1;查表前清 Thumb 位)。
         let lr = env.cpu.regs()[14] & !1u32;
