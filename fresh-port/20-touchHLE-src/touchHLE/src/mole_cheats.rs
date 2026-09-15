@@ -3530,8 +3530,10 @@ pub fn is_on(key: &str) -> bool {
 // 破解功能"按需复刻"层(香草基底)。把无限贝壳破解包的 inline 字节补丁做成运行时可开关
 // 的菜单功能:每个开关 ON 时把破解作者的【精确字节】写到模拟内存对应 vaddr(并失效
 // dynarmic JIT 缓存),OFF 时还原香草原字节 —— 逐字节复刻破解、可开可关、可验证。
-// 字节表由 vanilla vs cracked 自动 diff 生成(勿手改)。不含贝壳写死 0xb9ce0:那个由
-// UserInfoData.initWithCoder hook 忠于存档处理,不在此重新强制(避免溢出)。
+// 字节表由 vanilla vs cracked 自动 diff 生成(勿手改)。不含贝壳写死 0xb9ce0:它不是可开关的功能。
+// [2026-09-16] X2-01 原先这里写的「由 UserInfoData.initWithCoder hook 忠于存档处理」已过时:那个钩子在 be464e6(F1-05)
+// 已删除。现在由下方 restore_cracked_vipgold 在 guest 代码运行前无条件检查,只在加载的是旧破解版二进制时写回
+// 原版字节,永远不会写入破解字节。
 // ============================================================================
 #[derive(Clone, Copy, PartialEq)]
 enum CrackGroup {
@@ -3627,6 +3629,38 @@ fn apply_crack_patches(env: &mut Environment) {
         "[MOLECHEAT] 破解补丁应用: 越狱={} 修复占卜={} 节日村={} 商城免VIP={} 进新岛={} 跳校验={}",
         KILL_JAILBREAK.load(O), FIX_DIVINE.load(O), ENTER_HOLIDAY.load(O),
         STORE_NO_VIP.load(O), ENTER_NEWISLANDS.load(O), SKIP_PARSE_CHECK.load(O)
+    );
+}
+
+/// [2026-09-16] X2-01 旧破解版游戏包的「贝壳写死」强制还原,不受任何开关控制。
+/// 为什么:v0.0.4 及更早的安卓 APK 内置的是无限贝壳破解包。首次启动复制到外部存储后,旧版 ensure_bundled_moleworld
+///   从不覆盖,覆盖升级上来的老用户至今仍在跑破解二进制。破解包把 -[UserInfoData initWithCoder:]@0xb99f4 里
+///   VA 0xb9ce0 的原版 `add r2,pc; mov r1,r6; blx`(即 [coder decodeIntForKey:@"vipGold"])换成
+///   `movw r0,#0xffff; movt r0,#0x1f`(r0=2097151),后面的 encryptInt: → setNewVipGold: 两版相同。结果每次读档贝壳
+///   都回满,花掉或买进的贝壳重启就失效。以前靠 messages.rs 的 initWithCoder: 钩子按存档真实值补救,F1-05(be464e6)
+///   删掉钩子后这批用户没了兜底,CRACK_PATCHES 也不管这一处。lib.rs 已改成换 APK 后重新复制游戏包,这里再兜底一次:
+///   复制失败退回旧拷贝,或者玩家自己放了旧破解包时,贝壳也不会被写死。
+/// 做法:8 字节恰好等于破解版才写回原版字节并失效 JIT 缓存;香草基底(桌面、iOS、新复制的安卓包)什么都不做,也不打日志。
+/// 时机:lib.rs 的 main() 在 Environment::new 返回之后、env.run() 之前调用。此时各二进制已装入内存并完成链接,
+///   而 guest 代码(静态初始化器、_start → UIApplicationMain → 读档)要等 run() 恢复主线程协程才开始执行,
+///   所以一定早于第一次 initWithCoder:。这里也不在任何帧栈上,不发 msg_send,dynarmic 和解释器都还没翻译过这段指令。
+pub fn restore_cracked_vipgold(env: &mut Environment) {
+    const VADDR: u32 = 0xb9ce0;
+    const CRACKED: [u8; 8] = [0x4f, 0xf6, 0xff, 0x70, 0xc0, 0xf2, 0x1f, 0x00];
+    const VANILLA: [u8; 8] = [0x7a, 0x44, 0x31, 0x46, 0xcb, 0xf3, 0x34, 0xe2];
+    // 任何 app 启动都会调到这里。别的 app 的空页段如果盖住这个地址,bytes_at 会 panic;盖住就不可能是本游戏
+    // (本游戏 __TEXT 从 0x4000 开始),直接跳过。
+    if VADDR < env.mem.null_segment_size() {
+        return;
+    }
+    let ptr: MutPtr<u8> = Ptr::from_bits(VADDR);
+    if env.mem.bytes_at(ptr, 8) != &CRACKED[..] {
+        return;
+    }
+    env.mem.bytes_at_mut(ptr, 8).copy_from_slice(&VANILLA);
+    env.cpu.invalidate_cache_range(VADDR, 8);
+    log!(
+        "[MOLECHEAT] 检测到旧破解版游戏包(0xb9ce0 处贝壳写死为 2097151),已写回原版 decodeIntForKey:@\"vipGold\",贝壳按存档真实值读取"
     );
 }
 
