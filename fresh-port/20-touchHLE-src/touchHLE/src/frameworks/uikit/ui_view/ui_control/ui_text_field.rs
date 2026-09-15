@@ -35,6 +35,14 @@ pub type UIReturnKeyType = NSInteger;
 type UITextAutocapitalizationType = NSInteger;
 type UITextAutocorrectionType = NSInteger;
 
+/// [2026-09-16] C-06 余项:UITextInputTraits 各属性在 iOS 上的默认值(未设置时 getter 返回这些)。
+/// 自动大写默认按句首大写(Sentences = 2),其余默认都是 0。
+const UIKeyboardAppearanceDefault: UIKeyboardAppearance = 0;
+const UIKeyboardTypeDefault: UIKeyboardType = 0;
+const UIReturnKeyDefault: UIReturnKeyType = 0;
+const UITextAutocapitalizationTypeSentences: UITextAutocapitalizationType = 2;
+const UITextAutocorrectionTypeDefault: UITextAutocorrectionType = 0;
+
 /// [2026-09-16] C-06:`UITextBorderStyle`。
 type UITextBorderStyle = NSInteger;
 const UITextBorderStyleNone: UITextBorderStyle = 0;
@@ -88,6 +96,14 @@ struct UITextFieldHostObject {
     clear_button_mode: UITextFieldViewMode,
     secure: bool,
     content_vertical_alignment: UIControlContentVerticalAlignment,
+    /// [2026-09-16] C-06 余项:UITextInputTraits 键盘特性,只存值。桌面没有软键盘,这些值不影响输入;
+    /// 存下来是为了 getter 如实返回游戏设过的值,并消掉每次建输入框都打的 TODO 日志。
+    autocapitalization_type: UITextAutocapitalizationType,
+    autocorrection_type: UITextAutocorrectionType,
+    return_key_type: UIReturnKeyType,
+    keyboard_type: UIKeyboardType,
+    keyboard_appearance: UIKeyboardAppearance,
+    enables_return_key_automatically: bool,
 }
 impl_HostObject_with_superclass!(UITextFieldHostObject);
 impl Default for UITextFieldHostObject {
@@ -107,6 +123,12 @@ impl Default for UITextFieldHostObject {
             clear_button_mode: UITextFieldViewModeNever,
             secure: false,
             content_vertical_alignment: UIControlContentVerticalAlignmentCenter,
+            autocapitalization_type: UITextAutocapitalizationTypeSentences,
+            autocorrection_type: UITextAutocorrectionTypeDefault,
+            return_key_type: UIReturnKeyDefault,
+            keyboard_type: UIKeyboardTypeDefault,
+            keyboard_appearance: UIKeyboardAppearanceDefault,
+            enables_return_key_automatically: false,
         }
     }
 }
@@ -297,23 +319,54 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // UITextInputTraits implementation
+// [2026-09-16] C-06 余项:原来这 6 个都是 todo_objc_setter!,每建一个输入框就打 TODO 日志,getter 也不存在。
+// 游戏真正发给 UITextField 的只有前 4 个(re.py selref 核对,均为 movs r2 立即数):
+// - 改名框 -[AvatarLayer showTextField]@0xffa2e/0xffa44/0xffa5a 依次设 returnKeyType 9(Done)、
+//   autocorrectionType 1(No)、autocapitalizationType 1(Words);InviteFriendsLayer/RegisterView init、
+//   邀请码框 showRequestTextField、兑换码框 showActionTextField 也设同样三项;邀请码框设完 clearButtonMode
+//   后在 @0x37a4ac 又设 autocapitalizationType 3(AllCharacters,movs r2 #3 @0x37a4aa,无头日志顺序印证)。
+//   海底寻宝米米号框 showMimiNumberTextField 只设 returnKeyType。
+// - keyboardType 在委托的 textFieldShouldBeginEditing: 里设:InviteFriendsLayer@0x18a608、
+//   SeabedSeekingTreasureMainLayer@0x2c31d0、VerifyInviteCodeLayer@0x37a900、ActionCodeLayer@0x3c71cc
+//   都设 0(Default);账号菜单对非密码框设 1(ASCIICapable:TMAPasswordModifyView@0x4e1e46 等 5 个视图)
+//   或 2(NumbersAndPunctuation:TMAChangeIDView@0x4e699c)。[2026-09-16 复审] 补全前 3 个调用点。
+// keyboardAppearance / enablesReturnKeyAutomatically 游戏没有调用点,和上面一起改成存值,免得协议实现一半。
+// 桌面没有软键盘,只存值、不接到 start_text_input,行为不变;游戏里也没有读这些 getter 的调用点。
 - (())setAutocapitalizationType:(UITextAutocapitalizationType)type_ {
-    todo_objc_setter!(this, type_);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).autocapitalization_type = type_;
+}
+- (UITextAutocapitalizationType)autocapitalizationType {
+    env.objc.borrow::<UITextFieldHostObject>(this).autocapitalization_type
 }
 - (())setAutocorrectionType:(UITextAutocorrectionType)type_ {
-    todo_objc_setter!(this, type_);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).autocorrection_type = type_;
+}
+- (UITextAutocorrectionType)autocorrectionType {
+    env.objc.borrow::<UITextFieldHostObject>(this).autocorrection_type
 }
 - (())setReturnKeyType:(UIReturnKeyType)type_ {
-    todo_objc_setter!(this, type_);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).return_key_type = type_;
+}
+- (UIReturnKeyType)returnKeyType {
+    env.objc.borrow::<UITextFieldHostObject>(this).return_key_type
 }
 - (())setKeyboardAppearance:(UIKeyboardAppearance)appearance {
-    todo_objc_setter!(this, appearance);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).keyboard_appearance = appearance;
+}
+- (UIKeyboardAppearance)keyboardAppearance {
+    env.objc.borrow::<UITextFieldHostObject>(this).keyboard_appearance
 }
 - (())setKeyboardType:(UIKeyboardType)type_ {
-    todo_objc_setter!(this, type_);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).keyboard_type = type_;
+}
+- (UIKeyboardType)keyboardType {
+    env.objc.borrow::<UITextFieldHostObject>(this).keyboard_type
 }
 - (())setEnablesReturnKeyAutomatically:(bool)enables {
-    todo_objc_setter!(this, enables);
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).enables_return_key_automatically = enables;
+}
+- (bool)enablesReturnKeyAutomatically {
+    env.objc.borrow::<UITextFieldHostObject>(this).enables_return_key_automatically
 }
 
 // [2026-09-16] C-06 ⑥:游戏里 setBorderStyle: 的取值只有两种(反汇编 movs r2):3 = RoundedRect
