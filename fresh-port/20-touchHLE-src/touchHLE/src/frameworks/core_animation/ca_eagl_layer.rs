@@ -83,14 +83,18 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // This is stricter than it should be. In theory we should accumulate
         // the transforms and handle different anchor points etc, but real apps
         // probably only use this common case.
-        if layer_host_obj.bounds.size != screen_bounds.size
-            || layer_host_obj.bounds.origin != (CGPoint { x: 0.0, y: 0.0 })
+        // [同步 iOS 2026-09-16] 尺寸/位置比较带容差(移植自 iOS 分支 1f4f66b):--fill-screen 算出的逻辑屏
+        // (如 1188×768)经 guest 的 frame→bounds 浮点换算后会带尾差(768.00006),精确相等会把真正的全屏层
+        // 判成"不是全屏" → 每帧掉进慢合成路径(整屏像素来回拷)。4:3 的 1024/768 全是整数所以从没暴露。
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let bounds = layer_host_obj.bounds;
+        let position = layer_host_obj.position;
+        if !(near(bounds.size.width, screen_bounds.size.width)
+            && near(bounds.size.height, screen_bounds.size.height))
+            || !(near(bounds.origin.x, 0.0) && near(bounds.origin.y, 0.0))
             || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
-            || layer_host_obj.position
-                != (CGPoint {
-                    x: screen_bounds.size.width / 2.0,
-                    y: screen_bounds.size.height / 2.0,
-                })
+            || !(near(position.x, screen_bounds.size.width / 2.0)
+                && near(position.y, screen_bounds.size.height / 2.0))
             || layer_host_obj.hidden
             || layer_host_obj.opacity != 1.0
             // TODO: support affine transforms that result in a full-screen
