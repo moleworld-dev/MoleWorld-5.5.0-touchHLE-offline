@@ -4101,6 +4101,11 @@ const UI43_CALLSITES: &[u32] = &[
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化·居中偏移] 需要整体右移居中的 UI 根层(运行时类名,含父类链匹配)。
 /// 由离线分析生成:纳入 4:3 的 170 个类里剔除 Item/Cell/Sprite/Object/Control/Manager 等子节点或非节点类,
 /// 剩 162 个"层/场景/视图"根类。按字典序排列供二分查找。
+/// [2026-09-16 补 5 个] 共用任务框布局表(`[ResourceManager getPoint:@"quest_box"]` 等,npcdialogback.png 底图)
+/// 的弹框:WiltWarningLayer(作物枯萎了)、HelpQuestLayer、TimeQuestLayer、VipQuestLayer、OscarDialogueLayer。
+/// 它们从不调 winSize,坐标全来自 1024 设计布局表,所以按 winSize 调用点生成的名单漏掉了它们 → 宽屏下贴左不居中
+/// (同模板的 QuestLayer/DailyQuestLayer/LevelUpLayer 早在名单里)。已核实五个类都没有自己的触摸处理和
+/// locationInView:/convertTo* 调用(按钮走 CCMenu 真实变换),所以不需要补 UI43_CODE_RANGES。
 const UI43_OFFSET_CLASSES: &[&str] = &[
     "AcceptFriendsLayer", "AccountBindingLayer", "AchieveSystemLayer", "AchivementLayer",
     "ActionCenterLayer", "ActionCodeLayer", "ActionLevelLayer", "ActivityBulletinLayer",
@@ -4121,28 +4126,29 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "FuncIntroLayer", "GameDataCompareLayer", "GamePlayGoView", "GetItemRewardFromHaiwangLayer",
     "GetLastRewardLayer", "GiftAndMessageLayer", "GiftLayer", "GiftViewLayer",
     "GoodsViewLayer", "GreenRiceBallMainLayer", "GreenhouseLayer", "GuessWorldCupMainLayer",
-    "HalloweenMainLayer", "HelpLayer", "HouseRecyclerView", "IceSummerMainLayer",
-    "InviteFriendsLayer", "JunkShopLayer", "LeaveMessageLayer", "LeoAdvanceLayer",
-    "Level1", "Level2", "Level3", "Level4",
-    "LevelChooseLayer", "LevelUpLayer", "MagicNumberView", "MessageBox",
-    "MessageBoxGift", "MessageViewController", "MessagesLayer", "MinerAchivement",
-    "MinerGame", "MinerLevelChoose", "MiniBase", "MusicHallLayer",
-    "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer", "NewRewardsLayer",
-    "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneTestLayer", "NewStyleStoreItemsView",
-    "NewStyleStoreMainLayer", "NewStyleStoreMenuView", "NoticeBoardLayer", "OpenTreasureChestMainLayer",
-    "OptionLayer", "PaintingAchivement", "PaintingGame", "PaintingLevelChoose",
-    "PaybackObjectsTableLayer", "PersonalTargetLayer", "Plow", "PlowAchivement",
-    "PlowLevelChoose", "PopularItemsPKAdvanceLayer", "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer",
-    "PromoteSalesMainLayer", "PromoteShowItemsLayer", "QiXiAdvanceLayer", "QuestLayer",
-    "QuestionnaireLayer", "ReceiveGiftLayer", "RegisterView", "RequestCodeLayer",
-    "RestaurantView", "RewardLayer", "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer",
-    "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer", "SeekViewController", "ShopItemsLayer",
-    "ShoppingView", "ShowActivityRuleLayer", "ShowFreeShellsLayer", "ShowMoreFriendsLayer",
-    "ShowRuleLayer", "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer",
-    "SpringPoemPageLayer", "TeamTargetLayer", "TestLayer", "TourLineLayer",
-    "TreasureHuntPopLayer", "TreasureRewardLayer", "VIPFunctionsLayer", "VIPLayer",
-    "VerifyInviteCodeLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
-    "WaterTowerRewardView", "XmasMainLayer",
+    "HalloweenMainLayer", "HelpLayer", "HelpQuestLayer", "HouseRecyclerView",
+    "IceSummerMainLayer", "InviteFriendsLayer", "JunkShopLayer", "LeaveMessageLayer",
+    "LeoAdvanceLayer", "Level1", "Level2", "Level3",
+    "Level4", "LevelChooseLayer", "LevelUpLayer", "MagicNumberView",
+    "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
+    "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase",
+    "MusicHallLayer", "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
+    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneTestLayer",
+    "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView", "NoticeBoardLayer",
+    "OpenTreasureChestMainLayer", "OptionLayer", "OscarDialogueLayer", "PaintingAchivement",
+    "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer", "PersonalTargetLayer",
+    "Plow", "PlowAchivement", "PlowLevelChoose", "PopularItemsPKAdvanceLayer",
+    "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer", "PromoteSalesMainLayer", "PromoteShowItemsLayer",
+    "QiXiAdvanceLayer", "QuestLayer", "QuestionnaireLayer", "ReceiveGiftLayer",
+    "RegisterView", "RequestCodeLayer", "RestaurantView", "RewardLayer",
+    "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer", "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer",
+    "SeekViewController", "ShopItemsLayer", "ShoppingView", "ShowActivityRuleLayer",
+    "ShowFreeShellsLayer", "ShowMoreFriendsLayer", "ShowRuleLayer", "SpringPoemGetRewardLayer",
+    "SpringPoemIntroduceLayer", "SpringPoemMainLayer", "SpringPoemPageLayer", "TeamTargetLayer",
+    "TestLayer", "TimeQuestLayer", "TourLineLayer", "TreasureHuntPopLayer",
+    "TreasureRewardLayer", "VIPFunctionsLayer", "VIPLayer", "VerifyInviteCodeLayer",
+    "VipQuestLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
+    "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
 ];
 
 /// [MoleWorld 宽屏适配·虚拟世界换算] 白名单 UI 类(含其子类,按父类链 ≤6 层)全部方法的代码地址区间
