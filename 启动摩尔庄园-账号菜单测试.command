@@ -15,7 +15,7 @@ export MOLE_MIMI="${MOLE_MIMI:-88888888}"                  # 默认米米号(账
 export MOLE_SERVER="${MOLE_SERVER:-159.54.175.68:7821}"     # 私服 TCP IP:端口
 export MOLE_ACCOUNT_MENU=1                                  # ★账号菜单模式:走真 passport,弹账号菜单
 export MOLE_PASSWORD="${MOLE_PASSWORD:-}"                   # 密码(空=服务器宽松接受)
-export MOLE_HUD="${MOLE_HUD:-1}"
+export MOLE_HUD="${MOLE_HUD:-0}"
 export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"        # 保持 any_enabled 为真(intercept 生效)
 # passport 端点默认 = MOLE_SERVER 的 host + 80(Caddy 的 http://account-mapi.61.com 块 → web 8081)。
 # 如需直连其它地址覆盖:export MOLE_PASSPORT="login.moleworld.net:80"
