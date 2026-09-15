@@ -395,6 +395,15 @@ fn objc_msgSend_inner(
     // 只多一次分支判断;get_class_name / as_str 都是借用,整条路径不产生任何字符串分配。
     let trace_on = crate::mole_dev::trace_on();
     let cheats_on = crate::mole_cheats::any_enabled();
+    // [同步 iOS 2026-09-16] 宽屏 UI43 v2 虚拟世界换算(移植自 iOS 分支 8bc7046):已右移根层的 position/setPosition:、
+    // 已右移 UIKit 子视图的 frame/setFrame:、白名单代码的触摸/世界坐标换算、dealloc 除名。SEL 指针快判定、零分配,
+    // 没有任何登记对象时(未开 UI43 时恒如此)只付两次原子读。★`message_type_info.is_some()` = 本条消息由**宿主**
+    // msg_send 发出(宿主 msg_send 设置它、guest 派发恒为 None):宿主发起时 LR 是陈旧的 main 返回地址,不能拿来判定
+    // "谁在问",且宿主必须看到真实坐标。放在跟踪之前不会让跟踪漏看:换算臂转发真方法走的是宿主 msg_send,
+    // 同一个选择子会再经过这里一次并被跟踪打印。
+    if cheats_on && crate::mole_cheats::intercept_fast(env, selector, message_type_info.is_some()) {
+        return;
+    }
     if trace_on || cheats_on {
         // [MoleWorld P0-B] 先用借来的 &str(零分配)过粗筛:游戏每帧约 16000 条消息,99% 不命中任何
         // hook,直接 bail——不付出下面两次 to_string 堆分配,也不进 intercept 的长比较链(每条消息省

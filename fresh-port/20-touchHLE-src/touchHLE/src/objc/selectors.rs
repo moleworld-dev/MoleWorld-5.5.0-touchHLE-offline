@@ -71,6 +71,10 @@ impl SEL {
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
+    /// [同步 iOS 2026-09-16] 已驻留选择子的指针值(同名选择子只有一个),可当廉价的身份键用,不必解析字符串。
+    pub fn to_bits(self) -> u32 {
+        self.0.to_bits()
+    }
 }
 
 unsafe impl SafeRead for SEL {}
