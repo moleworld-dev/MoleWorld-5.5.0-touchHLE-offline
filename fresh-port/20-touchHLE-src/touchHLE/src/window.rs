@@ -357,6 +357,8 @@ pub enum Event {
     Quit,
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
+    /// [补完 2026-09-15] Android 上收到后不再退出:frameworks/uikit.rs 走「失活→挂起→激活」
+    /// (ui_application::suspend_app → [Window::suspend_until_foreground]);iOS 仍按上游退出。
     AppWillResignActive,
     /// OS has informed touchHLE it will soon terminate.
     /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
@@ -382,6 +384,44 @@ pub enum Event {
     /// 发过 WindowMinimized 时发一次;由 frameworks/uikit.rs 转成 applicationDidBecomeActive: 与对应通知。
     WindowRestored,
 }
+
+/// [补完 2026-09-15] 切后台挂起的结束条件,见 [Window::suspend_until_foreground]。
+#[derive(Debug, Clone, Copy)]
+pub enum SuspendEnd {
+    /// 等 SDL 报告应用已回到前台(`SDL_APP_DIDENTERFOREGROUND`,Android `onResume()`)。
+    Foreground,
+    /// 计时到点就结束(/tmp/mole_input 注入 `suspend <秒数>`,在桌面上无头验证挂起流程用)。
+    Timer(Duration),
+}
+
+/// [补完 2026-09-15] 挂起的结果,见 [Window::suspend_until_foreground]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    /// 回到前台(或计时到点),继续运行。
+    Resumed,
+    /// 挂起期间收到 `SDL_QUIT` / `SDL_APP_TERMINATING`(关窗或系统要结束应用),调用方走退出流程。
+    Terminate,
+    /// 回前台时 SDL 报 `SDL_RENDER_DEVICE_RESET`:恢复原 EGL 上下文失败、SDL 新建了上下文,游戏上传过的
+    /// 纹理/缓冲全部失效,touchHLE 其它 GL 上下文再 make current 会失败(unwrap panic)。调用方先存档再退出。
+    RenderDeviceLost,
+}
+
+/// [补完 2026-09-15] 挂起期间每轮 poll SDL 事件之后的休眠时长(省电)。
+const SUSPEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// [补完 2026-09-15] 进入挂起循环后,前这么多轮排空事件队列之后不休眠,让 SDL 尽快备份 EGL 上下文。
+/// 依据(rust-sdl2 touchHLE-3 自带的 SDL 2.26):SDL_PollEvent 就是 SDL_WaitEventTimeout(ev, 0),只在队列里
+/// 没有待取的 SDL_POLLSENTINEL(sentinel_pending == 0)时才 pump 并压入哨兵,取到哨兵即返回 0——所以一个
+/// while-let 排空周期只 pump 一次(touchHLE 没关 SDL_HINT_POLL_SENTINEL)。Android 非阻塞泵
+/// (Android_PumpEvents_NonBlocking)在 SDL_APP_DIDENTERBACKGROUND 被取走后的下一次 pump 才置 isPaused,
+/// 再下一次 pump 才 android_egl_context_backup(置 backup_done)。poll_for_events 取到 WILLENTERBACKGROUND
+/// 就停止轮询,DIDENTERBACKGROUND 和哨兵还留在队列里,于是:第 1 轮只取走它们(不 pump)、第 2 轮 pump 置
+/// isPaused、第 3 轮 pump 才备份。Java 侧 onNativeSurfaceDestroyed 只等 backup_done 约 49×10ms
+/// (SDL_android.c nb_attempt = 50),这段预算还要先扣掉跑完当前帧、取消触点、失活/进后台回调(存档)的时间;
+/// 若前两轮各睡 50ms,会平白多占约 100ms,超时后 SDL 会在上下文仍 current 时销毁 surface
+/// ("Try to release egl_surface with context probably still active"),部分机型回前台黑屏或崩溃。
+/// 计时模式(桌面注入)照此处理也无害,只是多两次立即 poll。
+const SUSPEND_FAST_ROUNDS: u32 = 3;
 
 pub enum BatteryState {
     Unknown,
@@ -526,6 +566,9 @@ impl Window {
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
             // Disable blocking of event loop when app is paused.
+            // [补完 2026-09-15] 保持非阻塞:切后台时由 Window::suspend_until_foreground 自己循环 poll 等回前台
+            // (这样能先让游戏跑完失活回调,挂起期间也收得到 SDL_QUIT / SDL_APP_TERMINATING);EGL 上下文的
+            // 备份/恢复仍由 SDL 在 pump 里完成。
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
 
@@ -697,8 +740,10 @@ impl Window {
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
         let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
-        let mut window_default_fbo: crate::gles::gles11_raw::types::GLuint = 0;
-        let mut window_default_rbo: crate::gles::gles11_raw::types::GLuint = 0;
+        // [补完 2026-09-15] 消除 "value assigned is never read" 告警:两个变量在下面的块里一定会被赋值,
+        // 原先的初值 0 从来没被读过;改成延迟初始化(只赋值一次,也就不需要 mut),各平台取值不变。
+        let window_default_fbo: crate::gles::gles11_raw::types::GLuint;
+        let window_default_rbo: crate::gles::gles11_raw::types::GLuint;
         {
             let mut gl_ctx = gl_ins.make_current(&mut window);
             let desc = unsafe { gl_ctx.driver_description() };
@@ -1089,8 +1134,9 @@ impl Window {
                 // F12-3:窗口最小化/隐藏 → WindowMinimized;还原/显示/最大化 → WindowRestored。
                 // 只在状态真正变化时发一次(Hidden+Minimized、Shown+Restored 常成对出现;启动时的
                 // Shown 与普通最大化因此不会误发)。普通失焦(FocusLost)不发:点一下别的窗口就暂停、
-                // 停音乐太打扰。只在桌面发:安卓/iOS 切后台走 AppWillEnterBackground(目前直接退出并
-                // 停止事件轮询),在那里再发只会与退出流程重复。
+                // 停音乐太打扰。只在桌面发:安卓/iOS 切后台走 AppWillEnterBackground(安卓挂起、iOS 退出,
+                // 两条路径都自己发失活回调),在这里再发只会重复。
+                // [补完 2026-09-15] 注释更新:安卓切后台已从"直接退出"改为挂起等回前台(suspend_until_foreground)。
                 E::Window {
                     win_event:
                         sdl2::event::WindowEvent::Minimized | sdl2::event::WindowEvent::Hidden,
@@ -1297,8 +1343,13 @@ impl Window {
                     self.high_priority_event = Some(Event::AppWillResignActive);
                     // For some reason, if we don't pause event polling, we will
                     // never finish handling the event.
-                    // TODO: Add a mechanism for re-enabling polling, if at some
-                    // point we support returning touchHLE to the foreground.
+                    // [补完 2026-09-15] 上游 TODO(回到前台后重新打开轮询)已实现:Android 上
+                    // frameworks/uikit.rs 先在模拟器线程给游戏发失活/进后台回调,再调
+                    // [Window::suspend_until_foreground] 自己 poll 等回前台,返回前把轮询恢复为 true。
+                    // 这里暂停轮询仍然必要:SDL(BLOCK_ON_PAUSE=0)在 SDL_APP_DIDENTERBACKGROUND 被取走后的
+                    // 下一次 pump 就会备份 EGL 上下文(MakeCurrent NULL);若继续轮询,游戏还没收到失活回调、
+                    // 可能还在画帧,上下文就被摘掉了。停轮询把这一步推迟到挂起循环里、游戏回调跑完之后。
+                    // iOS 仍按上游在 uikit.rs 里退出,不会回来。
                     self.enable_event_polling = false;
                     continue;
                 }
@@ -1474,6 +1525,225 @@ impl Window {
         self.high_priority_event
             .take()
             .or_else(|| self.event_queue.pop_front())
+    }
+
+    /// [补完 2026-09-15] 切后台挂起用:丢掉队列里已经翻译好、还没交给游戏的输入事件(触摸、文字输入、
+    /// 菜单键),并把窗口侧合成输入的"按住"状态复位(滚轮虚拟捏合、鼠标左键、方向键/摇杆/虚拟光标映射的
+    /// 触点、右键虚拟加速度计)。游戏里仍按着的触点由 frameworks/uikit.rs 的 cancel_tracked_touches 以取消
+    /// 结束,两边一起清,回来后第一下按键/触摸重新从"按下"开始:不会出现窗口侧以为还按着、只发移动
+    /// (ui_touch 不认识而丢掉),也不会让右键倾斜一直生效。只改字段、不调 SDL,可以在协程栈上调用。
+    /// 其它事件(Quit、WindowMinimized/Restored、EnterDebugger 等)保留。返回丢掉的事件数。
+    pub fn discard_pending_input(&mut self) -> usize {
+        let before = self.event_queue.len();
+        self.event_queue.retain(|event| {
+            !matches!(
+                event,
+                Event::TouchesDown(_)
+                    | Event::TouchesMove(_)
+                    | Event::TouchesUp(_)
+                    | Event::TouchesCancel(_)
+                    | Event::TextInput(_)
+                    | Event::ToggleMoleMenu
+            )
+        });
+        let dropped = before - self.event_queue.len();
+        // 虚拟捏合的两根手指若已交给游戏,由 cancel_tracked_touches 取消;这里只清窗口侧状态、不补发取消
+        // (补发的话队列里又多一条游戏已经不认识的取消)。
+        self.pinch = None;
+        self.mouse_left_down = false;
+        self.dpad_state.left = false;
+        self.dpad_state.right = false;
+        self.dpad_state.up = false;
+        self.dpad_state.down = false;
+        self.dpad_state.active = false;
+        self.stick_active = false;
+        if let Some(last) = self.virtual_cursor_last.as_mut() {
+            // (x, y, pressed, visible):只清"按下",保留光标位置;仍按着的键下次更新时会重新发按下。
+            last.2 = false;
+        }
+        if let Some(last) = self.virtual_accelerometer_last.as_mut() {
+            // (x, y, right_click_hold):右键若在挂起期间松开,不清就会一直保持倾斜。
+            last.2 = false;
+        }
+        dropped
+    }
+
+    /// [补完 2026-09-15] 切后台时在模拟器线程上挂起,直到回到前台(或计时到点)。
+    ///
+    /// 调用方(frameworks/uikit/ui_application.rs 的 suspend_app)先给游戏发完失活/进后台回调,再通过
+    /// `Environment::on_parent_stack_in_coroutine` 在主栈上调用本方法(Android 的 SDL poll 会走 JNI)。
+    /// 挂起期间不跑 guest、不渲染:自己循环 poll SDL 事件,每轮排空队列后休眠 [SUSPEND_POLL_INTERVAL]
+    /// ([补完 2026-09-15] 前 [SUSPEND_FAST_ROUNDS] 轮不休眠,见该常量)。
+    /// - Android(SDL_ANDROID_BLOCK_ON_PAUSE=0,vendor/SDL 的 Android_PumpEvents_NonBlocking):取走
+    ///   SDL_APP_DIDENTERBACKGROUND 后,下一次 pump 置 isPaused,再下一次 pump 备份 EGL 上下文(MakeCurrent
+    ///   NULL、backup_done=1;Java 侧 onNativeSurfaceDestroyed 最多等约 490ms 就是在等它,之后才销毁
+    ///   EGLSurface)。[补完 2026-09-15] 注意 SDL_PollEvent 每个排空周期(取到 SDL_POLLSENTINEL 为止)只 pump
+    ///   一次,这里的"下一次 pump"就是"下一轮排空",所以备份发生在进入本循环后的第 3 轮。
+    ///   回前台时同一次 pump 里依次发 WILLENTERFOREGROUND / DIDENTERFOREGROUND /
+    ///   WINDOWEVENT_RESTORED 并 MakeCurrent 回原上下文,失败则新建上下文并推 SDL_RENDER_DEVICE_RESET。
+    ///   所以一直 poll 即可:看到 DIDENTERFOREGROUND 时原上下文已恢复,后续继续用它。每轮先排空队列再判断
+    ///   是否结束,既能看到紧随其后的 RENDER_DEVICE_RESET,也能处理"刚回前台又被切走"(继续挂起)。
+    /// - 触摸/鼠标/按键/手柄输入一律丢弃;桌面窗口的最小化/还原照常换成 WindowMinimized/WindowRestored
+    ///   入队(回来后由 uikit.rs 处理);macOS 窗口尺寸变化只更新 viewport_y_offset(--lock-aspect 的
+    ///   窗口比例约束等下一次尺寸事件再做);手柄插拔照常登记。
+    /// - 收到 SDL_QUIT / SDL_APP_TERMINATING 立即返回 [SuspendOutcome::Terminate]。
+    ///
+    /// 返回前再丢一次残留输入(见 [Self::discard_pending_input]),并恢复 enable_event_polling = true。
+    pub fn suspend_until_foreground(&mut self, end: SuspendEnd) -> SuspendOutcome {
+        use sdl2::event::Event as E;
+        use sdl2::event::WindowEvent as WE;
+
+        assert!(self.on_main_stack);
+        let started = Instant::now();
+        let deadline = match end {
+            SuspendEnd::Foreground => None,
+            SuspendEnd::Timer(duration) => Some(started + duration),
+        };
+        let desktop_window = !Self::rotatable_fullscreen() && !cfg!(target_os = "ios");
+        let mut dropped = self.discard_pending_input();
+        let mut foreground = false;
+        let mut device_lost = false;
+        let end_desc = match end {
+            SuspendEnd::Foreground => "等待系统通知回到前台".to_string(),
+            SuspendEnd::Timer(duration) => format!("计时 {:.1}s 后结束", duration.as_secs_f64()),
+        };
+        log!(
+            "[生命周期] 模拟器线程挂起:{}(不跑 guest、不渲染;前 {} 轮排空后不休眠,好让 SDL 尽快备份 EGL 上下文,之后每 {}ms poll 一次 SDL 事件)",
+            end_desc,
+            SUSPEND_FAST_ROUNDS,
+            SUSPEND_POLL_INTERVAL.as_millis()
+        );
+
+        // [补完 2026-09-15] 已完成的排空轮数;前 SUSPEND_FAST_ROUNDS 轮不休眠(依据见该常量)。
+        let mut round: u32 = 0;
+        let outcome = 'suspend: loop {
+            while let Some(event) = self.event_pump.poll_event() {
+                match event {
+                    E::Quit { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_QUIT(关闭窗口 / 系统结束应用)");
+                        break 'suspend SuspendOutcome::Terminate;
+                    }
+                    E::AppTerminating { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_APP_TERMINATING(系统即将结束应用)");
+                        break 'suspend SuspendOutcome::Terminate;
+                    }
+                    E::AppWillEnterBackground { .. } | E::AppDidEnterBackground { .. } => {
+                        if foreground {
+                            log!("[生命周期] 刚回到前台又被切到后台,继续挂起");
+                        }
+                        foreground = false;
+                    }
+                    E::AppWillEnterForeground { .. } => {
+                        log!("[生命周期] SDL:应用即将回到前台");
+                    }
+                    E::AppDidEnterForeground { .. } => {
+                        log!("[生命周期] SDL:应用已回到前台(SDL 已在本次 pump 里恢复 EGL 上下文)");
+                        foreground = true;
+                    }
+                    E::AppLowMemory { .. } => {
+                        log!("[生命周期] 挂起期间收到系统低内存警告(忽略)");
+                    }
+                    E::RenderTargetsReset { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_RENDER_TARGETS_RESET(渲染目标被重置,纹理内容可能已丢失)");
+                    }
+                    E::RenderDeviceReset { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_RENDER_DEVICE_RESET:SDL 恢复原 EGL 上下文失败并新建了上下文,游戏上传过的纹理/缓冲全部失效");
+                        device_lost = true;
+                    }
+                    E::Window {
+                        win_event: WE::Minimized | WE::Hidden,
+                        ..
+                    } => {
+                        if desktop_window && !self.window_minimized {
+                            self.window_minimized = true;
+                            log!("[窗口] 挂起期间最小化/隐藏,WindowMinimized 入队,回来后处理");
+                            self.event_queue.push_back(Event::WindowMinimized);
+                        }
+                    }
+                    E::Window {
+                        win_event: WE::Restored | WE::Shown | WE::Maximized,
+                        ..
+                    } => {
+                        if desktop_window && self.window_minimized {
+                            self.window_minimized = false;
+                            log!("[窗口] 挂起期间还原/显示,WindowRestored 入队,回来后处理");
+                            self.event_queue.push_back(Event::WindowRestored);
+                        }
+                    }
+                    E::Window {
+                        win_event: WE::SizeChanged(..) | WE::Resized(..),
+                        ..
+                    } => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let (_, fh) = self.window.size();
+                            self.max_height = self.max_height.max(fh);
+                            self.viewport_y_offset = self.max_height - fh;
+                        }
+                    }
+                    E::ControllerDeviceAdded { which, .. } => {
+                        self.controller_added(which);
+                    }
+                    E::ControllerDeviceRemoved { which, .. } => {
+                        self.controller_removed(which);
+                    }
+                    E::MouseButtonDown { .. }
+                    | E::MouseButtonUp { .. }
+                    | E::MouseMotion { .. }
+                    | E::MouseWheel { .. }
+                    | E::FingerDown { .. }
+                    | E::FingerUp { .. }
+                    | E::FingerMotion { .. }
+                    | E::MultiGesture { .. }
+                    | E::KeyDown { .. }
+                    | E::KeyUp { .. }
+                    | E::TextEditing { .. }
+                    | E::TextInput { .. }
+                    | E::ControllerButtonDown { .. }
+                    | E::ControllerButtonUp { .. }
+                    | E::ControllerAxisMotion { .. } => {
+                        dropped += 1;
+                    }
+                    _ => {}
+                }
+            }
+            round = round.saturating_add(1);
+            let done = match deadline {
+                Some(deadline) => Instant::now() >= deadline,
+                None => foreground,
+            };
+            if done {
+                break if device_lost {
+                    SuspendOutcome::RenderDeviceLost
+                } else {
+                    SuspendOutcome::Resumed
+                };
+            }
+            // [补完 2026-09-15] 前几轮立即再 poll:第 2、3 轮的 pump 才置 isPaused、备份 EGL 上下文,
+            // 不能让 50ms 休眠挤占 Java 侧约 490ms 的等待预算(见 SUSPEND_FAST_ROUNDS)。
+            if round < SUSPEND_FAST_ROUNDS {
+                continue;
+            }
+            let nap = match deadline {
+                Some(deadline) => deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(SUSPEND_POLL_INTERVAL),
+                None => SUSPEND_POLL_INTERVAL,
+            };
+            std::thread::sleep(nap);
+        };
+
+        dropped += self.discard_pending_input();
+        self.enable_event_polling = true;
+        // 让回来后的第一次 poll_for_events 不被 1/120s 的节流跳过。
+        self.last_polled = Instant::now() - Duration::from_secs(1);
+        log!(
+            "[生命周期] 结束挂起:{:?},历时 {:.1}s,丢弃输入事件 {} 个",
+            outcome,
+            started.elapsed().as_secs_f64(),
+            dropped
+        );
+        outcome
     }
 
     fn controller_added(&mut self, joystick_idx: u32) {
@@ -1832,6 +2102,10 @@ impl Window {
                 }
             }
         }
+        // [补完 2026-09-15] 消除非 iOS 平台的 "unused variable: procname" 告警:procname 只在上面的 iOS 分支里用,
+        // 这里显式丢弃,行为不变。
+        #[cfg(not(target_os = "ios"))]
+        let _ = procname;
         addr
     }
 
@@ -1880,6 +2154,9 @@ impl Window {
 
         let image = self.splash_image.as_ref().unwrap();
         let window_fbo = self.default_framebuffer();
+        // [补完 2026-09-15] 只有下面 iOS 分支(swap 前绑回 viewRenderbuffer)用到它;非 iOS 平台不取,
+        // 消除 "unused variable: window_rbo" 告警,行为不变。
+        #[cfg(target_os = "ios")]
         let window_rbo = self.default_renderbuffer();
         // [MoleWorld 智能分辨率] 完整 drawable 尺寸,供 present_frame 的 --ambient-fill。
         let full_size = self.window.drawable_size();

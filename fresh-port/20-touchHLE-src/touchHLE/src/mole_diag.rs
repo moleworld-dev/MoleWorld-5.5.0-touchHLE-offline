@@ -165,6 +165,10 @@ pub enum Inject {
     /// Toggle the debug menu (same as pressing T) — lets the harness drive the
     /// menu without synthesising a keyboard event.
     Menu,
+    /// [补完 2026-09-15] `suspend <秒数>`:走与安卓切后台完全相同的 失活→挂起→激活 流程
+    /// (frameworks/uikit.rs → ui_application::suspend_app),只是挂起的结束条件换成计时到点,
+    /// 用来在桌面上无头验证 guest 侧的切后台流程。
+    Suspend(f32),
 }
 
 static PENDING_UP: Mutex<Option<(f32, f32)>> = Mutex::new(None);
@@ -178,6 +182,8 @@ static INJECT_QUEUE: Mutex<std::collections::VecDeque<Inject>> =
 ///   `drag <x1> <y1> <x2> <y2> [steps]` — Down at (x1,y1), `steps` interpolated Moves to (x2,y2), Up
 ///                                        (synthesises a map pan to reproduce the drag-flashing bug)
 ///   `menu`                             — toggle the debug menu
+///   `suspend [秒数]`                   — [补完 2026-09-15] 模拟切后台:失活→挂起 N 秒(缺省 3,钳到 0–3600)→激活,
+///                                        与 Android 切后台走同一条代码路径;日志关键字「[生命周期]」
 /// Coordinates are guest screen points. Multi-step gestures are queued and drained one per call.
 pub fn next_inject() -> Option<Inject> {
     if !diag_enabled() {
@@ -240,6 +246,18 @@ pub fn next_inject() -> Option<Inject> {
                 x1, y1, x2, y2, steps
             ));
             Some(Inject::Down(x1, y1))
+        }
+        Some("suspend") => {
+            // [补完 2026-09-15] 缺省 3 秒;解析失败或非有限值(如 NaN/inf)按缺省处理;
+            // 钳到 0–3600 秒,避免 Duration::from_secs_f32 / Instant 加法溢出 panic。
+            let secs: f32 = it
+                .next()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|s| s.is_finite())
+                .unwrap_or(3.0)
+                .clamp(0.0, 3600.0);
+            log_line(&format!("INJECT suspend {}", secs));
+            Some(Inject::Suspend(secs))
         }
         _ => None,
     }

@@ -102,15 +102,68 @@ pub struct State {
     ui_responder: ui_responder::State,
     /// [扫描修 2026-09-15] F12-1:系统弹框(UIAlertView)的显示队列与覆盖层。
     ui_alert_view: ui_view::ui_alert_view::State,
+    /// [补完 2026-09-15] 已经经 route_touch 交给系统弹框/游戏、还没抬起或取消的手指及其最后坐标。
+    /// 切后台挂起前据此把它们以取消结束(见 cancel_tracked_touches);ui_touch 的触点表是它模块私有的,
+    /// 这里在分发入口单独记一份。
+    touch_shadow: std::collections::HashMap<crate::window::FingerId, crate::window::Coords>,
 }
 
 /// [扫描修 2026-09-15] F12-1:触摸先问系统弹框(模态,显示中会吞掉),没被吞才交给游戏。
 /// [复核修 2026-09-15] R1-2:按手指拆分——弹框只拿走"按下时落在弹框上"的手指,同一事件里其余手指
 /// (弹框出现前就按下、已交给游戏的)照常交给游戏,不再整包吞掉或整包放行。
 fn route_touch(env: &mut Environment, event: crate::window::Event) {
+    // [补完 2026-09-15] 先记账(touch_shadow),再分发。
+    track_touch_shadow(env, &event);
     if let Some(event) = ui_view::ui_alert_view::filter_touch_event(env, event) {
         ui_touch::handle_event(env, event);
     }
+}
+
+/// [补完 2026-09-15] 维护 touch_shadow:按下记入、移动更新坐标(只更新已记录的手指)、抬起/取消移除。
+fn track_touch_shadow(env: &mut Environment, event: &crate::window::Event) {
+    use crate::window::Event;
+    let shadow = &mut env.framework_state.uikit.touch_shadow;
+    match event {
+        Event::TouchesDown(map) => {
+            for (&finger, &coords) in map {
+                shadow.insert(finger, coords);
+            }
+        }
+        Event::TouchesMove(map) => {
+            for (finger, &coords) in map {
+                if let Some(last) = shadow.get_mut(finger) {
+                    *last = coords;
+                }
+            }
+        }
+        Event::TouchesUp(map) | Event::TouchesCancel(map) => {
+            for finger in map.keys() {
+                shadow.remove(finger);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [补完 2026-09-15] 切后台挂起前:把仍按着的手指以取消结束(UITouchPhaseCancelled →
+/// touchesCancelled:withEvent:,与真机来电/切后台时 UIKit 的做法一致)。
+/// 根因:挂起期间真实的抬起事件被丢弃(安卓切走时 SDL 才补发的 FingerUp 也在其中),不收尾的话回来后
+/// 游戏里残留一根"一直按着"的手指(村庄拖动卡住、按钮停在按下态、下一次按下被当成移动)。
+/// 经 route_touch 发出:系统弹框先收回归它的手指(取消不算点击),其余交给 ui_touch 的
+/// handle_touches_cancelled(含 cocos2d 门控收尾);ui_touch 不认识的手指只记警告、不 panic。
+/// 调用上下文与 route_touch 相同(handle_events 内,可以发 msg_send)。
+fn cancel_tracked_touches(env: &mut Environment, reason: &str) {
+    let map = std::mem::take(&mut env.framework_state.uikit.touch_shadow);
+    if map.is_empty() {
+        return;
+    }
+    log!(
+        "[生命周期] {}:以取消结束 {} 个仍按着的触点 {:?}",
+        reason,
+        map.len(),
+        map.keys().collect::<Vec<_>>()
+    );
+    route_touch(env, crate::window::Event::TouchesCancel(map));
 }
 
 /// For use by `NSRunLoop`: handles any events that have queued up.
@@ -168,6 +221,17 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     );
                 }
             }
+            crate::mole_diag::Inject::Suspend(secs) => {
+                // [补完 2026-09-15] 无头验证切后台:走与 Android `Event::AppWillResignActive` 完全相同的
+                // 失活→挂起→激活 路径(ui_application::suspend_app),只是挂起的结束条件换成计时到点
+                // (桌面上没有 SDL 前后台事件)。这里与上面分发触摸同在 run loop 顶部,可以安全发 msg_send。
+                log!("[生命周期] 收到注入命令 suspend {}s", secs);
+                ui_application::suspend_app(
+                    env,
+                    crate::window::SuspendEnd::Timer(std::time::Duration::from_secs_f32(secs)),
+                    "注入 suspend",
+                );
+            }
         }
     }
 
@@ -204,31 +268,48 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::WindowMinimized => ui_application::handle_window_minimized(env),
             Event::WindowRestored => ui_application::handle_window_restored(env),
             Event::AppWillResignActive => {
-                // [扫描修 2026-09-15] F12-3 核实:移动端(Android 等)切后台【仍保持退出】,不改。原因:
-                // ① window.rs 收到 SDL AppWillEnterBackground 时把 enable_event_polling 置 false,
-                //    且没有回到前台后重新打开的机制——不退出的话回来后永远收不到输入;
-                // ② 据复核结论,SDL 在 Android 暂停时会销毁 EGL surface,touchHLE 目前没有
-                //    "后台停渲染"的 GL 闸门,继续渲染会崩;
-                // ③ 原版 applicationWillResignActive: 在 LogoLayer/LoadingScene 场景下本身就 exit(0)。
-                // ①② 在 window.rs / GL 层(不归本包)。现有 exit 路径会先发 resignActive + terminate,
-                // 游戏的 saveToLocal:/saveSettings 能落盘。桌面最小化见上面的 WindowMinimized 分支。
-                // Getting this event means touchHLE is becoming inactive, e.g.
-                // due to switching apps. The obvious way to handle this would
-                // be to just send `applicationWillResignActive:` to the
-                // UIApplicationDelegate. However:
-                // - touchHLE's event loop can't handle an inactive app well
-                //   right now. For example, audio isn't paused.
-                // - touchHLE's event loop can't handle the subsequent
-                //   termination of an app right now: it doesn't manage to send
-                //   the `applicationWillTerminate:` message in time. This can
-                //   mean loss of data!
-                // Therefore, for the moment we will simulate the early iOS
-                // behavior where switching app usually resulted in termination.
-                // We can usually handle this in time, so there won't be data
-                // loss, nor problems with background resource usage or audio.
-                // TODO: Handle this better.
-                log!("Handling app-will-resign-active event: exiting.");
-                ui_application::exit(env);
+                if ui_application::suspend_on_background(env) {
+                    // [补完 2026-09-15] Android 切后台(按 Home、切应用、来电)不再退出,改为挂起等回前台,
+                    // 回来停在原画面继续。此前保持退出的三条理由现在各有处理:
+                    // ① window.rs 收到 SDL AppWillEnterBackground 时仍把 enable_event_polling 置 false,
+                    //    但挂起循环(Window::suspend_until_foreground)返回前会把它恢复为 true;
+                    // ② SDL(BLOCK_ON_PAUSE=0)在挂起循环的 pump 里备份 EGL 上下文、回前台时恢复;挂起期间
+                    //    模拟器线程停在循环里,不跑 guest、不渲染,不需要额外的 GL 闸门;恢复失败
+                    //    (SDL_RENDER_DEVICE_RESET)则存档后退出;
+                    // ③ LogoLayer/LoadingScene 场景下不发生命周期回调(原版失活会 exit(0)),只挂起;
+                    // ④ [补完 2026-09-15] 上游说的"音频不暂停":宿主 OpenAL 混音线程不随模拟器线程挂起,
+                    //    挂起前把游戏的 CocosDenshion 静音、回前台再解除(不管发没发回调),循环音效不会在后台一直响。
+                    // 挂起期间系统要结束应用(SDL_APP_TERMINATING / SDL_QUIT)→ 走 exit,先发失活 + 终止落盘。
+                    // 流程、四个回调的反汇编依据与取舍见 ui_application::suspend_app。
+                    log!("Handling app-will-resign-active event: suspending until foreground.");
+                    ui_application::suspend_app(
+                        env,
+                        crate::window::SuspendEnd::Foreground,
+                        "系统切后台",
+                    );
+                } else {
+                    // [补完 2026-09-15] 注释更新:现在只有 iOS(以及应用选择器)还按上游退出——iOS 移植线的
+                    // 真机呈现 / EAGL 生命周期没有验证过挂起后恢复。现有 exit 路径会先发
+                    // resignActive + terminate,游戏的 saveToLocal:/saveSettings 能落盘。
+                    // 桌面最小化见上面的 WindowMinimized 分支(桌面不会收到本事件)。
+                    // Getting this event means touchHLE is becoming inactive, e.g.
+                    // due to switching apps. The obvious way to handle this would
+                    // be to just send `applicationWillResignActive:` to the
+                    // UIApplicationDelegate. However:
+                    // - touchHLE's event loop can't handle an inactive app well
+                    //   right now. For example, audio isn't paused.
+                    // - touchHLE's event loop can't handle the subsequent
+                    //   termination of an app right now: it doesn't manage to send
+                    //   the `applicationWillTerminate:` message in time. This can
+                    //   mean loss of data!
+                    // Therefore, for the moment we will simulate the early iOS
+                    // behavior where switching app usually resulted in termination.
+                    // We can usually handle this in time, so there won't be data
+                    // loss, nor problems with background resource usage or audio.
+                    // TODO: Handle this better.
+                    log!("Handling app-will-resign-active event: exiting.");
+                    ui_application::exit(env);
+                }
             }
             Event::AppWillTerminate => {
                 log!("Handling app-will-terminate event.");
