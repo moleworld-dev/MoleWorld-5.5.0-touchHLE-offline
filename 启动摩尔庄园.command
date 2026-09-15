@@ -31,6 +31,7 @@ echo ""
 # 进入 touchHLE 目录运行(用绝对路径指向 .app)
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
 cd "$TOUCHHLE_DIR" || exit 1
-# ★强制 mapExtend=0x1F 防拖地图闪。离线无服务器修不了本地坏存档(mapExtend=6),只能客户端兜底。设 MOLE_FIX_MAPEXTEND=0 可关。
+# ★[2026-09-16] MOLE_FIX_MAPEXTEND:只让村庄取景、可行走区和出生区按满图计算(返回真值|0x1F),用来消除本地坏档(mapExtend=6)
+#   造成的拖图闪屏;存档、扩地摆放、成就和任务仍按真实 mapExtend。离线没有服务器修不了坏档,只能客户端兜底。设 MOLE_FIX_MAPEXTEND=0 可关。
 export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"
 exec ./target/release/touchHLE "$APP_ABS" --landscape-right --device-family=ipad

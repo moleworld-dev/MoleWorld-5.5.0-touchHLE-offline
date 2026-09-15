@@ -63,7 +63,8 @@ if grep -qE "\[INTERP-UNIMPL\]" "$LOG" 2>/dev/null; then
 elif grep -qE "\[DERAIL\]" "$LOG" 2>/dev/null; then
   echo "▼ 控制流脱轨(跳进零页):"
   grep -E "\[DERAIL\]" "$LOG" | tail -2
-elif grep -qE "ios-present|\[splash\]|Renderer|CADisplayLink|present_frame" "$LOG" 2>/dev/null; then
+# [2026-09-16] window.rs 的日志前缀 [ios-present] 已在 d371d30 改名为 [present](全平台都打),正则跟着改,否则这一备选再也匹配不到。
+elif grep -qE "\[present\]|\[splash\]|Renderer|CADisplayLink|present_frame" "$LOG" 2>/dev/null; then
   echo "✓✓ 出现渲染/后续日志 —— 越过 CPU 模拟瓶颈了!"
 else
   echo "(无 UNIMPL/DERAIL —— 看上面尾部判断卡在哪)"
