@@ -231,10 +231,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)decodeObjectForKey:(id)key { // NSString*
-    let Some(next_uid) = get_value_to_decode_for_key(env, this, key) else {
+    // [深扫修 2026-09-11] 容错:键不存在 → nil;值不是 UID(对象引用)→ 记日志返回 nil,
+    // 不再 unwrap panic;UID 0 就是 "$null" = nil 对象(Apple 的 encodeObject:nil 会照写这个键,
+    // touchHLE 自己的归档器也把 nil 映射到 UID 0),必须解成 nil,原来会被解成内容为 "$null" 的
+    // NSString。与 Apple / GNUstep / swift-corelibs 行为一致。
+    let uid_or_other: Option<Option<Uid>> =
+        get_value_to_decode_for_key(env, this, key).map(|value| value.as_uid().copied());
+    let Some(maybe_uid) = uid_or_other else {
         return nil;
     };
-    let next_uid = next_uid.as_uid().copied().unwrap();
+    let Some(next_uid) = maybe_uid else {
+        let key_str = to_rust_string(env, key);
+        log!(
+            "[!] NSKeyedUnarchiver decodeObjectForKey:{:?} 的值不是对象引用(UID)— 返回 nil",
+            key_str
+        );
+        return nil;
+    };
+    if next_uid.get() == 0 {
+        return nil;
+    }
     let object = unarchive_key(env, this, next_uid);
 
     // on behalf of the caller
@@ -336,7 +352,21 @@ fn coerce_real(value: &Value) -> Option<f64> {
 /// The object returned is retained only by the archiver. Remember to retain and
 /// possibly autorelease it as appropriate.
 fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
+    // [深扫修 2026-09-11] UID 0 永远是 $objects[0] = "$null",代表 nil 对象,统一在此解成 nil
+    // (原来落到下面 Value::String 分支变成字符串 "$null")。越界 UID(坏档)记日志返回 nil,
+    // 不再数组下标 panic。
+    if key.get() == 0 {
+        return nil;
+    }
     let host_obj = borrow_host_obj(env, unarchiver);
+    if key.get() as usize >= host_obj.already_unarchived.len() {
+        log!(
+            "[!] NSKeyedUnarchiver: UID {} 超出 $objects 范围({} 项,坏档?)— 返回 nil",
+            key.get(),
+            host_obj.already_unarchived.len()
+        );
+        return nil;
+    }
     if let Some(existing) = host_obj.already_unarchived[key.get() as usize] {
         return existing;
     }
@@ -414,11 +444,40 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
         }
         Value::Date(date_val) => {
             let time: SystemTime = (*date_val).into();
-            let time_interval = time.duration_since(apple_epoch()).unwrap().as_secs_f64();
+            // [深扫修 2026-09-12] 2001 年以前的日期 duration_since 返回 Err,原来 unwrap 直接 panic。
+            let time_interval = match time.duration_since(apple_epoch()) {
+                Ok(d) => d.as_secs_f64(),
+                Err(e) => -e.duration().as_secs_f64(),
+            };
             let date: id = msg_class![env; NSDate alloc];
             msg![env; date initWithTimeIntervalSinceReferenceDate:time_interval]
         }
-        _ => unimplemented!("Unarchive: {:#?}", item),
+        // [深扫修 2026-09-11] Apple 的 NSKeyedArchiver 把不可变 NSData(dataWithBytes: 等,含空
+        // NSData)直接存成 $objects 里的原始 <data>(clang 实测),原来落到下面 unimplemented! panic。
+        // 构造不可变 NSData,分配逻辑与 decode_current_data 相同。
+        Value::Data(raw) => {
+            let raw: Vec<u8> = raw.clone();
+            let len: GuestUSize = raw.len().try_into().unwrap();
+            // alloc(0) 不安全:至少分配 1 字节;length 仍按真实 len(0 = 空 NSData)。
+            let guest_bytes: MutVoidPtr = env.mem.alloc(len.max(1));
+            if len > 0 {
+                env.mem
+                    .bytes_at_mut(guest_bytes.cast(), len)
+                    .copy_from_slice(raw.as_slice());
+            }
+            let data: id = msg_class![env; NSData alloc];
+            msg![env; data initWithBytesNoCopy:guest_bytes length:len freeWhenDone:true]
+        }
+        // [深扫修 2026-09-11] 其它形态(原始 Array、Uid 等)NSKeyedArchiver 不会放进 $objects,
+        // 没有现实触发源,不瞎猜语义:记日志返回 nil(不写入缓存),替代原来的 unimplemented! panic。
+        _ => {
+            log!(
+                "[!] NSKeyedUnarchiver: 不支持的 $objects[{}] 形态,返回 nil: {:?}",
+                key.get(),
+                item
+            );
+            return nil;
+        }
     };
 
     let host_obj = borrow_host_obj(env, unarchiver); // reborrow
@@ -433,6 +492,10 @@ pub fn decode_current_array(env: &mut Environment, unarchiver: id) -> Vec<id> {
     let keys = keys_for_key(env, unarchiver, "NS.objects");
 
     keys.into_iter()
+        // [深扫修 2026-09-11] UID 0($null)元素跳过:unarchive_key 现在把它解成 nil,
+        // 而集合里不能放 nil(Apple 的归档器也从不把 nil 编进 NS.objects,只可能来自坏档)。
+        // 只跳过显式 $null,真实对象 initWithCoder: 返回 nil 的情况保持原行为不变。
+        .filter(|key| key.get() != 0)
         .map(|key| {
             let new_object = unarchive_key(env, unarchiver, key);
             // object is retained by the Vec
@@ -451,22 +514,32 @@ pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id
     // DIAG: surface what the unarchiver actually reads for a big dict (the village map is the only
     // large dict here). NS.keys==0 ⇒ the gunzip'd bplist's root dict is empty (server/gzip/body
     // offset issue); NS.keys==N>0 but final count 0 ⇒ key/val unarchive or insert drops them.
+    // [扫描修 2026-09-15] F10-6:原来用 eprintln! 直接写 stderr,绕过 echo!/log! 的日志文件
+    // (touchHLE_log.txt 里看不到,排查读档时只在终端可见),每轮进村打 9 行。读档诊断已闭环,
+    // 改成 log_dbg!:平时不打印,需要时把本模块加进 log.rs 的 ENABLED_MODULES 即可,且会进日志文件。
     if keys.len() > 8 {
-        eprintln!(
-            "[MOLECHEAT] decode_current_dict: NS.keys={} NS.objects={}",
+        log_dbg!(
+            "decode_current_dict: NS.keys={} NS.objects={}",
             keys.len(),
             vals.len()
         );
     }
     log_dbg!("decode_current_dict: keys {:?}, vals {:?}", keys, vals);
 
-    let keys: Vec<id> = keys
+    // [深扫修 2026-09-11] 键或值为 UID 0($null)的条目整对跳过(字典不能存 nil 键/值,
+    // 只可能来自坏档);其余保持原顺序:先解全部键,再解全部值。
+    let pairs: Vec<(Uid, Uid)> = keys
         .into_iter()
-        .map(|key| unarchive_key(env, unarchiver, key))
+        .zip(vals)
+        .filter(|(k, v)| k.get() != 0 && v.get() != 0)
         .collect();
-    let vals: Vec<id> = vals
-        .into_iter()
-        .map(|val| unarchive_key(env, unarchiver, val))
+    let keys: Vec<id> = pairs
+        .iter()
+        .map(|&(key, _)| unarchive_key(env, unarchiver, key))
+        .collect();
+    let vals: Vec<id> = pairs
+        .iter()
+        .map(|&(_, val)| unarchive_key(env, unarchiver, val))
         .collect();
 
     keys.into_iter().zip(vals).collect()
@@ -507,21 +580,42 @@ pub fn decode_current_data(env: &mut Environment, unarchiver: id, _is_mutable: b
 }
 
 /// Shortcut for use by `[NSString initWithCoder:]`.
-/// TODO: mutability
 pub fn decode_current_string(env: &mut Environment, unarchiver: id) -> id {
-    let key = get_static_str(env, "NS.bytes");
+    // [深扫修 2026-09-11] 兼容两种形态,去掉两次 unwrap panic:
+    // - NS.bytes(<data>):nib / 旧式 NSString 归档,原有路径;
+    // - NS.string(<string>):Apple 运行时把 NSMutableString 存成 {$class, NS.string}(clang 实测)。
+    // 两者都缺或形态不对 → 记日志按空串处理。
+    // [审查修 2026-09-13] NSMutableString 由 Apple 或 touchHLE 归档器(ns_keyed_archiver.rs 的
+    // encode_object 与 -[NSString encodeWithCoder:])写成 {$class: NSMutableString, NS.string},
+    // 经抽象 NSString 的 initWithCoder: 走到这里;本函数只返回不可变串,可变性由 initWithCoder:
+    // 的 mutableCopy 分支负责。
+    let bytes_key = get_static_str(env, "NS.bytes");
+    let string_key = get_static_str(env, "NS.string");
     // TODO: avoid copying (twice!)
-    let bytes = get_value_to_decode_for_key(env, unarchiver, key)
-        .unwrap()
-        .as_data()
-        .unwrap()
-        .to_vec();
+    let mut value: Option<Value> = get_value_to_decode_for_key(env, unarchiver, bytes_key).cloned();
+    if value.is_none() {
+        value = get_value_to_decode_for_key(env, unarchiver, string_key).cloned();
+    }
+    let bytes: Vec<u8> = match value {
+        Some(Value::Data(d)) => d,
+        Some(Value::String(s)) => s.into_bytes(),
+        other => {
+            log!(
+                "[!] NSKeyedUnarchiver decode_current_string: 缺 NS.bytes/NS.string 或形态不支持({:?}),按空串处理",
+                other
+            );
+            Vec::new()
+        }
+    };
 
     let len: GuestUSize = bytes.len().try_into().unwrap();
-    let guest_bytes: ConstPtr<u8> = env.mem.alloc(len).cast().cast_const();
-    env.mem
-        .bytes_at_mut(guest_bytes.cast_mut(), len)
-        .copy_from_slice(bytes.as_slice());
+    // alloc(0) 不安全:至少分配 1 字节;length 仍按真实 len。
+    let guest_bytes: ConstPtr<u8> = env.mem.alloc(len.max(1)).cast().cast_const();
+    if len > 0 {
+        env.mem
+            .bytes_at_mut(guest_bytes.cast_mut(), len)
+            .copy_from_slice(bytes.as_slice());
+    }
 
     let str: id = msg_class![env; NSString alloc];
     // TODO: use initWithBytesNoCopy: once implemented
@@ -536,21 +630,35 @@ pub fn decode_current_number(env: &mut Environment, unarchiver: id) -> id {
     let int_key = get_static_str(env, "NS.intval");
     let dbl_key = get_static_str(env, "NS.dblval");
     let bool_key = get_static_str(env, "NS.boolval");
-    if let Some(value) = get_value_to_decode_for_key(env, unarchiver, int_key) {
-        // TODO: deal with type coercion
-        let longlong = value.as_signed_integer().unwrap();
-        msg![env; num initWithLongLong:longlong]
-    } else if let Some(value) = get_value_to_decode_for_key(env, unarchiver, dbl_key) {
-        // TODO: deal with type coercion
-        let double = value.as_real().unwrap();
-        msg![env; num initWithDouble:double]
-    } else if let Some(value) = get_value_to_decode_for_key(env, unarchiver, bool_key) {
-        // TODO: deal with type coercion
-        let boolean = value.as_boolean().unwrap();
-        msg![env; num initWithBool:boolean]
-    } else {
-        unimplemented!()
+    // [深扫修 2026-09-11] 去掉 unwrap / unimplemented! panic,改用跨数值类型强转:
+    // - NS.intval 超过 i64::MAX(touchHLE 自产 UnsignedLongLong)时 as_signed_integer 为 None,
+    //   原来 panic,现在走 initWithUnsignedLongLong:;
+    // - 值类型与键不符时用 coerce_int / coerce_real 兜底;三个键都缺 → 记日志返回 0。
+    // 键的优先顺序(intval → dblval → boolval)与原实现相同。
+    let int_val: Option<Value> = get_value_to_decode_for_key(env, unarchiver, int_key).cloned();
+    if let Some(value) = int_val {
+        if let Some(longlong) = value.as_signed_integer() {
+            return msg![env; num initWithLongLong:longlong];
+        }
+        if let Some(ulonglong) = value.as_unsigned_integer() {
+            return msg![env; num initWithUnsignedLongLong:ulonglong];
+        }
+        if let Some(longlong) = coerce_int(&value) {
+            return msg![env; num initWithLongLong:longlong];
+        }
     }
+    let dbl_val: Option<Value> = get_value_to_decode_for_key(env, unarchiver, dbl_key).cloned();
+    if let Some(double) = dbl_val.as_ref().and_then(coerce_real) {
+        return msg![env; num initWithDouble:double];
+    }
+    let bool_val: Option<Value> = get_value_to_decode_for_key(env, unarchiver, bool_key).cloned();
+    if let Some(int) = bool_val.as_ref().and_then(coerce_int) {
+        let boolean: bool = int != 0;
+        return msg![env; num initWithBool:boolean];
+    }
+    log!("[!] NSKeyedUnarchiver decode_current_number: 缺 NS.intval/NS.dblval/NS.boolval — 按 0 处理");
+    let zero: i64 = 0;
+    msg![env; num initWithLongLong:zero]
 }
 
 fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {

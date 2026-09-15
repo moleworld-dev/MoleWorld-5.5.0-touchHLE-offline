@@ -480,7 +480,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dictionaryWithObject:(id)object forKey:(id)key {
     assert_ne!(key, nil); // TODO: raise proper exception
 
-    let new_dict = dict_from_keys_and_objects(env, &[(key, object)]);
+    // [深扫修 2026-09-11] 根因:原实现直接调 dict_from_keys_and_objects,里面写死
+    // `NSDictionary alloc`,完全不看接收者;NSMutableDictionary 又没覆盖本方法,于是
+    // `[NSMutableDictionary dictionaryWithObject:forKey:]` 拿到的是不可变字典,之后的
+    // setObject:forKey: 全被 messages.rs 当成"不响应选择子"静默吞掉。
+    // 修法:与同类的 +dictionaryWithObjects:forKeys: 一致,走 `[[this alloc] initWithObjects:forKeys:]`,
+    // 让接收者类决定可变性(_touchHLE_NSDictionary / _touchHLE_NSMutableDictionary 都实现了该 init)。
+    // 临时数组用 from_vec 构造(要求元素已 retain),init 内部会自行 retain/copy,用完即 release。
+    retain(env, object);
+    let objects = ns_array::from_vec(env, vec![object]);
+    retain(env, key);
+    let keys = ns_array::from_vec(env, vec![key]);
+    let new_dict: id = msg![env; this alloc];
+    let new_dict: id = msg![env; new_dict initWithObjects:objects forKeys:keys];
+    release(env, objects);
+    release(env, keys);
     autorelease(env, new_dict)
 }
 

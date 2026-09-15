@@ -20,7 +20,6 @@ use crate::objc::{
 use crate::Environment;
 use plist::Value;
 use std::io::Cursor;
-use std::ops::Add;
 use std::time::{Duration, SystemTime};
 
 pub type NSPropertyListMutabilityOptions = NSUInteger;
@@ -219,7 +218,11 @@ fn deserialize_plist(
         }
         Value::Date(date_val) => {
             let time: SystemTime = (*date_val).into();
-            let time_interval = time.duration_since(apple_epoch()).unwrap().as_secs_f64();
+            // [深扫修 2026-09-12] 2001 年以前的日期 duration_since 返回 Err,原来 unwrap 直接 panic。
+            let time_interval = match time.duration_since(apple_epoch()) {
+                Ok(d) => d.as_secs_f64(),
+                Err(e) => -e.duration().as_secs_f64(),
+            };
             let date: id = msg_class![env; NSDate alloc];
             msg![env; date initWithTimeIntervalSinceReferenceDate:time_interval]
         }
@@ -333,7 +336,25 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
         Value::Data(buffer_slice.to_vec())
     } else if class == env.objc.get_known_class("NSDate", &mut env.mem) {
         let date = env.objc.borrow::<NSDateHostObject>(plist);
-        let time = apple_epoch().add(Duration::from_secs_f64(date.time_interval));
+        // [深扫修 2026-09-12] 原来 Duration::from_secs_f64 遇到 2001 年以前的日期(负值)
+        // 或 NaN/inf 会直接 panic。负值改为从纪元往回减,非法值记日志后按参考日期写出。
+        let interval = date.time_interval;
+        let time = Duration::try_from_secs_f64(interval.abs())
+            .ok()
+            .and_then(|d| {
+                if interval >= 0.0 {
+                    apple_epoch().checked_add(d)
+                } else {
+                    apple_epoch().checked_sub(d)
+                }
+            })
+            .unwrap_or_else(|| {
+                log!(
+                    "[!] NSPropertyListSerialization: NSDate 时间值 {} 无法表示,按 2001-01-01 写出",
+                    interval
+                );
+                apple_epoch()
+            });
         Value::Date(time.into())
     } else {
         unimplemented!("class {}", env.objc.get_class_name(class))

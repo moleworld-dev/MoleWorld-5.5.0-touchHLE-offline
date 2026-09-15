@@ -37,6 +37,10 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// [深扫修 2026-09-11] 原子写([Fs::write_atomic])在宿主同目录使用的隐藏临时文件后缀。
+/// 完整文件名形如 `.<目标文件名>.touchhle-tmp`。
+const ATOMIC_WRITE_TMP_SUFFIX: &str = ".touchhle-tmp";
+
 /// The actual location of a file outside the virtual filesystem, e.g. a host
 /// file path.
 #[derive(Debug)]
@@ -97,6 +101,26 @@ impl FsNode {
             } else {
                 kind
             };
+
+            // [深扫修 2026-09-11] 清理原子写残留的隐藏临时文件(见 [Fs::write_atomic])。
+            // 根因:进程若恰好死在"写临时文件"与"rename 覆盖"之间,宿主目录会留下
+            // `.<名>.touchhle-tmp`;不清理的话下次启动它会作为普通文件出现在 guest 的
+            // Documents 视图里(游戏枚举目录时能看到)。目标文件本身此时仍是完整旧版,
+            // 所以直接删掉残留即可,不影响任何存档。只对可写的沙盒目录做,bundle 不碰。
+            if writeable && kind.is_file() && name.ends_with(ATOMIC_WRITE_TMP_SUFFIX) {
+                match std::fs::remove_file(&host_path) {
+                    Ok(()) => {
+                        log!(
+                            "[fs] 启动时清理原子写残留临时文件 {:?}(上次写盘被打断,目标文件仍是完整旧版)",
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!("[fs] 无法清理原子写残留临时文件 {:?}: {}", host_path, e);
+                    }
+                }
+                continue;
+            }
 
             if kind.is_file() {
                 children.insert(
@@ -943,6 +967,147 @@ impl Fs {
         self.open_with_options(path, options)?
             .write_all(data)
             .map_err(FsError::IoError)
+    }
+
+    /// [深扫修 2026-09-11] 原子写:`writeToFile:atomically:YES` /
+    /// `writeToFile:options:NSDataWritingAtomic` 的真实语义。
+    ///
+    /// 根因:原来所有写盘都走 [Self::write] = `O_TRUNC` 打开后 `write_all`,
+    /// "先截断再写"。进程恰好死在截断与写入之间(关终端 SIGHUP、强退、断电、
+    /// 磁盘满)会留下 0 字节/残缺文件。摩尔庄园读到残缺的 userinfo.dat 会在
+    /// checkUserinfoMd5: 崩溃或走反作弊删档分支(连 map.dat 一起删),map.dat
+    /// 残缺会 resetUserGameData 整档清空;偏好 plist 残缺会让 isEncrypt 读成 NO
+    /// 而每次启动 exit(0)。真机 iOS 靠 NSDataWritingAtomic 天然防住,这是移植层退化。
+    ///
+    /// 做法:解析出目标的宿主真实路径 → 在宿主同目录写隐藏临时文件
+    /// `.<名>.touchhle-tmp` → `std::fs::rename` 覆盖目标。同卷 rename 在
+    /// macOS/Linux/Android/iOS 上是原子的,Windows 上是 MoveFileExW
+    /// (REPLACE_EXISTING),读者只会看到完整旧版或完整新版。
+    /// - 目标 guest 节点不存在时补建(与 [Self::open_with_options] 创建新文件一致)。
+    /// - 刻意不复用 [Self::rename]:它内部有 `assert!`/`unimplemented!`,且会让临时
+    ///   文件短暂出现在 guest 目录视图里。临时文件只存在于宿主侧。
+    /// - 刻意不调 `sync_all`:Apple 平台上它是 F_FULLFSYNC,每次几十毫秒且跑在模拟
+    ///   线程上,岛上节拍落盘一次写 6 个文件会明显卡顿;防进程被杀 rename 已足够。
+    ///   残余风险:断电/内核崩溃时未落盘的新数据可能丢失(但一般仍是完整旧版)。
+    /// - rename 失败(例如 Windows 上目标正被打开)时回落到旧的非原子写,保证不比
+    ///   修复前更差。启动时残留临时文件由 [FsNode::from_host_dir] 清理。
+    pub fn write_atomic<P: AsRef<GuestPath>>(
+        &mut self,
+        path: P,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let path = path.as_ref();
+
+        let (parent_node, file_name) = self
+            .lookup_parent_node(path)
+            .ok_or(FsError::DoesNotExist)?;
+        let FsNode::Directory {
+            children,
+            writeable: dir_host_path,
+        } = parent_node
+        else {
+            return Err(FsError::NonexistentParentDir);
+        };
+
+        // 解析目标的宿主路径;记下是否需要补建 guest 节点。
+        let (target_host_path, need_new_node): (PathBuf, bool) = match children.get(&file_name) {
+            Some(FsNode::File {
+                location,
+                writeable,
+            }) => {
+                if !*writeable {
+                    log!("Warning: attempt to write to read-only file {:?}", path);
+                    return Err(FsError::AccessDenied);
+                }
+                match location {
+                    FileLocation::Path(host_path) => (host_path.clone(), false),
+                    FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => {
+                        log!("Warning: attempt to write to read-only file {:?}", path);
+                        return Err(FsError::AccessDenied);
+                    }
+                }
+            }
+            Some(FsNode::Directory { .. }) => return Err(FsError::IsDirectory),
+            None => {
+                let Some(dir_host_path) = dir_host_path else {
+                    log!(
+                        "Warning: attempt to create file at path {:?}, but directory is read-only",
+                        path
+                    );
+                    return Err(FsError::AccessDenied);
+                };
+                if file_name.chars().any(std::path::is_separator) {
+                    log!(
+                        "Warning: attempt to create file at path {:?}, but filename contains a path separator",
+                        path
+                    );
+                    return Err(FsError::AccessDenied);
+                }
+                (dir_host_path.join(&file_name), true)
+            }
+        };
+
+        let tmp_host_path =
+            target_host_path.with_file_name(format!(".{}{}", file_name, ATOMIC_WRITE_TMP_SUFFIX));
+
+        // 1) 写临时文件(create+truncate 的是临时文件,目标完全不动)。
+        let tmp_result = (|| -> std::io::Result<()> {
+            let mut tmp = File::create(&tmp_host_path)?;
+            tmp.write_all(data)?;
+            tmp.flush()?;
+            Ok(())
+        })();
+
+        let final_result = match tmp_result {
+            Ok(()) => {
+                // 2) 同目录 rename 覆盖目标 = 原子替换。
+                match fs::rename(&tmp_host_path, &target_host_path) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        log!(
+                            "[fs] 原子写 rename {:?} -> {:?} 失败({}),回落为非原子写",
+                            tmp_host_path,
+                            target_host_path,
+                            e
+                        );
+                        let _ = fs::remove_file(&tmp_host_path);
+                        File::create(&target_host_path).and_then(|mut f| f.write_all(data))
+                    }
+                }
+            }
+            Err(e) => {
+                // 临时文件都写不出来(磁盘满等):目标保持完整旧版,返回失败。
+                log!(
+                    "[fs] 原子写临时文件 {:?} 失败({}),目标 {:?} 保持原样未改动",
+                    tmp_host_path,
+                    e,
+                    target_host_path
+                );
+                let _ = fs::remove_file(&tmp_host_path);
+                Err(e)
+            }
+        };
+
+        if let Err(e) = final_result {
+            return Err(FsError::IoError(e));
+        }
+
+        // 3) 目标原本不存在:补建 guest 节点,之后 open/exists 才能看到它。
+        if need_new_node {
+            log_dbg!(
+                "Created file at path {:?} (host path: {:?}) via atomic write",
+                path,
+                target_host_path
+            );
+            children.insert(
+                file_name,
+                FsNode::File {
+                    location: FileLocation::Path(target_host_path),
+                    writeable: true,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Like [File::open] but for the guest filesystem.
