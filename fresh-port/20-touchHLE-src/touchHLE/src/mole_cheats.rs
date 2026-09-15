@@ -3936,6 +3936,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         ))
         // [同步 iOS 2026-09-16] 启动第一屏竖屏 winSize 修正:不论是否开 UI43,只在缓存可能还是竖屏时放行(闩住后一次原子读)。
         || (sel == "winSize" && WINSIZE_STALE.load(O))
+        // [2026-09-16] 宽屏宽版底图锚点对齐(不依赖 UI43;is_widescreen() 只读两个 OnceLock)。
+        || (sel == "addChild:z:tag:" && crate::window::is_widescreen())
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -3945,6 +3947,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] 喂给白名单 UI 的原生设计尺寸(iPad landscape 4:3)。
 const UI43_W: f32 = 1024.0;
 const UI43_H: f32 = 768.0;
+/// [2026-09-16] 宽屏宽版整屏底图 X_wide.png 的宽度(fs.rs 重定向,20d64e9 生成:原画居中、左右各外扩 384)。
+const WIDE_BG_W: f32 = 1792.0;
 /// [同步 iOS 2026-09-16] cocos2d 缓存的 winSize 是否可能仍是启动时的竖屏值(见 intercept 里「启动第一屏」臂)。
 /// 一旦读到横屏就置 false,之后 winSize 在默认模式下不再进 intercept。
 static WINSIZE_STALE: AtomicBool = AtomicBool::new(true);
@@ -4253,6 +4257,7 @@ struct Ui43Sels {
     oai: SEL,
     parent: SEL,
     rel_ap: SEL,
+    set_ap: SEL,
 }
 fn ui43_sels(env: &mut Environment) -> Ui43Sels {
     let mut r = |n: &str| env.objc.register_host_selector(n.to_string(), &mut env.mem);
@@ -4268,6 +4273,7 @@ fn ui43_sels(env: &mut Environment) -> Ui43Sels {
         oai: r("objectAtIndex:"),
         parent: r("parent"),
         rel_ap: r("isRelativeAnchorPoint"),
+        set_ap: r("setAnchorPoint:"),
     }
 }
 
@@ -4517,6 +4523,46 @@ fn ui43_on_add_child(env: &mut Environment) {
     ];
     let s = ui43_sels(env);
     ui43_stretch_child(env, child, off, real_w, &s);
+    for (i, v) in saved.iter().enumerate() {
+        env.cpu.regs_mut()[i] = *v;
+    }
+}
+
+/// [2026-09-16] 宽屏宽版底图按设计锚点对齐。fs 层在宽屏下把 1024×768 整屏底图换成 X_wide.png(1792×768),
+/// 宽图是**原画居中、左右各外扩 384** 生成的。游戏按 1024 宽设计摆放:锚点居中的(钓鱼 fishbg)换图后原画
+/// 仍对准设计坐标;锚点贴左的(-[MinerGame setBg]@0x1380d8、-[Plow setBg]@0x15359c 都是
+/// setAnchorPoint:(0,0) + setPosition:(0,0),再加到 fakeParent 容器上)换图后原画整体偏右 384,矿石/木桩
+/// 与底图错位;叠加 UI43 根层右移后左侧还露出下面的村庄。
+/// 修法:加进节点树时(addChild:z:tag: 是 cocos2d 所有 addChild 变体的汇合点)把锚点 x 从设计锚点 a
+/// 映射成 (a·1024 + 384)/1792,原画左边缘就回到按 1024 宽设计时的位置。只认 contentSize 恰为 1792×768、
+/// scaleX=1、锚点 x 恰为 0 或 1 的 CCSprite:映射后的锚点不再是 0/1,重复触发(子类 addChild 转发 super、
+/// 同一精灵再次加入)天然幂等;锚点 0.5 映射后仍是 0.5,不用处理。4:3 下 is_widescreen() 为假,不进这里。
+fn wide_bg_align_on_add_child(env: &mut Environment) {
+    let child: id = Ptr::from_bits(env.cpu.regs()[2]);
+    if child == nil || !ui43_is_kind(env, child, "CCSprite") {
+        return;
+    }
+    let saved = [
+        env.cpu.regs()[0],
+        env.cpu.regs()[1],
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+    ];
+    let s = ui43_sels(env);
+    let cs: CGSize = msg_send(env, (child, s.cs));
+    if (cs.width - WIDE_BG_W).abs() < 0.5 && (cs.height - UI43_H).abs() < 0.5 {
+        let sx: f32 = msg_send(env, (child, s.sx));
+        let ap: CGPoint = msg_send(env, (child, s.ap));
+        if (sx - 1.0).abs() < 1e-3 && (ap.x == 0.0 || ap.x == 1.0) {
+            let nx = (ap.x * UI43_W + (WIDE_BG_W - UI43_W) / 2.0) / WIDE_BG_W;
+            let _: () = msg_send(env, (child, s.set_ap, CGPoint { x: nx, y: ap.y }));
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, O) < 20 {
+                let (ax, ay) = (ap.x, ap.y);
+                log!("[宽屏底图] 1792×768 宽版底图锚点 ({},{}) → ({},{}),原画对齐 1024 设计坐标", ax, ay, nx, ay);
+            }
+        }
+    }
     for (i, v) in saved.iter().enumerate() {
         env.cpu.regs_mut()[i] = *v;
     }
@@ -5002,6 +5048,10 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     if sel == "onEnter" && ui43_mode() {
         ui43_center_on_enter(env);
         return false;
+    }
+    // [2026-09-16] 宽屏宽版底图按设计锚点对齐(见 wide_bg_align_on_add_child);不 return,下面的 UI43 臂照常处理。
+    if sel == "addChild:z:tag:" && crate::window::is_widescreen() {
+        wide_bg_align_on_add_child(env);
     }
     // [MoleWorld 宽屏适配·居中偏移 v2] 已右移根层收到迟到的全宽背景子节点 → 当场拉伸铺满(见 ui43_on_add_child)。
     if ui43_mode() && (sel == "addChild:" || sel == "addChild:z:" || sel == "addChild:z:tag:") {
