@@ -4177,27 +4177,41 @@ fn ui43_inner<R>(env: &mut Environment, f: impl FnOnce(&mut Environment) -> R) -
 /// 纳入 4:3 的是【多元素复杂布局】UI——不喂设计尺寸就会被 Δ=164pt 拉散(实证:商店网格散架、
 /// 捉虫结算 "TOTAL" 截断、切水果卡片末项裁切):商店全套、8 类小游戏及其选关/成就面板、
 /// 各节日活动弹窗、好友/礼物/任务/VIP/兑换等面板。
+/// [2026-09-16 补 4 处] 白名单小游戏的子对象自己调 winSize 算方向/边界/出生点。当初生成名单时按「世界内移动
+/// 对象」排除了,于是拿到真实宽 1188,和所在根层的 1024 虚拟坐标对不上:
+///   · 0x147280 -[Fruit initWithType:type:parentNode:initPos:maxTime:minTime:]:initPos.x 与 width/3、2·width/3
+///     比较来决定抛射方向。同类 -[Fruit genarateVelocity:] 的 0x147572 读的是 height(stret 缓冲在 sp+4、
+///     读 [sp,#8]),不用加;
+///   · 0x1a3f84 -[FishObject setFishPosition:isLeft:]:结果写进 ivar winSize(+468),再算鱼的入场点(左侧分支用
+///     常量加随机数,右侧分支是否用 width 没逐条核实,纳入无害);
+///   · 0x1af8c2 -[BugObject initwithFile:]:写进 ivar winSize(+500)。nextPositionFrom: 按它夹紧虫子 x,Level3/4
+///     的虫子会跑到右侧 82pt 屏外点不到,左侧 82pt 却没有虫;0x1af96c 还按 width×常量算 speed,宽屏快约 16%;
+///   · 0x35e6ac -[WashRoomActor initWithIndex:type:parentNode:pathType:]:写进 ivar winSize(+488),
+///     getRandomOriginalPos 在 0x35e98e 取 width×0.5 算出生点,宽屏偏右 82。
+/// 四个类都只由白名单小游戏创建(classref:Fruit←CutFruit、FishObject←FishingGame、BugObject←Level2/3/4、
+/// WashRoomActor←WashRoomGame),主村不受影响。ActorManager GenarateScreenPos:(主村全局对象)和
+/// GoldSprite/XPSprite/MovableIcon(世界飘字)仍保持真实宽度。★插入时必须保持升序,否则 binary_search 静默失效。
 const UI43_CALLSITES: &[u32] = &[
     0xb468, 0xa71fe, 0xc07fa, 0xc93d0, 0xde600, 0xf2386, 0xf29fc, 0xf2b14,
     0xf2f46, 0xfbbe2, 0xfc76a, 0xfdb48, 0xfe6f4, 0xfe91c, 0x10fe60, 0x1102fc,
     0x110754, 0x110c42, 0x111952, 0x123932, 0x129e0a, 0x12d7c2, 0x134144, 0x134a86,
     0x13577e, 0x1358b6, 0x135bae, 0x136024, 0x137042, 0x1371d2, 0x1381d2, 0x13836e,
     0x138e24, 0x139e34, 0x13aab2, 0x13c338, 0x13c6e0, 0x13e318, 0x13f52e, 0x13f82a,
-    0x140d86, 0x144532, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0, 0x156604,
+    0x140d86, 0x144532, 0x147280, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0, 0x156604,
     0x156916, 0x156ab2, 0x156da6, 0x158354, 0x159486, 0x159ac0, 0x164fa6, 0x165146,
     0x16641e, 0x1676d6, 0x168adc, 0x168fa0, 0x169eda, 0x16a06a, 0x16a3d2, 0x16ba8c,
     0x17176a, 0x174ade, 0x177ea2, 0x17b8ba, 0x17e12c, 0x17e51e, 0x17ea02, 0x17ec6c,
     0x17ed3a, 0x17f1ea, 0x17f37a, 0x17f66c, 0x1806c8, 0x180d98, 0x18667c, 0x188bc2,
     0x18a138, 0x18c2bc, 0x18c3e8, 0x18cc24, 0x18d1fa, 0x18e790, 0x190a2e, 0x192de0,
-    0x193704, 0x193b36, 0x19c3d0, 0x1a24ec, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e,
-    0x1b11ec, 0x1b1c74, 0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c,
+    0x193704, 0x193b36, 0x19c3d0, 0x1a24ec, 0x1a3f84, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e,
+    0x1af8c2, 0x1b11ec, 0x1b1c74, 0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c,
     0x1d2274, 0x1d33b4, 0x1d40ee, 0x1e299e, 0x1e50aa, 0x1e6206, 0x1e73d4, 0x1eb2c8,
     0x1f00a2, 0x1f21fc, 0x1f2c3c, 0x1fea1e, 0x1fffb6, 0x1fffd6, 0x1fffec, 0x200314,
     0x210a9a, 0x2126f0, 0x213060, 0x217e7e, 0x233188, 0x235e68, 0x23687a, 0x23f17e,
     0x246ce6, 0x24a802, 0x24d4b2, 0x2553ae, 0x27abfe, 0x2c0942, 0x2d9d7a, 0x2ec99a,
     0x2f68d0, 0x2f8190, 0x301562, 0x30ba98, 0x30f5d2, 0x310186, 0x3107ec, 0x318ef2,
     0x323c0c, 0x32d78e, 0x32ffea, 0x3319a2, 0x3335fe, 0x336bc4, 0x339d5a, 0x345a52,
-    0x352f00, 0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x36a260, 0x36e3c6, 0x370270,
+    0x352f00, 0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x35e6ac, 0x36a260, 0x36e3c6, 0x370270,
     0x370c80, 0x371140, 0x375fb6, 0x37794a, 0x3796b4, 0x37af1c, 0x37cb66, 0x37de44,
     0x37fb0a, 0x381434, 0x392f4a, 0x396402, 0x3969a8, 0x397618, 0x39ac00, 0x39ca68,
     0x3a035a, 0x3a3ef8, 0x3a8ddc, 0x3ae616, 0x3af228, 0x3afb16, 0x3b5230, 0x3b770c,
@@ -4218,6 +4232,16 @@ const UI43_CALLSITES: &[u32] = &[
 /// 它们从不调 winSize,坐标全来自 1024 设计布局表,所以按 winSize 调用点生成的名单漏掉了它们 → 宽屏下贴左不居中
 /// (同模板的 QuestLayer/DailyQuestLayer/LevelUpLayer 早在名单里)。已核实五个类都没有自己的触摸处理和
 /// locationInView:/convertTo* 调用(按钮走 CCMenu 真实变换),所以不需要补 UI43_CODE_RANGES。
+/// [2026-09-16 补 4 个] 布局表类另补 4 个剧情对话层:StoryLayer(农场剧情)、TimeStoryLayer(限时任务剧情)、
+/// VipStoryLayer(VIP 剧情)、NewSceneStoryLayer(黄金岛剧情)。它们同样是 CCLayer 直接子类、从不调 winSize:
+/// -[StoryLayer nextStep]@0x114950(另三类在 0x1dde8c/0x385f7c/0x32e3bc,同一套代码)的对话条、左右 NPC、
+/// 箭头、点击提示全按 getPoint:@"story_*" 摆放,point_sizeiPad.plist 里是 1024 设计坐标(如 story_right_npc
+/// =(910,30)、story_right_arrow=(824,147))→ 宽屏下整体贴左 82pt,右侧露出村庄。挂法与名单里已有的层相同
+/// (前三个在 -[InGameScene init] 里 addChild,NewSceneStoryLayer 在 -[GameNewScene addMainVillageLayer:]
+/// 里和 NewSceneLevelUp/OscarDialogueLayer 挂到同一父节点)。四个类的 ccTouchesEnded:withEvent:
+/// (0x115584/0x1deac0/0x386bb0/0x32efd4)只调 nextStep、不读坐标,所以同样不需要补 UI43_CODE_RANGES。
+/// 整屏插图 story%d_wide(1792 宽)直接挂在层上,走 ui43_stretch_child 的 WIDE-KEEP 分支,不会被压扁。
+/// ★插入时按字节序(与 &str 的 Ord 一致),否则 binary_search 静默失效。
 const UI43_OFFSET_CLASSES: &[&str] = &[
     "AcceptFriendsLayer", "AccountBindingLayer", "AchieveSystemLayer", "AchivementLayer",
     "ActionCenterLayer", "ActionCodeLayer", "ActionLevelLayer", "ActivityBulletinLayer",
@@ -4245,7 +4269,7 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
     "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase",
     "MusicHallLayer", "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
-    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneTestLayer",
+    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneStoryLayer", "NewSceneTestLayer",
     "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView", "NoticeBoardLayer",
     "OpenTreasureChestMainLayer", "OptionLayer", "OscarDialogueLayer", "PaintingAchivement",
     "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer", "PersonalTargetLayer",
@@ -4256,10 +4280,10 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer", "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer",
     "SeekViewController", "ShopItemsLayer", "ShoppingView", "ShowActivityRuleLayer",
     "ShowFreeShellsLayer", "ShowMoreFriendsLayer", "ShowRuleLayer", "SpringPoemGetRewardLayer",
-    "SpringPoemIntroduceLayer", "SpringPoemMainLayer", "SpringPoemPageLayer", "TeamTargetLayer",
-    "TestLayer", "TimeQuestLayer", "TourLineLayer", "TreasureHuntPopLayer",
+    "SpringPoemIntroduceLayer", "SpringPoemMainLayer", "SpringPoemPageLayer", "StoryLayer", "TeamTargetLayer",
+    "TestLayer", "TimeQuestLayer", "TimeStoryLayer", "TourLineLayer", "TreasureHuntPopLayer",
     "TreasureRewardLayer", "VIPFunctionsLayer", "VIPLayer", "VerifyInviteCodeLayer",
-    "VipQuestLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
+    "VipQuestLayer", "VipStoryLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
     "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
 ];
 
@@ -4273,12 +4297,24 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
 /// 地址,一旦落在区间内就会把 UIKit 控件的触摸坐标也错扣 off。生成后自检:LC_FUNCTION_STARTS 里
 /// 落在区间内的非白名单函数起点必须为 0。
 /// 调用者 LR 落在区间内 = "白名单代码在问",此时触摸/世界坐标要按虚拟世界 ±off 换算。
+/// [2026-09-16 扩 2 段] 两个不在类名单里、但只在白名单小游戏里用的触摸辅助类,并入紧挨着的下一段
+/// (首尾正好相接,段数不变):
+///   · TouchTrailLayer [0x143b6c,0x1444a0)(9 个方法):CutFruit 在 ccTouchBegan/Moved 里把触摸原样转发给它;
+///     它在 0x143c30/0x143e58 调 locationInView:,再拿去 checkLists:touchPos: 和水果的虚拟坐标比对
+///     (-[Fruit checkAreaTouched:] 0x148cac CGRectContainsPoint)→ 宽屏下切中判定和刀光都偏右 82pt。
+///     前面的 0x1430c0..0x143b6c 是 CCBlade(刀光绘制),不纳入;
+///   · BackgroundSprite [0x17d6e8,0x17e0ac)(12 个方法):ccTouchEnded:withEvent: 在 0x17d9b0 取 locationInView:
+///     放进新建的 CCNode,回调 Level1-4 PrintMessage: 把拍打精灵 beat 摆过去 → 特效偏右 82pt。它的命中判定走
+///     containsTouchLocation: 里的 convertTouchToNodeSpace:(不在换算表),修前修后都对。前面的
+///     0x17d5d0..0x17d6e8 是 SeabedSeekingTreasureData,不纳入。
+/// 两段都已按 LC_FUNCTION_STARTS 核对,只含该类的函数起点(自检时把这两个类当白名单);段内没有
+/// convertToWorldSpace/convertToNodeSpace/convertToUI 调用,不会引入 +off 误伤;classref 只在 CutFruit、Level1-4。
 const UI43_CODE_RANGES: &[(u32, u32)] = &[
     (0xb2c0, 0xe890), (0xa70fc, 0xa7eb8), (0xc06c8, 0xc5a30), (0xc92a4, 0xcbda8),
     (0xde4cc, 0xdf040), (0xf2298, 0xf32b8), (0xfbb64, 0xfbd88), (0xfc628, 0x1001d4),
     (0x10fdd0, 0x111858), (0x1118b0, 0x112234), (0x123804, 0x123d9c), (0x128844, 0x12ad80),
-    (0x12d698, 0x12dda0), (0x133e4c, 0x1430c0), (0x1444a0, 0x147050), (0x14ce50, 0x151580),
-    (0x152b50, 0x1596f8), (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17e0ac, 0x180b54),
+    (0x12d698, 0x12dda0), (0x133e4c, 0x1430c0), (0x143b6c, 0x147050), (0x14ce50, 0x151580),
+    (0x152b50, 0x1596f8), (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17d6e8, 0x180b54),
     (0x180c6c, 0x182f90), (0x186500, 0x18c7e8), (0x18cb90, 0x1900f8), (0x190998, 0x193e24),
     (0x19c330, 0x19cf10), (0x1a2448, 0x1a3ef8), (0x1a66a8, 0x1a8e58), (0x1ab468, 0x1ae628),
     (0x1ae6d8, 0x1af850), (0x1b10e4, 0x1b35ec), (0x1b3f58, 0x1b89dc), (0x1baef0, 0x1bd7fc),
@@ -5125,8 +5161,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 env.mem.write(h, rh);
                 static N: AtomicU32 = AtomicU32::new(0);
                 let n = N.fetch_add(1, O);
-                if n < 12 {
+                // [2026-09-16] 每次启动首屏布局期间都会命中约 5 次,以前每次启动往 touchHLE_log.txt 刷 5 行。
+                // 首条保留 log! 作为修正生效的证据,其余降为 log_dbg!(调试时仍能打开);修正逻辑本身不变。
+                if n == 0 {
                     log!("[启动第一屏] winSize 竖屏缓存修正 #{n} lr={lr:#x} ({cw},{ch}) → ({rw},{rh})");
+                } else if n < 12 {
+                    log_dbg!("[启动第一屏] winSize 竖屏缓存修正 #{n} lr={lr:#x} ({cw},{ch}) → ({rw},{rh})");
                 }
                 return true;
             }
