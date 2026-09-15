@@ -777,19 +777,20 @@ impl GLES for GLES1OnGL2<'_> {
     }
     // TODO: GetFixedv
     unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat) {
-        let (type_, _count) = GET_PARAMS.get_type_info(pname);
-        match type_ {
-            ParamType::Float | ParamType::FloatSpecial => {
-                gl21::GetFloatv(pname, params);
-            }
-            _ => unimplemented!("TODO: type conversion for {:?}", type_),
-        }
+        // [MoleKart] As with GetIntegerv: forward float state queries straight to
+        // desktop GL, which converts int/boolean state to float and tolerates
+        // capability enums not enumerated in GET_PARAMS instead of panicking.
+        gl21::GetFloatv(pname, params);
     }
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
-        let (type_, _count) = GET_PARAMS.get_type_info(pname);
-        // TODO: type conversion
-        let allowed_float = type_ == ParamType::Float && pname == gl21::POINT_SIZE_MAX;
-        assert!(type_ == ParamType::Int || allowed_float);
+        // [MoleKart] Forward integer state queries straight to desktop GL, which
+        // validates the enum and performs the spec-mandated conversion for every
+        // state type (float rounded to nearest int, GLboolean → {0,1}). We skip the
+        // GET_PARAMS table lookup on purpose: Unity 3.x's GLES1.1 fixed-function
+        // path queries capability enums the table doesn't enumerate (e.g.
+        // GL_SMOOTH_LINE_WIDTH_RANGE, GL_MAX_RENDERBUFFER_SIZE 0x84E8), and the
+        // table would panic on them. gl21 sets GL_INVALID_ENUM for anything it
+        // genuinely doesn't know instead of crashing the emulator.
         gl21::GetIntegerv(pname, params);
     }
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
