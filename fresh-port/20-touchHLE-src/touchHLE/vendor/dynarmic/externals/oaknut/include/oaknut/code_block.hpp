@@ -32,7 +32,11 @@ public:
         m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 #elif defined(__APPLE__)
 #    if TARGET_OS_IPHONE
-        m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+        // [MoleWorld iOS] iOS:纯 RWX(不带 MAP_JIT)。实测 mmap(...MAP_JIT) 在未授权 JIT 的 iOS
+        // 第三方 app 上返回 MAP_FAILED(-1),dynarmic 随后往 -1 写码 → EmitPrelude 崩(code=1)。
+        // 所以不能用 MAP_JIT。纯 RWX 页:写恒可行;能否执行取决于进程是否被置上 CS_DEBUGGED
+        // (调试器)——这是「带调试器 JIT」在 iOS 上的标准做法(UTM 等同款)。
+        m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
 #    else
         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
 #    endif
@@ -72,18 +76,21 @@ public:
 
     void protect()
     {
+        // [MoleWorld iOS] iOS(TARGET_OS_IPHONE)故意空操作:JIT 页恒为 RWX,不做 W^X 翻转
+        // (iOS 上 pthread_jit_write_protect_np 不可用;RWX 写后执行由 CS_DEBUGGED 放行)。
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
         pthread_jit_write_protect_np(1);
-#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#elif defined(__NetBSD__) || defined(__OpenBSD__)
         mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
 #endif
     }
 
     void unprotect()
     {
+        // [MoleWorld iOS] 见 protect():iOS 空操作(页恒 RWX)。
 #if defined(__APPLE__) && !TARGET_OS_IPHONE
         pthread_jit_write_protect_np(0);
-#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#elif defined(__NetBSD__) || defined(__OpenBSD__)
         mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
 #endif
     }
