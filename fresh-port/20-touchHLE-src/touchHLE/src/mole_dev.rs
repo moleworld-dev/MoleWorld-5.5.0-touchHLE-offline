@@ -1356,3 +1356,82 @@ pub fn toggle_trace() -> DevResult {
         Ok("选择子跟踪:关".to_string())
     }
 }
+
+// ───────────────────────── 无头文本命令 ─────────────────────────
+
+/// [2026-09-16] A1-04 文本命令的数字参数解析,失败时把原文带进提示。
+fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T, String> {
+    raw.parse::<T>()
+        .map_err(|_| format!("{}「{}」不是合法的数字", what, raw))
+}
+
+/// [2026-09-16] A1-04 无头文本命令台:执行命令文件(mole_diag::next_inject)里的一行开发命令。
+/// 根因:回归脚本原来只能按菜单格子坐标点开发工具、隐藏物品、任务跳转,要开菜单、翻页、输寄存器好几步;
+/// 菜单加页、宽屏 --fill-screen 多出水平偏移,坐标就失效。这里按名字直接调菜单按钮背后的同一批函数:
+///   dev fps | dev grid | dev center | dev speed <倍率> → toggle_fps / toggle_map_grid / camera_center / set_time_scale
+///   quest main|time|vip|island <任务号>                → quest_jump
+///   time <分钟>                                        → apply_time_minutes
+///   give <物品ID>                                      → mole_items::place_item(与召唤页、隐藏物品页同一入口)
+/// 在线模式、场景、数值范围的拒绝都由这些函数自己给出,与菜单点按钮完全一致,这里不另加门。
+/// 刻意不开放时间旅行、快照恢复、删档:菜单上它们要二次确认,脚本一行就触发太危险。
+/// `menu <页名>`:按页名打开菜单要 mole_menu 提供翻页接口(当前页是它的私有状态),那不归本包,先明确报错;
+/// 不带参数的 `menu` 仍由 mole_diag 当开关处理。
+/// 调用上下文:frameworks/uikit.rs handle_events 的注入分派点,与菜单 handle_touch 相同,可以发宿主 msg_send。
+pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
+    let mut words = line.split_whitespace();
+    let head = words.next().unwrap_or("");
+    let args: Vec<&str> = words.collect();
+    match head {
+        "dev" => match args.as_slice() {
+            ["fps"] => toggle_fps(env),
+            ["grid"] => toggle_map_grid(env),
+            ["center"] => camera_center(env),
+            ["speed", x] => {
+                let scale: f32 = parse_command_number(x, "倍率")?;
+                set_time_scale(env, scale)
+            }
+            _ => Err("用法:dev fps | dev grid | dev center | dev speed <0.25..4>".to_string()),
+        },
+        "quest" => match args.as_slice() {
+            [family, n] => {
+                let family = match *family {
+                    "main" => QuestFamily::Main,
+                    "time" => QuestFamily::Time,
+                    "vip" => QuestFamily::Vip,
+                    "island" => QuestFamily::Island,
+                    other => {
+                        return Err(format!(
+                            "任务族「{}」不认识,只能是 main / time / vip / island",
+                            other
+                        ));
+                    }
+                };
+                let quest_id: i64 = parse_command_number(n, "任务号")?;
+                quest_jump(env, family, quest_id)
+            }
+            _ => Err("用法:quest main|time|vip|island <任务号>".to_string()),
+        },
+        "time" => match args.as_slice() {
+            [m] => {
+                let minutes: i64 = parse_command_number(m, "分钟数")?;
+                apply_time_minutes(env, minutes)
+            }
+            _ => Err(format!("用法:time <分钟>(1..{})", TIME_SKIP_MAX_MINUTES)),
+        },
+        "give" => match args.as_slice() {
+            [id] => {
+                let item: u32 = parse_command_number(id, "物品 ID")?;
+                crate::mole_items::place_item(env, item)
+            }
+            _ => Err("用法:give <物品ID>".to_string()),
+        },
+        "menu" => Err(format!(
+            "暂不支持按页名打开菜单(「{}」):mole_menu 还没有翻页接口,请用不带参数的 menu 开关菜单",
+            args.join(" ")
+        )),
+        _ => Err(format!(
+            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / time / give",
+            head
+        )),
+    }
+}

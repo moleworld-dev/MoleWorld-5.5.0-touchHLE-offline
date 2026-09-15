@@ -183,6 +183,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     // can't be clicked via the host). One Down/Up step per call; coordinates are
     // guest screen points.
     // [扫描修 2026-09-15] 注入的触摸同样先经过系统弹框(route_touch),脚本可以点弹框按钮。
+    // [2026-09-16] A1-04 注入通道改由 MOLE_DEV 或 MOLE_DIAG 打开,命令文件首选用户数据目录下的 mole_input
+    // (兼容 /tmp/mole_input,见 mole_diag::next_inject);新增 Inject::Dev 文本开发命令,在下面分派。
     if let Some(inject) = crate::mole_diag::next_inject() {
         match inject {
             crate::mole_diag::Inject::Menu => {
@@ -237,6 +239,21 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     crate::window::SuspendEnd::Timer(std::time::Duration::from_secs_f32(secs)),
                     "注入 suspend",
                 );
+            }
+            crate::mole_diag::Inject::Dev(line) => {
+                // [2026-09-16] A1-04 无头文本命令台:脚本按名字调开发工具、任务跳转、发物品,不再按菜单格子坐标点
+                // (菜单加页、宽屏 --fill-screen 的水平偏移都会让坐标失效)。这里与上面的菜单 handle_touch 同在
+                // run loop 顶部的 UIKit 事件上下文,不在 drawScene/mainLoop 帧栈上、也不在 objc_msgSend 钩子里,
+                // 菜单按钮本来就在这里调 mole_dev / mole_items,可以发宿主 msg_send,不需要恢复 r0–r3。
+                // 结果固定写一行 `[DEVCMD] ok|err`,供脚本 grep;在线模式、场景、数值范围的拒绝由被调函数给出,与菜单一致。
+                match crate::mole_dev::run_text_command(env, &line) {
+                    Ok(text) => {
+                        log!("[DEVCMD] ok 「{}」{}", line, text);
+                    }
+                    Err(e) => {
+                        log!("[DEVCMD] err 「{}」{}", line, e);
+                    }
+                }
             }
         }
     }
