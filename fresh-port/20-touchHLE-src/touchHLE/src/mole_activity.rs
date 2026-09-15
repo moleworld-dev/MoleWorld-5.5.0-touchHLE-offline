@@ -29,9 +29,11 @@
 //!   (比如从岛上回来的中间态),回环期间临时指回 GameManager,解析完恢复原值。
 //!
 //! # 本地数据
-//! 签到/脚印兑换/海底寻宝/烟花去重等"服务器侧状态"存旁路文件 `mole_activity.dat`
+//! 签到/脚印兑换/海底寻宝/烟花去重/每日任务选题等"服务器侧状态"存旁路文件 `mole_activity.dat`
 //! (路径取 `-[GameData pathForDataFile:]`,与岛档同目录;`writeToFile:atomically:YES` 原子写)。
-//! 坏档或缺字段一律按默认值处理,不崩溃。
+//! [2026-09-16] F2-06 格式升 v=2,末行 `sum=<fnv1a>` 必须存在且匹配;v=1 旧档宽松读一次,下次保存自动升级。
+//! 坏档先原样备份成 `.corrupt`(已存在加 `-<unix秒>`)再按默认值继续;备份失败则本会话不再覆盖原文件。
+//! [2026-09-16] F2-05 开发工具「时间旅行」偏移非 0 时只读写内存缓存、不落盘:重启回到现实,正式档不会被「未来日期」改写。
 //!
 //! # 限时折扣 1049([补完 2026-09-15] F2-2)
 //! 进村(-[GameManager startGame:])与回前台(applicationDidBecomeActive:)会发 1049。回环服务器按本地日期确定性地
@@ -39,15 +41,23 @@
 //! GameData.discountObjDataArr_,商店划线价/买得起判定/扣款全走原版。选品规则为移植者自拟,非原版数据;不落盘。
 //! 原版回包后 GameManager 只弹赛尔号/中信跨游戏推广层(折扣面板 UI 在 5.5.0 已是死代码),离线吞掉这次分发。
 //! MOLE_DISCOUNT=off 关闭(恢复原离线行为:无折扣)。
+//!
+//! # 每日任务 1074([2026-09-16] E-03)
+//! 离线时原版只在 isConnected 门内(startGame:+0xb04)或点 NPC 发现列表为空时发 1074,没人应答,点日常 NPC 就弹「没有连接网络」。
+//! 主村由回环应答;黄金岛不走回环(岛上会话吞掉全部 sendPacket),在宿主侧照 parseDailyTaskListWithSceneId:pos:len: 的做法
+//! 构造 DailyQuestList,再交给原版 updateDailyQuestListInHolidayVillageWithCurrentServerData:。选题规则见 daily_values_for_today。
 
 use crate::frameworks::foundation::ns_string;
+use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, Ptr};
 use crate::objc::{id, msg_send, nil, release, SEL};
 use crate::Environment;
 use digest::Digest;
 use md5::Md5;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const O: Ordering = Ordering::Relaxed;
 
@@ -79,6 +89,9 @@ const CMD_SEABED_REFRESH: u32 = 1223;
 /// [补完 2026-09-15] F2-2 1049 getDiscountListFromServer(0x1cb160,0x1cb184 `movw r3, #0x419`)→ parseDiscountList:pos:len:
 /// (parseData tbh 下标 49 → 0xe6896);GameManager onCommandReceived: 分发表 tbh@0x22ed8 下标 5 → 0x23592。
 const CMD_DISCOUNT_LIST: u32 = 1049;
+/// [2026-09-16] E-03 1074 getDailyTaskListFromServerWithSceneId:(0x1cb5cc,0x1cb60e `movw r3, #0x432`)→
+/// parseDailyTaskListWithSceneId:pos:len:(0x1c0398)。请求体 1 字节:参数 1 → 0(主村)、10 → 1(黄金岛),其它参数不发包。
+const CMD_DAILY_TASK_LIST: u32 = 1074;
 
 /// 包尾 md5 用的 16 字节盐(guest 数据段 byte_B3AE64;与私服 mole-protocol::SALT 相同)。
 const SALT: [u8; 16] = [
@@ -182,6 +195,27 @@ static LOOPBACK_DEPTH: AtomicU32 = AtomicU32::new(0);
 /// xorshift 随机数状态(0 = 未播种)。
 static RNG_STATE: AtomicU64 = AtomicU64::new(0);
 
+/// [2026-09-16] A1-01 春节烟花 1112 回包的延迟槽:(整包, 已检查次数, 最早下次检查时刻)。
+/// 回包到达时村庄场景可能还没挂上 FireworkLayer(见 feed_or_defer_firework),先放这里,约每秒重查一次。
+static FIREWORK_DEFERRED: Mutex<Option<(Vec<u8>, u32, Instant)>> = Mutex::new(None);
+/// [2026-09-16] A1-01 一个 1112 回包从入队到喂进解析链(或放弃)之间置位:同一会话再次进村时不重复排第二个烟花包。
+static FIREWORK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16] A1-01 烟花回包等场景就绪的最多检查次数(间隔约 1 秒)。
+const FIREWORK_RETRY_MAX: u32 = 10;
+
+/// [2026-09-16] F2-06 读到坏档且原样备份失败:本会话 save_state 一律跳过,不拿默认值覆盖原文件。
+static ACT_SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16] F2-06 「跳过写盘」提示是否已打过(防刷屏)。
+static ACT_BLOCK_LOGGED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16] F2-06 本会话已备份过的坏档内容指纹((1<<32)|fnv1a;0 = 没有)。
+/// 备份之后、下一次保存之前还可能有只读不写的 load_state(比如烟花判定),同一份坏档不重复备份出一串 .corrupt-*。
+static ACT_CORRUPT_BACKED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// [2026-09-16] F2-05 时间旅行隔离缓存:偏移非 0 时 load_state 首次从盘读进这里,之后只读写它,save_state 不落盘。
+    static TT_STATE: RefCell<Option<ActState>> = const { RefCell::new(None) };
+}
+
 // ═════════════════════════════════════════════ 对外接口 ═════════════════════════════════════════════
 
 /// 本模块是否要拦截这个 (类, 选择子)。会被 OR 进 mole_cheats::intercept_wants,必须廉价(只做字符串比较)。
@@ -203,6 +237,9 @@ pub fn wants(class: &str, sel: &str) -> bool {
                 | "seabedSeekingTreasureDigShellToGainMimiCoinWith:coinCount:"
                 // [补完 2026-09-15] F2-2 限时折扣:state==4 时原版不发包的兜底
                 | "getDiscountListFromServer"
+                // [2026-09-16] E-03 黄金岛每日任务:请求入口 + 排到运行循环的自用选择子(宿主侧构造列表)
+                | "getDailyTaskListFromServerWithSceneId:"
+                | "moleActivityIslandDailyQuest"
         ),
         // [补完 2026-09-15] F2-2 回环喂 1049 时吞掉 GameManager 的推广弹窗分发;离线进村时补发 1049
         "GameManager" => sel == "onCommandReceived:" || sel == "startGame:",
@@ -210,6 +247,8 @@ pub fn wants(class: &str, sel: &str) -> bool {
         "ActionCenterLayer" => sel == "changeActionLayer:",
         "DailySignLayer" | "SealExchangeLayer" | "SeabedSeekingTreasureMainLayer" => sel == "checkNetWork",
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
+        // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
+        "FireworkLayer" => sel == "showFireWorkFullScreen",
         _ => false,
     }
 }
@@ -227,8 +266,41 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 if let Ok(mut q) = LOOPBACK_QUEUE.lock() {
                     q.clear();
                 }
+                // [2026-09-16] A1-01 等场景的烟花包一并丢弃(已经进岛,村庄场景不会再挂 FireworkLayer)。
+                if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
+                    *d = None;
+                }
+                FIREWORK_IN_FLIGHT.store(false, O);
             } else {
                 run_loopback(env, nm);
+            }
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        // [2026-09-16] E-03 黄金岛每日任务。岛上会话里 mole_cheats 吞掉所有 sendPacket:commandId:,本模块的回环在岛上也整体停用
+        //   (上面 moleActivityLoopback 会清队列),两边都不放开;改在请求入口接住参数 10,排一次运行循环回调,由宿主侧照
+        //   parseDailyTaskListWithSceneId:pos:len: 的做法构造 DailyQuestList 交给原版。不在当前调用栈里同步做:岛上的调用点之一
+        //   -[HolidayVillageLayer onEnter](0x239484)跑在切场景的 drawScene 帧栈上。参数 1(主村)照常放行,由 handle_send_packet 应答。
+        //   条件不满足时只读过寄存器、没发消息,落到下面照常处理。
+        //   [2026-09-16] 复审:并成一个条件,免得 lint.sh 的 clippy --deny warnings 报 collapsible_if。
+        if sel == "getDailyTaskListFromServerWithSceneId:"
+            && !env.options.network_access
+            && crate::mole_cheats::island_session_active()
+            && env.cpu.regs()[2] == 10
+        {
+            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+            let perform = sel_named(env, "performSelector:withObject:afterDelay:");
+            let tick = sel_named(env, "moleActivityIslandDailyQuest");
+            let _: () = msg_send(env, (nm, perform, tick, nil, 0.0f64));
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        if sel == "moleActivityIslandDailyQuest" {
+            // NetworkManager 并不实现它,任何状态下都必须接住。
+            if !env.options.network_access && crate::mole_cheats::island_session_active() {
+                island_daily_quest_apply(env);
+            } else {
+                log!("[ACTIVITY] 黄金岛每日任务:回调到达时已不在岛上会话,放弃构造");
             }
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
@@ -342,15 +414,18 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             // 所以离线主村原版永远不会发 1049。这里在进村时(前置,商店数组已由 load:type: 加载好)照原版同一个入口
             // 补发一次:[[NetworkManager sharedInstance] getDiscountListFromServer] → sendPacket:1049 → 回环应答;
             // 回包排到运行循环再喂,那时 startGame: 已设好 delegateGameData。发过宿主消息,放行前恢复 r0-r3。
-            if !discount_disabled() {
-                let saved = save_regs(env);
-                let nm = singleton(env, "NetworkManager", "sharedInstance");
-                if nm != nil {
+            // [2026-09-16] E-02 / A1-01 / E-03 同一个门内还有公告 1058、春节烟花 1112、每日任务 1074,1049 之后按原版顺序补发
+            //   (见 startgame_resend_offline);全程同一对 save_regs/restore_regs。
+            let saved = save_regs(env);
+            let nm = singleton(env, "NetworkManager", "sharedInstance");
+            if nm != nil {
+                if !discount_disabled() {
                     let get_list = sel_named(env, "getDiscountListFromServer");
                     let _: () = msg_send(env, (nm, get_list));
                 }
-                restore_regs(env, saved);
+                startgame_resend_offline(env, nm);
             }
+            restore_regs(env, saved);
             None
         }
         ("NetworkManager", "getDiscountListFromServer") => {
@@ -448,6 +523,25 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             // 不自造奖励,也不弹"看你的脚下,我们给你留下了神秘的礼物!"这种骗人的提示 → 离线恒返回 NO。
             env.cpu.regs_mut()[0] = 0;
             Some(true)
+        }
+        // ── [2026-09-16] A1-01 春节烟花:真开播才记当天额度 ──
+        ("FireworkLayer", "showFireWorkFullScreen") => {
+            // -[FireworkLayer showFireWorkFullScreen]@0x3e3198 全二进制只有 -[GameManager onCommandReceived:] 的 1112 臂(0x23ee2)调用,
+            // 离线只可能来自回环喂进去的 1112。以前在 1112 入队前就写 firework_day,场景没就绪、烟花没放出来也白扣一天;改到这里记。
+            // save_state 要发 dataWithBytes:length: / writeToFile:atomically:,放行真方法前恢复 r0-r3。
+            let saved = save_regs(env);
+            let today = local_date(env);
+            let mut st = load_state(env);
+            if st.firework_day != today.ymd() {
+                st.firework_day = today.ymd();
+                save_state(env, &st);
+            }
+            log!(
+                "[ACTIVITY] 春节烟花开播 showFireWorkFullScreen:记下今天({})已放过",
+                today.ymd()
+            );
+            restore_regs(env, saved);
+            None
         }
         _ => None,
     }
@@ -612,11 +706,19 @@ fn enqueue_reply(env: &mut Environment, nm: id, cmd: u32, body: Vec<u8>) {
 
 /// 运行循环安全点:把队列里的包追加进 buffer_ 并调原版解析。
 fn run_loopback(env: &mut Environment, nm: id) {
-    let packets: Vec<Vec<u8>> = match LOOPBACK_QUEUE.lock() {
+    let queued: Vec<Vec<u8>> = match LOOPBACK_QUEUE.lock() {
         Ok(mut q) => std::mem::take(&mut *q),
         Err(_) => return,
     };
-    if packets.is_empty() || nm == nil {
+    if nm == nil {
+        return;
+    }
+    // [2026-09-16] A1-01 春节烟花 1112 单独拿出来按场景就绪与否决定喂不喂,其它命令照常立即喂,不被它拖住。
+    let (firework_pkts, mut packets): (Vec<Vec<u8>>, Vec<Vec<u8>>) = queued
+        .into_iter()
+        .partition(|p| packet_cmd(p) == CMD_FIREWORK);
+    let fed_firework = feed_or_defer_firework(env, nm, firework_pkts, &mut packets);
+    if packets.is_empty() {
         return;
     }
     let buffer: id = match read_ivar_u32(env, nm, SLOT_NM_BUFFER) {
@@ -628,6 +730,9 @@ fn run_loopback(env: &mut Environment, nm: id) {
             "[ACTIVITY] 回环放弃:NetworkManager.buffer_ 为 nil(丢弃 {} 个包)",
             packets.len()
         );
+        if fed_firework {
+            FIREWORK_IN_FLIGHT.store(false, O);
+        }
         return;
     }
     let append = sel_named(env, "appendBytes:length:");
@@ -659,6 +764,105 @@ fn run_loopback(env: &mut Environment, nm: id) {
     if patched_delegate {
         write_ivar_u32(env, nm, SLOT_NM_DELEGATE_GAMEDATA, 0);
     }
+    if fed_firework {
+        // 解析链已同步跑完 onCommandReceived:;真开播时 showFireWorkFullScreen 钩子已记下今天。
+        FIREWORK_IN_FLIGHT.store(false, O);
+    }
+}
+
+/// 整包里的命令号(24 字节头的第 2 个 u32;build_packet 组的包至少 40 字节)。
+fn packet_cmd(pkt: &[u8]) -> u32 {
+    if pkt.len() < 8 {
+        return 0;
+    }
+    u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]])
+}
+
+/// [2026-09-16] A1-01 决定本轮喂不喂 1112 烟花包:场景就绪就追加进 packets 并返回 true;没就绪就放进 FIREWORK_DEFERRED,
+/// 约 1 秒后排一次 moleActivityLoopback 重查,最多 FIREWORK_RETRY_MAX 次,超限丢弃(不写 firework_day,下次进村再试)。
+/// 为什么要等:startGame: 由 -[LoadingLayer loadTarget](0x12ee32)调用,之后才切到村庄场景;回包 afterDelay:0 下一轮运行循环就到,
+/// 而 -[GameManager onCommandReceived:] 的 1112 臂要 curSceneId==1(0x23e90)且 runningScene 有 tag 1 子节点(0x23ed0)才开播,
+/// 否则静默退出。只在运行循环回调里调用(不在帧栈上)。
+fn feed_or_defer_firework(
+    env: &mut Environment,
+    nm: id,
+    fresh: Vec<Vec<u8>>,
+    packets: &mut Vec<Vec<u8>>,
+) -> bool {
+    let mut slot = match FIREWORK_DEFERRED.lock() {
+        Ok(mut d) => d.take(),
+        Err(_) => None,
+    };
+    if slot.is_none() {
+        // FIREWORK_IN_FLIGHT 挡住了重复回包,同一轮理论上最多一个 1112;万一有多个只留第一个。
+        slot = fresh.into_iter().next().map(|p| (p, 0u32, Instant::now()));
+    }
+    let Some((pkt, tries, not_before)) = slot else {
+        return false;
+    };
+    let now = Instant::now();
+    if tries > 0 && now < not_before {
+        // 别的命令顺路触发的回环轮次:还没到下次检查时间,原样放回,不计次、不重复排程(1 秒后的回调已经在路上)。
+        if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
+            *d = Some((pkt, tries, not_before));
+        }
+        return false;
+    }
+    if firework_scene_ready(env) {
+        log!(
+            "[ACTIVITY] 春节烟花 cmd=1112:村庄场景已挂好 FireworkLayer(第 {} 次检查),喂包",
+            tries + 1
+        );
+        packets.push(pkt);
+        return true;
+    }
+    if tries + 1 >= FIREWORK_RETRY_MAX {
+        log!(
+            "[ACTIVITY] 春节烟花 cmd=1112:检查 {} 次场景里仍没有 FireworkLayer,丢弃回包(不记今天的额度,下次进村再试)",
+            FIREWORK_RETRY_MAX
+        );
+        FIREWORK_IN_FLIGHT.store(false, O);
+        return false;
+    }
+    log!(
+        "[ACTIVITY] 春节烟花 cmd=1112:村庄场景还没就绪,1 秒后重查({}/{})",
+        tries + 1,
+        FIREWORK_RETRY_MAX
+    );
+    if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
+        *d = Some((pkt, tries + 1, now + Duration::from_millis(900)));
+    }
+    let perform = sel_named(env, "performSelector:withObject:afterDelay:");
+    let tick = sel_named(env, "moleActivityLoopback");
+    let _: () = msg_send(env, (nm, perform, tick, nil, 1.0f64));
+    false
+}
+
+/// [2026-09-16] A1-01 与 -[GameManager onCommandReceived:] 1112 臂同一判据:[[SceneMannager sharedManager] curSceneId]==1,
+/// 且 [[[CCDirector sharedDirector] runningScene] getChildByTag:1] 存在并且是 FireworkLayer(宿主侧沿 isa 链判,等价 isKindOfClass:;
+/// InGameScene init 在 0x18722/0x18736 以 tag 1 挂 FireworkLayer)。加载阶段 tag 1 子节点可能是别的层,不能只判非空。
+fn firework_scene_ready(env: &mut Environment) -> bool {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return false;
+    }
+    let cur_sel = sel_named(env, "curSceneId");
+    let cur: i32 = msg_send(env, (sm, cur_sel));
+    if cur != 1 {
+        return false;
+    }
+    let director = singleton(env, "CCDirector", "sharedDirector");
+    if director == nil {
+        return false;
+    }
+    let rs_sel = sel_named(env, "runningScene");
+    let scene: id = msg_send(env, (director, rs_sel));
+    if scene == nil {
+        return false;
+    }
+    let gct = sel_named(env, "getChildByTag:");
+    let child: id = msg_send(env, (scene, gct, 1i32));
+    crate::mole_items::is_kind_of(env, child, "FireworkLayer")
 }
 
 // ─────────────────────────────── 时间与节日 ───────────────────────────────
@@ -756,51 +960,32 @@ enum Festival {
     Xmas,
 }
 
-/// 春节(农历正月初一)的公历日期表 2024–2040。表外年份不开春节窗口。
-const SPRING_FESTIVAL: [(i32, u32, u32); 17] = [
-    (2024, 2, 10),
-    (2025, 1, 29),
-    (2026, 2, 17),
-    (2027, 2, 6),
-    (2028, 1, 26),
-    (2029, 2, 13),
-    (2030, 2, 3),
-    (2031, 1, 23),
-    (2032, 2, 11),
-    (2033, 1, 31),
-    (2034, 2, 19),
-    (2035, 2, 8),
-    (2036, 1, 28),
-    (2037, 2, 15),
-    (2038, 2, 4),
-    (2039, 1, 24),
-    (2040, 2, 12),
-];
-
-/// 今天是否处于节日窗口。春节窗口 = 除夕(初一前 1 天)到元宵(初一后 14 天);圣诞窗口 = 12-20 ~ 12-31。
-/// 原版活动的确切日期本地没有依据(服务器下发),窗口为移植者自定。
-/// 测试用环境变量 MOLE_FESTIVAL=spring|xmas|off 可强制指定。
+/// 今天是否处于节日窗口。
+/// [2026-09-16] F2-07 统一节日日历:窗口与 MOLE_FESTIVAL 的取值都改用 mole_items 那一份(与商店节日物同一张表),
+/// 删掉了这里自带的春节表和环境变量解析。圣诞 = christmas 窗口(12/10~次年 1/06),春节 = newyear 窗口(初一前后 15 天,
+/// 表外年份 1/20~2/28)。原版活动的确切日期本地没有依据(服务器下发),窗口为移植者自拟;统一后废品站高价回收从 12/10 起、
+/// 春节烟花从初一前 15 天起生效(以前分别是 12/20 与除夕)。
+/// MOLE_FESTIVAL:christmas/xmas → 强制圣诞;newyear/spring → 强制春节;off 或强制成其它节日 → 都不开;
+/// all/date/未设置 → 按日期(两个窗口不重叠,判定先后不影响结果)。菜单「节日商店」轮换只管商店,不影响这里。
 fn festival_today(env: &mut Environment) -> (Festival, LocalDate) {
     let today = local_date(env);
-    if let Ok(v) = std::env::var("MOLE_FESTIVAL") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "spring" => return (Festival::Spring, today),
-            "xmas" | "christmas" => return (Festival::Xmas, today),
-            "off" | "none" => return (Festival::Off, today),
-            _ => {}
+    let by_date = || {
+        let day = days_from_civil(today.year, today.month, today.day);
+        if crate::mole_items::festival_on_date("christmas", day) {
+            Festival::Xmas
+        } else if crate::mole_items::festival_on_date("newyear", day) {
+            Festival::Spring
+        } else {
+            Festival::Off
         }
-    }
-    if today.month == 12 && today.day >= 20 {
-        return (Festival::Xmas, today);
-    }
-    let t = days_from_civil(today.year, today.month, today.day);
-    for &(y, m, d) in SPRING_FESTIVAL.iter() {
-        let cny = days_from_civil(y, m, d);
-        if t >= cny - 1 && t <= cny + 14 {
-            return (Festival::Spring, today);
-        }
-    }
-    (Festival::Off, today)
+    };
+    let fest = match crate::mole_items::festival_forced() {
+        Some("christmas") => Festival::Xmas,
+        Some("newyear") => Festival::Spring,
+        None | Some("all") | Some("date") => by_date(),
+        Some(_) => Festival::Off,
+    };
+    (fest, today)
 }
 
 fn rand_u32() -> u32 {
@@ -846,6 +1031,14 @@ struct ActState {
     shells: Vec<(u32, u32)>,
     /// 节日烟花最近一次放的日期 yyyymmdd(每天最多一次)。
     firework_day: u32,
+    /// [2026-09-16] E-03 主村每日任务选题所属日期 yyyymmdd(与客户端截止时间同一口径,见 daily_day_key)。
+    daily_day: u32,
+    /// 主村 1074 回包里的 5 个原始值(不是任务 ID,客户端 hashDailyQuestIdInMainVillage: 映射后才是 ID)。
+    daily_vals: Vec<u32>,
+    /// [2026-09-16] E-03 黄金岛每日任务选题所属日期 yyyymmdd。
+    hv_daily_day: u32,
+    /// 黄金岛列表的 3 个原始值(hashDailyQuestIdInHolidayVillage: 映射之前)。
+    hv_daily_vals: Vec<u32>,
 }
 
 impl Default for ActState {
@@ -862,19 +1055,24 @@ impl Default for ActState {
             dug: 0,
             shells: Vec::new(),
             firework_day: 0,
+            daily_day: 0,
+            daily_vals: Vec::new(),
+            hv_daily_day: 0,
+            hv_daily_vals: Vec::new(),
         }
     }
 }
 
 impl ActState {
+    /// [2026-09-16] F2-06 v=2:正文之后追加 `sum=<fnv1a(正文)>` 一行(与 vip.dat 同一算法);读档时 v=2 缺 sum 或不匹配就是坏档。
     fn serialize(&self) -> String {
         let shells: Vec<String> = self
             .shells
             .iter()
             .map(|(t, ts)| format!("{},{}", t, ts))
             .collect();
-        format!(
-            "v=1\nsign_month={}\nsign_days={}\nsign_foot={}\nsign_patch={}\nsign_reward={}\nexch_month={}\nexch_mask={}\npearl={}\ndug={}\nshells={}\nfirework_day={}\n",
+        let mut body = format!(
+            "v=2\nsign_month={}\nsign_days={}\nsign_foot={}\nsign_patch={}\nsign_reward={}\nexch_month={}\nexch_mask={}\npearl={}\ndug={}\nshells={}\nfirework_day={}\ndaily_day={}\ndaily_vals={}\nhv_daily_day={}\nhv_daily_vals={}\n",
             self.sign_month,
             self.sign_days,
             self.sign_foot,
@@ -885,8 +1083,15 @@ impl ActState {
             self.pearl,
             self.dug,
             shells.join(";"),
-            self.firework_day
-        )
+            self.firework_day,
+            self.daily_day,
+            join_u32(&self.daily_vals),
+            self.hv_daily_day,
+            join_u32(&self.hv_daily_vals)
+        );
+        let sum = crate::mole_items::fnv1a(body.as_bytes());
+        body.push_str(&format!("sum={:08x}\n", sum));
+        body
     }
 
     /// 宽松解析:认不出的行/值一律忽略,保持默认。
@@ -909,6 +1114,10 @@ impl ActState {
                 "pearl" => st.pearl = num().unwrap_or(0).min(1_000_000),
                 "dug" => st.dug = num().unwrap_or(0),
                 "firework_day" => st.firework_day = num().unwrap_or(0),
+                "daily_day" => st.daily_day = num().unwrap_or(0),
+                "daily_vals" => st.daily_vals = parse_u32_list(v),
+                "hv_daily_day" => st.hv_daily_day = num().unwrap_or(0),
+                "hv_daily_vals" => st.hv_daily_vals = parse_u32_list(v),
                 "shells" => {
                     let mut shells = Vec::new();
                     for item in v.split(';') {
@@ -929,6 +1138,58 @@ impl ActState {
         }
         st
     }
+
+    /// [2026-09-16] F2-06 带校验的读档。Ok = 可用(空文件也算,按默认值);Err(原因) = 坏档。
+    /// 首行 v=1:旧档,按宽松规则读一次(下次保存自动升 v=2);首行 v=2:末行必须是 sum= 且与正文 fnv1a 一致
+    /// (sum 在文件末尾,截断时最先丢的就是它,所以 v=2 缺 sum 也算坏档);首行两者都不是的非空文件同样算坏档。
+    /// 只做宿主侧字符串处理,不发消息。
+    fn parse_checked(bytes: &[u8]) -> Result<ActState, &'static str> {
+        if bytes.is_empty() {
+            return Ok(ActState::default());
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| "不是合法 UTF-8")?;
+        match text.lines().next().unwrap_or("").trim() {
+            "v=1" => Ok(ActState::parse(text)),
+            "v=2" => {
+                let pos = text.rfind("sum=").ok_or("v=2 缺 sum 行(文件可能被截断)")?;
+                let (body, tail) = text.split_at(pos);
+                if !body.ends_with('\n') {
+                    return Err("sum 不在行首");
+                }
+                let sum = u32::from_str_radix(tail["sum=".len()..].trim(), 16)
+                    .map_err(|_| "sum 值不是十六进制")?;
+                if crate::mole_items::fnv1a(body.as_bytes()) != sum {
+                    return Err("校验和不匹配");
+                }
+                Ok(ActState::parse(body))
+            }
+            _ => Err("首行既不是 v=1 也不是 v=2"),
+        }
+    }
+}
+
+/// u32 列表 → "a,b,c"(空列表为空串)。
+fn join_u32(v: &[u32]) -> String {
+    v.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// "a,b,c" → u32 列表;任何一项解析失败返回空列表(调用方据此当作没有记录)。
+fn parse_u32_list(s: &str) -> Vec<u32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for item in s.split(',') {
+        match item.trim().parse::<u32>() {
+            Ok(x) => out.push(x),
+            Err(_) => return Vec::new(),
+        }
+    }
+    out
 }
 
 /// 旁路档完整 guest 路径(NSString,autoreleased;失败返回 nil)。
@@ -945,7 +1206,30 @@ fn state_path(env: &mut Environment) -> id {
     path
 }
 
+/// [2026-09-16] F2-05 开发工具「时间旅行」偏移是否生效(偏移只增不减,一旦非 0 本会话一直非 0)。
+fn time_travel_active() -> bool {
+    crate::libc::time::time_offset_secs() != 0
+}
+
 fn load_state(env: &mut Environment) -> ActState {
+    // [2026-09-16] F2-05 时间旅行隔离:偏移非 0 时第一次从盘读进 TT_STATE,之后只读缓存。
+    //   以前拨到下个月再开签到层,sign_roll_month 会清掉本月签到并落盘,重启回到现实又清一次;现在旅行期间的改动只留在内存里。
+    if time_travel_active() {
+        if let Some(st) = TT_STATE.with(|c| c.borrow().clone()) {
+            return st;
+        }
+        let st = load_state_from_disk(env);
+        TT_STATE.with(|c| *c.borrow_mut() = Some(st.clone()));
+        log!(
+            "[ACTIVITY] 时间旅行中:{} 读入内存缓存,本会话之后的改动不落盘(重启即回到旅行前的档)",
+            STATE_FILE
+        );
+        return st;
+    }
+    load_state_from_disk(env)
+}
+
+fn load_state_from_disk(env: &mut Environment) -> ActState {
     let path = state_path(env);
     if path == nil {
         return ActState::default();
@@ -957,10 +1241,73 @@ fn load_state(env: &mut Environment) -> ActState {
         return ActState::default();
     }
     let bytes = nsdata_bytes(env, data);
-    ActState::parse(&String::from_utf8_lossy(&bytes))
+    match ActState::parse_checked(&bytes) {
+        Ok(st) => st,
+        Err(why) => {
+            backup_corrupt_state(env, path, &bytes, why);
+            ActState::default()
+        }
+    }
+}
+
+/// [2026-09-16] F2-06 坏档原样备份为 `<路径>.corrupt`(已存在则 `.corrupt-<unix秒>`,不覆盖更早的备份);
+/// 成功才允许之后按默认值覆盖原文件,失败置 ACT_SAVE_BLOCKED,本会话 save_state 全部跳过。
+/// 做法同 vip.dat(mole_items side_ensure_loaded):只动宿主 fs(env.fs.exists / write_atomic),不另发 msg_send。
+/// 路径 NSString 来自 pathForDataFile:(0x75374,NSSearchPathForDirectoriesInDomains + stringByAppendingPathComponent:),
+/// 是宿主字符串对象,to_rust_string 直接读(mole_cheats quarantine_corrupt_file 同样用法)。
+fn backup_corrupt_state(env: &mut Environment, path: id, bytes: &[u8], why: &str) {
+    if ACT_SAVE_BLOCKED.load(O) {
+        return; // 已判定备份失败:本会话不再重复尝试,也不刷日志
+    }
+    let fingerprint = (1u64 << 32) | u64::from(crate::mole_items::fnv1a(bytes));
+    if ACT_CORRUPT_BACKED.load(O) == fingerprint {
+        return; // 同一份坏档本会话已经备份过
+    }
+    let src = ns_string::to_rust_string(env, path).into_owned();
+    let mut bak = format!("{}.corrupt", src);
+    if env.fs.exists(GuestPath::new(&bak)) {
+        bak = format!(
+            "{}.corrupt-{}",
+            src,
+            crate::libc::time::host_now_unix_secs()
+        );
+    }
+    if env.fs.write_atomic(GuestPath::new(&bak), bytes).is_ok() {
+        ACT_CORRUPT_BACKED.store(fingerprint, O);
+        log!(
+            "[ACTIVITY] ⚠️ {} 是坏档({})→ 已原样备份为 {},本次按默认值处理",
+            STATE_FILE,
+            why,
+            bak
+        );
+    } else {
+        ACT_SAVE_BLOCKED.store(true, O);
+        log!(
+            "[ACTIVITY] ⚠️ {} 是坏档({})且备份到 {} 失败 → 本会话不覆盖它(签到/脚印/海底寻宝等本会话不落盘)",
+            STATE_FILE,
+            why,
+            bak
+        );
+    }
 }
 
 fn save_state(env: &mut Environment, st: &ActState) {
+    // [2026-09-16] F2-05 时间旅行中只写内存缓存。
+    if time_travel_active() {
+        TT_STATE.with(|c| *c.borrow_mut() = Some(st.clone()));
+        log!("[ACTIVITY] 时间旅行中:{} 只写内存缓存,不落盘", STATE_FILE);
+        return;
+    }
+    // [2026-09-16] F2-06 坏档备份失败时,不拿内存里的默认值覆盖原文件(提示只打一次,签到/挖贝每次操作都会走到这里)。
+    if ACT_SAVE_BLOCKED.load(O) {
+        if !ACT_BLOCK_LOGGED.swap(true, O) {
+            log!(
+                "[ACTIVITY] 跳过写 {}(原文件是未能备份的坏档,本会话不再提示)",
+                STATE_FILE
+            );
+        }
+        return;
+    }
     let path = state_path(env);
     if path == nil {
         log!("[ACTIVITY] 存档失败:拿不到 {} 的路径", STATE_FILE);
@@ -1193,14 +1540,19 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                 env.cpu.regs_mut()[0] = 0;
                 return Some(true);
             }
-            let mut st = load_state(env);
+            let st = load_state(env);
             if st.firework_day == today.ymd() {
                 log!("[ACTIVITY] 春节烟花今天已放过,cmd=1112 不回包");
                 env.cpu.regs_mut()[0] = 0;
                 return Some(true);
             }
-            st.firework_day = today.ymd();
-            save_state(env, &st);
+            if nm != nil && FIREWORK_IN_FLIGHT.swap(true, O) {
+                log!("[ACTIVITY] 春节烟花:已有一个 1112 回包在途,本次不重复回包");
+                env.cpu.regs_mut()[0] = 0;
+                return Some(true);
+            }
+            // [2026-09-16] A1-01 不再在这里写 firework_day:回包要等村庄场景挂好 FireworkLayer 才喂(feed_or_defer_firework),
+            //   真开播时由 (FireworkLayer, showFireWorkFullScreen) 钩子记账;没放出来就不扣当天额度。
             // parseFireworkFlag@0x1c2258 只读 1 字节,同时写 showFirework 与 hasFireworkGift。
             enqueue_reply(env, nm, cmd, vec![1u8]);
             env.cpu.regs_mut()[0] = 0;
@@ -1268,6 +1620,27 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
             }
             let body = encode_discount_list(env);
             enqueue_reply(env, nm, cmd, body);
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
+        }
+        CMD_DAILY_TASK_LIST => {
+            // [2026-09-16] E-03 每日任务列表。请求体首字节:0 主村 / 1 黄金岛(getDailyTaskListFromServerWithSceneId:@0x1cb5cc)。
+            //   岛上会话在 intercept 入口就已排除,岛上的请求在请求入口改走宿主侧构造(island_daily_quest_apply)。
+            //   这里若还收到 1(不在岛上会话却传了 10,正常走不到),不回包,免得在主村场景跑岛上的列表更新。
+            let req = nsdata_bytes(env, body);
+            match req.first().copied() {
+                Some(0) => {
+                    if let Some(reply) = encode_daily_task_list_main(env) {
+                        enqueue_reply(env, nm, cmd, reply);
+                    }
+                }
+                other => {
+                    log!(
+                        "[ACTIVITY] 每日任务 cmd=1074 请求体首字节={:?}(非主村),不回包",
+                        other
+                    );
+                }
+            }
             env.cpu.regs_mut()[0] = 0;
             Some(true)
         }
@@ -1857,4 +2230,489 @@ fn encode_discount_list(env: &mut Environment) -> Vec<u8> {
         expire
     );
     b
+}
+
+// ─────────────────────────────── [2026-09-16] E-02 / A1-01 / E-03 进村补发 ───────────────────────────────
+
+/// 离线进村补发 -[GameManager startGame:] 在 isConnected 门内(0x19938..0x19e18)跳过的另外三条同步,按原版顺序:
+/// - 0x19ae6 `[[GameData sharedInstance] setIsUserSelectedNoticeBoardMenu:NO]`(re.py 追寄存器:接收者 r11 = r5 = 0x197ae 的
+///   GameData 类引用、r8 = sharedInstance;全二进制也只有 GameData 实现这个选择子)→ 0x19b00 `[nm getNoticeMessages]`(1058;
+///   回包后 onCommandReceived: 0x237a4 在玩家没点过公告栏时只给公告按钮加小星星,不强弹);
+/// - 0x19b68 `[nm getFireworkFlagFromServer]`(1112):只在春节窗口、今天还没放过、也没有烟花包在途时补发;
+/// - 0x19c6c `[nm getDailyTaskListFromServerWithSceneId:1]`(1074):进村就备好当天列表。-[ActorManager touchEnd:] 在列表为空时
+///   先弹「没有连接网络」再重发(0x9eba4/0x9ebb4 → 0x9ec40),不提前备好的话第一次点日常 NPC 仍会弹框。
+/// 三个发包方法都不查 state,直接 sendPacket:commandId:(0x1cb33a / 0x1cbc68 / 0x1cb618),由 handle_send_packet 回环应答。
+/// 调用方负责 save_regs/restore_regs。
+fn startgame_resend_offline(env: &mut Environment, nm: id) {
+    let gd = singleton(env, "GameData", "sharedInstance");
+    if gd != nil {
+        let set_flag = sel_named(env, "setIsUserSelectedNoticeBoardMenu:");
+        let _: () = msg_send(env, (gd, set_flag, false));
+    }
+    let get_notice = sel_named(env, "getNoticeMessages");
+    let _: () = msg_send(env, (nm, get_notice));
+
+    let (fest, today) = festival_today(env);
+    if fest == Festival::Spring {
+        if FIREWORK_IN_FLIGHT.load(O) {
+            log!("[ACTIVITY] 春节烟花:上一个 1112 回包还在等场景就绪,本次进村不重复补发");
+        } else if load_state(env).firework_day == today.ymd() {
+            log!("[ACTIVITY] 春节烟花今天已放过,进村不补发 1112");
+        } else {
+            let get_fw = sel_named(env, "getFireworkFlagFromServer");
+            let _: () = msg_send(env, (nm, get_fw));
+        }
+    }
+
+    let get_daily = sel_named(env, "getDailyTaskListFromServerWithSceneId:");
+    let _: () = msg_send(env, (nm, get_daily, 1i32));
+}
+
+// ─────────────────────────────── [2026-09-16] E-03 每日任务 1074 ───────────────────────────────
+
+/// 主村每日任务表 dec/DailyQuest.dat(34 条,包内静态数据)的 take_level,下标 = 任务 ID − 1。
+const DAILY_MAIN_TAKE_LEVEL: [u8; 34] = [
+    1, 2, 4, 5, 6, 8, 9, 10, 10, // type 1 建造 ID 1-9
+    1, 5, 5, 8, 8, 10, 10, // type 2 摆放 ID 10-16
+    1, 5, 5, 7, 8, 9, // type 3 收获 ID 17-22
+    1, 6, 10, // type 4 打工 ID 23-25
+    3, 4, 9, // type 5 小游戏 ID 26-28
+    1, 5, 7, 9, 10, 10, // type 6 条件 ID 29-34
+];
+/// 主村列表第 i 条映射到的任务 ID 段 (起始 ID, 条数)。
+/// -[GameData hashDailyQuestIdInMainVillage:]@0x829f8 按「GameData 列表里已有几条」tbb 分派(0x82aa0,跳转表字节 03 11 1f 2d 3a 47,
+/// 已对二进制原始字节核对):第 0..5 条依次取 v%9+1、v%7+10、v%6+17、v%3+23、v%3+26、v%6+29,正好是 type 1..6 的 ID 段。
+/// 也就是说原版主村每天 6 条、每个类型各 1 条;服务器给的是任意整数,ID 由客户端映射,回包不能直接填任务 ID。
+const DAILY_MAIN_SLOTS: [(u32, u32); 6] = [(1, 9), (10, 7), (17, 6), (23, 3), (26, 3), (29, 6)];
+/// 主村回包的原始值个数。-[NetworkManager parseDailyTaskListWithSceneId:pos:len:] 主村分支(0x1c055a..0x1c059c)会把第 1 个值
+/// 再追加到列表末尾,所以回 5 个值,客户端列表就是 6 条(第 6 条 = v0%6+29)。
+/// 回 6 个会让第 7 条走「已有条数 > 5」的 v % 条数 分支(0x82a82),可能映射成不存在的 ID 0。
+const DAILY_MAIN_WIRE_COUNT: usize = 5;
+/// 第 1 个原始值的取值范围 0..18(9 与 6 的最小公倍数):它同时决定第 1 条与第 6 条。
+const DAILY_MAIN_V0_SPAN: u32 = 18;
+
+/// 黄金岛每日任务表 dec/DailyQuestHV.dat(15 条)的 take_level,下标 = 任务 ID − 1。
+const DAILY_HV_TAKE_LEVEL: [u8; 15] = [18, 20, 21, 18, 24, 18, 24, 18, 30, 9, 1, 1, 1, 1, 1];
+/// 黄金岛列表第 i 条的 ID 段:-[GameData hashDailyQuestIdInHolidayVillage:]@0x83f40 对已有 0/1/2 条分别取
+/// v%5+1、v%5+6、v%5+11(0x84066 / 0x84026 / 0x84044);解析函数岛分支不追加重复值 → 每天 3 条。
+const DAILY_HV_SLOTS: [(u32, u32); 3] = [(1, 5), (6, 5), (11, 5)];
+
+/// 客户端判「今天」的口径:-[GameData updateDailyQuestListWithCurrentServerData:] 把截止时间设为
+/// t + 86400 − ((t + 28800) % 86400)(0x82fe2..0x83014,t = 回包服务器时间换成的 CFAbsoluteTime),即写死北京时间的下一个 0 点,
+/// 与 MOLE_TZ 无关。选题的「同一天」按同一公式算,列表只在客户端自己认为跨天时才换(2001-01-01 正好是日界,换算成 unix 不变)。
+fn daily_day_key(cf: u32) -> u32 {
+    let unix = i64::from(cf) + 978_307_200;
+    let (year, month, day) = civil_from_days((unix + 28_800).div_euclid(86_400));
+    LocalDate { year, month, day }.ymd()
+}
+
+/// 主村玩家等级:[[GameData sharedInstance] userInfoData] curLevel(getter 自己解 XOR 混淆);取不到按 1。
+fn main_player_level(env: &mut Environment) -> i32 {
+    let gd = singleton(env, "GameData", "sharedInstance");
+    if gd == nil {
+        return 1;
+    }
+    let ui_sel = sel_named(env, "userInfoData");
+    let ui: id = msg_send(env, (gd, ui_sel));
+    if ui == nil {
+        return 1;
+    }
+    let lv_sel = sel_named(env, "curLevel");
+    let lv: i32 = msg_send(env, (ui, lv_sel));
+    lv.max(1)
+}
+
+/// 某一条的候选偏移(相对该段起始 ID):take_level ≤ level 的全部偏移;一个都没有时退回 take_level 最低的那个
+/// (第几条对应哪个类型是客户端写死的,不能空着不发)。
+fn daily_slot_candidates(take_levels: &[u8], start: u32, count: u32, level: i32) -> Vec<u32> {
+    let lv = |o: u32| i32::from(take_levels[(start + o - 1) as usize]);
+    let ok: Vec<u32> = (0..count).filter(|&o| lv(o) <= level).collect();
+    if !ok.is_empty() {
+        return ok;
+    }
+    vec![(0..count).min_by_key(|&o| lv(o)).unwrap_or(0)]
+}
+
+/// 按日期确定性地挑主村 5 个原始值。规则为移植者自拟(原版选题在服务器,私服也没实现):
+/// 每个类型在 take_level ≤ 当前主村等级的任务里随机取一条,没有够得着的就取该类型等级要求最低的一条。
+/// 第 1 个值同时决定第 1 条(v%9+1)与第 6 条(v%6+29),在 0..18 里找两边都够得着的取值,找不到就只保证第 1 条。
+fn pick_daily_main(ymd: u32, level: i32) -> Vec<u32> {
+    let mut state = splitmix64(u64::from(ymd) ^ 0x4d4f_4c45_0432);
+    let mut next = || {
+        state = splitmix64(state);
+        state
+    };
+    let (s0, n0) = DAILY_MAIN_SLOTS[0];
+    let (s5, n5) = DAILY_MAIN_SLOTS[5];
+    let ok0 = daily_slot_candidates(&DAILY_MAIN_TAKE_LEVEL, s0, n0, level);
+    let ok5 = daily_slot_candidates(&DAILY_MAIN_TAKE_LEVEL, s5, n5, level);
+    let mut pool: Vec<u32> = (0..DAILY_MAIN_V0_SPAN)
+        .filter(|v| ok0.contains(&(v % n0)) && ok5.contains(&(v % n5)))
+        .collect();
+    if pool.is_empty() {
+        pool = (0..DAILY_MAIN_V0_SPAN)
+            .filter(|v| ok0.contains(&(v % n0)))
+            .collect();
+    }
+    let mut vals = Vec::with_capacity(DAILY_MAIN_WIRE_COUNT);
+    vals.push(pool[(next() % pool.len() as u64) as usize]);
+    for &(start, count) in &DAILY_MAIN_SLOTS[1..DAILY_MAIN_WIRE_COUNT] {
+        let cands = daily_slot_candidates(&DAILY_MAIN_TAKE_LEVEL, start, count, level);
+        vals.push(cands[(next() % cands.len() as u64) as usize]);
+    }
+    vals
+}
+
+/// 黄金岛 3 个原始值:每一条在 take_level ≤ 等级的任务里随机取一条。等级口径为移植者自拟:DailyQuestHV.dat 的 take_level
+/// 最高到 30,而岛升级表 levelupHV.dat 只有 26 级,按岛等级会有任务永远拿不到,所以暂用主村等级。
+fn pick_daily_island(ymd: u32, level: i32) -> Vec<u32> {
+    let mut state = splitmix64(u64::from(ymd) ^ 0x4d4f_4c45_1074);
+    DAILY_HV_SLOTS
+        .iter()
+        .map(|&(start, count)| {
+            state = splitmix64(state);
+            let cands = daily_slot_candidates(&DAILY_HV_TAKE_LEVEL, start, count, level);
+            cands[(state % cands.len() as u64) as usize]
+        })
+        .collect()
+}
+
+/// 旁路档里记下的原始值是否还能用(个数与每条的取值范围)。
+fn daily_vals_valid(vals: &[u32], island: bool) -> bool {
+    if island {
+        vals.len() == DAILY_HV_SLOTS.len()
+            && vals
+                .iter()
+                .zip(DAILY_HV_SLOTS.iter())
+                .all(|(&v, &(_, n))| v < n)
+    } else {
+        vals.len() == DAILY_MAIN_WIRE_COUNT
+            && vals[0] < DAILY_MAIN_V0_SPAN
+            && vals[1..]
+                .iter()
+                .zip(DAILY_MAIN_SLOTS[1..].iter())
+                .all(|(&v, &(_, n))| v < n)
+    }
+}
+
+/// 原始值 → 客户端映射出的任务 ID(只用于日志)。
+fn daily_ids(vals: &[u32], island: bool) -> Vec<u32> {
+    if island {
+        vals.iter()
+            .zip(DAILY_HV_SLOTS.iter())
+            .map(|(&v, &(s, n))| v % n + s)
+            .collect()
+    } else {
+        let mut ids: Vec<u32> = vals
+            .iter()
+            .zip(DAILY_MAIN_SLOTS.iter())
+            .map(|(&v, &(s, n))| v % n + s)
+            .collect();
+        if let Some(&v0) = vals.first() {
+            let (s5, n5) = DAILY_MAIN_SLOTS[5];
+            ids.push(v0 % n5 + s5);
+        }
+        ids
+    }
+}
+
+/// 取当天的原始值:旁路档里有同一天、格式正确的记录就原样复用,否则挑一次并存档(之后同一天不受升级影响)。
+/// 同一天必须回同一份:原版 update… 在截止时间未到时保留进度(unfinishedDailyQuestData 的 currentDoingQuestId/nextQuestId),
+/// 却会整表替换列表(0x82c6c removeAllObjects 后重填),列表一变进度就对不上;而 isDailyQuestListForTodayRecieved 在列表为空时
+/// 会反复发 1074(0x8329e),每次重启列表对象也是空的,都会再要一次。
+fn daily_values_for_today(env: &mut Environment, island: bool, ymd: u32) -> Vec<u32> {
+    let mut st = load_state(env);
+    let (day, stored) = if island {
+        (st.hv_daily_day, &st.hv_daily_vals)
+    } else {
+        (st.daily_day, &st.daily_vals)
+    };
+    if day == ymd && daily_vals_valid(stored, island) {
+        return stored.clone();
+    }
+    let level = main_player_level(env);
+    let vals = if island {
+        pick_daily_island(ymd, level)
+    } else {
+        pick_daily_main(ymd, level)
+    };
+    if island {
+        st.hv_daily_day = ymd;
+        st.hv_daily_vals = vals.clone();
+    } else {
+        st.daily_day = ymd;
+        st.daily_vals = vals.clone();
+    }
+    save_state(env, &st);
+    log!(
+        "[ACTIVITY] 每日任务选题({}):日期={} 主村等级={} 原始值={:?} → 任务ID={:?}(选题规则为移植者自拟,非原版数据)",
+        if island { "黄金岛" } else { "主村" },
+        ymd,
+        level,
+        vals,
+        daily_ids(&vals, island)
+    );
+    vals
+}
+
+/// 主村 1074 回包(parseDailyTaskListWithSceneId:pos:len:@0x1c0398 逐字节核实):
+/// [u8 场景标志 0=主村(1=岛,0x1c0420)][u32 unix 秒(0x1c046c 转 double、减 kCFAbsoluteTimeIntervalSince1970 → setCurrentServerTime:)]
+/// [u32 个数][u32 原始值 × 个数]。时间取 now_cf_u32,与 CFAbsoluteTimeGetCurrent/NewSceneTimer 同一虚拟时钟(含时间旅行偏移),
+/// 否则 isDailyQuestListForTodayRecieved 拿截止时间比较时会每次都判成跨天并清进度。
+/// GameData.dailyQuestData 不足 34 条时不回包:hashDailyQuestIdInMainVillage: 在表条数小于原始值时做 v % 条数(0x82a50),
+/// 表没加载好(0 条)会除以 0。
+fn encode_daily_task_list_main(env: &mut Environment) -> Option<Vec<u8>> {
+    let gd = singleton(env, "GameData", "sharedInstance");
+    let loaded: usize = if gd == nil {
+        0
+    } else {
+        let dq_sel = sel_named(env, "dailyQuestData");
+        let arr: id = msg_send(env, (gd, dq_sel));
+        if arr == nil {
+            0
+        } else {
+            let count_sel = sel_named(env, "count");
+            let n: GuestUSize = msg_send(env, (arr, count_sel));
+            n as usize
+        }
+    };
+    if loaded < DAILY_MAIN_TAKE_LEVEL.len() {
+        log!(
+            "[ACTIVITY] 每日任务 cmd=1074:GameData.dailyQuestData 只有 {} 条(应为 {}),表未加载好,本次不回包",
+            loaded,
+            DAILY_MAIN_TAKE_LEVEL.len()
+        );
+        return None;
+    }
+    let cf = now_cf_u32();
+    let ymd = daily_day_key(cf);
+    let vals = daily_values_for_today(env, false, ymd);
+    let unix = (u64::from(cf) + 978_307_200).min(u64::from(u32::MAX)) as u32;
+    let mut b = Vec::with_capacity(9 + vals.len() * 4);
+    b.push(0u8);
+    put_u32(&mut b, unix);
+    put_u32(&mut b, vals.len() as u32);
+    for &v in &vals {
+        put_u32(&mut b, v);
+    }
+    Some(b)
+}
+
+/// 黄金岛:照 parseDailyTaskListWithSceneId:pos:len: 岛分支在宿主侧构造(0x1c03e4 alloc/init → 0x1c044c setSceneId:10 →
+/// 0x1c0496 setCurrentServerTime: → 0x1c04f8 起逐个 [currentQuestList addObject:[NSNumber numberWithInt:]] →
+/// 0x1c05fe [[GameData sharedInstance] updateDailyQuestListInHolidayVillageWithCurrentServerData:] → 0x1c0610 release),
+/// 列表更新、排序、截止时间、进度保留全部走原版。只在运行循环回调里调用。
+/// NewSceneData.dailyQuestData 不足 15 条时不构造(hashDailyQuestIdInHolidayVillage: 0x83fea 同样会做 v % 条数)。
+fn island_daily_quest_apply(env: &mut Environment) {
+    let nsd = singleton(env, "NewSceneData", "sharedInstance");
+    let gd = singleton(env, "GameData", "sharedInstance");
+    if nsd == nil || gd == nil {
+        log!("[ACTIVITY] 黄金岛每日任务:NewSceneData/GameData 未就绪,放弃构造");
+        return;
+    }
+    let dq_sel = sel_named(env, "dailyQuestData");
+    let arr: id = msg_send(env, (nsd, dq_sel));
+    let loaded: usize = if arr == nil {
+        0
+    } else {
+        let count_sel = sel_named(env, "count");
+        let n: GuestUSize = msg_send(env, (arr, count_sel));
+        n as usize
+    };
+    if loaded < DAILY_HV_TAKE_LEVEL.len() {
+        log!(
+            "[ACTIVITY] 黄金岛每日任务:NewSceneData.dailyQuestData 只有 {} 条(应为 {}),表未加载好,放弃构造",
+            loaded,
+            DAILY_HV_TAKE_LEVEL.len()
+        );
+        return;
+    }
+    let list_cls = env.objc.get_known_class("DailyQuestList", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if list_cls == nil || num_cls == nil {
+        log!("[ACTIVITY] 黄金岛每日任务:找不到 DailyQuestList/NSNumber 类,放弃构造");
+        return;
+    }
+    let cf = now_cf_u32();
+    let ymd = daily_day_key(cf);
+    let vals = daily_values_for_today(env, true, ymd);
+
+    let alloc_sel = sel_named(env, "alloc");
+    let init_sel = sel_named(env, "init");
+    let list: id = msg_send(env, (list_cls, alloc_sel));
+    let list: id = msg_send(env, (list, init_sel));
+    if list == nil {
+        log!("[ACTIVITY] 黄金岛每日任务:DailyQuestList init 返回 nil,放弃构造");
+        return;
+    }
+    let set_scene = sel_named(env, "setSceneId:");
+    let _: () = msg_send(env, (list, set_scene, 10u32));
+    let set_time = sel_named(env, "setCurrentServerTime:");
+    let _: () = msg_send(env, (list, set_time, cf));
+    let cql_sel = sel_named(env, "currentQuestList");
+    let quests: id = msg_send(env, (list, cql_sel));
+    let nwi_sel = sel_named(env, "numberWithInt:");
+    let add_sel = sel_named(env, "addObject:");
+    for &v in &vals {
+        let num: id = msg_send(env, (num_cls, nwi_sel, v as i32));
+        let _: () = msg_send(env, (quests, add_sel, num));
+    }
+    let update = sel_named(
+        env,
+        "updateDailyQuestListInHolidayVillageWithCurrentServerData:",
+    );
+    let _: () = msg_send(env, (gd, update, list));
+    release(env, list);
+    log!(
+        "[ACTIVITY] 黄金岛每日任务:宿主侧构造 DailyQuestList(sceneId=10 serverTime={} 原始值={:?} → 任务ID={:?}),交给 updateDailyQuestListInHolidayVillageWithCurrentServerData:",
+        cf,
+        vals,
+        daily_ids(&vals, true)
+    );
+    // [2026-09-16] 复审补:真回包解析完还会分发给 HolidayVillageLayer,宿主侧构造绕过了这一步,照原版补上 NPC 提示图标。
+    island_daily_quest_prompt(env, gd);
+}
+
+/// [2026-09-16] 复审补 E-03:原版岛上 1074 回包在 parse 之后还要走 -[HolidayVillageLayer onNewSceneGameDataCommandReceived:]
+/// 的 1074 臂(0x23e744..0x23ebda),宿主侧构造没有这次分发,不补的话岛上日常 NPC 头顶不出提示图标。逐条照原版:
+/// - NPC 编号 = curSceneId==1 ? 98 : 96(0x23e7a6/0x23e7ae);curSceneId==1 走另一支(0x23e7b8,主村数据),与岛上列表无关,这里不做;
+/// - 取 [GameData unfinishedDailyQuestDataInHolidayVillage] 与 dailyQuestListInHolidayVillage,[[ActorManager Instance] GetNpcActor:96]
+///   非 nil、两者非 nil、currentQuestList.count>0,且 currentDoingQuestId>0 或 nextQuestId>=1 时 [actor showPromptIcon:YES](0x23ebba),
+///   再 [[DailyQuest sharedInstance] resetTimer](0x23ebc8 → 公共尾 0x23df1a);任一条件不满足原版直接收尾(0x23ea68),这里也什么都不做。
+/// 主村走回环,GameManager onCommandReceived: 的同一臂(0x24978..0x24a46)由原版照跑,不用补。只在运行循环回调里调用。
+fn island_daily_quest_prompt(env: &mut Environment, gd: id) {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return;
+    }
+    let cur_sel = sel_named(env, "curSceneId");
+    let cur: i32 = msg_send(env, (sm, cur_sel));
+    if cur == 1 {
+        return;
+    }
+    let unfinished_sel = sel_named(env, "unfinishedDailyQuestDataInHolidayVillage");
+    let unfinished: id = msg_send(env, (gd, unfinished_sel));
+    let list_sel = sel_named(env, "dailyQuestListInHolidayVillage");
+    let list: id = msg_send(env, (gd, list_sel));
+    let am = singleton(env, "ActorManager", "Instance");
+    if am == nil {
+        return;
+    }
+    let get_npc = sel_named(env, "GetNpcActor:");
+    let actor: id = msg_send(env, (am, get_npc, 96i32));
+    if actor == nil || unfinished == nil || list == nil {
+        return;
+    }
+    let cql_sel = sel_named(env, "currentQuestList");
+    let quests: id = msg_send(env, (list, cql_sel));
+    if quests == nil {
+        return;
+    }
+    let count_sel = sel_named(env, "count");
+    let n: GuestUSize = msg_send(env, (quests, count_sel));
+    if n == 0 {
+        return;
+    }
+    let doing_sel = sel_named(env, "currentDoingQuestId");
+    let doing: i32 = msg_send(env, (unfinished, doing_sel));
+    if doing <= 0 {
+        let next_sel = sel_named(env, "nextQuestId");
+        let next: i32 = msg_send(env, (unfinished, next_sel));
+        if next < 1 {
+            return;
+        }
+    }
+    let show_sel = sel_named(env, "showPromptIcon:");
+    let _: () = msg_send(env, (actor, show_sel, true));
+    let dq = singleton(env, "DailyQuest", "sharedInstance");
+    if dq != nil {
+        let reset_sel = sel_named(env, "resetTimer");
+        let _: () = msg_send(env, (dq, reset_sel));
+    }
+    log!("[ACTIVITY] 黄金岛每日任务:照原版分发臂给日常 NPC(96)挂提示图标并 resetTimer");
+}
+
+// [2026-09-16] 包3 纯函数单测:旁路档 v=2 校验、每日任务选题映射、客户端日界口径。放在文件最末(clippy items_after_test_module)。
+#[cfg(test)]
+mod offline_server_tests {
+    use super::*;
+
+    #[test]
+    fn state_v2_roundtrip_truncation_and_legacy() {
+        let st = ActState {
+            sign_month: 202_609,
+            sign_foot: 12,
+            daily_day: 20_260_916,
+            daily_vals: vec![3, 1, 2, 0, 2],
+            ..ActState::default()
+        };
+        let text = st.serialize();
+        let back = ActState::parse_checked(text.as_bytes()).expect("完整 v=2 档应可读");
+        assert_eq!(back.sign_foot, 12);
+        assert_eq!(back.daily_day, 20_260_916);
+        assert_eq!(back.daily_vals, vec![3, 1, 2, 0, 2]);
+        // 截掉末尾 sum 行(最常见的写残)→ 坏档
+        let cut = &text[..text.rfind("sum=").unwrap()];
+        assert!(ActState::parse_checked(cut.as_bytes()).is_err());
+        // 改动正文 → 校验和不匹配
+        let tampered = text.replace("sign_foot=12", "sign_foot=99");
+        assert!(ActState::parse_checked(tampered.as_bytes()).is_err());
+        // v=1 旧档宽松可读;空文件按默认;首行不认识的非空文件算坏档
+        let legacy = ActState::parse_checked(b"v=1\nsign_foot=7\n").expect("v=1 旧档应可读");
+        assert_eq!(legacy.sign_foot, 7);
+        assert!(ActState::parse_checked(b"").is_ok());
+        assert!(ActState::parse_checked(b"garbage\n").is_err());
+    }
+
+    #[test]
+    fn daily_main_one_quest_per_type() {
+        for ymd in [20_260_916u32, 20_260_917, 20_261_231, 20_270_101] {
+            for level in [1, 3, 5, 10, 52] {
+                let vals = pick_daily_main(ymd, level);
+                assert!(daily_vals_valid(&vals, false));
+                assert_eq!(vals, pick_daily_main(ymd, level), "同一天同等级必须确定");
+                let ids = daily_ids(&vals, false);
+                assert_eq!(ids.len(), 6);
+                for (i, &quest) in ids.iter().enumerate() {
+                    let (s, n) = DAILY_MAIN_SLOTS[i];
+                    assert!(
+                        quest >= s && quest < s + n,
+                        "第 {} 条 ID {} 不在类型段内",
+                        i,
+                        quest
+                    );
+                }
+            }
+        }
+        // 1 级:type 5 没有够得着的,退回等级要求最低的 26;其余都是 take_level 1 的那条
+        assert_eq!(
+            daily_ids(&pick_daily_main(20_260_916, 1), false),
+            vec![1, 10, 17, 23, 26, 29]
+        );
+    }
+
+    #[test]
+    fn daily_island_three_slots() {
+        for level in [1, 18, 30] {
+            let vals = pick_daily_island(20_260_916, level);
+            assert!(daily_vals_valid(&vals, true));
+            let ids = daily_ids(&vals, true);
+            assert_eq!(ids.len(), 3);
+            for (i, &quest) in ids.iter().enumerate() {
+                let (s, n) = DAILY_HV_SLOTS[i];
+                assert!(quest >= s && quest < s + n);
+            }
+        }
+        // 1 级:第 1 段都够不着 → 取等级要求最低的 ID 1;第 2 段最低是 ID 10(9 级)
+        let ids = daily_ids(&pick_daily_island(20_260_916, 1), true);
+        assert_eq!(&ids[..2], &[1, 10]);
+    }
+
+    #[test]
+    fn daily_day_key_uses_client_beijing_midnight() {
+        // 北京时间 2026-09-16 00:00:00 = unix 1789488000
+        let cf = (1_789_488_000i64 - 978_307_200) as u32;
+        assert_eq!(daily_day_key(cf), 20_260_916);
+        assert_eq!(daily_day_key(cf - 1), 20_260_915);
+    }
 }

@@ -64,7 +64,8 @@ fn shared(env: &mut Environment, class_name: &str, getter: &str) -> id {
 }
 
 /// 宿主侧沿 isa/superclass 链判断类型(不发消息,不碰寄存器)。
-fn is_kind_of(env: &Environment, obj: id, want: &str) -> bool {
+/// [2026-09-16] 改 pub(crate):mole_activity 喂春节烟花回包前要判 tag 1 子节点是不是 FireworkLayer,复用这一份。
+pub(crate) fn is_kind_of(env: &Environment, obj: id, want: &str) -> bool {
     if obj == nil {
         return false;
     }
@@ -239,6 +240,62 @@ fn festival_on_day(idx: usize, day: i64) -> bool {
     }
 }
 
+/// [2026-09-16] F2-07 统一节日日历:按日序号(1970-01-01 = 0,本地日期)判断节日键 `key` 当天是否在窗口内。
+/// 只看日期,不看 MOLE_FESTIVAL,也不看菜单「节日商店」模式;认不出的键返回 false。
+/// 以前 mole_activity 另有一套窗口(圣诞只算 12/20~12/31、春节只算除夕~元宵),与商店节日物上架对不上;
+/// 现在废品站高价回收(christmas)与春节烟花(newyear)直接复用这张表。两套窗口原本都是移植者自拟(原版由服务器按活动下发),
+/// 统一后高价回收从 12/10 起、烟花从初一前 15 天起生效。
+pub(crate) fn festival_on_date(key: &str, day_index: i64) -> bool {
+    FESTIVALS
+        .iter()
+        .position(|f| f.key == key)
+        .is_some_and(|i| festival_on_day(i, day_index))
+}
+
+/// [2026-09-16] F2-07 MOLE_FESTIVAL 的解析结果(商店模式与活动模块共用同一份解析)。
+enum FestEnv {
+    ByDate,
+    All,
+    Off,
+    /// 只开 FESTIVALS[下标] 这一个节日。
+    Only(usize),
+}
+
+/// [2026-09-16] F2-07 解析 MOLE_FESTIVAL 原值,认不出返回 None(调用方按日期处理)。
+/// 接受 date/auto、all/on/1、off/none/0、节日英文键或中文名,以及活动模块旧取值的别名 spring→newyear、xmas→christmas。
+fn parse_festival_env(raw: &str) -> Option<FestEnv> {
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "date" | "auto" => Some(FestEnv::ByDate),
+        "all" | "on" | "1" => Some(FestEnv::All),
+        "off" | "none" | "0" => Some(FestEnv::Off),
+        other => {
+            let key = match other {
+                "spring" => "newyear",
+                "xmas" => "christmas",
+                k => k,
+            };
+            FESTIVALS
+                .iter()
+                .position(|f| f.key == key || f.cn == key)
+                .map(FestEnv::Only)
+        }
+    }
+}
+
+/// [2026-09-16] F2-07 只解析 MOLE_FESTIVAL,不看菜单「节日商店」轮换模式(那个开关只管商店)。
+/// 返回强制的节日键(如 "christmas"/"newyear"),或强制态 "all"/"off"/"date";未设置或认不出返回 None(= 按日期)。
+/// 认不出时的「无法识别」日志由 fest_mode 打一次,这里不重复打。
+pub(crate) fn festival_forced() -> Option<&'static str> {
+    let raw = std::env::var("MOLE_FESTIVAL").ok()?;
+    match parse_festival_env(&raw)? {
+        FestEnv::ByDate => Some("date"),
+        FestEnv::All => Some("all"),
+        FestEnv::Off => Some("off"),
+        FestEnv::Only(i) => Some(FESTIVALS[i].key),
+    }
+}
+
 const FEST_UNINIT: u8 = 0xff;
 const FEST_BY_DATE: u8 = 0;
 const FEST_ALL: u8 = 1;
@@ -253,23 +310,22 @@ fn fest_mode() -> u8 {
     if m != FEST_UNINIT {
         return m;
     }
+    // [2026-09-16] F2-07 解析改走 parse_festival_env(与 festival_forced 同一份),新增别名 spring/xmas。
     let init = match std::env::var("MOLE_FESTIVAL") {
         Err(_) => FEST_BY_DATE,
-        Ok(raw) => {
-            let v = raw.trim().to_ascii_lowercase();
-            match v.as_str() {
-                "" | "date" | "auto" => FEST_BY_DATE,
-                "all" | "on" | "1" => FEST_ALL,
-                "off" | "none" | "0" => FEST_OFF,
-                other => match FESTIVALS.iter().position(|f| f.key == other || f.cn == other) {
-                    Some(i) => FEST_FORCE_BASE + i as u8,
-                    None => {
-                        log!("[MOLEITEMS] MOLE_FESTIVAL={} 无法识别(可用 all/off/date 或节日名),按日期处理", raw);
-                        FEST_BY_DATE
-                    }
-                },
+        Ok(raw) => match parse_festival_env(&raw) {
+            Some(FestEnv::ByDate) => FEST_BY_DATE,
+            Some(FestEnv::All) => FEST_ALL,
+            Some(FestEnv::Off) => FEST_OFF,
+            Some(FestEnv::Only(i)) => FEST_FORCE_BASE + i as u8,
+            None => {
+                log!(
+                    "[MOLEITEMS] MOLE_FESTIVAL={} 无法识别(可用 all/off/date、节日名,或别名 spring/xmas),按日期处理",
+                    raw
+                );
+                FEST_BY_DATE
             }
-        }
+        },
     };
     let _ = FEST_MODE.compare_exchange(FEST_UNINIT, init, O, O);
     FEST_MODE.load(O)
@@ -664,7 +720,8 @@ fn side() -> MutexGuard<'static, Side> {
     SIDE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn fnv1a(bytes: &[u8]) -> u32 {
+/// [2026-09-16] F2-06 改 pub(crate):mole_activity.dat 升 v=2 后用同一个校验和算法。
+pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in bytes {
         h ^= b as u32;
@@ -862,6 +919,28 @@ fn online_total_secs(s: &Side) -> u64 {
 /// 规则:同一本地日重复进村不变;昨天进过 → 连续天数 +1;断档或首次 → 1;宿主时钟回拨 → 保持原记录。
 fn on_enter_village(env: &mut Environment) {
     side_ensure_loaded(env);
+    // [2026-09-16] F2-05 时间旅行隔离:开发工具「时间旅行」的偏移只在内存里(重启回到现实),期间把「未来」的本地日写进 last_day,
+    //   会让连续登录冻结到现实日期追上为止;往前拨超过 1 天还会把 streak 直接打回 1。
+    //   所以偏移非 0 时,本次进村不改登录日/连续天数,这里也不落盘;在线计时照常开始、累计(切后台与 5 分钟节流时照旧落盘)。
+    //   代价:旅行期间测出来的「连续登录」重启即丢,这是有意的。
+    if crate::libc::time::time_offset_secs() != 0 {
+        let secs = {
+            let mut s = side();
+            s.village_entered = true;
+            if s.anchor.is_none() {
+                s.anchor = Some(Instant::now());
+            }
+            online_flush(&mut s);
+            online_total_secs(&s)
+        };
+        log!(
+            "[MOLEITEMS] 时间旅行中(偏移 {} 秒):本次进村不记登录日/连续天数,不在这里写 {}(累计在线 {} 秒照常计)",
+            crate::libc::time::time_offset_secs(),
+            SIDE_FILE,
+            secs
+        );
+        return;
+    }
     let today = local_day_index();
     let (changed, streak, secs) = {
         let mut s = side();
@@ -2048,5 +2127,53 @@ mod vip_accumulate_tests {
         assert_eq!(vip_progress(3, 60, &th), (3, 20000));
         // 门槛表用完(环境变量只给 2 级)时下一级门槛为 0
         assert_eq!(vip_progress(0, 100, &[60, 90]), (2, 0));
+    }
+}
+
+// [2026-09-16] F2-07 统一节日日历的纯函数单测(商店与活动模块共用 festival_on_date / parse_festival_env)。
+#[cfg(test)]
+mod festival_calendar_tests {
+    use super::*;
+
+    #[test]
+    fn unified_calendar_dates() {
+        // 12/15、1/3 在圣诞窗口;2027 年初一是 2/6,前 10 天(1/27)与当天都在新年窗口
+        assert!(festival_on_date("christmas", days_from_civil(2026, 12, 15)));
+        assert!(festival_on_date("christmas", days_from_civil(2027, 1, 3)));
+        assert!(!festival_on_date("newyear", days_from_civil(2026, 12, 15)));
+        assert!(festival_on_date("newyear", days_from_civil(2027, 1, 27)));
+        assert!(festival_on_date("newyear", days_from_civil(2027, 2, 6)));
+        assert!(!festival_on_date("christmas", days_from_civil(2027, 2, 6)));
+        assert!(!festival_on_date(
+            "no_such_festival",
+            days_from_civil(2027, 2, 6)
+        ));
+    }
+
+    #[test]
+    fn christmas_and_newyear_windows_never_overlap() {
+        // mole_activity::festival_today 按「先圣诞后春节」判定,依赖两个窗口不重叠
+        for y in 2020..=2041i64 {
+            let end = days_from_civil(y + 1, 1, 1);
+            let mut d = days_from_civil(y, 1, 1);
+            while d < end {
+                assert!(!(festival_on_date("christmas", d) && festival_on_date("newyear", d)));
+                d += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn festival_env_aliases() {
+        assert!(
+            matches!(parse_festival_env("spring"), Some(FestEnv::Only(i)) if FESTIVALS[i].key == "newyear")
+        );
+        assert!(
+            matches!(parse_festival_env(" XMAS "), Some(FestEnv::Only(i)) if FESTIVALS[i].key == "christmas")
+        );
+        assert!(matches!(parse_festival_env("all"), Some(FestEnv::All)));
+        assert!(matches!(parse_festival_env("none"), Some(FestEnv::Off)));
+        assert!(matches!(parse_festival_env(""), Some(FestEnv::ByDate)));
+        assert!(parse_festival_env("bogus").is_none());
     }
 }
