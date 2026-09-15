@@ -43,6 +43,18 @@ pub const CONSTANTS: ConstantExports = &[
         "_NSDefaultRunLoopMode",
         HostConstant::NSString(NSDefaultRunLoopMode),
     ),
+    // [2026-09-16] C-01:Foundation 的全局 `double NSFoundationVersionNumber`(不属于 NSRunLoop,只是借
+    // Foundation 已注册的常量表导出)。根因:此前没导出,dyld 把游戏的非懒指针槽 0x9c8050 留成 0,
+    // -[GameManager iosVerGreaterThan7]@0x1bd18 `vldr d16,[r0]` 读地址 0 → MemoryError panic;好友搜索结果的
+    // 「拜访」「加好友」、留言列表的「留言」「拜访好友」「拜访」「删除」(SeekViewController/MessageViewController
+    // 共 6 个按钮回调)一点就崩。取值 678.24 = NSFoundationVersionNumber_iPhoneOS_2_0,与 UIDevice
+    // systemVersion 报的 "2.0" 一致;≤890.1 时 iosVerGreaterThan7 返回 NO,按钮回调走「按钮→contentView→cell」
+    // 分支,且 addBtnTouched: 自带两层/三层 superview 后备分支,取值大小都能找到 cell。
+    // 另一个读者是 InMobi 的 -[IMCommonMgr configTimestampUpdate:],只影响其版本分支。
+    (
+        "_NSFoundationVersionNumber",
+        HostConstant::Custom(|env| env.mem.alloc_and_write(678.24f64).cast().cast_const()),
+    ),
 ];
 
 #[derive(Default)]

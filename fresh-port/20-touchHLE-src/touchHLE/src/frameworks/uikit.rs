@@ -185,7 +185,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     // [扫描修 2026-09-15] 注入的触摸同样先经过系统弹框(route_touch),脚本可以点弹框按钮。
     if let Some(inject) = crate::mole_diag::next_inject() {
         match inject {
-            crate::mole_diag::Inject::Menu => crate::mole_menu::toggle(env),
+            crate::mole_diag::Inject::Menu => {
+                // [2026-09-16] F2-03:同下面 T 键分支,打开菜单前先收尾仍按着的手指。
+                if !crate::mole_menu::is_open() {
+                    cancel_tracked_touches(env, "打开修改器菜单");
+                }
+                crate::mole_menu::toggle(env)
+            }
             crate::mole_diag::Inject::Down(x, y) => {
                 if crate::mole_menu::is_open() {
                     crate::mole_menu::handle_touch(env, x, y);
@@ -243,7 +249,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 ui_application::exit(env);
             }
             // [MoleWorld] T toggles the built-in debug/cheat menu.
-            Event::ToggleMoleMenu => crate::mole_menu::toggle(env),
+            Event::ToggleMoleMenu => {
+                // [2026-09-16] F2-03:即将打开菜单时,先把已经交给游戏、仍按着的手指以取消结束。
+                // 根因:菜单开着时下面的分支直接吞掉 TouchesMove/TouchesUp,不经过 route_touch,ui_touch 和
+                // touch_shadow 里一直留着那根手指;关菜单后的第一次按下会被 ui_touch 当成旧触点的移动
+                // (日志 "treating as movement"),点建筑/按钮没反应。取消路径与切后台挂起、滚轮捏合共用。
+                if !crate::mole_menu::is_open() {
+                    cancel_tracked_touches(env, "打开修改器菜单");
+                }
+                crate::mole_menu::toggle(env)
+            }
             // While the menu is open, route touches to it instead of the game.
             Event::TouchesDown(ref map) if crate::mole_menu::is_open() => {
                 if let Some((_, &(x, y))) = map.iter().next() {
@@ -357,9 +372,10 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                         }
                     }
                 } else {
-                    // [MoleWorld 改名诊断] 收到文本输入但没有聚焦的 UITextField/UITextView → 丢弃。
-                    log!(
-                        "[改名诊断] 收到文本输入但 first_responder={:?} 不是输入框,输入被丢弃",
+                    // [2026-09-16] B-01:没有聚焦的 UITextField/UITextView 时丢弃。window.rs 把回车/退格的
+                    // KeyDown 无条件翻译成文本输入事件,未聚焦时按键也会走到这里,只留调试级日志。
+                    log_dbg!(
+                        "收到文本输入但 first_responder={:?} 不是输入框,丢弃",
                         responder
                     );
                 }
