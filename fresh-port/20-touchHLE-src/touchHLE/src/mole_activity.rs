@@ -34,6 +34,9 @@
 //! [2026-09-16] F2-06 格式升 v=2,末行 `sum=<fnv1a>` 必须存在且匹配;v=1 旧档宽松读一次,下次保存自动升级。
 //! 坏档先原样备份成 `.corrupt`(已存在加 `-<unix秒>`)再按默认值继续;备份失败则本会话不再覆盖原文件。
 //! [2026-09-16] F2-05 开发工具「时间旅行」偏移非 0 时只读写内存缓存、不落盘:重启回到现实,正式档不会被「未来日期」改写。
+//! [2026-09-16] X4-02 但补签、挖贝、刷新贝壳、脚印兑换、珍珠兑换的扣款与发物都由客户端本地完成、照常进主档,侧档不落盘就会在重启后
+//! 变成「扣了款、进度回滚」或「同一档位能再兑一次」。所以旅行期间在本地扣款之前拦下这些付费入口(见 block_paid_action_in_time_travel),
+//! 免费踩格、看翻月不拦。
 //!
 //! # 限时折扣 1049([补完 2026-09-15] F2-2)
 //! 进村(-[GameManager startGame:])与回前台(applicationDidBecomeActive:)会发 1049。回环服务器按本地日期确定性地
@@ -245,7 +248,19 @@ pub fn wants(class: &str, sel: &str) -> bool {
         "GameManager" => sel == "onCommandReceived:" || sel == "startGame:",
         "UserInfoLayer" => sel == "checkActivityStatus",
         "ActionCenterLayer" => sel == "changeActionLayer:",
-        "DailySignLayer" | "SealExchangeLayer" | "SeabedSeekingTreasureMainLayer" => sel == "checkNetWork",
+        // [2026-09-16] X4-02 三个活动层除 checkNetWork 外,再加时间旅行期间要在本地扣款之前拦下的付费入口
+        "DailySignLayer" => matches!(
+            sel,
+            "checkNetWork" | "onButtonPatchSign:" | "onChooseUseVipGold"
+        ),
+        "SealExchangeLayer" => matches!(
+            sel,
+            "checkNetWork" | "onButtonExchange:" | "onChooseConfirm"
+        ),
+        "SeabedSeekingTreasureMainLayer" => matches!(
+            sel,
+            "checkNetWork" | "onDigShellClick:" | "onSureRefreshClick" | "onExchangeRewardClick:"
+        ),
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
         // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
         "FireworkLayer" => sel == "showFireWorkFullScreen",
@@ -333,6 +348,16 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             Some(false)
         }
         ("NetworkManager", "isReachable") => {
+            // [2026-09-16] X4-02 时间旅行中不放行 -[EditMenuLayer onButtonOkSelected:] 珍珠兑换放置确认的网络门。原版门失败时
+            //   弹"需要联网才能领取奖励哦!"并 onButtonDeleteSelected: 删掉刚放下的奖励(0x4eb20 → 0x4ebd4 → 0x4ebb4..0x4ebcc),
+            //   1221 按 exChangeRewardButtonTag(tbb@0x4eb60)分四处取选择子(0x4eb7c/0x4ec1a/0x4ec32/0x4ec4a),共用 0x4ec4e 一条 blx 发出,
+            //   全在两道门(0x4eb18 isReachable、0x4eb36 isConnected)之后;门失败时不发 1221、珍珠不扣,已放下的奖励被删掉。兑换层入口 onExchangeRewardClick:
+            //   另有拦截,这里兜的是旅行开始前就已选好奖励、正在摆放的那一次。只读寄存器与原子变量,没发消息,返回 None 时寄存器原样;
+            //   主村离线时 mole_cheats 只在登录门与进岛/在岛窗口里强制 isReachable,放行后真 getter 读到的是离线值 0。
+            if lr_is(env, SITE_EDIT_SEABED_REACHABLE) && time_travel_active() {
+                log!("[ACTIVITY] 时间旅行中:珍珠兑换放置确认的网络门不放行 → 原版「需要联网才能领取奖励哦!」并删掉刚放下的奖励(不发 1221、不扣珍珠)");
+                return None;
+            }
             if lr_is(env, SITE_UIL_REACHABLE)
                 || lr_is(env, SITE_ACTION_LEVEL_REACHABLE)
                 || lr_is(env, SITE_BULLETIN_REACHABLE)
@@ -348,6 +373,10 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             }
         }
         ("NetworkManager", "isConnected") => {
+            // [2026-09-16] X4-02 对称兜底(正常到不了:时间旅行中同一分支上面的 isReachable 门已先失败)。只读寄存器,没发消息。
+            if lr_is(env, SITE_EDIT_SEABED_CONNECTED) && time_travel_active() {
+                return None;
+            }
             if lr_is(env, SITE_UIL_CONNECTED)
                 || lr_is(env, SITE_BULLETIN_CONNECTED)
                 || lr_is(env, SITE_SIGN_SHOW_CONNECTED)
@@ -367,6 +396,65 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
         | ("SealExchangeLayer", "checkNetWork")
         | ("SeabedSeekingTreasureMainLayer", "checkNetWork") => {
             env.cpu.regs_mut()[0] = 1;
+            Some(true)
+        }
+
+        // ── [2026-09-16] X4-02 时间旅行期间,在客户端本地扣款/发物之前拦下活动中心的付费入口 ──
+        // F2-05 让旅行期间的侧档只写内存,但下面这些操作的扣款与发物由客户端本地完成、照常经 saveUserInfoData/saveMapData 进主档。
+        // 重启后侧档回到旅行前:补签格、5 个贝壳、珍珠回滚而钱已扣;脚印/珍珠没扣而物品已入账,同一档位还能再兑。
+        // 不能在 sendPacket 处吞包(发包前已扣款);入口逐个反汇编确认都在扣款之前:
+        // - -[DailySignLayer onButtonPatchSign:]@0x39907c:needToPatchDay 非 0 且本月补签不足 3 次时,0x399406 addGold:-needGoldNum
+        //   后直接 completePatchSign(发 1116);之后改弹「用贝壳补签」确认框,回调 onChooseUseVipGold@0x399ab8 在 0x399b56 addVipGold:-needShellsNum。
+        // - -[SealExchangeLayer onButtonExchange:]@0x39c344 只弹「确定兑换」框;回调 onChooseConfirm@0x39c5d0 在 0x39c748 调
+        //   -[WrapperManager addIceCreamActivityRewardToMap:num:],晶玉类当场 addInvisibleReward:num: 入账,之后 0x266636 才发 1120。
+        // - -[SeabedSeekingTreasureMainLayer onSureRefreshClick]@0x2c2454:0x2c250a addVipGold:-3 之后才在 0x2c2550 发 1223。
+        // - -[SeabedSeekingTreasureMainLayer onExchangeRewardClick:]@0x2c26b4 打开珍珠兑换层;选中奖励后 onChangeItemReward:@0x23fc88
+        //   直接 addItemObjectToMap: 把物品放进村庄。
+        // selref 核对:这些选择子只出现在 displayUI/updatePatchSignMenu/addAndUpdateExchangeMenu 建菜单项、各自的确认框,以及
+        // onDigShellClick: 内部转发,都是菜单项或 MessageBox 按钮回调,不在 drawScene 帧栈上。没在旅行中只做一次原子读就返回 None,寄存器未动。
+        ("DailySignLayer", "onButtonPatchSign:")
+        | ("DailySignLayer", "onChooseUseVipGold")
+        | ("SealExchangeLayer", "onButtonExchange:")
+        | ("SealExchangeLayer", "onChooseConfirm")
+        | ("SeabedSeekingTreasureMainLayer", "onSureRefreshClick")
+        | ("SeabedSeekingTreasureMainLayer", "onExchangeRewardClick:") => {
+            if !time_travel_active() {
+                return None;
+            }
+            // 确认框回调(onChooseUseVipGold / onChooseConfirm / onSureRefreshClick)只记日志不弹框,原因见 block_paid_action_in_time_travel。
+            let (what, show_box) = match sel {
+                "onButtonPatchSign:" => ("补签", true),
+                "onChooseUseVipGold" => ("贝壳补签确认", false),
+                "onButtonExchange:" => ("脚印兑换", true),
+                "onChooseConfirm" => ("脚印兑换确认", false),
+                "onSureRefreshClick" => ("刷新贝壳确认", false),
+                _ => ("珍珠兑换", true),
+            };
+            block_paid_action_in_time_travel(env, what, show_box);
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
+        }
+        ("SeabedSeekingTreasureMainLayer", "onDigShellClick:") => {
+            // -[SeabedSeekingTreasureMainLayer onDigShellClick:]@0x2c1c64 按 [sender tag] 分派(tbh@0x2c2024,表项已按指令编码复算):
+            // - 0..4 挖第几个贝壳:摩尔豆贝 0x2c2010 addGold:-1000,两种晶玉贝 0x2c1da0/0x2c1dba、0x2c1e4a/0x2c1e66 addCoupon:number: 扣晶玉,
+            //   海王贝不扣钱但由海王贝奖励层发物品;这些都在 0x2c20c6/0x2c21bc 发 1220 之前。
+            // - 5 活动规则:免费,放行。
+            // - 6 弹「刷新贝壳」确认框(回调 onSureRefreshClick):提前拦掉,不让框弹出。
+            // - 7 转发 onExchangeRewardClick::由上面那条臂拦;tag>4 时原版不取贝壳也不扣费。
+            // tag 是 -[CCNode tag]@0x2d466c 的平凡 ivar 读(CCMenuItemSpriteIndependent 只覆写了 selected/unselected/dealloc),
+            // 直接读 ivar 不发消息;sender 为 nil 时原版 [nil tag]=0 走挖第 1 个贝壳,这里同样按 0 算。放行路径寄存器未动。
+            if !time_travel_active() {
+                return None;
+            }
+            let sender: id = Ptr::from_bits(env.cpu.regs()[2]);
+            let tag = read_ivar_u32(env, sender, SLOT_CCNODE_TAG).unwrap_or(0);
+            let what = match tag {
+                0..=4 => "挖贝壳",
+                6 => "刷新贝壳",
+                _ => return None,
+            };
+            block_paid_action_in_time_travel(env, what, true);
+            env.cpu.regs_mut()[0] = 0;
             Some(true)
         }
 
@@ -1209,6 +1297,42 @@ fn state_path(env: &mut Environment) -> id {
 /// [2026-09-16] F2-05 开发工具「时间旅行」偏移是否生效(偏移只增不减,一旦非 0 本会话一直非 0)。
 fn time_travel_active() -> bool {
     crate::libc::time::time_offset_secs() != 0
+}
+
+/// [2026-09-16] X4-02 时间旅行期间付费入口被拦时给玩家看的提示(get_static_str 静态串,不释放)。
+const TIME_TRAVEL_PAID_BLOCKED_MSG: &str = "时间旅行中，补签、挖贝壳、刷新贝壳和兑换奖励暂不可用（这段时间的活动进度不会保存）。重新启动游戏回到现实时间后即可恢复。";
+
+/// [2026-09-16] X4-02 拦下一次活动中心付费操作:记日志;show_box 为真时再弹游戏自带 MessageBox(type 6 = 只有「确定」,关框无回调)。
+/// 调用序列照原版同一批层里的提示,例如 -[SeabedSeekingTreasureMainLayer onDigShellClick:] 0x2c1f3c..0x2c1fda 的
+/// `[[MessageBox sharedInstance] showWithTarget:self selector:0 title:nil message:msg type:6 vipgold:0]`;target 传 nil,
+/// 与 mole_cheats::show_game_message_box 一致(type 6 的 onButtonOK: 只关框)。那个函数是私有的,mole_menu 也没有公开的提示函数,
+/// 这里照抄它的调用序列:宿主 msg_send 只实现到「接收者+选择子+5 个参数」,type(低 32 位)与 vipgold(高 32 位,恒 0)合成一个 u64,
+/// 落到 sp+8/sp+0xc,与分开传逐字节相同。
+/// show_box=false 用于 MessageBox 按钮回调:原版 onSureRefreshClick 在回调里发现贝壳不足时也不当场弹框,而是置 isNoMuchVipGold
+/// 再 scheduleUpdate,延到 update: 里弹(0x2c24d2/0x2c24d6)。可见在回调栈里再弹框不可靠,所以只记日志;入口已拦,正常走不到回调。
+/// 只在菜单/按钮回调里调用(不在 drawScene/mainLoop 帧栈上);会改写 r0-r3,调用方吞掉调用并自写 r0。
+fn block_paid_action_in_time_travel(env: &mut Environment, what: &str, show_box: bool) {
+    log!(
+        "[ACTIVITY] 时间旅行中(偏移 {} 秒):拦下「{}」——活动侧档此时只写内存,客户端本地扣款/发物却照常进主档,放行会在重启后变成扣了款、进度回滚或同一档位可再兑",
+        crate::libc::time::time_offset_secs(),
+        what
+    );
+    if !show_box {
+        return;
+    }
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if mb_cls == nil {
+        return;
+    }
+    let sh = sel_named(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        return;
+    }
+    let msg = ns_string::get_static_str(env, TIME_TRAVEL_PAID_BLOCKED_MSG);
+    let show = sel_named(env, "showWithTarget:selector:title:message:type:vipgold:");
+    let type_and_vipgold: u64 = 6; // 低 32 位 = type 6,高 32 位 = vipgold 0
+    let _: () = msg_send(env, (mb, show, nil, SEL::null(), nil, msg, type_and_vipgold));
 }
 
 fn load_state(env: &mut Environment) -> ActState {
@@ -2306,20 +2430,57 @@ fn daily_day_key(cf: u32) -> u32 {
     LocalDate { year, month, day }.ymd()
 }
 
-/// 主村玩家等级:[[GameData sharedInstance] userInfoData] curLevel(getter 自己解 XOR 混淆);取不到按 1。
-fn main_player_level(env: &mut Environment) -> i32 {
+/// [2026-09-16] X1-01 UserInfoData.curLevel_(i,编译期 +16)的 _OBJC_IVAR 槽,存的是密文(re.py ivar 核对)。
+/// -[UserInfoData curLevel]@0xbaffc 读这个槽(0xbb00c/0xbb026)后调 +[CryptUtils decryptInt:]@0x124b34 解密:
+/// `movw r0,#0x1011; movt r0,#0x101; eors r0,r2; bx lr`。偏移运行时从槽里现读。
+const SLOT_UI_CUR_LEVEL: u32 = 0xb03ff8;
+/// curLevel 密文的 XOR 掩码(decryptInt: 与 encryptInt:@0x124b28 同一常量)。
+const CUR_LEVEL_XOR: u32 = 0x0101_1011;
+/// 解出的等级超过它就当没读对(等级表 114_0 共 52 级;密文槽若存的是明文 0,会解出 0x01011011)。
+const CUR_LEVEL_SANE_MAX: i32 = 999;
+
+/// 主村玩家真实等级:[[GameData sharedInstance] userInfoData] curLevel(getter 自己解 XOR 混淆);取不到对象按 1。
+/// [2026-09-16] X1-01 修改器「等级=N」开着时,mole_cheats 的 FORCE_LEVEL 臂对所有调用者(含宿主 msg_send)的 curLevel 都返回强制等级。
+///   选题结果却按天写进 mole_activity.dat、同一天原样复用:关掉作弊甚至重启后,真实 1~9 级的玩家当天仍拿着 take_level 9/10 的任务,
+///   岛上的 hv_daily_vals 同样受影响。那个臂只该改显示(与深扫 #5 encryptCurLevel 同类)。所以作弊开着时不发 curLevel,
+///   直接读密文 ivar,按原 getter 解密。返回 None = 作弊开着且读不到可信的真实等级,调用方只临时选题回包、不落盘。
+///   作弊关着照旧发消息。
+fn main_player_level(env: &mut Environment) -> Option<i32> {
     let gd = singleton(env, "GameData", "sharedInstance");
     if gd == nil {
-        return 1;
+        return Some(1);
     }
     let ui_sel = sel_named(env, "userInfoData");
     let ui: id = msg_send(env, (gd, ui_sel));
     if ui == nil {
-        return 1;
+        return Some(1);
+    }
+    let forced = crate::mole_cheats::level();
+    if forced > 0 {
+        let real = read_ivar_u32(env, ui, SLOT_UI_CUR_LEVEL).map(|c| (c ^ CUR_LEVEL_XOR) as i32);
+        return match real {
+            Some(lv) if (0..=CUR_LEVEL_SANE_MAX).contains(&lv) => {
+                let lv = lv.max(1);
+                log!(
+                    "[ACTIVITY] 每日任务选题:修改器「等级={}」开着,不发被覆盖的 curLevel,按密文 ivar 解出的真实等级 {} 选题",
+                    forced,
+                    lv
+                );
+                Some(lv)
+            }
+            other => {
+                log!(
+                    "[ACTIVITY] 每日任务选题:修改器「等级={}」开着,真实等级读不到(解密结果 {:?}),本次只临时选题回包、不落盘",
+                    forced,
+                    other
+                );
+                None
+            }
+        };
     }
     let lv_sel = sel_named(env, "curLevel");
     let lv: i32 = msg_send(env, (ui, lv_sel));
-    lv.max(1)
+    Some(lv.max(1))
 }
 
 /// 某一条的候选偏移(相对该段起始 ID):take_level ≤ level 的全部偏移;一个都没有时退回 take_level 最低的那个
@@ -2430,12 +2591,27 @@ fn daily_values_for_today(env: &mut Environment, island: bool, ymd: u32) -> Vec<
     if day == ymd && daily_vals_valid(stored, island) {
         return stored.clone();
     }
-    let level = main_player_level(env);
+    let (level, persist) = match main_player_level(env) {
+        Some(lv) => (lv, true),
+        // [2026-09-16] X1-01 修改器等级开着且读不到真实等级:按最保守的 1 级选(每条都做得了),本次只回包,
+        //   不写 daily_day/daily_vals(岛上是 hv_daily_day/hv_daily_vals),下一次请求(比如重启后客户端列表为空再要)重新选题。
+        None => (1, false),
+    };
     let vals = if island {
         pick_daily_island(ymd, level)
     } else {
         pick_daily_main(ymd, level)
     };
+    if !persist {
+        log!(
+            "[ACTIVITY] 每日任务选题({}):日期={} 按 1 级临时选题 原始值={:?} → 任务ID={:?},不写旁路档(修改器等级开着且读不到真实等级)",
+            if island { "黄金岛" } else { "主村" },
+            ymd,
+            vals,
+            daily_ids(&vals, island)
+        );
+        return vals;
+    }
     if island {
         st.hv_daily_day = ymd;
         st.hv_daily_vals = vals.clone();
