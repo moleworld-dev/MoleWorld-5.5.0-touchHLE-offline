@@ -52,11 +52,16 @@ static ONLINE_MODE: AtomicBool = AtomicBool::new(false);
 /// [扫描修 2026-09-15] 集成:mole_dev::startup 只调一次(见 intercept)。
 static DEV_STARTUP_DONE: AtomicBool = AtomicBool::new(false);
 /// [扫描修 2026-09-15] F10-6 去广告/地图上传各日志点的"已打过一次 log!"标志。
-static LOG1_AD_MOLECART: AtomicBool = AtomicBool::new(false);
+// [2026-09-16] B-05 删掉 LOG1_AD_MOLECART:它只服务 getMoleCartAdImageFromServer 诊断臂,那一臂在原版不可达,已一并删除。
+//   (用普通注释而非 ///,免得这句挂成下一行 LOG1_AD_PROMPT 的文档注释。)
 static LOG1_AD_PROMPT: AtomicBool = AtomicBool::new(false);
 static LOG1_AD_MOREGAME: AtomicBool = AtomicBool::new(false);
 static LOG1_AD_ZHONGXIN: AtomicBool = AtomicBool::new(false);
 static LOG1_MAP_UPLOAD: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16] F1-02 mapExtend 取景覆盖、F1-01 岛上 showWithTarget:selector: 非法哨兵 target 被吞掉,各自的首次 log! 标志
+/// (两处都可能每帧/每次点击命中,首次 log! 证明钩子生效,之后降为 log_dbg!)。
+static LOG1_MAPEXTEND_VIEW: AtomicBool = AtomicBool::new(false);
+static LOG1_ISLAND_BAD_TARGET: AtomicBool = AtomicBool::new(false);
 /// [扫描修 2026-09-15] F12-10 「左左右右」操作提示本进程是否已弹过(只弹一次)。
 static WASHROOM_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
@@ -194,7 +199,8 @@ thread_local! {
     static ISLAND_LAST_TICK: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// [P3 商店空白真因诊断] 仅在首次强制 curSceneId 时打一行真实值(curSceneId 每帧多次读,防刷屏)。
+/// 岛上 curSceneId 被改成 1/10 以外的值时强制 10,只打一次真实值(防刷屏)。
+/// [2026-09-16] B-08 旧标签「[P3 商店空白真因诊断]」已过时:商店空白的真因早已由非脆弱 ivar 偏移写回 guest 修掉,这里只剩一次性状态日志。
 static CURSCENE_DIAG_DONE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -1168,45 +1174,117 @@ fn save_island_map(env: &mut Environment) -> Option<String> {
     Some(format!("存盘 island_map.dat(count={} ok={})", cnt, ok))
 }
 
-/// 沙原地图碎片注入(从 build_default 抽出:持久化路径和默认路径都要保沙原探险图可用;Phase 4 改真实获取)。
+/// [2026-09-16] A1-02+A2-02 本岛档的沙原碎片是否已改按「原版获取途径」管理:不再白送商店可买的 31006/31008,
+/// 31005/31007 只在任务已完成却缺碎片时兜底。置位后由 save_island_userinfo 写进 island_userinfo.dat 的
+/// ISLAND_FRAG_BY_QUEST_KEY 键,load_island_userinfo 每次进岛先清零再读回。老版本读档只认固定键,多一个键无影响。
+/// ★为什么必须持久化、不能只看 island_fragments.dat 在不在:save_island_fragments 碎片数为 0 时不写文件(防空壳坏档),
+///   真新岛档没买碎片、任务没做到 81 就退岛,只会留下 island_map.dat。第二次进岛它和「P4-b 之前的老档」一模一样,
+///   又会被当老档补齐 4 块(island_e2e.sh 两进两出的第二进必现),降级等于白做。
+static ISLAND_FRAG_BY_QUEST: AtomicBool = AtomicBool::new(false);
+const ISLAND_FRAG_BY_QUEST_KEY: &str = "moleSandFragByQuest";
+
+/// 沙原地图碎片兜底(从 build_default 抽出:持久化路径和默认路径都在 load_island_fragments 之后调用)。
 /// [扫描修 2026-09-15] F1-3/F5-10 纠错:31005-31008 是「沙原地图碎片Ⅰ-Ⅳ」,火山是 31009-31012(propertyHV 描述实证),
 ///   以前的函数名/注释/日志都把它叫"火山",错。原版来源本地齐全:
 ///   · 31006/31008(以及火山 31009/31011)= 岛建设商店 20 贝壳可买(shop_type=1 sub=2);
 ///   · 31005/31007 = 岛农场任务 81/83 的 rew_potato(-[NewSceneQuest rewardXP:vipGold:buildValue:]@0x32a49c ≥1000 走物品分支
 ///     → GET_ITEM_FROM_QUEST 框 → addAdventureMapFragment:@0x32a6d6);火山 31010/31012 = 咖啡任务 16/17 的 rew_object。
-///   所以这里是"绕过"而非"补全"。暂不降级成"仅任务 81/83 已完成却缺碎片时兜底":81/83 在 91 条岛任务链靠后
-///   (4 工人 24h / 6 工人 48h),需先实跑任务链到 83、确认离线无断点再改,否则新档沙原会被锁死;老档已持久化 4 块不受影响。
+/// [2026-09-16] A1-02+A2-02 从「每次进岛无条件补 4 块」降级为兜底,分三种情况:
+///   (a) 老档:island_fragments.dat 不存在、island_map.dat 存在,且 island_userinfo.dat 里没有 ISLAND_FRAG_BY_QUEST 标记
+///       (P4-b 之前的档,或从没正常退岛落盘过)→ 照旧补齐 4 块。否则老档的 31006/31008 会凭空消失,任务又早就做完、
+///       31005/31007 不会再发,沙原被锁。补齐后本次退岛会把 4 块写进 island_fragments.dat,下次进岛自然转入 (c)。
+///   (b) 真新岛档(两个文件都不存在)/(c) island_fragments.dat 已存在或已有标记:不注入 31006/31008,
+///       31005/31007 只按任务进度兜底 done(N) = nextQuestId > N && curQuestId != N(N=81/83),并置位标记。
+///       依据:-[NewSceneQuest accept]@0x3289b0 在 0x328a6c setCurQuestId:next、0x328a88 setNextQuestId:next+1;
+///       -[NewSceneQuest postFinish]@0x32a2a0 发完奖在 0x32a334 setCurQuestId:0。两处接收者都是
+///       -[NewSceneQuest getUserInfoData]@0x328040 = [[NewSceneData sharedInstance] userInfoDataInNewScene],
+///       也就是这里读的同一个对象(getter nextQuestId@0x323a04 / curQuestId@0x323a24 都是纯 ivar 读)。
+///       所以「任务 N 进行中」(cur==N、next==N+1)不算完成,不提前送。
+///       时序:两个调用点都在 build_default_island_mapdata 里 load_island_userinfo 之后,进度已从 island_userinfo.dat 读回;
+///       没档时是 init 默认的 nextQuestId=1。不读 NewSceneQuest 单例的 curQuestId(进岛注入时它可能还没初始化)。
+///   读不到进度(userInfoDataInNewScene 为 nil,或 nextQuestId<=0)→ 退回全量注入且不置标记,绝不锁死沙原。
+///   31006/31008 即便因坏档丢失,也能在岛建设商店重新买到,不会锁死。
 fn inject_sandgarden_fragments(env: &mut Environment, nsd: id) {
-    let frags_s = env
-        .objc
-        .register_host_selector("mapFragments".to_string(), &mut env.mem);
+    let frags_s = island_sel(env, "mapFragments");
     let frags: id = msg_send(env, (nsd, frags_s));
-    if frags != nil {
-        let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
-        let nwi = env
-            .objc
-            .register_host_selector("numberWithInt:".to_string(), &mut env.mem);
-        let add_s = env
-            .objc
-            .register_host_selector("addObject:".to_string(), &mut env.mem);
-        let has_s = env
-            .objc
-            .register_host_selector("containsObject:".to_string(), &mut env.mem);
-        let mut added = 0;
-        for fid in [31005i32, 31006, 31007, 31008] {
-            let num: id = msg_send(env, (num_cls, nwi, fid));
-            let dup: bool = msg_send(env, (frags, has_s, num));
-            if !dup {
-                let _: () = msg_send(env, (frags, add_s, num));
-                added += 1;
-            }
+    if frags == nil {
+        return;
+    }
+    // 情况 (a) 判定。标记已置位时不必再发 fileExistsAtPath:。
+    let mut legacy = false;
+    if !ISLAND_FRAG_BY_QUEST.load(O) {
+        let frag_path = island_data_path(env, "island_fragments.dat");
+        if !guest_file_exists(env, frag_path) {
+            let map_path = island_map_path(env);
+            legacy = guest_file_exists(env, map_path);
         }
-        // [扫描修 2026-09-15] F10-6 只在真的补进了碎片时打 log!(老档每次进岛 4 块都已在,不再重复刷一行)。
-        if added > 0 {
-            log!("[MOLECHEAT] island: 补注入沙原地图碎片 {} 块(31005-31008,去重)", added);
+    }
+    let (ids, mode): (Vec<i32>, &str) = if legacy {
+        (vec![31005, 31006, 31007, 31008], "老档补齐")
+    } else {
+        let ui_s = island_sel(env, "userInfoDataInNewScene");
+        let ui: id = msg_send(env, (nsd, ui_s));
+        let (next, cur): (i32, i32) = if ui != nil {
+            let next_s = island_sel(env, "nextQuestId");
+            let cur_s = island_sel(env, "curQuestId");
+            let next: i32 = msg_send(env, (ui, next_s));
+            let cur: i32 = msg_send(env, (ui, cur_s));
+            (next, cur)
         } else {
-            log_dbg!("[MOLECHEAT] island: 沙原地图碎片 31005-31008 已齐,无需补注入");
+            (0, 0)
+        };
+        if next <= 0 {
+            log!(
+                "[MOLECHEAT] island: 读不到岛任务进度(userInfo 为空={} nextQuestId={}),沙原碎片退回全量兜底(不锁死)",
+                ui == nil,
+                next
+            );
+            (vec![31005, 31006, 31007, 31008], "读不到任务进度,全量兜底")
+        } else {
+            ISLAND_FRAG_BY_QUEST.store(true, O);
+            let done = |n: i32| next > n && cur != n;
+            let mut v = Vec::new();
+            if done(81) {
+                v.push(31005);
+            }
+            if done(83) {
+                v.push(31007);
+            }
+            log_dbg!(
+                "[MOLECHEAT] island: 沙原碎片按任务进度兜底 nextQuestId={} curQuestId={} → 候选 {:?}",
+                next,
+                cur,
+                v
+            );
+            (v, "按岛任务 81/83 进度兜底")
         }
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwi = island_sel(env, "numberWithInt:");
+    let add_s = island_sel(env, "addObject:");
+    let has_s = island_sel(env, "containsObject:");
+    let mut added: Vec<i32> = Vec::new();
+    for fid in ids {
+        let num: id = msg_send(env, (num_cls, nwi, fid));
+        let dup: bool = msg_send(env, (frags, has_s, num));
+        if !dup {
+            let _: () = msg_send(env, (frags, add_s, num));
+            added.push(fid);
+        }
+    }
+    // [扫描修 2026-09-15] F10-6 只在真的补进了碎片时打 log!(老档每次进岛碎片都已在,不再重复刷一行)。
+    if !added.is_empty() {
+        log!(
+            "[MOLECHEAT] island: 补注入沙原地图碎片 {} 块 {:?}({},去重)",
+            added.len(),
+            added,
+            mode
+        );
+    } else {
+        log_dbg!("[MOLECHEAT] island: 沙原地图碎片无需补注入({})", mode);
     }
 }
 
@@ -1279,8 +1357,9 @@ fn save_island_fragments(env: &mut Environment) -> Option<String> {
 
 /// [P4-b 探险地图碎片持久化] 进岛读回 island_fragments.dat 里玩家买到的碎片,逐个并入 mapFragments_
 /// (containsObject 去重,与 inject_sandgarden_fragments 同法,不发包)。坏档/无档=静默跳过(NSKeyedUnarchiver
-/// 已有数值解码容错)。★注:沙原的 31005/31007 商店【不卖】(propertyHV 实证 shop_type=None,原版来源是岛任务 81/83),
-/// 离线暂靠 inject_sandgarden_fragments bootstrap;故本函数只负责【恢复买到的】,沙原可达仍由 inject 保证(不锁死)。
+/// 已有数值解码容错)。★注:沙原的 31005/31007 商店【不卖】(propertyHV 实证 shop_type=None,原版来源是岛任务 81/83)。
+/// 本函数只负责【恢复买到的/已得的】;[2026-09-16] A1-02+A2-02 起 inject_sandgarden_fragments 只做兜底
+/// (老档补齐 4 块,其余只补任务 81/83 已完成却缺的 31005/31007),规则见该函数注释。
 /// [扫描修 2026-09-15] F1-3/F5-10 纠错:以前这里写成"火山必需",实为沙原碎片;火山 31010/31012 来自咖啡任务 16/17。
 fn load_island_fragments(env: &mut Environment) {
     let path = island_data_path(env, "island_fragments.dat");
@@ -1721,6 +1800,13 @@ fn save_island_userinfo(env: &mut Environment) -> Option<String> {
         let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
         let _: () = msg_send(env, (dict, sfk, num, k));
     }
+    // [2026-09-16] A1-02+A2-02 沙原碎片「按任务进度兜底」标记(见 ISLAND_FRAG_BY_QUEST)。只在置位时写,
+    //   没有这个键 = 老档语义;老版本读档只认固定键,多一个键无影响。
+    if ISLAND_FRAG_BY_QUEST.load(O) {
+        let num: id = msg_send(env, (num_cls, nwi, 1i32));
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_FRAG_BY_QUEST_KEY);
+        let _: () = msg_send(env, (dict, sfk, num, k));
+    }
     // curQuestResult 是 double
     {
         let g = env
@@ -1773,6 +1859,9 @@ fn save_island_userinfo(env: &mut Environment) -> Option<String> {
 
 /// [P5] 进岛读回 island_userinfo.dat,覆盖到岛 userInfo(在 server-fed/默认值之后、渲染之前)。
 fn load_island_userinfo(env: &mut Environment) -> bool {
+    // [2026-09-16] A1-02+A2-02 每次进岛先清零沙原碎片标记,只由本次读到的档决定(无档/坏档 = 未置位),
+    //   防止上一个岛会话的值串到删档重建或换档之后。
+    ISLAND_FRAG_BY_QUEST.store(false, O);
     let path = island_data_path(env, "island_userinfo.dat");
     if path == nil {
         return false;
@@ -1830,6 +1919,15 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
             let v: i32 = msg_send(env, (num, iv));
             let s = env.objc.register_host_selector(setter.to_string(), &mut env.mem);
             let _: () = msg_send(env, (ui, s, v));
+        }
+    }
+    // [2026-09-16] A1-02+A2-02 读回沙原碎片「按任务进度兜底」标记(见 ISLAND_FRAG_BY_QUEST;函数开头已清零)。
+    {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_FRAG_BY_QUEST_KEY);
+        let num: id = msg_send(env, (dict, ofk, k));
+        if num != nil {
+            let v: i32 = msg_send(env, (num, iv));
+            ISLAND_FRAG_BY_QUEST.store(v != 0, O);
         }
     }
     {
@@ -3086,7 +3184,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         assign_island_seqids(env); // [P2b/P3a 修] 读档对象没有 seqId(不在 NSCoding 键里)→ 补发,否则回写/合并全被 seqId==0 守卫跳过
         load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片
         // [扫描修 2026-09-15] F1-3/F5-10 纠错:补的是沙原碎片(31005/31007 原版是岛任务 81/83 奖励、商店不卖),不是火山。
-        inject_sandgarden_fragments(env, nsd); // 再 bootstrap 沙原 31005-31008,去重不覆盖
+        inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片:老档补齐 4 块,其余只补任务 81/83 已完成却缺的 31005/31007(去重)
         migrate_island_timestamps(env); // [审计修] unix 纪元残留 → CFAbsoluteTime
         load_island_ships(env); // [审计修] 船 shipState/待领奖品、咖啡馆 isNew(不在 NSCoding 里)
         fix_stuck_ships(env); // [审计修] 唯一会永久卡死的船状态组合兜底
@@ -3204,12 +3302,13 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         .register_host_selector("setMapData:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (nsd, set_s, dict));
 
-    // ★Bug D(探险地图碎片)补偿:mapFragments 离线无回包→恒空→探险船凑不齐;注入沙原 4 块 31005-31008。
+    // ★Bug D(探险地图碎片)补偿:mapFragments 离线无回包→恒空→探险船凑不齐;原来无条件注入沙原 4 块 31005-31008。
     //   已抽成 inject_sandgarden_fragments,持久化路径也复用。
+    //   [2026-09-16] A1-02+A2-02 已降级为兜底:真新岛档不送商店可买的 31006/31008,31005/31007 按任务 81/83 进度补,规则见该函数注释。
     // [扫描修 2026-09-15] F5-10 纠错:-[NewSceneData activatedAdventureMap] 判的是 12 槽 / 3 张图(0x222f12 cmp #0xb),
     //   不是"只判这 4 槽";这里只保证沙原一张图可探险,火山(31009-31012)仍靠商店购买 + 咖啡任务 16/17。
     load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片(默认岛首进通常无,空过)
-    inject_sandgarden_fragments(env, nsd); // 再 bootstrap 沙原 31005-31008(31005/31007 是任务奖励、商店不卖)
+    inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片(真新岛档:31006/31008 走商店购买,31005/31007 按任务 81/83 进度补)
     restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001-90008,抬游标到 90008 防新放置撞号
 
     log!("[MOLECHEAT] island: injected default mapData (5 shops 30101-30105 / restaurant 30002 / apartment 30001 / ship 34001)");
@@ -3539,6 +3638,11 @@ fn apply_crack_patches(env: &mut Environment) {
 /// ★[深扫修 2026-09-11] #12 语义改成与 ui43_mode 一致的 `!= "0"`:以前 `var_os().is_some()` 让 MOLE_FIX_MAPEXTEND=0
 ///   也算开启,与启动器注释"设 0 可关"矛盾。此前不敢改,是因为启动器靠 export 它来"保住 any_enabled 为真";
 ///   现在 any_enabled 已与环境变量脱钩(见下),设 0 只会关掉 mapExtend 修复本身,不再连带关掉常驻钩子。
+/// ★[2026-09-16] F1-02 覆盖范围收窄:以前 getter 对全部 23 个调用点恒返回 0x1F,经 -[UserInfoData encodeWithCoder:] 每次存档
+///   都把 0x1F 永久写进 userinfo.dat,并直接放开未修桥/梯的扩地摆放、扩地成就与任务判定。现在只对 VillageLayer
+///   setBkg/curVisibleArea/curWalkableArea/curBornArea 这 4 个取景调用点返回 真值|0x1F(按调用者 LR 精确匹配,见
+///   MAPEXTEND_VIEW_LRS 与 intercept 里的 mapExtend 臂),其余调用点一律读真值。开关默认值未改(交用户决定);
+///   已被旧逻辑写成 0x1F 的存档无法自动还原。
 fn fix_mapextend_on() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -3550,6 +3654,10 @@ fn fix_mapextend_on() -> bool {
             .unwrap_or(cfg!(target_os = "ios"))
     })
 }
+
+/// [2026-09-16] F1-02 mapExtend 取景覆盖只认这 4 个调用者返回址(Thumb 返回址 = blx 地址 + 4 | 1,re.py annot 逐个核对):
+///   -[VillageLayer setBkg] blx@0x334b8、curVisibleArea blx@0x350a4、curWalkableArea blx@0x351d8、curBornArea blx@0x3535c。
+const MAPEXTEND_VIEW_LRS: [u32; 4] = [0x334bd, 0x350a9, 0x351dd, 0x35361];
 
 /// objc/messages.rs 进入 intercept 的总闸。
 /// ★[深扫修 2026-09-11] #12 无条件返回 true。
@@ -3892,7 +4000,7 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "showWithTarget:"
             | "showWithTarget:selector:"
             | "checkPromptForLoadingNewApp" // [去广告] 赛尔号跨游戏广告弹窗触发器(GameManager)
-            | "getMoleCartAdImageFromServer" // [去广告] AdViewForMoleCart 拉广告图入口(兜底拦截)
+            // [2026-09-16] B-05 删掉 getMoleCartAdImageFromServer:intercept 里对它只有一个不可达的诊断臂(唯一调用者就是上面的触发器)
             // [去广告·真凶] 淘米「更多游戏」跨游戏推荐弹窗的展示方法(赛尔号/摩尔卡丁车整屏弹窗)
             | "showMoreGameOnRootView:withScale:andOrientationSupported:"
             | "showMoreGameOnRootView:withScale:"
@@ -5107,14 +5215,9 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 触发 → getMoleCartAdImageFromServer → onImageRecieved → 直接 addChild 上屏(有 defaultAdImage 兜底,
     // 本端 HTTP 已 drop 也照弹)。所以正确的拦点是【触发器本身】:掐掉 checkPromptForLoadingNewApp,
     // 整条广告流程不启动。按 selector 收窄,不影响别的类。
-    // 诊断:记录拉图入口是否被调用(确认 banner 确实走 AdView 这条路)。
-    // [扫描修 2026-09-15] F10-6 去广告 4 个日志点:每个点本进程首次用 log!(证明钩子生效、保留「去广告」关键字),之后降为 log_dbg!。
-    if sel == "getMoleCartAdImageFromServer" {
-        log_first_then_dbg!(
-            LOG1_AD_MOLECART,
-            "[MOLECHEAT] 去广告诊断:{class}.getMoleCartAdImageFromServer 被调用(AdView 广告流程在跑)"
-        );
-    }
+    // [2026-09-16] B-05 拉图入口 getMoleCartAdImageFromServer 全二进制只有 1 处调用,在 -[GameManager checkPromptForLoadingNewApp]@0x25a24
+    //   内(+0xce,0x25af2),下面已在触发器处无条件吞掉,所以原来这里的诊断臂永远走不到,已删。
+    // [扫描修 2026-09-15] F10-6 去广告各日志点:每个点本进程首次用 log!(证明钩子生效、保留「去广告」关键字),之后降为 log_dbg!。
     // ★将来接私服「自定义公告推送」:这里改成——不 return,而是放行/改喂我们后台的 PNG;现在=纯 ban。
     if sel == "checkPromptForLoadingNewApp"
         || (class == "AdViewForMoleCart" && (sel == "showWithTarget:selector:" || sel == "showWithTarget:"))
@@ -5469,7 +5572,15 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //     拦 TMAHttpManager getDictionaryWithJsonData:,自己在 Rust 解析 passport 响应 JSON
             //     构造【标准 NSDictionary】喂回,客户端 requestFinish: 照常 objectForKey: 取 status_code/extra_data 分发。
             if class == "TMAHttpManager" && sel == "getDictionaryWithJsonData:" {
-                let data: id = Ptr::from_bits(env.cpu.regs()[2]);
+                // [2026-09-16] F1-04 nsdata_to_bytes 发了 length/bytes 两次宿主 msg_send(返回后 r0-r3 是被调方留下的值);
+                //   空键路径要放行真方法,先快照、落空前恢复。真方法@0x4aeb8c 眼下只用 r2,不恢复也侥幸无害,但不能靠侥幸。
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let data: id = Ptr::from_bits(saved[2]);
                 let bytes = nsdata_to_bytes(env, data);
                 let pairs = parse_flat_json(&bytes);
                 if !pairs.is_empty() {
@@ -5481,14 +5592,25 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     env.cpu.regs_mut()[0] = dict.to_bits();
                     return true;
                 }
+                env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
             }
             // (P1) 拦 TMA_ASINetworkQueue addOperation:(passport 真正的发送动作),代理到私服 shim。
             //      只在切换账号激活后代理(避免碰进村自动 autoLogin 的静默登录崩溃分支)。
             if MENU_ACTIVE.load(O) && class == "TMA_ASINetworkQueue" && sel == "addOperation:" {
-                let req: id = Ptr::from_bits(env.cpu.regs()[2]);
+                // [2026-09-16] F1-04 passport_proxy_enqueue 先经 asi_request_url 发 url/absoluteString 两次宿主 msg_send;
+                //   非 passport URL 或没抓到 reqID 时返回 false、要放行真 addOperation:(@0x4d6ac4 开头 mov r5,r0 取 self),
+                //   不恢复就会拿 NSString 当 self 跑。它内部的每个 return false 都由这里统一恢复 r0-r3。
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let req: id = Ptr::from_bits(saved[2]);
                 if passport_proxy_enqueue(env, req) {
                     return true;
                 }
+                env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
             }
             // (P2) 回灌:原版 requestFinish: 读 [request responseData] 时,把代理拿到的 JSON 喂回去。
             if sel == "responseData"
@@ -5531,11 +5653,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // establishConnection 开头 `if(self->isReachable_)` 读的是 IVAR(G1 只改了方法),
         // 进入前先 [self setIsReachable:YES] 置 ivar,否则直接 bail 不连。放行真方法。
         if LOGIN_ARMED.load(O) && class == "NetworkManager" && sel == "establishConnection" {
-            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+            // [2026-09-16] F1-04 setIsReachable: 是宿主 msg_send,返回后 r0-r3 是被调方留下的值。现在只因
+            //   -[NetworkManager setIsReachable:]@0xed30c 恰好是 `strb r2,[r0,r1]; bx lr` 才保住 r0(r1 已变成 180),
+            //   真方法@0xe104c 开头 mov r8,r0 取 self。放行前恢复快照,不靠被调方的实现细节。
+            let saved = [
+                env.cpu.regs()[0],
+                env.cpu.regs()[1],
+                env.cpu.regs()[2],
+                env.cpu.regs()[3],
+            ];
+            let nm: id = Ptr::from_bits(saved[0]);
             let set = env
                 .objc
                 .register_host_selector("setIsReachable:".to_string(), &mut env.mem);
             let _: () = msg_send(env, (nm, set, true));
+            env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
             // 落到下面 -> 返回 false,真 establishConnection 用 isReachable_=1 运行
         }
         // HUD 统计:state 6 = 发了一个包,state 7 = 解析了一个包。一律 pass-through ——
@@ -5925,19 +6057,26 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // 而最初的 issue-4 修复(在此顶 gameMode=1)经 workflow 实证=本崩的根因:顶 gameMode 会
         // 提前打开 HolidayVillageLayer.processTouch 触摸派发循环、命中未初始化哨兵槽 0x1。故 gameMode
         // 待机化已移到 HolidayVillageLayer.onEnter 延后顶(见下 onEnter hook);这里只保留硬兜底:
-        // target 不像指针(<0x1000)就吞掉整条 showWithTarget:(任意类,防别的建筑面板同样的崩),
+        // target 非零却不像指针(<0x1000)就吞掉整条 showWithTarget:(任意类,防别的建筑面板同样的崩),
         // 作为 0x1 的最后一道防线。寄存器:self=r0, _cmd=r1, target=r2, selector=r3。
+        // [2026-09-16] F1-01 nil 不再算无效。岛 HUD 是 NewSceneUserInfoLayer(继承 UserInfoLayer 的按钮回调),点成就/兑换中心/
+        //   VIP 功能发的是 [XxxLayer showWithTarget:nil selector:nil](-[UserInfoLayer onButtonAchieveSelected:]@0x59c90 在
+        //   0x59e40 movs r2,#0;兑换中心 0x59f3e、VIP 功能 0x5a28a 同样传 nil)。原版各 show 方法都容忍 nil:AchieveSystemLayer@0x310044、
+        //   VIPFunctionsLayer@0x37b83c、VIPLayer@0x37ef18、ExchangeCenterLayer@0x376d60;RestaurantView@0x249768 自己在
+        //   0x2497ae 起判 nil 就 return。旧判据 `target < 0x1000` 连 0 一起吞 → 这些面板在岛上点了没反应。
+        //   只改判据,仍对任意类生效、不按类名收窄(别的岛建筑面板是否会收到 0x1 没核实,收窄会让它们失去这道防线)。
         if ON_ISLAND.load(O) && sel == "showWithTarget:selector:" {
             let target = env.cpu.regs()[2];
-            if target < 0x1000 {
-                log!(
+            if target != 0 && target < 0x1000 {
+                log_first_then_dbg!(
+                    LOG1_ISLAND_BAD_TARGET,
                     "[MOLECHEAT] island: {} showWithTarget: 无效 target={:#x},吞掉防崩",
                     class,
                     target
                 );
                 return true; // 吞掉:不跑真方法 → 不会 [0x1 isKindOfClass:] → 不崩
             }
-            // target 有效:直接放行真方法(gameMode 门已由 LR 收窄 hook 放行,布兰的家正常弹面板)。
+            // target 为 nil 或有效指针:放行真方法(nil 由原版自己处理;gameMode 门已由 LR 收窄 hook 放行,布兰的家正常弹面板)。
         }
 
         // ★Bug B 续(公寓雇用按了没真出摩尔):点雇用 NewSceneApartment 走 setCurrentProduceMoleNums:(old+1)
@@ -6527,11 +6666,44 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
 
     // [MoleWorld] mapExtend 修复(见 fix_mapextend_on() 注释):在线进村存档 mapExtend=6 与满图
     // 内容不一致 → curVisibleArea/curWalkableArea/curBornArea/setBkg 算出错误可视区 → 拖动闪。
-    // 强制 mapExtend getter 返回 0x1F(满图全区)。
+    // ★[2026-09-16] F1-02 只在这 4 个取景调用点生效,返回 真值|0x1F(保留 0x1F 以上的位,如存档 287=0x11F 的 0x100)。
+    //   根因:以前对 -[UserInfoData mapExtend]@0xbd6cc(`ldrh r0,[r0,r1]` 读 mapExtend_ +72,纯 u16 getter)的全部 23 个调用点
+    //   都返回 0x1F:encodeWithCoder: 在 0xba246 取值编码 → 每次存档把 0x1F 永久写进 userinfo.dat;encodeUserInfoData
+    //   0xbc47c 上传私服;Bridge/Ladder onFinishHandler、ObjectManager moveBridge:/checkMapExtendError、VillageMenuLayer
+    //   addNewObject2Map:gift: 读后 orr 再 setMapExtend: 把假值写回 ivar;Porter isReachable 摆放可达、GameData getLockType4Object:、
+    //   Quest 任务与 AchievementControl checkAchieve_ReqMap 成就判定全被直接满足。与深扫 #5 encryptCurLevel 显示覆盖漏进存档同类。
+    //   现在按调用者 LR 精确匹配 MAPEXTEND_VIEW_LRS(四处取值后都只用低 5 位:0x350c0/0x351f4 and #0x1f、0x35364 ands #0x1f、
+    //   setBkg 存到 [sp,#0xa0] 后全函数只在 0x3358a tst #0x10 用一次;所以 真值|0x1F 与旧的恒 0x1F 对这 4 处效果完全相同),
+    //   其余调用点一律放行真 getter。不加在线门控(离线也有早先在线同步来的 mapExtend=6 本地坏档要兜底);不额外调
+    //   checkMapExtendError(原版 -[GameManager endLoadCallBack]+0x30 已调,且它只补 0x2/0x4 两位)。
     if fix_mapextend_on() {
         if let ("UserInfoData", "mapExtend") = (class, sel) {
-            env.cpu.regs_mut()[0] = 0x1F;
-            return true;
+            let lr = env.cpu.regs()[14];
+            if MAPEXTEND_VIEW_LRS.contains(&lr) {
+                let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
+                let real: Option<u16> = if recv == nil {
+                    None
+                } else {
+                    env.objc
+                        .object_lookup_ivar(&env.mem, recv, &"mapExtend_".to_string())
+                        .map(|p| {
+                            let p: MutPtr<u16> = p.cast();
+                            env.mem.read(p)
+                        })
+                };
+                // 查不到 ivar(理论上不会)时退回旧值 0x1F:只影响这 4 个取景调用点,不会进存档。
+                let ret: u32 = real.map_or(0x1F, |r| (r as u32) | 0x1F);
+                log_first_then_dbg!(
+                    LOG1_MAPEXTEND_VIEW,
+                    "[MOLECHEAT] mapExtend 取景覆盖:LR={:#x} 真值={:?} → 返回 {:#x}(只改 4 个取景调用点,存档/扩地/成就/任务读真值)",
+                    lr,
+                    real,
+                    ret
+                );
+                env.cpu.regs_mut()[0] = ret;
+                return true;
+            }
+            // 其余 19 个调用点:放行真 getter。
         }
     }
 
