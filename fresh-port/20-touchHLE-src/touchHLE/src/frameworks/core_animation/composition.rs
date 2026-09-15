@@ -63,6 +63,14 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    // [深扫修 2026-09-11] #23(a):合成前先布局 setNeedsLayout 打过脏标记的视图
+    // (MBProgressHUD 的底框宽高/指示器居中都在 layoutSubviews 里算),必须在
+    // display_layers(drawRect:)之前。放在函数最前面:① 早于下面对 windows 的
+    // 克隆,避免 guest 的 layoutSubviews 改动窗口列表后用到过期列表;② 早于全屏
+    // EAGL 快路径判断,因为布局可能增删子视图从而改变能否走快路径。
+    // 本调用由 NSRunLoop 发起,不在游戏 drawScene 帧栈内;无脏视图时只是一次计数判断。
+    crate::frameworks::uikit::ui_view::layout_dirty_views_before_composition(env);
+
     let mut animation_state = animation::State::default();
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     if !windows.iter().any(|&window| !msg![env; window isHidden]) {

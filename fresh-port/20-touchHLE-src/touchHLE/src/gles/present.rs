@@ -158,30 +158,9 @@ pub unsafe fn present_frame(
     }
 
     gles.DrawArrays(gles11::TRIANGLES, 0, 6);
-    // [MoleWorld iOS 三角定位诊断·临时] 主纹理四边形之上叠两个角块:
-    //  左上=纯品红实心(不采样纹理)→ 验证 present 上屏是否通;
-    //  右上=纹理四边形但 texcoord 全硬编码 (0.5,0.5)(采样纹理正中)→ 若它出图而主四边形黑,
-    //        说明【主四边形的客户端 texcoord 数组没被应用】(采样到角落黑);若它也黑则是纹理采样本身坏。
-    #[cfg(target_os = "ios")]
-    {
-        // 左上品红
-        gles.Disable(gles11::TEXTURE_2D);
-        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
-        gles.Color4f(1.0, 0.0, 1.0, 1.0);
-        let mv: [f32; 12] = [-1.0, 0.3, -1.0, 1.0, -0.3, 0.3, -0.3, 0.3, -1.0, 1.0, -0.3, 1.0];
-        gles.VertexPointer(2, gles11::FLOAT, 0, mv.as_ptr() as *const GLvoid);
-        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
-        // 右上:纹理,texcoord 硬编码采样中心 (0.5,0.5)
-        gles.Color4f(1.0, 1.0, 1.0, 1.0);
-        gles.Enable(gles11::TEXTURE_2D);
-        gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
-        let cv: [f32; 12] = [0.3, 0.3, 0.3, 1.0, 1.0, 0.3, 1.0, 0.3, 0.3, 1.0, 1.0, 1.0];
-        let ct: [f32; 12] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
-        gles.VertexPointer(2, gles11::FLOAT, 0, cv.as_ptr() as *const GLvoid);
-        gles.TexCoordPointer(2, gles11::FLOAT, 0, ct.as_ptr() as *const GLvoid);
-        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
-        gles.Color4f(1.0, 1.0, 1.0, 1.0);
-    }
+    // [扫描修 2026-09-15] 这里曾有 iOS 专属「三角定位诊断角块」(左上品红实心 + 右上采样纹理中心),
+    // 是黑屏排查的临时脚手架,每帧叠画在真机屏幕上,已删除,勿复活。上方的纹理单元锁 TEXTURE0、
+    // texcoord 绕中心旋转,以及紧接着的 LoadIdentity 都是黑屏真修复,必须保留。
     // clean this up so we don't need to worry about it in e.g. Core Animation
     gles.LoadIdentity();
 
