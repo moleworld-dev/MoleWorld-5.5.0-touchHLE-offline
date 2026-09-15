@@ -6,7 +6,7 @@
 //! `sys/timeb.h`
 
 use crate::dyld::FunctionExports;
-use crate::libc::time::time_t;
+use crate::libc::time::{guest_wall_clock_now, time_t};
 use crate::mem::{MutPtr, SafeRead};
 use crate::{export_c_func, Environment};
 use std::time::SystemTime;
@@ -27,7 +27,8 @@ struct timeb {
 unsafe impl SafeRead for timeb {}
 
 fn ftime(env: &mut Environment, tb: MutPtr<timeb>) -> i32 {
-    let epoch_duration = SystemTime::now()
+    // [扫描修 2026-09-15] 接入时间旅行偏移:改读统一的虚拟墙钟(偏移为 0 时与原先一致)。
+    let epoch_duration = guest_wall_clock_now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     let time64 = epoch_duration.as_secs();

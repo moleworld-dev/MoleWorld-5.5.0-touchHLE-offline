@@ -7,8 +7,9 @@
 
 use super::ns_string::{from_rust_ordering, from_rust_string};
 use super::{NSComparisonResult, NSOrderedDescending, NSTimeInterval};
+// [扫描修 2026-09-15] "现在"统一改走 cf_absolute_time_now(含时间旅行偏移),不再直接用 SystemTime/apple_epoch。
 use crate::frameworks::core_foundation::time::{
-    apple_epoch, CFAbsoluteTimeGetGregorianDate, SECS_FROM_UNIX_TO_APPLE_EPOCHS,
+    cf_absolute_time_now, CFAbsoluteTimeGetGregorianDate, SECS_FROM_UNIX_TO_APPLE_EPOCHS,
 };
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -17,8 +18,6 @@ use crate::objc::{
 
 use crate::frameworks::foundation::ns_keyed_archiver::get_value_to_encode_for_current_key;
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_date;
-use std::ops::{Add, Sub};
-use std::time::{Duration, SystemTime};
 
 #[derive(Default)]
 pub(super) struct NSDateHostObject {
@@ -38,10 +37,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (NSTimeInterval)timeIntervalSinceReferenceDate {
-    SystemTime::now()
-        .duration_since(apple_epoch())
-        .unwrap()
-        .as_secs_f64()
+    // [扫描修 2026-09-15] 接入时间旅行偏移。
+    cf_absolute_time_now()
 }
 
 + (id)date {
@@ -55,10 +52,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // As of 2024, this approximately corresponds to 20 years into the future.
     // While `distantFuture` docs are talking in terms of centuries,
     // this should be OK to use for our purposes.
-    let time_interval = SystemTime::now()
-        .duration_since(apple_epoch())
-        .unwrap()
-        .as_secs_f64() * 2.0;
+    // [扫描修 2026-09-15] 以虚拟墙钟为基准,保证时间旅行后 distantFuture 仍在"现在"之后。
+    let time_interval = cf_absolute_time_now() * 2.0;
     let host_object = Box::new(NSDateHostObject {
         time_interval
     });
@@ -111,10 +106,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)init {
     // "Date objects are immutable, representing an invariant time interval
     // relative to an absolute reference date (00:00:00 UTC on 1 January 2001)."
-    let time_interval = SystemTime::now()
-        .duration_since(apple_epoch())
-        .unwrap()
-        .as_secs_f64();
+    // [扫描修 2026-09-15] 接入时间旅行偏移([NSDate date] 走这里)。
+    let time_interval = cf_absolute_time_now();
     env.objc.borrow_mut::<NSDateHostObject>(this).time_interval = time_interval;
     this
 }
@@ -127,10 +120,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithTimeIntervalSinceNow:(NSTimeInterval)secs {
-    let time_interval = SystemTime::now()
-        .duration_since(apple_epoch())
-        .unwrap()
-        .as_secs_f64();
+    // [扫描修 2026-09-15] 接入时间旅行偏移。
+    let time_interval = cf_absolute_time_now();
     env.objc.borrow_mut::<NSDateHostObject>(this).time_interval = time_interval + secs;
     this
 }
@@ -181,24 +172,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)timeIntervalSinceNow {
     let host_object = env.objc.borrow::<NSDateHostObject>(this);
-    let time_interval = SystemTime::now()
-        .duration_since(apple_epoch())
-        .unwrap()
-        .as_secs_f64();
+    // [扫描修 2026-09-15] 接入时间旅行偏移(NSThread sleepUntilDate: 也经由这里,口径随之一致)。
+    let time_interval = cf_absolute_time_now();
     host_object.time_interval - time_interval
 }
 
 - (NSTimeInterval)timeIntervalSince1970 {
+    // [深扫修 2026-09-11] 原实现经 SystemTime/Duration 往返,1970 年以前的日期在
+    // duration_since(UNIX_EPOCH).unwrap() 处 panic,NaN/inf 在 from_secs_f64 处 panic。
+    // 数学上完全等价的写法就是直接加两个纪元的差。
     let time_interval = env.objc.borrow::<NSDateHostObject>(this).time_interval;
-    let new_time = if time_interval >= 0.0 {
-        apple_epoch().add(Duration::from_secs_f64(time_interval))
-    } else {
-        apple_epoch().sub(Duration::from_secs_f64(-time_interval))
-    };
-    new_time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
+    time_interval + SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64
 }
 
 - (id)addTimeInterval:(NSTimeInterval)seconds {
@@ -232,6 +216,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)description {
     let time_interval = env.objc.borrow::<NSDateHostObject>(this).time_interval;
+    // [深扫修 2026-09-11] CFAbsoluteTimeGetGregorianDate 已改为 i64 实现,2001/1970 以前
+    // 的日期不再 panic;description 按真机语义固定输出 GMT(+0000),tz 传 nil。
     let greg_date = CFAbsoluteTimeGetGregorianDate(env, time_interval, nil);
     // Format similar to NSDate description: "YYYY-MM-DD HH:MM:SS +0000"
     let year = greg_date.year;
