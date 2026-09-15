@@ -22,6 +22,8 @@
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::from_rust_string;
+use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::uikit::ui_font::{UILineBreakMode, UILineBreakModeCharacterWrap};
 use crate::mem::{MutVoidPtr, Ptr};
 use crate::mole_dev::QuestFamily;
 use crate::objc::{id, msg, msg_class, msg_send, nil, release, retain, SEL};
@@ -65,6 +67,7 @@ pub enum Action {
     CloseSummoned,
     /// 删本地存档文件(主档/岛档/vip.dat/mole_activity.dat)后立即退出进程 → 重开即为全新存档。
     /// [复核修 2026-09-15] 删完不退出的话,关窗时游戏会把内存里的旧档写回,详见 run_action。
+    /// [2026-09-16] X4-01 有文件删不掉时已删的原样写回、不退出,只在 toast 里列出删不掉的文件。
     ResetLocalSave,
     /// [2026-09-16] G-02/G-06 只在底部 toast 显示说明、不做任何游戏调用:未实现或离线不可用的入口
     /// (丝尔特三键、超级贝壳树、广告墙板)。按钮删不删交用户拍板,先止损不再报假成功。
@@ -632,6 +635,71 @@ fn add_label_sized(
     release(env, lbl);
 }
 
+/// [2026-09-16] X4-02 折行 toast 的候选字号,从大到小取第一个放得下的。
+const TOAST_WRAP_FONT_SIZES: [CGFloat; 3] = [15.0, 13.0, 11.0];
+
+/// [2026-09-16] X4-02 底部 toast。一行放得下时照旧走 add_label(17 号单行,外观与改动前一致),放不下时改用多行标签。
+/// 根因:touchHLE 的 UILabel 单行文字不裁剪、居中后向两侧溢出屏外(见 add_label_sized)。时间旅行确认补上活动中心说明、
+/// 删档失败列出文件名之后都超过 992 宽,两头读不到。numberOfLines=0 时 UILabel drawRect 走
+/// sizeWithFont:constrainedToSize:lineBreakMode: 与 drawInRect:withFont:lineBreakMode:alignment:,逐行居中;
+/// 中文没有空格,按词折行(WordWrap)断不开,所以用 UILineBreakModeCharacterWrap 按字符断行。
+/// 折行时框往下加高到 718..766:按钮最靠下的是「隐藏物品」页(6 个功能键 + 36 格目录,每行 3 个共 14 行),最后一行底边 715,
+/// 屏幕底边 768;左右各内缩 8pt 给文字留边。三档字号都放不下时用最小一档(可能略超出框,不裁剪)。
+fn add_toast(env: &mut Environment, container: id, frame: CGRect, text: &str, bg: id, fg: id) {
+    let t: id = from_rust_string(env, text.to_string());
+    let one_line_size: CGFloat = 17.0; // UILabel 默认字号
+    let one_line_font: id = msg_class![env; UIFont systemFontOfSize:one_line_size];
+    let one_line: CGSize = msg![env; t sizeWithFont:one_line_font];
+    // 以原标签宽度判定:改动前能在 992 宽内放下的 toast 一律照旧单行,外观不变。
+    if one_line.width <= frame.size.width {
+        release(env, t);
+        add_label(env, container, frame, text, bg, fg);
+        return;
+    }
+    let inner_w = frame.size.width - 16.0;
+    let wrap_frame = CGRect {
+        origin: CGPoint {
+            x: frame.origin.x + 8.0,
+            y: frame.origin.y - 4.0,
+        },
+        size: CGSize {
+            width: inner_w,
+            height: frame.size.height + 10.0,
+        },
+    };
+    let mode: UILineBreakMode = UILineBreakModeCharacterWrap;
+    let limit = CGSize {
+        width: wrap_frame.size.width,
+        height: 10_000.0,
+    };
+    let mut font_size: CGFloat = TOAST_WRAP_FONT_SIZES[TOAST_WRAP_FONT_SIZES.len() - 1];
+    for size in TOAST_WRAP_FONT_SIZES {
+        let font: id = msg_class![env; UIFont systemFontOfSize:size];
+        let wrapped: CGSize = msg![env; t sizeWithFont:font
+                                        constrainedToSize:limit
+                                            lineBreakMode:mode];
+        if wrapped.height <= wrap_frame.size.height {
+            font_size = size;
+            break;
+        }
+    }
+    let lbl: id = msg_class![env; UILabel alloc];
+    let lbl: id = msg![env; lbl initWithFrame:wrap_frame];
+    () = msg![env; lbl setText:t];
+    // setText: 内部会 copy,这里配对释放 from_rust_string 的 +1(同 add_label_sized)。
+    release(env, t);
+    let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+    () = msg![env; lbl setFont:font];
+    let lines: NSInteger = 0; // 0 = 不限行数
+    () = msg![env; lbl setNumberOfLines:lines];
+    () = msg![env; lbl setLineBreakMode:mode];
+    () = msg![env; lbl setBackgroundColor:bg];
+    () = msg![env; lbl setTextColor:fg];
+    () = msg![env; lbl setTextAlignment:1i32]; // centered
+    () = msg![env; container addSubview:lbl];
+    release(env, lbl);
+}
+
 fn build(env: &mut Environment, fade: bool) {
     let app: id = msg_class![env; UIApplication sharedApplication];
     let window: id = msg![env; app keyWindow];
@@ -841,7 +909,8 @@ fn build(env: &mut Environment, fade: bool) {
             },
         };
         let tbg = color(env, 0.08, 0.09, 0.12, 0.96);
-        add_label(env, container, shifted(tframe), &toast, tbg, white);
+        // [2026-09-16] X4-02 一行放不下的长提示(时间旅行确认、删档失败)改成折行,见 add_toast。
+        add_toast(env, container, shifted(tframe), &toast, tbg, white);
     }
 
     layout_selfcheck(all_pages[PAGE_DEV_DEBUG].title, page_idx, &buttons);
@@ -1020,6 +1089,7 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
                 ));
             }
             // [复核修 2026-09-15] run_action 删完就直接退出进程,正常走不到这里;留着分支免得落到「已执行」。
+            // [2026-09-16] X4-01 删档失败时 run_action 自己写了失败 toast,走上面的 action_wrote_toast 分支,也到不了这里。
             Action::ResetLocalSave => set_toast("已删本地存档,正在退出游戏".to_string()),
             Action::Close | Action::SwitchPage(_) => {} // 导航不提示
             Action::EnterIsland | Action::ExitIsland => {} // 自带成功/失败提示,别覆盖
@@ -1128,10 +1198,21 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] 已关闭召唤层");
         }
         Action::ResetLocalSave => {
-            // [2026-09-16] F2-01 删档清单(主档/4 份岛档/vip.dat/mole_activity.dat)只在 save_reset.rs 维护一份;
-            // delete_local_saves 会先撤销「下次启动恢复快照」标记,否则重开时快照被写回,删档被静默撤销。
+            // [2026-09-16] F2-01 删档清单(主档/4 份岛档/vip.dat/mole_activity.dat 及其坏档备份)只在 save_reset.rs 维护一份;
+            // 存档全部删掉之后 delete_local_saves 才撤销「下次启动恢复快照」标记,否则重开时快照被写回,删档被静默撤销。
             // 「⚠️整库重置」确认后也走这里(G-01)。
-            let n = crate::save_reset::delete_local_saves(env);
+            // [2026-09-16] X4-01 有文件删不掉(chflags uchg、属主不对、Windows 上被杀毒/同步软件占着)时,delete_local_saves
+            // 已把本轮删掉的文件原样写回并返回 Err。这时绝不能往下走:forget_sidecar 会禁写 vip.dat,exit(0) 后重开拿到的是
+            // 「一部分旧档 + 一部分新档」的混合档。只写 toast 列出出问题的文件,游戏照常继续,处理后可以重试。
+            let n = match crate::save_reset::delete_local_saves(env) {
+                Ok(n) => n,
+                Err(fail) => {
+                    let text = reset_failure_toast(&fail);
+                    log!("[MOLEMENU] 删本地存档未完成,不退出:{}", text);
+                    set_toast(text);
+                    return;
+                }
+            };
             // [复核修 2026-09-15] R5-1/R6-3 返修:删完【立即退出进程】,不走 ui_application::exit。
             // 根因:进程还活着时内存里仍是旧档——启动时 -[LoadingLayer loadResource] 在 0x12f3fa 就已 loadUserInfoData,
             // 而 loadUserInfoData@0x75704 发现文件不存在时在 0x7576e 直接跳到函数尾 0x75b3c,不清内存。
@@ -1887,13 +1968,34 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
     }
 }
 
+/// [2026-09-16] X4-01 删档失败的 toast 文案。已删的都写回时说清「存档保持原样、游戏不退出」;
+/// 写回也失败时如实列出已丢失的文件,让玩家去看日志 [RESET]。
+fn reset_failure_toast(fail: &crate::save_reset::ResetFailure) -> String {
+    let problems = fail.problems.join("、");
+    if fail.not_restored.is_empty() {
+        format!(
+            "删档未完成,存档保持原样,游戏不退出:{}。多半是文件只读、被锁定或被其他程序占用,处理后再删一次",
+            problems
+        )
+    } else {
+        format!(
+            "⚠️ 删档中止({}),且 {} 写回失败、已丢失;游戏不退出,详情见日志 [RESET]",
+            problems,
+            fail.not_restored.join("、")
+        )
+    }
+}
+
 /// 需要二次确认的开发工具动作:返回(确认编码, 第一次点击时的提示)。编码非 0 且各动作互不相同。
 fn dev_confirm(action: Action) -> Option<(u32, String)> {
     match action {
+        // [2026-09-16] X4-02 确认文案补上活动中心的限制:旅行期间 mole_activity 侧档只写内存(F2-05),付费操作的扣款和发奖
+        // 却照常写进主档,所以这些操作在旅行中被禁用(拦截在 mole_activity.rs);旅行中拍快照时,主档是旅行后的,
+        // 活动档还是旅行前的。文案超过一行,底部 toast 会自动折行(add_toast)。
         Action::Dev(DevTool::TimeTravelHours(h)) => Some((
             1000 + h.clamp(0, 1_000_000) as u32,
             format!(
-                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走),再点一次确认",
+                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。再点一次确认",
                 h
             ),
         )),

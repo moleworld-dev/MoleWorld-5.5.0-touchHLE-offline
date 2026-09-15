@@ -842,8 +842,10 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
         hours,
         total_hours
     );
+    // [2026-09-16] X4-02 成功文案补一句活动中心的限制,与菜单确认文案一致:旅行期间活动侧档只写内存(F2-05),
+    // 付费操作的扣款却照常进主档,所以这些操作被禁用(拦截在 mole_activity.rs);旅行中拍的快照活动档仍是旅行前的。
     Ok(format!(
-        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上",
+        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致",
         hours, total_hours
     ))
 }
@@ -852,6 +854,7 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
 
 /// 快照要复制的沙盒 Documents 文件,与 save_reset.rs 的删档清单是同一组文件(改一处要同步另一处)。
 /// 快照另外带偏好 plist(见 snapshot_save),删档不删偏好 plist。
+/// [2026-09-16] 删档另外会删 mole_activity.dat 的坏档备份(.corrupt / .corrupt-<秒>),那不是游戏进度,快照不收。
 /// [复核修 2026-09-15] R6-2 补 mole_activity.dat:签到/脚印兑换/海底寻宝/烟花去重这些原本在服务器上的状态
 /// 存在这个旁路档(mole_activity.rs STATE_FILE,经 -[GameData pathForDataFile:]@0x75374 =
 /// NSSearchPathForDirectoriesInDomains(NSDocumentDirectory) 落在 Documents),漏掉它快照回滚后 userinfo 回到旧状态、
@@ -1052,14 +1055,17 @@ pub fn snapshot_restore_on_next_launch(env: &mut Environment) -> DevResult {
     ))
 }
 
-/// [2026-09-16] F2-01 删档时撤销「下次启动恢复快照」:删掉 snapshots_root()/RESTORE_PENDING,标记确实存在并删掉时返回 true。
+/// [2026-09-16] F2-01 删档时撤销「下次启动恢复快照」:删掉 snapshots_root()/RESTORE_PENDING。
 /// 根因:startup 在读档前只要看到标记就把快照写回 Documents,删档路径原来都不碰标记,「先安排恢复、再删档」重开后
 /// 拿到的是旧快照而不是承诺的全新存档,界面上没有任何提示。快照目录本身不动,玩家仍可再次手动安排恢复。
+/// [2026-09-16] X4-01 返回值改成 Ok(true)=标记存在并已删掉、Ok(false)=本来就没有、Err(标记路径)=删不掉。
+/// 原来删不掉只打日志返回 false,调用方分不清「没有标记」和「删不掉」,删档照样退出,重开仍被快照回滚。
+/// 现在 save_reset::delete_local_saves 在存档全部删掉之后才调它,拿到 Err 就把存档原样写回、菜单不退出。
 /// 只用宿主 std::fs,不发 msg_send,可以放在 exit(0) 之前调用。
-pub fn cancel_pending_restore() -> bool {
+pub fn cancel_pending_restore() -> Result<bool, String> {
     let marker = snapshots_root().join(RESTORE_MARKER);
     if !marker.exists() {
-        return false;
+        return Ok(false);
     }
     let name = std::fs::read_to_string(&marker)
         .map(|raw| raw.trim().to_string())
@@ -1067,16 +1073,18 @@ pub fn cancel_pending_restore() -> bool {
     match std::fs::remove_file(&marker) {
         Ok(()) => {
             log!("[MOLEDEV] 删档时撤销待恢复快照 {}", name);
-            true
+            Ok(true)
         }
+        // exists 与 remove_file 之间被外部删掉:结果同样是「没有标记」。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => {
             log!(
-                "[MOLEDEV] 删档时撤销待恢复快照 {} 失败:{}(重开后仍会被快照回滚,请退出游戏后手动删除 {})",
+                "[MOLEDEV] 删档时撤销待恢复快照 {} 失败:{}(删档中止、存档写回;请退出游戏后手动删除 {} 再删档)",
                 name,
                 e,
                 marker.display()
             );
-            false
+            Err(marker.display().to_string())
         }
     }
 }
