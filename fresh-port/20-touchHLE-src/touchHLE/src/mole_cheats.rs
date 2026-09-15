@@ -4247,6 +4247,11 @@ fn ui43_inner<R>(env: &mut Environment, f: impl FnOnce(&mut Environment) -> R) -
 ///
 /// 名单由离线分析生成(全二进制反汇编找 winSize 调用点 → ObjC metadata 的 imp 地址表归属到 类.方法):
 /// 共 **464 处调用点 / 264 个类**,其中 **170 个 UI 类的 240 处**纳入 4:3,**94 个类保持真实宽度**。
+/// [2026-09-16] 生成器与自检已入库:touchHLE 目录下 `python3 dev-scripts/ui43_gen.py`(依赖 capstone),默认把
+/// 生成结果与本文件三张表逐项比对。改三张表先改生成器里的分类数据,再按它的输出同步到这里。生成器实测 stret 调用点
+/// 445 处 / 264 类(上面的 464 未能复现);纳入类的真实调用点是 239 处,另 1 处 0x1fffd6 是
+/// -[NoticeBoardLayer showWithTarget:selector:] 里 [CCDirector sharedDirector](objc_msgSend)的返回地址,不是
+/// winSize 调用点,下面查表永远匹配不上、不影响行为;为与已验收名单逐项一致暂留(见生成器 LEGACY_DEAD_CALLSITES)。
 /// 保持真实宽度的是:世界场景与相机(VillageLayer/FriendsVillageLayer/InGameLayer/MoveLayer/CameraLayer
 /// 的 checkBounding/zoom/moveToBaseTile,必须真实宽才能 Hor+ 显示更多海洋)、贴边 HUD 与菜单条
 /// (VillageMenuLayer/TopMenuLayer,必须真实宽才贴得住屏幕边)、全屏画面(MainMenuScene/Logo/Loading,
@@ -4366,9 +4371,11 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
 ];
 
 /// [MoleWorld 宽屏适配·虚拟世界换算] 白名单 UI 类(含其子类,按父类链 ≤6 层)全部方法的代码地址区间
-/// (已合并、升序、[start,end)),离线生成:dev-scripts 的生成器直接遍历 __objc_classlist /
+/// (已合并、升序、[start,end)),离线生成:`dev-scripts/ui43_gen.py` 直接遍历 __objc_classlist /
 /// __objc_catlist 的 class_ro_t.baseMethods 拿到 imp→类.方法 的精确归属,再用 LC_FUNCTION_STARTS
 /// 截断每个方法的结尾(191 类 3306 方法 → 100 段)。
+/// [2026-09-16] 以前这里写的「dev-scripts 的生成器」其实不在仓库里(草稿区脚本,已丢),现已补进上面的路径;
+/// 并入下面两个辅助类后是 193 类 3327 个方法入口 → 仍 100 段。补类、改区间都先改生成器再重跑,别手工改地址。
 /// ★两个必须踩住的坑:①不能靠 `otool -ov` 文本行的大小写猜类名(会把 app delegate 的方法记到
 /// CommonChristmasFatherGiftLayer 名下);②不能拿"下一个 imp"当方法结尾,那会把方法之间的非 ObjC
 /// 代码(含 `main` @0xe890)吞进区间——宿主发消息时 LR 正是 main 里 `blx _UIApplicationMain` 的返回
