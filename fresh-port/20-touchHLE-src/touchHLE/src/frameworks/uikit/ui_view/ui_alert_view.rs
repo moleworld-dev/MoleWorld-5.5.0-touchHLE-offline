@@ -113,14 +113,15 @@ struct Overlay {
     map: CoordMap,
 }
 
+/// [2026-09-16] F2-04 改 pub(crate):作弊菜单(mole_menu)复用同一套逻辑尺寸与旋转,宽屏下同样铺满、居中。
 #[derive(Clone, Copy)]
-struct CoordMap {
+pub(crate) struct CoordMap {
     /// guest 竖屏点坐标尺寸(与 UIScreen bounds 同源)。
-    screen_w: CGFloat,
-    screen_h: CGFloat,
+    pub(crate) screen_w: CGFloat,
+    pub(crate) screen_h: CGFloat,
     /// 覆盖层逻辑尺寸(横屏时宽高互换)。
-    logical_w: CGFloat,
-    logical_h: CGFloat,
+    pub(crate) logical_w: CGFloat,
+    pub(crate) logical_h: CGFloat,
     /// 窗口旋转矩阵(guest 归一化坐标 → 窗口归一化坐标)的两列。
     col0: [f32; 2],
     col1: [f32; 2],
@@ -760,7 +761,8 @@ fn color(env: &mut Environment, r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) 
 /// 乘旋转矩阵的逆(纯旋转的逆 = 转置)回到 guest 归一化坐标,再乘 guest 宽高。
 /// 结果只会是 0/±1,四舍五入去掉浮点噪声。--landscape-right 下得到 (a,b,c,d)=(0,-1,1,0),
 /// 与 mole_menu 实测可用的写法一致。
-fn coord_map_and_transform(env: &Environment) -> (CoordMap, CGAffineTransform) {
+/// [2026-09-16] F2-04 改 pub(crate),mole_menu 的菜单容器也用它(原来写死 1024×768,宽屏下偏到一侧、露出未遮罩竖条)。
+pub(crate) fn coord_map_and_transform(env: &Environment) -> (CoordMap, CGAffineTransform) {
     let (pw, ph) = env.window().device_family().portrait_size();
     let (screen_w, screen_h) = (pw as CGFloat, ph as CGFloat);
     let rotation = env.window().rotation_matrix();

@@ -490,7 +490,23 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
             }
             game_data_call(env, "saveUserInfoData");
         }
-        QuestFamily::Time | QuestFamily::Vip => {
+        QuestFamily::Time => {
+            game_data_call(env, "saveUserInfoData");
+            game_data_call(env, "saveMapData");
+            // [2026-09-16] A2-05 限时跳转后补发激活,与主线补发 activateStoryQuest 同理:quickStart: 只写 nextQuestId,
+            // 要等 -[TimeQuest activate:] 才真正变成任务 N。-[GameManager activateTimeStoryQuest]@0x1a434 就是
+            // [[TimeQuest instance] activate:0](0x1a464)+ [[TimeQuest instance] checkLastTimeState](0x1a47c),
+            // 原版 ActorManager touchEnd:/UserInfoData checkUpgrade 也发 activate:。activate: 自己的门照原版执行:
+            // 0x1d88ee 语言门(currentUserLanguange:1 = zh-Hans 为真即放行,默认 --preferred-languages=zh-Hans 不受限)、
+            // GameManager.gameMode 不为 0/6(0x1d892a/0x1d893e)、checkCanActivate(questState/timeQuestData:/等级≥needLevel)。
+            // 这里是菜单点击回调,不在帧栈上,可以发宿主 msg_send;不在 intercept 里,不需要恢复 r0-r3。
+            let gm = singleton(env, "GameManager", "sharedManager");
+            if gm != nil {
+                let s = sel(env, "activateTimeStoryQuest");
+                let _: () = msg_send(env, (gm, s));
+            }
+        }
+        QuestFamily::Vip => {
             game_data_call(env, "saveUserInfoData");
             game_data_call(env, "saveMapData");
         }
@@ -502,10 +518,11 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
         quest_id,
         count
     );
+    // [2026-09-16] A2-05 删掉原来「简体中文下限时/VIP 任务受原版语言门限制」的附注:与反汇编相反。
+    // -[VipQuest activate:]@0x38722c 没有语言门;-[TimeQuest activate:] 的语言门在 zh-Hans 下放行(见上)。
     let note = match family {
-        QuestFamily::Time | QuestFamily::Vip => {
-            ";简体中文下限时/VIP 任务受原版语言门限制,面板可能不出现"
-        }
+        // 文案保持短:菜单还会在后面追加激活条件,toast 只有 992 宽。
+        QuestFamily::Time => ";已补发激活",
         _ => "",
     };
     Ok(format!(
@@ -833,7 +850,8 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
 
 // ───────────────────────── 存档快照 ─────────────────────────
 
-/// 快照要复制的沙盒 Documents 文件(与 mole_menu ResetLocalSave / save_reset.rs 同一份清单,另加 vip.dat)。
+/// 快照要复制的沙盒 Documents 文件,与 save_reset.rs 的删档清单是同一组文件(改一处要同步另一处)。
+/// 快照另外带偏好 plist(见 snapshot_save),删档不删偏好 plist。
 /// [复核修 2026-09-15] R6-2 补 mole_activity.dat:签到/脚印兑换/海底寻宝/烟花去重这些原本在服务器上的状态
 /// 存在这个旁路档(mole_activity.rs STATE_FILE,经 -[GameData pathForDataFile:]@0x75374 =
 /// NSSearchPathForDirectoriesInDomains(NSDocumentDirectory) 落在 Documents),漏掉它快照回滚后 userinfo 回到旧状态、
@@ -1032,6 +1050,35 @@ pub fn snapshot_restore_on_next_launch(env: &mut Environment) -> DevResult {
         "已安排恢复快照 {}:请现在退出游戏再重新打开,启动时会自动回滚(退出前的自动存档不影响恢复)",
         latest
     ))
+}
+
+/// [2026-09-16] F2-01 删档时撤销「下次启动恢复快照」:删掉 snapshots_root()/RESTORE_PENDING,标记确实存在并删掉时返回 true。
+/// 根因:startup 在读档前只要看到标记就把快照写回 Documents,删档路径原来都不碰标记,「先安排恢复、再删档」重开后
+/// 拿到的是旧快照而不是承诺的全新存档,界面上没有任何提示。快照目录本身不动,玩家仍可再次手动安排恢复。
+/// 只用宿主 std::fs,不发 msg_send,可以放在 exit(0) 之前调用。
+pub fn cancel_pending_restore() -> bool {
+    let marker = snapshots_root().join(RESTORE_MARKER);
+    if !marker.exists() {
+        return false;
+    }
+    let name = std::fs::read_to_string(&marker)
+        .map(|raw| raw.trim().to_string())
+        .unwrap_or_default();
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            log!("[MOLEDEV] 删档时撤销待恢复快照 {}", name);
+            true
+        }
+        Err(e) => {
+            log!(
+                "[MOLEDEV] 删档时撤销待恢复快照 {} 失败:{}(重开后仍会被快照回滚,请退出游戏后手动删除 {})",
+                name,
+                e,
+                marker.display()
+            );
+            false
+        }
+    }
 }
 
 /// [复核修 2026-09-15] R6-4 恢复用临时文件后缀。必须以 fs.rs 的 ATOMIC_WRITE_TMP_SUFFIX(".touchhle-tmp")结尾:

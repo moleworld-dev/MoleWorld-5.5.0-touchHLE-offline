@@ -66,17 +66,18 @@ pub enum Action {
     /// 删本地存档文件(主档/岛档/vip.dat/mole_activity.dat)后立即退出进程 → 重开即为全新存档。
     /// [复核修 2026-09-15] 删完不退出的话,关窗时游戏会把内存里的旧档写回,详见 run_action。
     ResetLocalSave,
-    /// 一键拷贝丝尔特(xiaotulv)家园地图到玩家自己存档(覆盖、不可逆;handle_touch 里二次确认)。
-    CopyXiaoTuLvHome,
+    /// [2026-09-16] G-02/G-06 只在底部 toast 显示说明、不做任何游戏调用:未实现或离线不可用的入口
+    /// (丝尔特三键、超级贝壳树、广告墙板)。按钮删不删交用户拍板,先止损不再报假成功。
+    Notice(&'static str),
+    /// [2026-09-16] G-06 按物品 ID 走 mole_items::place_item 摆到当前地图(召唤页「水塔」「乌鸦祭司」)。
+    PlaceItem(u32),
     /// `[[GameData userInfoData] <sel>:val]` then save.
     UserInfoSet(&'static str, i32),
     /// Set total + available workers, then save.
     SetWorkers(i32),
-    /// Load a bundled demo map + userinfo resource and reload the scene.
-    EnterXiaoTuLv(&'static str, &'static str),
     /// Flip a toggle-style cheat (see `mole_cheats`) by its key.
     ToggleCheat(&'static str),
-    /// Cycle the forced VIP level (1..=15) and enable force_vip.
+    /// 强制 VIP 等级在 1..=VIP_LEVEL_MAX(当前 4)间循环,并顺带打开 force_vip(标签与 toast 会说明,见 G-11)。
     VipLevelInc,
     /// Cycle the forced player level (0/10/.../100) — overrides curLevel.
     LevelInc,
@@ -176,8 +177,6 @@ thread_local! {
     // 底部 toast 文本(最近一次操作反馈);删本地存档的二次确认待定态。
     static TOAST: RefCell<String> = const { RefCell::new(String::new()) };
     static PENDING_RESET: Cell<bool> = const { Cell::new(false) };
-    // 拷贝丝尔特家园的二次确认待定态。
-    static PENDING_COPY: Cell<bool> = const { Cell::new(false) };
     // [扫描修 2026-09-15] toast 版本号:动作自己写了 toast 时,handle_touch 不再用「已执行」覆盖。
     static TOAST_GEN: Cell<u64> = const { Cell::new(0) };
     // [扫描修 2026-09-15] 开发工具不可回退动作(时间旅行/快照恢复)的二次确认待定态:0=无,其余=动作编码。
@@ -214,6 +213,65 @@ const PAGE_DEV_DEBUG: usize = 4;
 const PAGE_OLD_ACTIVITY: usize = 7;
 /// 隐藏物品目录每页条目数(3 列 × 12 行)。
 const CATALOG_PER_PAGE: usize = 36;
+/// [2026-09-16] G-02 丝尔特三键的说明 toast。
+const XIAOTULV_TODO: &str = "丝尔特家园暂未实现(原版需切 NPC 地图)";
+/// [2026-09-16] G-10 离线时「魔法密码任意过」的标签:MagicNumberView 只由 -[LoadingLayer onCommandReceived:] 收到 1018、
+/// 且 [GameData magicPassword] 非空时创建(0x1313f6-0x131454),离线回环不回 1018,开关离线永远没有效果。
+const MAGIC_BYPASS_OFFLINE_LABEL: &str = "魔法密码任意过(仅联机:私服回 1018 才出现)";
+/// 按钮区设计宽度:页签、网格、toast 都按 1024×768 横屏设计坐标排版。
+const DESIGN_W: CGFloat = 1024.0;
+
+/// [2026-09-16] F2-04 菜单几何。原来容器写死 1024×768、center (384,512)、触摸 lx = 1024 - gy:--fill-screen 宽屏
+/// (iOS 默认、桌面宽屏启动器)下 guest 逻辑屏是 768×1188 等,菜单偏到一侧,另一侧露出没有遮罩、点了没反应的竖条。
+/// 现在逻辑尺寸与旋转复用系统弹框的 ui_alert_view::coord_map_and_transform(同时兼容 --landscape-left):
+/// 遮罩铺满逻辑屏,按钮区仍按 1024 设计宽排版、整体水平偏移 ox 居中。Button.frame 一律存设计坐标,只在渲染时加 ox。
+/// 4:3 横屏右时 logical=1024×768、ox=0、transform=(0,-1,1,0)、center=(384,512),与改动前逐字节一致。
+#[derive(Clone, Copy)]
+struct MenuGeometry {
+    screen_w: CGFloat,
+    screen_h: CGFloat,
+    logical_w: CGFloat,
+    logical_h: CGFloat,
+    transform: CGAffineTransform,
+    /// 设计宽 1024 的按钮区在逻辑屏里的水平偏移(宽屏 1188 时为 82)。
+    ox: CGFloat,
+}
+
+fn menu_geometry(env: &Environment) -> MenuGeometry {
+    let (map, t) = crate::frameworks::uikit::ui_view::ui_alert_view::coord_map_and_transform(env);
+    // 旋转矩阵里 cos(π/2) 的浮点噪声经 round() 后可能是 -0.0;加 0.0 归一成 +0.0,
+    // 让 4:3 下交给 setTransform: 的值与原来写死的 (0,-1,1,0) 逐位相同。
+    let transform = CGAffineTransform {
+        a: t.a + 0.0,
+        b: t.b + 0.0,
+        c: t.c + 0.0,
+        d: t.d + 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    MenuGeometry {
+        screen_w: map.screen_w,
+        screen_h: map.screen_h,
+        logical_w: map.logical_w,
+        logical_h: map.logical_h,
+        transform,
+        ox: ((map.logical_w - DESIGN_W) / 2.0).max(0.0).floor(),
+    }
+}
+
+/// guest 触摸点 → 设计坐标。容器视图变换是纯旋转(各项只有 0/±1),guest 偏移 = M·逻辑偏移,
+/// M = [a c; b d];正交矩阵的逆是转置,所以逻辑偏移 dx = a·ux + b·uy、dy = c·ux + d·uy。
+/// 4:3 横屏右:dx = -(gy-512)、dy = gx-384 → (1024 - gy, gx),与原公式一致;宽屏时再扣掉 ox。
+fn guest_to_design(g: &MenuGeometry, gx: f32, gy: f32) -> (f32, f32) {
+    // CGAffineTransform 是 repr(packed),先整体拷出再按值读字段,不对字段取引用。
+    let t = g.transform;
+    let (a, b, c, d) = (t.a, t.b, t.c, t.d);
+    let ux = gx - g.screen_w / 2.0;
+    let uy = gy - g.screen_h / 2.0;
+    let dx = a * ux + b * uy;
+    let dy = c * ux + d * uy;
+    (g.logical_w / 2.0 + dx - g.ox, g.logical_h / 2.0 + dy)
+}
 
 fn pages() -> Vec<Page> {
     use Action::*;
@@ -274,17 +332,26 @@ fn pages() -> Vec<Page> {
         // [扫描修 2026-09-15] F10-9:原来 23 个标「弃用」的联网驱动活动层折叠进「旧活动观赏」子页(不删,离线怀旧观赏)。
         // F9-2:「新版商店(勿点!易卡)」换成原版单例入口。SummonClass 会 alloc 出一个和 +sharedInstance 并存的
         // 第二个 NewStyleStoreMainLayer(回调目标为 nil、没发顶层视图通知),这就是「易卡」的根因。
-        // (已核实:召唤列表里只有 NewStyleStoreMainLayer 带 +sharedInstance,其余类没有单例,不必另加防呆。)
+        // [2026-09-16] G-06 更正上面 09-15 的结论「只有 NewStyleStoreMainLayer 带 +sharedInstance」:当时只查了 sharedInstance
+        // 这个名字,漏了 +shareInstance 命名的单例——ShowFreeShellsLayer@0x2552a8、ShowAdwallBoardLayer@0x4331c8 都是。
+        // 现在 summon_class 对响应 +sharedInstance/+shareInstance/+sharedManager 的类一律拒绝召唤。
+        // SuperShellTree/WaterTower/CrowPriest 是 Object 子类、没有 -init,alloc/init 落到 -[CCNode init] 只得到空节点;
+        // 真构造器是 initWithTile:sprite:size:data:/initWithMapData:,原版只由 loadMapObjects:/Porter 建。
         Page {
             title: "召唤",
             layout: Layout::ColumnFirst3,
             parent: None,
             buttons: vec![
-                ("超级贝壳树", SummonClass("SuperShellTree", 88888)),
-                ("免费贝壳墙", SummonClass("ShowFreeShellsLayer", 88888)),
-                ("水塔", SummonClass("WaterTower", 88888)),
-                ("乌鸦祭司", SummonClass("CrowPriest", 88888)),
+                ("超级贝壳树(主村无)", Notice("超级贝壳树:主村没有对应的物品,召唤出来只是空节点")),
+                // 原版 -[ShowFreeShellsLayer open]@0x2569cc 的门:GameManager.gameMode==1;岛上场景没有 tag 0x11、主村场景没有
+                // tag 0x1a 的子节点;!hasTopView;!isLogicLayersOpen。通过后 setIsInteractEnabled:NO、lockOthers、setVisible:YES。
+                // 单例由 -[InGameScene init]+0x350 建好挂进场景,所以直接对单例发 open,不再 alloc 第二份。
+                ("免费贝壳墙", SingletonCall("ShowFreeShellsLayer", "shareInstance", "open")),
+                // property.dat:14956 乐乐水塔、14974 克劳神父,都是 type 14,描述写着需充值解锁。
+                ("水塔(放到地图)", PlaceItem(14956)),
+                ("乌鸦祭司(放到地图)", PlaceItem(14974)),
                 ("圣诞树", SummonClass("ChrismasTreeView", 88888)),
+                // 保留按钮(删不删交用户拍板),点击会被 summon_class 拒绝:它的 dealloc@0x5ed68 会 purge 商店/作物单例。
                 ("村庄菜单层", SummonClass("VillageMenuLayer", 88888)),
                 ("建设商店(原版单例入口)", Dev(D::BuildingStore)),
                 ("促销主层", SummonClass("PromoteSalesMainLayer", 88888)),
@@ -309,9 +376,15 @@ fn pages() -> Vec<Page> {
                 //   不加 6 涂鸦馆:图集缺失,大概率黑屏或空精灵帧。
                 ("Mini: 占卜屋", MiniGame(7)),
                 ("Mini: 左左右右(沙滩WC)", MiniGame(8)),
-                ("丝尔特(春)", EnterXiaoTuLv("xiaotulv_map", "xiaotulv_userinfo")),
-                ("丝尔特(冬)", EnterXiaoTuLv("xiaotulv_winter_map", "xiaotulv_winter_userinfo")),
-                ("⚠️拷贝丝尔特家园到自己(覆盖存档!)", CopyXiaoTuLvHome),
+                // [2026-09-16] G-02 丝尔特三键先止损:原实现丢弃了 -[GameData loadMapdataFromResource:]@0x7e11c /
+                // loadUserInfoFromResource:@0x7df8c 的返回值(两者只解档返回、不写 mapdata_),无参 saveMapData 存的是当前场景
+                // 对象,reloadMapFromNewSceneData@0x24642c 在 nextSceneId_==0 时直接返回——什么都没做,「拷贝」还报成功。
+                // 真做要照搬 -[FriendsVillageLayer showNPCMainVillageAgain]@0x10b3f0:loadMapdataFromResource:@"xiaotulv_map"
+                // (冬季为 xiaotulv_winter_map)→ [GameManager unloadMap] → loadMapFromData:selector:mapData:forNPC:1@0x2099c,
+                // 回家照 goToHomeVillage@0x108bbc;动手前须先核实 forNPC 期间不会把 NPC 地图写进玩家 map.dat。
+                ("丝尔特(春)(未实现)", Notice(XIAOTULV_TODO)),
+                ("丝尔特(冬)(未实现)", Notice(XIAOTULV_TODO)),
+                ("拷贝丝尔特家园(未实现)", Notice(XIAOTULV_TODO)),
                 ("给宝藏奖励", GameManagerCall("addTreasureReward")),
                 ("给宝藏兔奖励", GameManagerCall("addTreasureRabbitReward")),
                 ("强开剧情任务", GameManagerCall("activateStoryQuest")),
@@ -322,7 +395,9 @@ fn pages() -> Vec<Page> {
                 ("重置每日列表", GameDataReset("resetDailyQuestList")),
                 ("重置宝箱数据", GameDataReset("resetTreasureChestData")),
                 ("重置加勒比", GameDataReset("resetCaribbeanData")),
-                ("⚠️整库重置", GameDataReset("resetUserGameData")),
+                // [2026-09-16] G-01 点击后在 handle_touch 里改道成 ResetLocalSave(二次确认 + 删全部存档 + 立即退出),
+                // 不再发 resetUserGameData。按钮位置与本页按钮数不变。
+                ("⚠️整库重置(删全部存档并退出)", GameDataReset("resetUserGameData")),
             ],
         },
         // 3 开关 + 解锁/成就/收获 合并(VIP等级/强制VIP/购物免费 已移到「开发者/调试」)。
@@ -497,7 +572,9 @@ fn pages() -> Vec<Page> {
                 ("开宝箱", SummonClass("OpenTreasureChestMainLayer", 88888)),
                 ("世界杯竞猜", SummonClass("GuessWorldCupMainLayer", 88888)),
                 ("冰夏", SummonClass("IceSummerMainLayer", 88888)),
-                ("广告墙板", SummonClass("ShowAdwallBoardLayer", 88888)),
+                // [2026-09-16] G-06 ShowAdwallBoardLayer 是 +shareInstance@0x4331c8 单例,不能 alloc 第二份;而单例入口
+                // -[ShowAdwallBoardLayer open]@0x43399c 又被 mole_cheats 的去广告钩子整个吞掉,离线点了也不会出现。只留说明。
+                ("广告墙板(离线不可用)", Notice("广告墙板:原版展示入口 open 被去广告钩子拦截,离线不会出现")),
                 ("更多好友", SummonClass("ShowMoreFriendsLayer", 88888)),
                 ("活动规则层", SummonClass("ShowActivityRuleLayer", 88888)),
             ],
@@ -570,11 +647,21 @@ fn build(env: &mut Environment, fade: bool) {
         CURRENT_PAGE.with(|c| c.set(0));
     }
 
+    // [2026-09-16] F2-04 容器铺满 guest 逻辑屏(宽屏时宽于 1024),按钮区按设计坐标排版后整体右移 ox 居中。
+    let geom = menu_geometry(env);
+    let ox = geom.ox;
+    let shifted = |r: CGRect| CGRect {
+        origin: CGPoint {
+            x: r.origin.x + ox,
+            y: r.origin.y,
+        },
+        size: r.size,
+    };
     let full = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
-            width: 1024.0,
-            height: 768.0,
+            width: geom.logical_w,
+            height: geom.logical_h,
         },
     };
     let container: id = msg_class![env; UIView alloc];
@@ -619,7 +706,7 @@ fn build(env: &mut Environment, fade: bool) {
             };
             (all_pages[p].title, Action::SwitchPage(p), bg)
         };
-        add_label_sized(env, container, frame, label, bg, white, tab_font);
+        add_label_sized(env, container, shifted(frame), label, bg, white, tab_font);
         buttons.push(Button { frame, action, label });
     }
 
@@ -671,7 +758,7 @@ fn build(env: &mut Environment, fade: bool) {
         };
         // 滑块格子:自定义渲染(轨道+填充+实时值),点击在 handle_touch 里按比例设值。
         if let Action::Slider(kind) = action {
-            render_slider(env, container, frame, *kind, white);
+            render_slider(env, container, shifted(frame), *kind, white);
             buttons.push(Button {
                 frame,
                 action: *action,
@@ -679,6 +766,9 @@ fn build(env: &mut Environment, fade: bool) {
             });
             continue;
         }
+        // [2026-09-16] G-10 离线时魔法密码开关的标签更长,缩到 12 号字防止溢出到相邻列;其余按钮仍用默认字号。
+        let magic_offline =
+            matches!(action, Action::ToggleCheat("magic_bypass")) && !env.options.network_access;
         let (display, bg) = match action {
             Action::ToggleCheat(key) => {
                 let on = crate::mole_cheats::is_on(key);
@@ -687,12 +777,27 @@ fn build(env: &mut Environment, fade: bool) {
                 } else {
                     color(env, 0.45, 0.3, 0.32, 1.0)
                 };
-                (format!("{}: {}", label, if on { "开" } else { "关" }), c)
+                let name: &str = if magic_offline {
+                    MAGIC_BYPASS_OFFLINE_LABEL
+                } else {
+                    *label
+                };
+                (format!("{}: {}", name, if on { "开" } else { "关" }), c)
             }
-            Action::VipLevelInc => (
-                format!("VIP等级={} (点+)", crate::mole_cheats::vip_level()),
-                color(env, 0.2, 0.62, 0.28, 1.0),
-            ),
+            // [2026-09-16] G-11 原来恒绿、恒显示 VIP_LEVEL:强制 VIP 关着时这个等级根本不生效,颜色和数字都误导。
+            Action::VipLevelInc => {
+                if crate::mole_cheats::is_on("force_vip") {
+                    (
+                        format!("VIP等级 = VIP {} (点+)", crate::mole_cheats::vip_level()),
+                        color(env, 0.2, 0.62, 0.28, 1.0),
+                    )
+                } else {
+                    (
+                        "VIP等级: 强制VIP 关".to_string(),
+                        color(env, 0.45, 0.3, 0.32, 1.0),
+                    )
+                }
+            }
             Action::LevelInc => {
                 let lv = crate::mole_cheats::level();
                 let c = if lv > 0 {
@@ -703,17 +808,21 @@ fn build(env: &mut Environment, fade: bool) {
                 (format!("等级={} (点+10)", lv), c)
             }
             Action::MiniGame(_) => (label.to_string(), color(env, 0.18, 0.5, 0.3, 1.0)),
-            Action::SummonClass(..) => (label.to_string(), color(env, 0.5, 0.35, 0.65, 1.0)),
+            Action::SummonClass(..) | Action::PlaceItem(_) => {
+                (label.to_string(), color(env, 0.5, 0.35, 0.65, 1.0))
+            }
             Action::GameDataReset(_) | Action::GameManagerCall(_) | Action::ResetLocalSave => {
                 (label.to_string(), color(env, 0.55, 0.4, 0.18, 1.0))
             }
-            Action::EnterXiaoTuLv(..) => (label.to_string(), color(env, 0.2, 0.5, 0.55, 1.0)),
+            // [2026-09-16] 只出说明的入口用灰色,和能真正执行的按钮区分开。
+            Action::Notice(_) => (label.to_string(), color(env, 0.34, 0.34, 0.36, 1.0)),
             // [扫描修 2026-09-15] 开发工具 / 隐藏物品页的动态标签(寄存器值、开关状态、目录条目)。
             Action::Dev(tool) => dev_display(env, label, *tool),
             Action::Hidden(h) => hidden_display(env, label, *h),
             _ => (label.to_string(), color(env, 0.16, 0.45, 0.7, 1.0)),
         };
-        add_label(env, container, frame, &display, bg, white);
+        let font_size: CGFloat = if magic_offline { 12.0 } else { 0.0 };
+        add_label_sized(env, container, shifted(frame), &display, bg, white, font_size);
         buttons.push(Button {
             frame,
             action: *action,
@@ -732,22 +841,19 @@ fn build(env: &mut Environment, fade: bool) {
             },
         };
         let tbg = color(env, 0.08, 0.09, 0.12, 0.96);
-        add_label(env, container, tframe, &toast, tbg, white);
+        add_label(env, container, shifted(tframe), &toast, tbg, white);
     }
 
     layout_selfcheck(all_pages[PAGE_DEV_DEBUG].title, page_idx, &buttons);
 
-    // Rotate -90° + centre so the landscape layout shows upright.
-    let rot = CGAffineTransform {
-        a: 0.0,
-        b: -1.0,
-        c: 1.0,
-        d: 0.0,
-        tx: 0.0,
-        ty: 0.0,
-    };
+    // Rotate + centre so the landscape layout shows upright.
+    // [2026-09-16] F2-04 旋转与居中取自 menu_geometry(横屏右仍是 (0,-1,1,0) 与 (384,512))。
+    let rot = geom.transform;
     () = msg![env; container setTransform:rot];
-    let center = CGPoint { x: 384.0, y: 512.0 };
+    let center = CGPoint {
+        x: geom.screen_w / 2.0,
+        y: geom.screen_h / 2.0,
+    };
     () = msg![env; container setCenter:center];
 
     () = msg![env; window addSubview:container];
@@ -801,8 +907,7 @@ fn teardown(env: &mut Environment) {
     CURRENT_PAGE.with(|c| c.set(0));
     TOAST.with(|t| t.borrow_mut().clear());
     PENDING_RESET.with(|c| c.set(false));
-    // [扫描修 2026-09-15] 关菜单时所有二次确认待定态一起清掉(原先漏了拷贝丝尔特家园那一个)。
-    PENDING_COPY.with(|c| c.set(false));
+    // [扫描修 2026-09-15] 关菜单时所有二次确认待定态一起清掉。
     PENDING_DEV.with(|c| c.set(0));
     log!("[MOLEMENU] closed");
 }
@@ -826,8 +931,9 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
         return false;
     }
     // Guest (portrait 768x1024) -> landscape-logical (1024x768).
-    let lx = 1024.0 - gy;
-    let ly = gx;
+    // [2026-09-16] F2-04 按 menu_geometry 换算并扣掉宽屏水平偏移 ox,得到与 Button.frame 相同的设计坐标。
+    let geom = menu_geometry(env);
+    let (lx, ly) = guest_to_design(&geom, gx, gy);
     let hit = MENU.with(|m| {
         m.borrow()
             .buttons
@@ -839,43 +945,49 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
         // 数值显示格(原"滑块"改为只读实时值显示):点击只回显当前值,改值用下面的 +/- 按钮。
         let _ = frame; // 不再用 tap 坐标(滑块已弃用)
         if let Action::Slider(kind) = action {
-            let (name, cur, max) = slider_info(env, kind);
-            set_toast(format!("{} 当前 {}/{}(只读·用 +/- 改)", name, cur, max));
+            let (name, cur, max, overridden) = slider_info(env, kind);
+            set_toast(format!(
+                "{} 当前 {}/{}(只读·用 +/- 改){}",
+                name,
+                cur,
+                max,
+                if overridden {
+                    "(作弊覆盖:显示的是作弊开关给的值,存档里不是这个数)"
+                } else {
+                    ""
+                }
+            ));
             rebuild(env);
             return true;
         }
+        // [2026-09-16] G-01 「⚠️整库重置」改道成与「删本地存档并退出」完全相同的二次确认 + 删档退出路径。
+        // 根因:-[GameData resetUserGameData]@0x7de50 只删 map.dat(0x7dec8)/userinfo.dat(0x7df0e)、清 mapdata_、
+        // 在内存里换一个空白 UserInfoData,不卸载场景也不退出;原版 -[OptionLayer onRestartYesRestart] 是先在 0x14f668
+        // [GameManager unloadMap] 才到 0x14f68c 重置。菜单少了卸载,-[GameData saveMapData:] 又是从 ObjectManager
+        // 的场景对象序列化(0x7690c),关窗 saveToLocal:1 就把旧庄园写回 → 等级金币清零、庄园照旧的混合档,
+        // 岛档/vip.dat/mole_activity.dat 也都还在。误点一次就半毁存档,所以和删档一样要确认两次。
+        let action = match action {
+            Action::GameDataReset("resetUserGameData") => Action::ResetLocalSave,
+            other => other,
+        };
         // 二次确认类:第一次只提示,第二次才执行;点别的按钮则取消所有待确认。
         if matches!(action, Action::ResetLocalSave) {
             if !PENDING_RESET.with(|c| c.get()) {
                 PENDING_RESET.with(|c| c.set(true));
-                PENDING_COPY.with(|c| c.set(false));
                 PENDING_DEV.with(|c| c.set(0));
-                set_toast(
-                    "⚠️ 再点一次「删本地存档并退出」确认(清空本地存档后游戏立即退出)".to_string(),
-                );
+                set_toast(format!(
+                    "⚠️ 再点一次「{}」确认:删除全部本地存档后游戏立即退出,已安排的快照恢复也会一并取消",
+                    label.trim_start_matches("⚠️").trim()
+                ));
                 rebuild(env);
                 return true;
             }
             PENDING_RESET.with(|c| c.set(false)); // 已确认,下面真删
-        } else if matches!(action, Action::CopyXiaoTuLvHome) {
-            if !PENDING_COPY.with(|c| c.get()) {
-                PENDING_COPY.with(|c| c.set(true));
-                PENDING_RESET.with(|c| c.set(false));
-                PENDING_DEV.with(|c| c.set(0));
-                set_toast(
-                    "⚠️ 确认要这样吗?会覆盖你的存档、不可逆!再点一次「拷贝丝尔特家园」确认"
-                        .to_string(),
-                );
-                rebuild(env);
-                return true;
-            }
-            PENDING_COPY.with(|c| c.set(false)); // 已确认,下面真拷贝
         } else if let Some((code, prompt)) = dev_confirm(action) {
             // [扫描修 2026-09-15] 开发工具里不可回退的动作(时间旅行、快照恢复)同样二次确认。
             if PENDING_DEV.with(|c| c.get()) != code {
                 PENDING_DEV.with(|c| c.set(code));
                 PENDING_RESET.with(|c| c.set(false));
-                PENDING_COPY.with(|c| c.set(false));
                 set_toast(prompt);
                 rebuild(env);
                 return true;
@@ -883,7 +995,6 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
             PENDING_DEV.with(|c| c.set(0)); // 已确认,下面真执行
         } else {
             PENDING_RESET.with(|c| c.set(false));
-            PENDING_COPY.with(|c| c.set(false));
             PENDING_DEV.with(|c| c.set(0));
         }
         let toast_gen_before = TOAST_GEN.with(|g| g.get());
@@ -895,13 +1006,21 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
             _ if action_wrote_toast => {}
             Action::ToggleCheat(key) => {
                 let on = crate::mole_cheats::is_on(key);
-                set_toast(format!("「{}」已{}", label, if on { "开启" } else { "关闭" }));
+                // [2026-09-16] G-10 离线切魔法密码开关时说明它只在联机时有意义,开关本身照常翻转。
+                let note = if key == "magic_bypass" && !env.options.network_access {
+                    "(仅联机有效:离线不会出现魔法密码框,私服回 1018 才出现)"
+                } else {
+                    ""
+                };
+                set_toast(format!(
+                    "「{}」已{}{}",
+                    label,
+                    if on { "开启" } else { "关闭" },
+                    note
+                ));
             }
             // [复核修 2026-09-15] run_action 删完就直接退出进程,正常走不到这里;留着分支免得落到「已执行」。
             Action::ResetLocalSave => set_toast("已删本地存档,正在退出游戏".to_string()),
-            Action::CopyXiaoTuLvHome => {
-                set_toast("已拷贝丝尔特家园到你的存档(已重载)".to_string())
-            }
             Action::Close | Action::SwitchPage(_) => {} // 导航不提示
             Action::EnterIsland | Action::ExitIsland => {} // 自带成功/失败提示,别覆盖
             // [扫描修 2026-09-15] 键盘输入与目录翻页:标签本身就是反馈,不刷「已执行」。
@@ -959,6 +1078,12 @@ fn run_action(env: &mut Environment, action: Action) {
         Action::SummonClass(name, z) => summon_class(env, name, z),
         Action::MiniGame(id_) => mini_game(env, id_),
         Action::GameDataReset(selector) => {
+            if selector == "resetUserGameData" {
+                // [2026-09-16] G-01 兜底:handle_touch 已把它改道成 ResetLocalSave。这里绝不单独发 resetUserGameData
+                // (不卸载场景、不退出,会得到半重置混合档,见 handle_touch 注释)。
+                log!("[MOLEMENU] 拒绝单独发 resetUserGameData(应走删本地存档并退出)");
+                return;
+            }
             let gd = game_singleton(env, "GameData", "sharedInstance");
             if gd == nil {
                 return;
@@ -1003,29 +1128,11 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] 已关闭召唤层");
         }
         Action::ResetLocalSave => {
-            // 删本地存档文件(home/Documents 下);先取 owned 路径再 remove(避免借用冲突)。
-            let docs = env.fs.home_directory().join("Documents");
-            let mut n = 0;
-            // 黄金岛的 4 份离线岛档也一起删,否则重置后岛上进度还留着。
-            // [复核修 2026-09-15] R5-1/R6-3:vip.dat(VIP 三值/登录日与连续天数/累计在线毫秒)和
-            // mole_activity.dat(签到/兑换/海底寻宝状态)这两份旁路档不绑定用户 ID,也要删,
-            // 否则新档继承旧号的 VIP 等级、连续登录天数和当天已签到状态。
-            for f in [
-                "userinfo.dat",
-                "map.dat",
-                "island_map.dat",
-                "island_userinfo.dat",
-                "island_ships.dat",
-                "island_fragments.dat",
-                "vip.dat",
-                "mole_activity.dat",
-            ] {
-                let p = docs.join(f);
-                if env.fs.remove(&p).is_ok() {
-                    n += 1;
-                }
-            }
-            // [复核修 2026-09-15] R5-1/R6-3 返修:删完【立即退出进程】,与 save_reset.rs 一致,不走 ui_application::exit。
+            // [2026-09-16] F2-01 删档清单(主档/4 份岛档/vip.dat/mole_activity.dat)只在 save_reset.rs 维护一份;
+            // delete_local_saves 会先撤销「下次启动恢复快照」标记,否则重开时快照被写回,删档被静默撤销。
+            // 「⚠️整库重置」确认后也走这里(G-01)。
+            let n = crate::save_reset::delete_local_saves(env);
+            // [复核修 2026-09-15] R5-1/R6-3 返修:删完【立即退出进程】,不走 ui_application::exit。
             // 根因:进程还活着时内存里仍是旧档——启动时 -[LoadingLayer loadResource] 在 0x12f3fa 就已 loadUserInfoData,
             // 而 loadUserInfoData@0x75704 发现文件不存在时在 0x7576e 直接跳到函数尾 0x75b3c,不清内存。
             // 正常关窗走 ui_application::exit,会先发 applicationWillResignActive:;原版在 gameMode 不为 0/6 且当前是
@@ -1068,14 +1175,47 @@ fn run_action(env: &mut Environment, action: Action) {
             save_user_info(env);
             log!("[MOLEMENU] workers = {}", n);
         }
-        Action::EnterXiaoTuLv(map_res, ui_res) => enter_xiaotulv(env, map_res, ui_res),
+        Action::Notice(text) => {
+            log!("[MOLEMENU] 说明入口:{}", text);
+            set_toast(text.to_string());
+        }
+        Action::PlaceItem(item) => match crate::mole_items::place_item(env, item) {
+            Ok(text) => {
+                log!("[MOLEMENU] 召唤页放置物品 {} 成功:{}", item, text);
+                set_toast(format!("{}(原版需充值解锁,放下后的交互未核实)", text));
+            }
+            Err(e) => {
+                log!("[MOLEMENU] 召唤页放置物品 {} 失败:{}", item, e);
+                set_toast(format!("放置物品 {} 失败:{}", item, e));
+            }
+        },
         Action::ToggleCheat(key) => {
+            // [2026-09-16] G-08 离线不许关「可建筑黄金岛·热点开关」:ENABLE_NEWSCENE_ISLAND 关着时离线岛钩子
+            // (网络门/解活锁/SUCC 调度)整块不跑,之后点村里飞机进岛卡死;island_arm_entry 只在菜单「一键进入黄金岛」里
+            // 重新打开,飞机路径不会。开发者页按钮数须保持 19..=21,所以不删按钮,只拒绝关闭。
+            if key == "enable_newscene_island"
+                && !env.options.network_access
+                && crate::mole_cheats::is_on(key)
+            {
+                log!("[MOLEMENU] 离线拒绝关闭 enable_newscene_island(离线进岛依赖它)");
+                set_toast("离线进岛依赖此开关,不能关闭".to_string());
+                rebuild(env);
+                return;
+            }
             crate::mole_cheats::toggle(key);
             // Rebuild so the on/off label refreshes immediately.
             rebuild(env);
         }
         Action::VipLevelInc => {
+            // [2026-09-16] G-11 bump_vip_level 在 1..=4 间循环并顺带打开 force_vip;原来悄悄打开,这里在 toast 说清楚。
+            let was_forced = crate::mole_cheats::is_on("force_vip");
             crate::mole_cheats::bump_vip_level();
+            let lv = crate::mole_cheats::vip_level();
+            set_toast(if was_forced {
+                format!("强制VIP 等级 → VIP {}", lv)
+            } else {
+                format!("强制VIP 等级 → VIP {}(已同时开启强制VIP)", lv)
+            });
             rebuild(env);
         }
         Action::LevelInc => {
@@ -1113,29 +1253,13 @@ fn run_action(env: &mut Environment, action: Action) {
         Action::Hidden(h) => run_hidden(env, h),
         // 滑块(只读显示)在 handle_touch 里直接处理;此处占位满足穷尽匹配。
         Action::Slider(_) => {}
-        // 拷贝丝尔特家园:加载 xiaotulv 地图 → saveMapData 落盘 → 重载场景(二次确认在 handle_touch)。
-        Action::CopyXiaoTuLvHome => {
-            let gd = game_singleton(env, "GameData", "sharedInstance");
-            if gd == nil {
-                return;
-            }
-            let lm = sel(env, "loadMapdataFromResource:");
-            let map_str = from_rust_string(env, "xiaotulv_map".to_string());
-            let _: () = msg_send(env, (gd, lm, map_str));
-            let save = sel(env, "saveMapData");
-            let _: () = msg_send(env, (gd, save));
-            let ngm = game_singleton(env, "NewGameManager", "sharedManager");
-            if ngm != nil {
-                let r = sel(env, "reloadMapFromNewSceneData");
-                let _: () = msg_send(env, (ngm, r));
-            }
-            log!("[MOLEMENU] 已拷贝丝尔特家园地图到玩家存档(saveMapData)");
-        }
     }
 }
 
-/// 读某滑块种类的(显示名, 当前值, 上限)。当前值实时读游戏 UserInfoData。
-fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i64) {
+/// 读某滑块种类的(显示名, 当前值, 上限, 是否被作弊覆盖)。当前值实时读游戏 UserInfoData。
+/// [2026-09-16] G-11 宿主 msg_send 同样经过 objc_msgSend 的作弊钩子:FORCE_LEVEL 开着时 curLevel 返回强制等级,
+/// max_facility 开着时 totalWorkers/totalRooms 恒返回 99。读法不改,只把「被覆盖」标出来,免得玩家以为存档已改。
+fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i64, bool) {
     let (name, max): (&'static str, i64) = match kind {
         SliderKind::Level => ("等级", 52),
         SliderKind::Gold => ("摩尔豆", 9_999_999),
@@ -1143,9 +1267,14 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
         SliderKind::Workers => ("工人", 99),
         SliderKind::Rooms => ("房间", 99),
     };
+    let overridden = match kind {
+        SliderKind::Level => crate::mole_cheats::level() > 0,
+        SliderKind::Workers | SliderKind::Rooms => crate::mole_cheats::is_on("max_facility"),
+        SliderKind::Gold | SliderKind::VipGold => false,
+    };
     let ui = user_info_data(env);
     if ui == nil {
-        return (name, 0, max);
+        return (name, 0, max, overridden);
     }
     let getter = match kind {
         SliderKind::Level => "curLevel",
@@ -1156,7 +1285,7 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
     };
     let s = sel(env, getter);
     let cur: i32 = msg_send(env, (ui, s));
-    (name, cur as i64, max)
+    (name, cur as i64, max, overridden)
 }
 
 // [扫描修 2026-09-15] 删掉 slider_set:滑块早已改为只读显示,它标着 allow(dead_code) 且全仓零引用;
@@ -1164,7 +1293,7 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
 
 /// 在一个格子里渲染点击式滑块:深色轨道 + 亮色填充(宽=当前/上限) + 实时值文字。
 fn render_slider(env: &mut Environment, container: id, frame: CGRect, kind: SliderKind, white: id) {
-    let (name, cur, max) = slider_info(env, kind);
+    let (name, cur, max, overridden) = slider_info(env, kind);
     let frac = if max > 0 {
         (cur as f32 / max as f32).clamp(0.0, 1.0)
     } else {
@@ -1184,7 +1313,13 @@ fn render_slider(env: &mut Environment, container: id, frame: CGRect, kind: Slid
         add_label(env, container, fill, "", fill_bg, white);
     }
     let clear = color(env, 0.0, 0.0, 0.0, 0.0);
-    let txt = format!("{} {}/{} (只读)", name, cur, max);
+    let txt = format!(
+        "{} {}/{} (只读){}",
+        name,
+        cur,
+        max,
+        if overridden { "(作弊覆盖)" } else { "" }
+    );
     add_label(env, container, frame, &txt, clear, white);
 }
 
@@ -1238,10 +1373,88 @@ fn ghost_call(env: &mut Environment, selector: &str, repeat: u32) {
     log!("[MOLEMENU] ghost TestLayer {} x{}", selector, repeat);
 }
 
+/// [SceneMannager curSceneId]:1 = 主村,10 = 黄金岛,2 = 切场景过场/加载中;单例拿不到时返回 -1。
+/// 取法与 mole_items::place_item_route 相同(+[SceneMannager sharedManager]@0x240cec 懒建,curSceneId@0x241730)。
+fn cur_scene_id(env: &mut Environment) -> i32 {
+    let sm = game_singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return -1;
+    }
+    let s = sel(env, "curSceneId");
+    msg_send(env, (sm, s))
+}
+
 fn summon_class(env: &mut Environment, name: &str, z: i32) {
     let cls = env.objc.get_known_class(name, &mut env.mem);
     if cls == nil {
         log!("[MOLEMENU] class {} not found", name);
+        set_toast(format!("召唤失败:找不到类 {}", name));
+        return;
+    }
+    // [2026-09-16] G-06 防呆①:dealloc 会清全局单例的类。下面修掉 alloc 的 +1 泄漏后,关闭召唤层会真正 dealloc;
+    // -[VillageMenuLayer dealloc]@0x5ed68 在 0x5edba/0x5edcc purge CropViewLayer 与 NewStyleStoreMainLayer 单例,
+    // 关一次就把场景里那份正在用的商店/作物界面清掉。召唤列表其余类的 dealloc 已逐个核过:只清自己的
+    // NetworkManager 代理、取消调度、移除触摸代理/通知或卸载自己的精灵帧,不 purge 全局单例。
+    if name == "VillageMenuLayer" {
+        log!("[MOLEMENU] 拒绝召唤 {}(dealloc 会 purge 商店/作物单例)", name);
+        set_toast(format!(
+            "拒绝召唤 {}:它销毁时会清掉商店/作物单例,关掉后场景里正在用的界面会坏",
+            name
+        ));
+        return;
+    }
+    // [2026-09-16] G-06 防呆②:单例类不 alloc 第二份。第二份与场景里那份并存,回调目标/顶层视图通知都对不上
+    // (新版商店「易卡」就是这个根因);ShowFreeShellsLayer/ShowAdwallBoardLayer 用的是 +shareInstance 命名。
+    // 类对象的 isa 是元类,object_has_method_named 查到的是类方法。
+    for shared in ["sharedInstance", "shareInstance", "sharedManager"] {
+        if env.objc.object_has_method_named(&env.mem, cls, shared) {
+            log!("[MOLEMENU] 拒绝召唤 {}(响应 +{},是单例)", name, shared);
+            set_toast(format!(
+                "拒绝召唤 {}:它是 +{} 单例,请用单例入口打开",
+                name, shared
+            ));
+            return;
+        }
+    }
+    // [2026-09-16] G-09 GM 面板场景门控。-[NewSceneTestLayer onButtonbuildValuePlus:]@0x330f10 加完建设值走
+    // saveUserinfoBothInLocalAndRemote@0x21f42c,只写主村 userinfo.dat;岛档只在岛会话里由 mole_cheats 置脏落盘,
+    // 进岛时 load_island_userinfo 又会用 island_userinfo.dat 覆盖建设值,所以在主村加的值进岛就没了。
+    // TestLayer 的各项改的是主村数据,只在主村开放。
+    match name {
+        "NewSceneTestLayer" => {
+            if cur_scene_id(env) != 10 || !crate::mole_cheats::island_session_active() {
+                log!("[MOLEMENU] 拒绝召唤 NewSceneTestLayer:不在黄金岛上");
+                set_toast("请在黄金岛上打开「黄金岛GM面板」(在主村加的建设值不会写进岛档)".to_string());
+                return;
+            }
+        }
+        "TestLayer" => {
+            let cur = cur_scene_id(env);
+            // [2026-09-16] 复审修:与 mole_items::place_item_route 同一口径,curSceneId==1 但岛会话仍活跃时是进出岛过场,
+            // runningScene 可能正要被换掉,面板挂上去就跟着旧场景走了,同样拒绝。
+            let island = crate::mole_cheats::island_session_active();
+            if cur != 1 || island {
+                log!(
+                    "[MOLEMENU] 拒绝召唤 TestLayer:curSceneId={} 岛会话活跃={}",
+                    cur,
+                    island
+                );
+                set_toast("请在主村打开「GM面板 TestLayer」".to_string());
+                return;
+            }
+        }
+        _ => {}
+    }
+    // 先取运行中场景再 alloc,免得场景拿不到时 alloc 出来的对象无人释放。
+    let director = game_singleton(env, "CCDirector", "sharedDirector");
+    if director == nil {
+        set_toast("召唤失败:CCDirector 还没初始化".to_string());
+        return;
+    }
+    let rs = sel(env, "runningScene");
+    let scene: id = msg_send(env, (director, rs));
+    if scene == nil {
+        set_toast("召唤失败:当前没有运行中的场景".to_string());
         return;
     }
     let alloc = sel(env, "alloc");
@@ -1250,15 +1463,7 @@ fn summon_class(env: &mut Environment, name: &str, z: i32) {
     let obj: id = msg_send(env, (obj, init));
     if obj == nil {
         log!("[MOLEMENU] {} alloc/init failed", name);
-        return;
-    }
-    let director = game_singleton(env, "CCDirector", "sharedDirector");
-    if director == nil {
-        return;
-    }
-    let rs = sel(env, "runningScene");
-    let scene: id = msg_send(env, (director, rs));
-    if scene == nil {
+        set_toast(format!("召唤失败:{} alloc/init 返回 nil", name));
         return;
     }
     let add = sel(env, "addChild:z:");
@@ -1270,6 +1475,9 @@ fn summon_class(env: &mut Environment, name: &str, z: i32) {
     }
     retain(env, obj);
     LAST_SUMMONED.with(|c| c.set(obj));
+    // [2026-09-16] G-06 抵消 alloc/init 的 +1。原来从不释放:场景(addChild)和 LAST_SUMMONED 各持一份后
+    // CloseSummoned 只 remove + release 一次,对象永远不会释放。现在关闭召唤层或它自己从父节点移除后会正常 dealloc。
+    release(env, obj);
     log!("[MOLEMENU] summoned {} z={}", name, z);
 }
 
@@ -1285,26 +1493,6 @@ fn mini_game(env: &mut Environment, id_: i32) {
     let select: u32 = 0; // NULL SEL
     let _: () = msg_send(env, (mgr, s, id_, play_type, target, select));
     log!("[MOLEMENU] startMiniGame {}", id_);
-}
-
-fn enter_xiaotulv(env: &mut Environment, map_res: &str, ui_res: &str) {
-    let gd = game_singleton(env, "GameData", "sharedInstance");
-    if gd == nil {
-        return;
-    }
-    let lm = sel(env, "loadMapdataFromResource:");
-    let map_str = from_rust_string(env, map_res.to_string());
-    let _: () = msg_send(env, (gd, lm, map_str));
-    let lu = sel(env, "loadUserInfoFromResource:");
-    let ui_str = from_rust_string(env, ui_res.to_string());
-    let _: () = msg_send(env, (gd, lu, ui_str));
-    // Reload the scene from the freshly loaded data.
-    let ngm = game_singleton(env, "NewGameManager", "sharedManager");
-    if ngm != nil {
-        let r = sel(env, "reloadMapFromNewSceneData");
-        let _: () = msg_send(env, (ngm, r));
-    }
-    log!("[MOLEMENU] enter xiaotulv {} / {}", map_res, ui_res);
 }
 
 /// Mature + harvest every farm. `ObjectManager.farms` is the game's own farm
@@ -1653,8 +1841,12 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
                 text
             };
             if matches!(tool, DevTool::Quest(QuestFamily::Time)) {
-                // F7-1 复核:限时任务 activate: 有语言门(0x1d88e8 调 currentUserLanguange:),简体下多半看不到效果。
-                shown.push_str("(注:限时任务有语言门,简体中文下可能无可见效果)");
+                // [2026-09-16] A2-05 更正 F7-1 复核的「简体下有语言门」:-[TimeQuest activate:]@0x1d88b4 在 0x1d88ee
+                // 先查 currentUserLanguange:1(zh-Hans),为真直接放行;-[TimeQuest setCanActivate:] 只在 en 下清零。
+                // 真正的条件是 GameManager.gameMode 不为 0/6(0x1d892a/0x1d893e)与 checkCanActivate(等级≥needLevel 等)。
+                // [2026-09-16] 复审修:去掉重复的「限时任务」前缀。连同 quest_jump 的正文整句约 1040pt,超出 992 宽的 toast
+                // (UILabel 单行不裁剪,居中后两侧溢出屏外),缩短后能放下。
+                shown.push_str("(需不在 gameMode 0/6、等级≥needLevel,由雅丽激活)");
             }
             set_toast(shown);
         }
@@ -1874,6 +2066,8 @@ fn run_hidden(env: &mut Environment, h: HiddenAct) {
 /// tap 178 519 点「一键进入黄金岛」、tap 220 517 点「岛上一键回主村」。换算与 handle_touch 相同:
 /// 横屏逻辑 x = 1024 - gy, y = gx。布局一旦漂移(改了页表或按钮数),这里在日志里明确报警,
 /// 而不是让测试莫名其妙地超时。只在不匹配时打日志。
+/// [2026-09-16] F2-04 Button.frame 存的是 1024 设计坐标,这里按 4:3 横屏右换算核对设计布局,宽屏下同样成立;
+/// 宽屏(--fill-screen)跑无头测试时实际要 tap 的 guest y 需加 ox(1188 宽为 +82),x 不变。
 fn layout_selfcheck(dev_title: &str, page_idx: usize, buttons: &[Button]) {
     let hit = |gx: f32, gy: f32| -> Option<Action> {
         let (lx, ly) = (1024.0 - gy, gx);
