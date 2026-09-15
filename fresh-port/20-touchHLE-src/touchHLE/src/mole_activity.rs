@@ -32,6 +32,13 @@
 //! 签到/脚印兑换/海底寻宝/烟花去重等"服务器侧状态"存旁路文件 `mole_activity.dat`
 //! (路径取 `-[GameData pathForDataFile:]`,与岛档同目录;`writeToFile:atomically:YES` 原子写)。
 //! 坏档或缺字段一律按默认值处理,不崩溃。
+//!
+//! # 限时折扣 1049([补完 2026-09-15] F2-2)
+//! 进村(-[GameManager startGame:])与回前台(applicationDidBecomeActive:)会发 1049。回环服务器按本地日期确定性地
+//! 挑几件主村商店的纯贝壳商品打 7~8 折回包,经原版 parseDiscountList:pos:len: → addOneDiscountGood: 进
+//! GameData.discountObjDataArr_,商店划线价/买得起判定/扣款全走原版。选品规则为移植者自拟,非原版数据;不落盘。
+//! 原版回包后 GameManager 只弹赛尔号/中信跨游戏推广层(折扣面板 UI 在 5.5.0 已是死代码),离线吞掉这次分发。
+//! MOLE_DISCOUNT=off 关闭(恢复原离线行为:无折扣)。
 
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, Ptr};
@@ -69,6 +76,9 @@ const CMD_SEABED_DIG: u32 = 1220;
 const CMD_SEABED_EXCHANGE: u32 = 1221;
 /// 1223 seabedSeekingTreasureRefreshShells(0x1cce10)。
 const CMD_SEABED_REFRESH: u32 = 1223;
+/// [补完 2026-09-15] F2-2 1049 getDiscountListFromServer(0x1cb160,0x1cb184 `movw r3, #0x419`)→ parseDiscountList:pos:len:
+/// (parseData tbh 下标 49 → 0xe6896);GameManager onCommandReceived: 分发表 tbh@0x22ed8 下标 5 → 0x23592。
+const CMD_DISCOUNT_LIST: u32 = 1049;
 
 /// 包尾 md5 用的 16 字节盐(guest 数据段 byte_B3AE64;与私服 mole-protocol::SALT 相同)。
 const SALT: [u8; 16] = [
@@ -86,6 +96,11 @@ const SLOT_NM_DELEGATE_GAMEDATA: u32 = 0xb04448;
 const SLOT_HDR_USER_ID: u32 = 0xb0489c;
 /// MVPacketHeader.deviceIDHash_(L,编译期 +24)。
 const SLOT_HDR_DEVICE_HASH: u32 = 0xb048a0;
+/// [补完 2026-09-15] MVPacketHeader.commandID_(L,编译期 +8)。parseData:header:pos: 把包头(r3,0xe5c5c 存 [sp,#0x34])
+/// 原样作为 onCommandReceived: 的参数(0xe79e0)。
+const SLOT_HDR_COMMAND_ID: u32 = 0xb04890;
+/// [补完 2026-09-15] NetworkManager.state(编译期 +12;getDiscountListFromServer 0x1cb16c..0x1cb172 经 GOT 读此槽)。
+const SLOT_NM_STATE: u32 = 0xb043d0;
 
 // ───────────────────────────── 按调用点精确放行的网络门(blx 指令地址;LR = 地址+4,带 Thumb 位) ─────────────────────────────
 /// -[UserInfoLayer onButtonActionFunctionsSelected:] 活动按钮 isReachable(LR 0x5a431)。
@@ -131,6 +146,28 @@ const SLOT_ACL_HIDE_ACTIVITY: u32 = 0xb08074;
 const SLOT_CCNODE_VISIBLE: u32 = 0xb06ed4;
 const SLOT_CCNODE_TAG: u32 = 0xb06ed8;
 
+// [补完 2026-09-15] F2-2 限时折扣选品用到的 ivar 槽。re.py 核对取值方法均为平凡 ivar 读:-[GameData storeBuildingsArray]@0x8c0b8 /
+// storeDecorationsArray@0x8c0c8、-[ObjectData objectId]@0x8dd30 / type@0x8dd80 / cost_gold@0x8dde0 / cost_vip_gold@0x8de00 /
+// limit_count@0x8df40 / shop_type@0x8e0a0 / vip_level@0x8e1e4。偏移运行时从槽里现读。
+/// GameData.storeBuildingsArray_(+624):shop_type 1 的分页数组(-[GameData parseObjectData:] 0x6f492 按 shop_sub_type 1..6 归页)。
+const SLOT_GD_STORE_BUILDINGS: u32 = 0xb039a0;
+/// GameData.storeDecorationsArray_(+628):shop_type 2 的分页数组(0x6f4e2)。
+const SLOT_GD_STORE_DECORATIONS: u32 = 0xb039a4;
+/// ObjectData.objectId_(i,+4)。
+const SLOT_OBJ_ID: u32 = 0xb03c2c;
+/// ObjectData.type_(C,+13)。
+const SLOT_OBJ_TYPE: u32 = 0xb03c34;
+/// ObjectData.cost_gold_(i,+24)。
+const SLOT_OBJ_COST_GOLD: u32 = 0xb03c40;
+/// ObjectData.cost_vip_gold_(i,+28)。
+const SLOT_OBJ_COST_VIP_GOLD: u32 = 0xb03c44;
+/// ObjectData.limit_count_(C,+68)。
+const SLOT_OBJ_LIMIT_COUNT: u32 = 0xb03c6c;
+/// ObjectData.shop_type_(C,+93)。
+const SLOT_OBJ_SHOP_TYPE: u32 = 0xb03c98;
+/// ObjectData.vip_level_(i,+132)。
+const SLOT_OBJ_VIP_LEVEL: u32 = 0xb03cbc;
+
 /// 旁路存档文件名(Documents 下,经 GameData pathForDataFile: 拼路径)。
 const STATE_FILE: &str = "mole_activity.dat";
 
@@ -164,7 +201,11 @@ pub fn wants(class: &str, sel: &str) -> bool {
                 | "seabedSeekingTreasureDigShellWith:shellType:pearlCount:"
                 | "seabedSeekingTreasureExchangeRewardWithPearlCount:"
                 | "seabedSeekingTreasureDigShellToGainMimiCoinWith:coinCount:"
+                // [补完 2026-09-15] F2-2 限时折扣:state==4 时原版不发包的兜底
+                | "getDiscountListFromServer"
         ),
+        // [补完 2026-09-15] F2-2 回环喂 1049 时吞掉 GameManager 的推广弹窗分发;离线进村时补发 1049
+        "GameManager" => sel == "onCommandReceived:" || sel == "startGame:",
         "UserInfoLayer" => sel == "checkActivityStatus",
         "ActionCenterLayer" => sel == "changeActionLayer:",
         "DailySignLayer" | "SealExchangeLayer" | "SeabedSeekingTreasureMainLayer" => sel == "checkNetWork",
@@ -271,6 +312,62 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 restore_regs(env, saved);
             }
             r
+        }
+
+        // ── [补完 2026-09-15] F2-2 限时折扣 1049 ──
+        ("GameManager", "onCommandReceived:") => {
+            // 只管回环喂进来的 1049;其它命令、非回环一律放行。这里只读寄存器与 guest 内存,不发宿主消息,放行时寄存器未动。
+            if LOOPBACK_DEPTH.load(O) == 0 {
+                return None;
+            }
+            let header: id = Ptr::from_bits(env.cpu.regs()[2]);
+            if read_ivar_u32(env, header, SLOT_HDR_COMMAND_ID) != Some(CMD_DISCOUNT_LIST) {
+                return None;
+            }
+            // 1049 臂(0x23592..0x23d80)只做一件事:[[GameData sharedInstance] isOpenGreatRewardLayer] 为真 →
+            // [[AutoPopZhongXinLayer shareInstance] open](0x235ec),否则 purge 后 [[DiscountInfoLayer sharedInstance] show]
+            // (0x23d7e),两路都经 0x2265a 落到函数收尾 0x22efa(只有栈保护检查)。5.5.0 的 DiscountInfoLayer 已改成赛尔号推广层:
+            // init@0x1eb234 只摆 seer_bg_back / seer_button_join→onButtonLinkToItunesSiteOfIseer / seer_button_off;折扣列表
+            // UI(showDiscountObjects 只被无 selref 的 onButtonLeft/onButtonRight 调用,dTable 从不创建)是死代码。
+            // 原版每收到一次 1049 回包就弹一次推广;离线不弹跨游戏推广(与 mole_cheats 吞 AutoPopZhongXinLayer open 同一口径)。
+            // 折扣数据在此之前已由 parseDiscountList:pos:len: 写进 GameData,吞掉分发不影响商店价格。
+            log!("[ACTIVITY] 限时折扣 cmd=1049:吞掉 GameManager 分发(原版此臂只弹赛尔号/中信推广层,折扣数据已入库)");
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
+        }
+        ("GameManager", "startGame:") => {
+            // [补完 2026-09-15] F2-2 实测纠正:-[GameManager startGame:] 在 0x1992a 先查 [NetworkManager isConnected],
+            // 为假就跳到 0x19e18,整段服务器同步(getFriendsInfo:/getGiftsFromServer/getAmendVIPGoldFromServer/
+            // 0x19a56 getDiscountListFromServer)都不执行;回前台那处(0x10f38)又要求 InGameScene 且中信奖励类型≥2。
+            // 所以离线主村原版永远不会发 1049。这里在进村时(前置,商店数组已由 load:type: 加载好)照原版同一个入口
+            // 补发一次:[[NetworkManager sharedInstance] getDiscountListFromServer] → sendPacket:1049 → 回环应答;
+            // 回包排到运行循环再喂,那时 startGame: 已设好 delegateGameData。发过宿主消息,放行前恢复 r0-r3。
+            if !discount_disabled() {
+                let saved = save_regs(env);
+                let nm = singleton(env, "NetworkManager", "sharedInstance");
+                if nm != nil {
+                    let get_list = sel_named(env, "getDiscountListFromServer");
+                    let _: () = msg_send(env, (nm, get_list));
+                }
+                restore_regs(env, saved);
+            }
+            None
+        }
+        ("NetworkManager", "getDiscountListFromServer") => {
+            // 原版 0x1cb174:state==4 直接返回不发包;其它状态走 sendPacket:commandId:1049,由 handle_send_packet 应答。
+            // 离线状态机按理到不了 4,这里只是兜底(state==4 时照样本地应答并记日志)。放行路径只读内存,寄存器未动。
+            if discount_disabled() {
+                return None;
+            }
+            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+            if read_ivar_u32(env, nm, SLOT_NM_STATE) != Some(4) {
+                return None;
+            }
+            log!("[ACTIVITY] 限时折扣:NetworkManager.state==4,原版不会发 1049,本地兜底应答");
+            let body = encode_discount_list(env);
+            enqueue_reply(env, nm, CMD_DISCOUNT_LIST, body);
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
         }
 
         // ── F3-3 / F5-4 每日签到(需要参数的上层发包方法) ──
@@ -1162,6 +1259,18 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
             env.cpu.regs_mut()[0] = 0;
             Some(true)
         }
+        CMD_DISCOUNT_LIST => {
+            // [补完 2026-09-15] F2-2 主村限时折扣(黄金岛的 1073 不走这里;岛上会话已在 intercept 入口排除)。
+            //   MOLE_DISCOUNT=off 时放行真 sendPacket:commandId:——原离线行为(只 packetsCount+1、setSendFlag 后返回,无折扣);
+            //   此前没发过任何宿主消息,调用处 None 时还会恢复 r0-r3。
+            if discount_disabled() {
+                return None;
+            }
+            let body = encode_discount_list(env);
+            enqueue_reply(env, nm, cmd, body);
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
+        }
         _ => None,
     }
 }
@@ -1545,4 +1654,207 @@ fn seabed_exchange(env: &mut Environment, nm: id, cost: u32) {
     let mut b = Vec::with_capacity(4);
     put_u32(&mut b, 0);
     enqueue_reply(env, nm, CMD_SEABED_EXCHANGE, b);
+}
+
+// ─────────────────────────────── [补完 2026-09-15] F2-2 限时折扣 1049 ───────────────────────────────
+
+/// 每天挑几件。
+const DISCOUNT_COUNT: usize = 6;
+/// 折扣率(百分比,7~8 折)。
+const DISCOUNT_PCTS: [u32; 3] = [70, 75, 80];
+/// 贝壳原价下限(太便宜的打完折看不出差价)。
+const DISCOUNT_MIN_PRICE: u32 = 5;
+/// 贝壳原价上限(防脏数据;属性表在售贝壳商品最高 150)。
+const DISCOUNT_MAX_PRICE: u32 = 10_000;
+/// 只挑装饰类(ObjectData.type 14):属性表在售纯贝壳商品 313 件里 268 件是 14;
+/// -[NewStyleStoreMainLayer onBuyItem:] 0x3b27a0 起对 rest_place==2、type 20/25 与个别 ID 另走分支,避开最稳。
+const DISCOUNT_OBJECT_TYPE: u8 = 14;
+/// 充值解锁物(getLockType4Object: 返回 13 = RECHARGE_TO_UNLOCK,离线永锁,打折也买不了):16283 都教授在售(shop_type 2 / sub 4);
+/// 14956 乐乐水塔 / 14974 克劳神父 / 14987 织女鹊桥 本来不在商店,一并列出防御。
+const DISCOUNT_EXCLUDE: [u32; 4] = [14956, 14974, 14987, 16283];
+
+/// MOLE_DISCOUNT=off|0|false|no|none 关闭离线限时折扣。
+fn discount_disabled() -> bool {
+    match std::env::var("MOLE_DISCOUNT") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "none"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// 本地"今天"的日期与次日 0:00 的 unix 秒。时区口径同 local_date([NSTimeZone systemTimeZone],默认北京时间,
+/// 含开发工具时间旅行偏移);次日 0:00 用那一刻的 UTC 偏移换算,MOLE_TZ=host 跨夏令时也准。
+fn local_today_and_midnight(env: &mut Environment) -> (LocalDate, i64) {
+    use crate::frameworks::foundation::ns_time_zone::seconds_from_gmt_at_unix;
+    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = if cf.is_finite() { cf } else { 0.0 };
+    let unix = cf.floor() as i64 + 978_307_200;
+    let tz_cls = env.objc.get_known_class("NSTimeZone", &mut env.mem);
+    let tz: Option<id> = if tz_cls != nil {
+        let s = sel_named(env, "systemTimeZone");
+        let tz_obj: id = msg_send(env, (tz_cls, s));
+        Some(tz_obj)
+    } else {
+        None
+    };
+    let offset: i64 = match tz {
+        Some(t) => seconds_from_gmt_at_unix(env, t, unix) as i64,
+        None => 8 * 3600,
+    };
+    let day_index = (unix + offset).div_euclid(86_400);
+    let (year, month, day) = civil_from_days(day_index);
+    let next_local_midnight = (day_index + 1) * 86_400;
+    let offset_next: i64 = match tz {
+        Some(t) => seconds_from_gmt_at_unix(env, t, next_local_midnight - offset) as i64,
+        None => 8 * 3600,
+    };
+    (
+        LocalDate { year, month, day },
+        next_local_midnight - offset_next,
+    )
+}
+
+/// 从主村商店分页数组收集可打折的贝壳商品:(物品 ID, 贝壳原价),按 ID 升序去重。
+/// 这两个数组就是商店实际展示的数据源(-[NewStyleStoreItemsView loadObjectsDataByType:] 5..16 直接取用),元素是 ObjectData;
+/// 只对数组发 count / objectAtIndex:,字段直接读 ivar,不逐个发消息。
+/// 选品规则(移植者自拟,非原版):shop_type 1/2 · 装饰类 type 14 · 纯贝壳价(cost_gold==0 且 cost_vip_gold 5..=10000)·
+/// 非 VIP 专属(vip_level==0)· 不限购(limit_count==0)· ID>1000 且不在充值解锁清单。
+/// - 为什么只挑贝壳价:消费方拿 goodsPrice 顶替的是 cost_vip_gold(见 encode_discount_list),金币价物品打折会变成贝壳价。
+/// - ID>1000:addOneDiscountGood:@0x82240 对 ID 1..7(贝壳充值包)不查物品表直接收,商店详情对 ID<=1000 显示
+///   SUPER_SHELL_DISCOUNT「打折期间额外赠送%d个超级贝壳」,那是内购档位,离线不碰。
+/// - 隐藏物品页注入进同一数组的物品没有 shop_type(属性表缺该键 → 0),天然被排除。
+/// - 不筛等级(属性表里在售贝壳商品 level 全为 1,也免得同一天因玩家升级而换品);不查美术(在售商品商店本来就要画)。
+fn discount_candidates(env: &mut Environment) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let gd = singleton(env, "GameData", "sharedInstance");
+    if gd == nil {
+        return out;
+    }
+    let count_sel = sel_named(env, "count");
+    let at_sel = sel_named(env, "objectAtIndex:");
+    for (slot, want_shop_type) in [
+        (SLOT_GD_STORE_BUILDINGS, 1u8),
+        (SLOT_GD_STORE_DECORATIONS, 2u8),
+    ] {
+        let pages: id = match read_ivar_u32(env, gd, slot) {
+            Some(bits) => Ptr::from_bits(bits),
+            None => nil,
+        };
+        if pages == nil {
+            continue;
+        }
+        let page_count: GuestUSize = msg_send(env, (pages, count_sel));
+        for p in 0..page_count.min(16) {
+            let page: id = msg_send(env, (pages, at_sel, p));
+            if page == nil {
+                continue;
+            }
+            let n: GuestUSize = msg_send(env, (page, count_sel));
+            for i in 0..n.min(4096) {
+                let obj: id = msg_send(env, (page, at_sel, i));
+                if obj == nil {
+                    continue;
+                }
+                // 只认 ObjectData 本类(主村商店数组的元素类型;岛上的是别的数据源)。
+                let isa = crate::objc::ObjC::read_isa(obj, &env.mem);
+                if env.objc.try_get_class_name(isa) != Some("ObjectData") {
+                    continue;
+                }
+                let shop_type = read_ivar_u8(env, obj, SLOT_OBJ_SHOP_TYPE).unwrap_or(0);
+                let obj_type = read_ivar_u8(env, obj, SLOT_OBJ_TYPE).unwrap_or(0);
+                let limit_count = read_ivar_u8(env, obj, SLOT_OBJ_LIMIT_COUNT).unwrap_or(1);
+                let vip_level = read_ivar_u32(env, obj, SLOT_OBJ_VIP_LEVEL).unwrap_or(1);
+                let cost_gold = read_ivar_u32(env, obj, SLOT_OBJ_COST_GOLD).unwrap_or(1);
+                let price = read_ivar_u32(env, obj, SLOT_OBJ_COST_VIP_GOLD).unwrap_or(0);
+                let Some(item) = read_ivar_u32(env, obj, SLOT_OBJ_ID) else {
+                    continue;
+                };
+                if shop_type != want_shop_type
+                    || obj_type != DISCOUNT_OBJECT_TYPE
+                    || limit_count != 0
+                    || vip_level != 0
+                    || cost_gold != 0
+                    || !(DISCOUNT_MIN_PRICE..=DISCOUNT_MAX_PRICE).contains(&price)
+                    || item <= 1000
+                    || DISCOUNT_EXCLUDE.contains(&item)
+                {
+                    continue;
+                }
+                out.push((item, price));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup_by_key(|e| e.0);
+    out
+}
+
+/// splitmix64:按日期做确定性伪随机(同一天多次请求结果一致,不依赖进程内随机状态,重启游戏也一样)。
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// 从候选里按日期 yyyymmdd 确定性地挑 DISCOUNT_COUNT 件(部分 Fisher-Yates),返回 (ID, 原价, 折后价)。
+fn pick_discounts(candidates: &[(u32, u32)], ymd: u32) -> Vec<(u32, u32, u32)> {
+    let mut pool = candidates.to_vec();
+    let n = DISCOUNT_COUNT.min(pool.len());
+    let mut state = splitmix64(u64::from(ymd) ^ 0x4d4f_4c45_0419);
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        state = splitmix64(state);
+        let j = k + (state % (pool.len() - k) as u64) as usize;
+        pool.swap(k, j);
+        let (item, orig) = pool[k];
+        let pct = DISCOUNT_PCTS[((state >> 32) % DISCOUNT_PCTS.len() as u64) as usize];
+        // 四舍五入到整贝壳,且至少便宜 1 个(候选原价 >= 5,区间 [1, orig-1] 合法)。
+        let price = ((orig * pct + 50) / 100).clamp(1, orig - 1);
+        out.push((item, orig, price));
+    }
+    out
+}
+
+/// 1049 body(parseDiscountList:pos:len:@0x1bfa8c 逐字节核实):count(u32) + count × 12 字节
+/// [goodsId(+0 → setGoodsId:)][goodsPrice(+4 → setGoodsPrice:)][expireTime(+8 → setExpireTime:)](0x1bfbb4/0x1bfbc4/0x1bfbd6)。
+/// - goodsPrice = 折后**贝壳**单价:消费方都拿它顶替 cost_vip_gold——getLockType4Object:@0x7d8c2、onBuyItem:@0x3b2790、
+///   VillageMenuLayer canBuyMultiple:@0x643bc、商店详情 updateObjectInfo(0x3ba2dc 判定后 0x3baf10 取价,discount_line.png 划线)。
+///   [补完 2026-09-15] 复核更正扣款点:主村真正扣贝壳的是 -[Porter finishBuildWithHouseLevel:isGift:](0x2b7c6 取 goodsPrice →
+///   0x2b80e 取负 → 0x2b856 addVipGold:)与 -[VillageMenuLayer showCostGoldView:](0x64a64 取价 → 0x64a88 取负 → 0x64ad2 addVipGold:);
+///   -[EditMenuLayer onButtonOkSelected:]@0x4ed6e 也按折扣价判定要不要花贝壳;onChooseUse@0x53380 只查 checkIsDiscountObj:,
+///   命中时上报折扣购买统计(0x534d2 addAnalyticsEvent:eventName:)。
+///   -[GameData addVipGoldForBuy:UIUpdate:](IMP 0x86c30)与商店扣款无关:它只被 addAlreadyPurchaseVipgoldWithPurchaseInfo:@0x7f176
+///   和 -[InAppPurchaseManager onPurchaseSuccessful]@0x117c4c 调用，是内购充值包(itemid 1..7,0x86d1a/0x86d1e)命中折扣时把
+///   goodsPrice 作为额外赠送的贝壳加到到账数上(0x86d84 取价、0x86d8e 相加、0x86db4 addVipGold:)。本模块选品已排除 ID<=1000,不走这条路。
+/// - expireTime:客户端从不读(DiscountInfo 的 expireTime 取值方法无 selref,ivar 只有 init/存取器引用;DiscountInfoLayer
+///   lefttime_ 无写入者、startTimer 无调用者,CommonEffectController innerupdateDiscount: 只由 startTimer 排程,均是死代码)。
+///   照私服 economy.rs 口径填当天本地 24:00 的 unix 秒,仅作语义与日志用。
+/// - count==0 时解析器不清旧表(0x1bfae2 在 removeAllObjectFromDiscountArr 之前返回);count>0 先清再加,所以跨天后的下一次
+///   1049(进村/回前台)会整表换成新一天的折扣。原版客户端不在会话中途过期清表,这里保持一致。
+fn encode_discount_list(env: &mut Environment) -> Vec<u8> {
+    let (today, midnight_unix) = local_today_and_midnight(env);
+    let candidates = discount_candidates(env);
+    let picks = pick_discounts(&candidates, today.ymd());
+    let expire = midnight_unix.clamp(0, u32::MAX as i64) as u32;
+    let mut b = Vec::with_capacity(4 + picks.len() * 12);
+    put_u32(&mut b, picks.len() as u32);
+    let mut desc: Vec<String> = Vec::with_capacity(picks.len());
+    for &(item, orig, price) in picks.iter() {
+        put_u32(&mut b, item);
+        put_u32(&mut b, price);
+        put_u32(&mut b, expire);
+        desc.push(format!("{}:{}→{}", item, orig, price));
+    }
+    log!(
+        "[ACTIVITY] 限时折扣 cmd=1049 日期={} 候选={} 选中{}件 [{}] 到期unix={}",
+        today.ymd(),
+        candidates.len(),
+        picks.len(),
+        desc.join(" "),
+        expire
+    );
+    b
 }
