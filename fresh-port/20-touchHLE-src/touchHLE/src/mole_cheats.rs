@@ -234,11 +234,6 @@ static LAST_MAP_COUNT: AtomicI32 = AtomicI32::new(-99);
 /// the drawScene frame stack — so it can't interfere with packets or the village scene transition.
 static STATE_IS_7: AtomicBool = AtomicBool::new(false);
 static HUD_TIMER_SET: AtomicBool = AtomicBool::new(false);
-/// Once the login round-trip reached state 7, drive the map request (cmd 1001) ourselves. The
-/// native 1234-reply handler only sends it when MainMenuScene.isOptionLayerShow_==0 AND it reaches
-/// the delegate, which our boot-synthesized flow doesn't reliably satisfy (server saw only
-/// 1234→1052, never 1001). Driving getLocalUserAndMapInfo + byte_B409B0 directly is robust.
-static SENT_1001: AtomicBool = AtomicBool::new(false);
 /// Village-render workaround. showWithTarget:4 schedules -[LoadingLayer update:] → (performSelector
 /// OnMainThread:) loadTarget → case 4 (loadFromLocal + [GameManager startGame]) = build the village.
 /// But in touchHLE the LoadingLayer's `update:` re-schedule after a prior loadTarget's

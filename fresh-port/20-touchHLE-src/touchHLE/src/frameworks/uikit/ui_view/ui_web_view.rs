@@ -57,14 +57,19 @@ fn html_to_text(html: &str) -> String {
             let lo_rest = &lo[base..];
             if let Some(i) = lo_rest.find(open) {
                 let start = base + i;
-                res.push_str(&rest[..start - (base - (s.len() - rest.len()))]);
+                // [补完 2026-09-15] 修越界切片:rest 恒等于 &s[base..],旧写法
+                // `&rest[..start - (base - (s.len() - rest.len()))]` 化简后是 `&rest[..start]`,
+                // 把绝对下标当成相对下标用;同一种标签第二次出现时会多切 base 个字节(混入正文、
+                // 越界或切在多字节字符中间 panic)。i 是相对 rest 的下标(小写化不改字节长度)。
+                res.push_str(&rest[..i]);
                 // find close after start
                 if let Some(j) = lo[start..].find(close) {
                     let end = start + j + close.len();
                     rest = &s[end..];
                     base = end;
                 } else {
-                    rest = "";
+                    // [补完 2026-09-15] 此处原有 `rest = "";`,紧跟 break 后 rest 再无读取
+                    // (unused_assignments 警告),删去不改行为:未闭合的块照旧丢弃到文末。
                     break;
                 }
             } else {

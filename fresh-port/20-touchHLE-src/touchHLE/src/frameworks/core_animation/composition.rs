@@ -154,6 +154,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定;
     // 以及 viewRenderbuffer,swap 前绑回 GL_RENDERBUFFER。
     let window_default_fbo = env.window().default_framebuffer();
+    // [补完 2026-09-15] window_default_rbo 只在下方 #[cfg(target_os = "ios")] 的 BindRenderbufferOES 用到,
+    // 桌面/安卓构建报 unused_variables。只在非 iOS 放宽该 lint,取值与调用照旧(不把这行门控掉,
+    // 免得 default_renderbuffer() 在其它调用点也门控后变成 dead_code),各平台行为不变。
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
     let window_default_rbo = env.window().default_renderbuffer();
 
     // TODO: draw status bar if it's not hidden

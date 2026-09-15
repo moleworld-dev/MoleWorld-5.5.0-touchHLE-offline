@@ -135,6 +135,10 @@ impl Image {
     /// alpha. 0 on the y axis is the top of the image.
     ///
     /// Returns [None] if `at` is out-of-bounds.
+    // [补完 2026-09-15] 本仓 CGContextDrawImage 已改用 cg_bitmap_context.rs 里与本函数逐位一致的查表版
+    // (F10-10,见该文件对 Image::get_pixel 的引用注释),此处全仓无调用 → dead_code 警告。它是上游
+    // touchHLE 的公开方法,也是查表版的对拍参照,保留以便核对与合并上游,只对它放宽 dead_code。
+    #[allow(dead_code)]
     pub fn get_pixel(&self, at: (i32, i32)) -> Option<(f32, f32, f32, f32)> {
         let (x, y) = at;
         let (x_usize, y_usize) = (x as usize, y as usize);
