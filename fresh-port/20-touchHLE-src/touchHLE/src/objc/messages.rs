@@ -487,7 +487,6 @@ fn objc_msgSend_inner(
             // 最后吞掉"无网络"弹窗。
             if name == "AvatarLayer" && selector.as_str(&env.mem) == "showNetWorkError" {
                 let recv = receiver;
-                drop(message_type_info);
                 // 1) 本地生效 + 刷新屏幕昵称(saveName 只读 self.textField,离线安全)。
                 if env.objc.object_has_method_named(&env.mem, recv, "saveName") {
                     let save_name = env
@@ -576,7 +575,6 @@ fn objc_msgSend_inner(
                 // initWithCoder: 的 NSCoder 实参在 r2(r0=self, r1=_cmd, r2=arg1);
                 // 必须在任何 msg_send 之前读出(后续调用会覆写寄存器)。
                 let coder: id = MutPtr::from_bits(env.cpu.regs()[2]);
-                drop(message_type_info);
                 // 1) 放行原 initWithCoder:(递归卫=true → 落正常派发跑原方法)。
                 MOLE_IN_UID_INITCODER.store(true, Ordering::Relaxed);
                 let result: id = crate::objc::msg_send(env, (recv, selector, coder));
@@ -631,7 +629,6 @@ fn objc_msgSend_inner(
             {
                 if let Some(sel) = env.objc.lookup_selector("replaceByLoadingScene") {
                     let recv = receiver;
-                    drop(message_type_info);
                     // [深扫修 2026-09-12] 补回原版在这里做的版本记录写入(0x1905b0-0x190616):
                     // 本地版本号大于 newVersionRecord 时先 setNewVersionRecord: + saveSettings,
                     // 然后才决定弹不弹介绍层。只吞介绍层不补写的话 newVersionRecord 永远是 0,
@@ -694,12 +691,18 @@ fn objc_msgSend_inner(
             if name == "NewStyleStoreMainLayer"
                 && selector.as_str(&env.mem) == "onBuyVIPGold:"
             {
-                // onBuyVIPGold:(int 档位索引):regs[2] = 包索引(0..=6;原版 cmp r2,8)。
-                // 按原版各档真实贝壳数发放(20/105/225/370/650/1500/3500),不再死值 1000。
+                // onBuyVIPGold:(int):按原版各档真实贝壳数发放,不再死值 1000。
                 // 必须在任何 msg_send 前读 regs[2],否则被覆盖。
-                let pack_idx = env.cpu.regs()[2] as usize;
-                const SHELL_PACKS: [i32; 7] = [20, 105, 225, 370, 650, 1500, 3500];
-                let shells = SHELL_PACKS.get(pack_idx).copied().unwrap_or(20);
+                // [补完 2026-09-15] 参数纠正:regs[2] 不是 0 起的包下标,而是 ShopItemData.itemid(1..7,取自 100_0.dat)。
+                // 原版 -[NewStyleStoreMainLayer onBuyVIPGold:]@0x3b29b0 用它调 -[GameData getShopItemData:]@0x7bf3c,
+                // 按 itemid 相等查档位;itemid 8 是广告墙「免费贝壳」格(0x3b29c4 cmp r2,#8 → 广告墙,不是充值)。
+                // 三个调用方传的都是 itemid:-[NewStyleStoreItemsView onButtonBuyItemSelected:]@0x3bd9c0(_selectedObjectId−1 ≤ 7 才发,
+                // 0 永远到不了这里)、-[DiscountInfoLayer onButtonShop:]@0x1ec46a(goodsId ≤ 7)、onItemsMenuSelected:@0x3b23ce(固定 8)。
+                // 旧代码按下标取 [20,105,…,3500]:每档都多发一档,itemid 7(3500 贝壳档)越界落到兜底只发 20。
+                // 档位表(贝壳数 + 标价)移到 mole_items::SHELL_PACKS,与 VIP 累计共用一份;查不到的参数沿用旧兜底 20 贝壳。
+                let item_id = env.cpu.regs()[2];
+                let pack = crate::mole_items::shell_pack(item_id);
+                let shells = pack.map_or(20, |p| p.shells);
                 let gd_class = env.objc.get_known_class("GameData", &mut env.mem);
                 let shared_sel = env
                     .objc
@@ -708,22 +711,25 @@ fn objc_msgSend_inner(
                     "addVipGoldForBuy:UIUpdate:".to_string(),
                     &mut env.mem,
                 );
-                drop(message_type_info);
                 let gd: id = crate::objc::msg_send(env, (gd_class, shared_sel));
                 if gd != nil {
                     let amount: i32 = shells;
                     let do_update: bool = true;
                     let _: () = crate::objc::msg_send(env, (gd, add_sel, amount, do_update));
                     log!(
-                        "[SHELLHOOK] granted {} shells (pack idx {}, offline IAP bypass)",
-                        amount, pack_idx
+                        "[SHELLHOOK] granted {} shells (pack idx {} = ShopItemData.itemid{}, offline IAP bypass)",
+                        amount,
+                        item_id,
+                        if pack.is_some() { "" } else { ",不是 100_0.dat 充值档位,按旧兜底发放" }
                     );
                     // [扫描修 2026-09-15] F2-1:这个钩子吞掉了原版 IAP 流程,原版「充值成功」的副作用
                     // (-[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]@0x7f3bc:gamedataFlag |= 0x20/0x10、
                     // unlockItem:16283 都教授等)离线永远不会发生。只在贝壳确实发放成功(gd != nil)后交给
                     // mole_items 补齐。它内部会发宿主 msg_send、可能改写 r0-r3,所以放在最终写回返回寄存器
                     // 之前调用;onBuyVIPGold: 返回 void,下面统一把 r0/r1 清零,寄存器最终状态与原来一致。
-                    crate::mole_items::on_shells_purchased(env);
+                    // [补完 2026-09-15] 同时把本次购买的 itemid / 实发贝壳数 / 档位(含标价)交给 mole_items,
+                    // 替原版服务器做「累计充值 → VIP 等级」(原版 1083 上报 + 1084 回包 parseVipInfo 写三值)。
+                    crate::mole_items::on_shells_purchased(env, item_id, amount, pack);
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
@@ -747,7 +753,6 @@ fn objc_msgSend_inner(
                 let close_sel = env
                     .objc
                     .register_host_selector("doClose".to_string(), &mut env.mem);
-                drop(message_type_info);
                 let del: id = crate::objc::msg_send(env, (recv, del_sel));
                 if del != nil {
                     let _: () = crate::objc::msg_send(env, (del, finish_sel));
@@ -765,7 +770,6 @@ fn objc_msgSend_inner(
             // the no-network popup. Gated on a cheap flag so it's free when off.
             if crate::mole_cheats::fix_golden_island_on() {
                 if name == "GameData" && selector.as_str(&env.mem) == "caribbeanData" {
-                    drop(message_type_info);
                     let data = crate::mole_cheats::build_caribbean_data(env);
                     env.cpu.regs_mut()[0] = data.to_bits();
                     return;
@@ -782,7 +786,6 @@ fn objc_msgSend_inner(
                     && selector.as_str(&env.mem) == "showLayerWithTarget:selector:"
                 {
                     let recv = receiver;
-                    drop(message_type_info);
                     if env
                         .objc
                         .object_has_method_named(&env.mem, recv, "closeCaribbeanMainLayer")
@@ -801,7 +804,6 @@ fn objc_msgSend_inner(
                     && selector.as_str(&env.mem) == "getCaribbeanStateInfo:"
                 {
                     let recv = receiver;
-                    drop(message_type_info);
                     // Build the local state and store it in GameData so the
                     // activity's getter / direct-ivar reads both see valid data.
                     let data = crate::mole_cheats::build_caribbean_data(env);

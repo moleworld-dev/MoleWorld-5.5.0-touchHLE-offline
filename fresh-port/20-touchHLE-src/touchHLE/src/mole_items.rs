@@ -16,6 +16,8 @@
 //! - `-[UserVIPInfoData …]` 三个 getter/三个 setter/reset:VIP 本地持久化(F5-2)。
 //! - `-[iMoleVillageAppDelegate applicationWillResignActive:/applicationWillTerminate:/applicationDidBecomeActive:]`:
 //!   在线时长暂停/落盘。
+//! - (非钩子)objc/messages.rs 的 SHELLHOOK 假购买贝壳后调 `on_shells_purchased`:充值解锁物补状态(F2-1),
+//!   [补完 2026-09-15] 以及 VIP 值按档位价累计、按门槛升级(门槛为移植者自拟,非原版数据,可用 MOLE_VIP_THRESHOLDS 覆盖)。
 //!
 //! 返回值约定:归本模块独占的钩子(商店注入、头像锁、计数 getter)返回 Some(..);
 //! 与 mole_cheats 共用的消息(startGame:、UserVIPInfoData、AppDelegate 生命周期)只做旁路副作用并返回 None,
@@ -27,7 +29,7 @@ use crate::fs::GuestPathBuf;
 use crate::objc::{id, msg_send, nil, release, SEL};
 use crate::Environment;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 const O: Ordering = Ordering::Relaxed;
@@ -992,7 +994,15 @@ fn vip_apply(env: &mut Environment, obj: id, v: VipVals) {
 /// 做法:本地对象第一次被读(vipLevelWithNewType/vipValue/vipValueOfNextLevel)时把 sidecar 的值用 setter 写回;
 /// -[GameData resetObjectInfoUnaddedInMap]@0x7abc8 会对它 reset,reset 后下一次读再写回。
 /// 值的来源:任何代码(含菜单)经 setter 改了本地对象的 VIP 值,这里记账并原子落盘。
-/// 在线模式整段跳过(交给 parseVipInfo)。所有分支返回 None,不遮挡 mole_cheats 的强制 VIP 钩子。
+/// 在线模式整段跳过(交给 parseVipInfo)。除下面这一处外所有分支返回 None,不遮挡 mole_cheats 的强制 VIP 钩子。
+/// [补完 2026-09-15] 唯一例外:强制 VIP 开着时,本地对象的 vipValueOfNextLevel 返回 0(Some(true))。
+/// 根因:-[VIPLayer showWithTarget:selector:] 读 vipValue(0x37f07e,被 mole_cheats 强制成 999999)和
+/// vipValueOfNextLevel(0x37f0a0,mole_cheats 不拦、读真实值)。VIP 累计升级之后真实 next 不再是 0,
+/// 于是跳过 0x37f136 的满级分支,进度 = 999999×100/next,0x37f240 按无符号算 (next−999999)/10,
+/// 例如强制 VIP4、真实 next=1000 时,界面出现「达到 VIP 5 您还需充值 429396829 元」,进度 99999%。强制显示值和真实累计值混在一起了。
+/// 这里把 next 也按「强制 = 满级」返回 0,和强制 vipValue 配套,等价于累计升级之前离线恒为 0 时的满级显示。
+/// 全二进制读 vipValueOfNextLevel 的只有 3 处(initWithVIPInfoData:@0x6ac7e、在线的 parseVipInfo、VIPLayer),
+/// 离线没有「读 next → 调 setter 写回」的路径,返回强制值 0 不会经 setter 写进侧档;真实值仍在对象和 vip.dat 里,关掉强制 VIP 就恢复。
 fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
     if env.options.network_access || VIP_BUSY.load(O) {
         return None;
@@ -1007,30 +1017,46 @@ fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
             None
         }
         "vipLevelWithNewType" | "vipValue" | "vipValueOfNextLevel" => {
+            // [补完 2026-09-15] 强制 VIP 下本地对象的 next 返回 0(原因见函数注释)。
+            // 强制 VIP 关着时 force_next 恒 false,下面的读档注入流程与原来逐字一致。
+            let force_next =
+                sel == "vipValueOfNextLevel" && crate::mole_cheats::is_on("force_vip");
             if recv == VIP_LOCAL.load(O) && VIP_INJECTED.load(O) {
+                if force_next {
+                    env.cpu.regs_mut()[0] = 0;
+                    return Some(true);
+                }
                 return None;
             }
             side_ensure_loaded(env);
             let vals = side().vip;
-            let Some(v) = vals else {
+            if vals.is_none() && !force_next {
                 return None;
-            };
+            }
             VIP_BUSY.store(true, O);
             let local = local_vip_object(env);
-            if local != nil && local.to_bits() == recv {
+            let is_local = local != nil && local.to_bits() == recv;
+            if is_local {
                 VIP_LOCAL.store(recv, O);
-                vip_apply(env, local, v);
-                VIP_INJECTED.store(true, O);
-                log!(
-                    "[MOLEITEMS] VIP 读档:从 {} 写回 vipLevel={} vipValue={} vipValueOfNextLevel={}",
-                    SIDE_FILE,
-                    v.level,
-                    v.value,
-                    v.next
-                );
+                if let Some(v) = vals {
+                    vip_apply(env, local, v);
+                    VIP_INJECTED.store(true, O);
+                    log!(
+                        "[MOLEITEMS] VIP 读档:从 {} 写回 vipLevel={} vipValue={} vipValueOfNextLevel={}",
+                        SIDE_FILE,
+                        v.level,
+                        v.value,
+                        v.next
+                    );
+                }
             }
             VIP_BUSY.store(false, O);
             restore_regs(env, saved);
+            if force_next && is_local {
+                // 读档注入(若有)已先做完,对象里是真实值;这里只改本次返回值。
+                env.cpu.regs_mut()[0] = 0;
+                return Some(true);
+            }
             None
         }
         "setVipLevel:" | "setVipValue:" | "setVipValueOfNextLevel:" => {
@@ -1085,10 +1111,273 @@ fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
 }
 
 // ============================================================================
-// 充值解锁物(F2-1)
+// 充值解锁物(F2-1)+ [补完 2026-09-15] 贝壳档位表 / VIP 随贝壳购买累计升级
 // ============================================================================
 
-/// objc/messages.rs 的 SHELLHOOK 发完贝壳后调用:补上原版「活动期充值」应有的副作用。
+/// [补完 2026-09-15] 贝壳商店的一个充值档位。数据逐字取自客户端 zh-Hans.lproj/100_0.dat
+/// (-[GameData loadShopItems]@0x70264 读入 GameData.shopItems_,键 itemid/count/price/productid;
+/// productid「saleN」在 0x70518 用 "%@.%@" 拼成 com.taomee.MoleWorld.saleN,N = itemid − 1)。
+/// SHELLHOOK 用它决定发几个贝壳,VIP 累计用它的价格。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellPack {
+    /// ShopItemData.itemid,即 -[NewStyleStoreMainLayer onBuyVIPGold:] 的 int 参数(1..7)。
+    pub item_id: u32,
+    /// 100_0.dat 的 count:本档贝壳数。
+    pub shells: i32,
+    /// 100_0.dat 的 price,单位美分。客户端只存美元价:-[InAppPurchaseManager onPurchaseSuccessful] 调
+    /// +[TaomeeAnalytics logIAP:productId:price:currency:] 时币种写死 "USD"(0x117cf4)。
+    pub usd_cents: u32,
+    /// 同一 App Store 价格档在中国区的人民币价(元)。⚠️ 外部资料换算(App Store 中国区价格矩阵:
+    /// $0.99/4.99/9.99/14.99/24.99/49.99/99.99 → ¥6/30/68/98/163/328/648),客户端里没有这项数据,未能在二进制内核实;
+    /// 想换口径直接改这张表。
+    pub cny_yuan: u32,
+}
+
+/// [补完 2026-09-15] 100_0.dat 的 7 个充值档位(按 itemid 升序)。
+pub const SHELL_PACKS: [ShellPack; 7] = [
+    ShellPack { item_id: 1, shells: 20, usd_cents: 99, cny_yuan: 6 },
+    ShellPack { item_id: 2, shells: 105, usd_cents: 499, cny_yuan: 30 },
+    ShellPack { item_id: 3, shells: 225, usd_cents: 999, cny_yuan: 68 },
+    ShellPack { item_id: 4, shells: 370, usd_cents: 1499, cny_yuan: 98 },
+    ShellPack { item_id: 5, shells: 650, usd_cents: 2499, cny_yuan: 163 },
+    ShellPack { item_id: 6, shells: 1500, usd_cents: 4999, cny_yuan: 328 },
+    ShellPack { item_id: 7, shells: 3500, usd_cents: 9999, cny_yuan: 648 },
+];
+
+/// [补完 2026-09-15] 按 onBuyVIPGold: 的参数(itemid)查档位;itemid 8(广告墙「免费贝壳」格,
+/// -[NewStyleStoreItemsView loadResourceItems]@0x3b998a setItemid:8)等非充值参数返回 None。
+pub fn shell_pack(item_id: u32) -> Option<ShellPack> {
+    SHELL_PACKS.iter().copied().find(|p| p.item_id == item_id)
+}
+
+/// [补完 2026-09-15] 客户端 VIP 值的单位是 0.1 元:-[VIPLayer showWithTarget:selector:] 显示
+/// MONEY_NEEDED_TO_NEXT_VIP_LEVEL「达到 VIP %d 您还需充值 %d 元」时,元数 = (vipValueOfNextLevel − vipValue) / 10
+/// (0x37f240 sub、0x37f24e umull 0xCCCCCCCD、0x37f256 lsrs #3);进度条 = vipValue × 100 / vipValueOfNextLevel(0x37f13c)。
+/// 所以 vipValueOfNextLevel 是「升到下一级所需的累计总额」,不是差额。
+const VIP_VALUE_PER_YUAN: i64 = 10;
+
+/// [补完 2026-09-15] 客户端实际支持的最高 VIP 等级是 4,不是 250_1.dat 的 6 行:
+/// -[NetworkManager parseVipInfo:pos:len:] 把服务器下发等级 clamp 到 4(0x1c0c8e)、VIP4 时把 next 置 0(0x1c0d38);
+/// -[GameData loadVipUserInfoData]@0x73e08 只读 250_1.dat 前 4 行(0x7416e cmp r5,#4,getVipInfoDataWithLevel:5/6 取不到);
+/// -[VIPLayer showWithTarget:selector:] 显示也 clamp 到 4(0x37f03e)。与 mole_cheats 的 VIP_LEVEL_MAX 一致。
+const VIP_CLIENT_MAX_LEVEL: usize = 4;
+
+/// [补完 2026-09-15] 默认升级门槛:累计充值元数,依次为 VIP1..VIP4。
+/// ⚠️ 移植者自拟,非原版数据——原版门槛只在淘米服务器(parseVipInfo 直接收服务器算好的三值),客户端没有任何门槛表。
+/// 取值思路(保守):VIP1 = 最小档 ¥6,呼应客户端文案 CHARGE_FOR_VIP_HINT「只要充值到 VIP %d,即可获得首充大礼包」
+/// (VIPLayer 在 vipValue==0 时以 level+1 填 %d,0x37f39e);之后逐级明显拉开,单笔最大档 ¥648 只到 VIP3。
+const VIP_DEFAULT_THRESHOLDS_YUAN: [u32; VIP_CLIENT_MAX_LEVEL] = [6, 100, 500, 2000];
+
+/// [补完 2026-09-15] 单个门槛的上限(元):×10 换算成 VIP 值后仍装得进 i32。
+const VIP_THRESHOLD_YUAN_MAX: u32 = 200_000_000;
+
+/// [补完 2026-09-15] 解析 MOLE_VIP_THRESHOLDS:逗号分隔的累计充值元数(正整数、严格递增,依次为 VIP1、VIP2…),
+/// 空段忽略,也接受全角逗号。Err(原因) 时调用方回落默认表;多于 4 个由调用方截断。纯函数,不打日志。
+fn parse_vip_thresholds(raw: &str) -> Result<Vec<u32>, String> {
+    let mut out: Vec<u32> = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c == '，') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: u32 = t.parse().map_err(|_| format!("「{}」不是正整数", t))?;
+        if v == 0 || v > VIP_THRESHOLD_YUAN_MAX {
+            return Err(format!("「{}」超出范围 1..={}", t, VIP_THRESHOLD_YUAN_MAX));
+        }
+        if let Some(&prev) = out.last() {
+            if v <= prev {
+                return Err(format!("门槛必须严格递增({} 之后是 {})", prev, v));
+            }
+        }
+        out.push(v);
+    }
+    if out.is_empty() {
+        return Err("没有任何数字".to_string());
+    }
+    Ok(out)
+}
+
+/// [补完 2026-09-15] 本会话生效的升级门槛(单位同 VIP 值 = 0.1 元),第 i 项是 VIP(i+1) 的门槛。
+/// 第一次用到时读一次 MOLE_VIP_THRESHOLDS 并打日志,之后不再变化。
+fn vip_thresholds() -> &'static [i32] {
+    static TH: OnceLock<Vec<i32>> = OnceLock::new();
+    TH.get_or_init(|| {
+        let default = VIP_DEFAULT_THRESHOLDS_YUAN.to_vec();
+        let (yuan, source) = match std::env::var("MOLE_VIP_THRESHOLDS") {
+            Ok(raw) if !raw.trim().is_empty() => match parse_vip_thresholds(&raw) {
+                Ok(mut v) => {
+                    if v.len() > VIP_CLIENT_MAX_LEVEL {
+                        log!(
+                            "[MOLEITEMS] ⚠️ MOLE_VIP_THRESHOLDS 给了 {} 个门槛,客户端最高只到 VIP{},多出的忽略",
+                            v.len(),
+                            VIP_CLIENT_MAX_LEVEL
+                        );
+                        v.truncate(VIP_CLIENT_MAX_LEVEL);
+                    }
+                    (v, "环境变量 MOLE_VIP_THRESHOLDS")
+                }
+                Err(why) => {
+                    log!(
+                        "[MOLEITEMS] ⚠️ MOLE_VIP_THRESHOLDS=「{}」无效({}),改用默认门槛",
+                        raw,
+                        why
+                    );
+                    (default, "默认(环境变量无效)")
+                }
+            },
+            _ => (default, "默认"),
+        };
+        let desc: Vec<String> = yuan
+            .iter()
+            .enumerate()
+            .map(|(i, y)| format!("VIP{} ≥ ¥{}", i + 1, y))
+            .collect();
+        log!(
+            "[MOLEITEMS] VIP 升级门槛(移植者自拟,非原版数据;原版门槛在服务器,客户端无表):{}(累计充值,来源:{})",
+            desc.join(" / "),
+            source
+        );
+        yuan.iter()
+            .map(|&y| (y as i64 * VIP_VALUE_PER_YUAN) as i32)
+            .collect()
+    })
+}
+
+/// [补完 2026-09-15] 纯函数:累计 VIP 值 → (等级, 下一级门槛)。thresholds 单位同 VIP 值、严格递增。
+/// - 等级只升不降:取 old_level 与门槛推导值的较大者。原版 parseVipInfo 发现下发等级低于本地会
+///   showCheatWarningMessage 并拒收(0x1c0c96),等级在客户端眼里本就单调不降。
+/// - 到 VIP4(或门槛表用完)时下一级门槛写 0,与原版 parseVipInfo 在 VIP4 把 next 置 0(0x1c0d38)一致;
+///   VIPLayer 看到 next==0 走满级分支(0x37f136),不会除以 0。
+fn vip_progress(old_level: i32, value: i32, thresholds: &[i32]) -> (i32, i32) {
+    let derived = thresholds
+        .iter()
+        .take_while(|&&t| value >= t)
+        .count()
+        .min(VIP_CLIENT_MAX_LEVEL) as i32;
+    let level = old_level.max(derived);
+    let next = if level >= VIP_CLIENT_MAX_LEVEL as i32 {
+        0
+    } else {
+        thresholds.get(level as usize).copied().unwrap_or(0)
+    };
+    (level, next)
+}
+
+/// [补完 2026-09-15] 离线假购买后替原版服务器做「累计充值 → VIP 等级」。
+/// 原版链路:-[InAppPurchaseManager onPurchaseSuccessful]@0x117a70 从 productIdentifier 截出 saleN 的 N(0x117d74,N ≤ 6),
+/// 发 -[NetworkManager sendCostMoneyInfoToServerWithUserId:andNumber:]@0xeabb4(8B userId+N),紧接 getVipInfo@0xeac2c;
+/// 服务器回包进 -[NetworkManager parseVipInfo:pos:len:]@0x1c0b9c,按 setVipLevel: → setVipValue: → setVipValueOfNextLevel:
+/// (0x1c0cea/0x1c0d1c/0x1c0d5a)写本地 UserVIPInfoData。离线这一段由这里在宿主侧补上:
+/// ① 旧值只取 vip.dat 侧档(vip_hook 经原版 setter 记下的真实值),绝不读 getter:强制 VIP 开着时
+///    vipLevelWithNewType/vipValue 会被 mole_cheats 改写成强制值(vipValue 固定 999999),读 getter 会把强制值累加进侧档;
+/// ② 本次增量 = 档位人民币价 × 10(VIP 值单位 0.1 元,见 VIP_VALUE_PER_YUAN);
+/// ③ 等级/下一级门槛由 vip_progress 按 vip_thresholds()(移植者自拟,非原版数据)算出;
+/// ④ 用 vip_apply 按 parseVipInfo 的顺序调三个原版 setter(setter 自己 CryptUtils 加密),不置 VIP_BUSY,
+///    让 vip_hook 自然记账并原子落盘;万一没记上(比如本地 VIP 对象还没建),直接写侧档,下次读 VIP 时由 vip_hook 注入。
+/// [补完 2026-09-15] 待补项(有意省略,不是原版不弹):parseVipInfo 的首充大礼包。
+/// 原版进村 -[GameManager startGame:]+0xb38(0x19ca0)每次都发 getVipInfo,没充过值的玩家也会先收到一次 VIP 信息,
+/// 本地旧 next 不为 0;第一次真充值后 parseVipInfo 在 0x1c0e34-0x1c0e48 判定「旧等级 [sp+4]=0、旧 VIP 值 [sp+8]=0、
+/// 旧 next [sp+0x18]≠0、新 VIP 值 [sp+0x20]≠0」成立,调 [[WrapperManager sharedManager] initFirstChargeGifts],
+/// 再 [FirstChargeGiftsLayer layerWithRewards:[wm firstChargeGiftsArray]] showWithTarget:NetworkManager selector:nil。
+/// 所以原版每个玩家第一次充值都会弹首充礼包(-[WrapperManager initFirstChargeGifts]@0x262d58:702×2000、704×10、22022、22023);
+/// 移植版第一次假购买只发贝壳、升 VIP1,没有礼包。
+/// 暂不复刻的原因(都没法无头验证):① -[FirstChargeGiftsLayer showWithTarget:selector:]@0x3803cc 会取 currentUiLayer 的
+/// tag 6、tag 5 子层(0x380444/0x38048e getChildByTag:)调 performSelector:detach;这里还在商店购买按钮回调的调用栈上,
+/// 若商店正挂在这两个 tag 上,当场拆掉可能留下悬空对象(原版是异步回包触发,不在按钮栈上);
+/// ② 领礼物走 releaseFirstChargeGift:@0x2630a4 → onAddFirstChargeGiftToMap:@0x262f2c 把物品摆到地图上,
+/// 黄金岛会话里、商店开着时能否正常摆放不清楚;③ 关闭按钮 onButtonCloseSelected@0x3806e4 还要弹「放弃礼包」确认框。
+/// 以后要补:锁存「应弹首充」标志,等商店关闭、回到主村安全点再按上面的顺序调用,先用开关门控、无头验证弹层能关再默认打开。
+/// 调用方已判离线;本函数发宿主 msg_send 但不保存/恢复 r0-r3(由 on_shells_purchased 统一做)。
+fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option<ShellPack>) {
+    let Some(pack) = pack else {
+        log!(
+            "[MOLEITEMS] VIP 累计:onBuyVIPGold: 参数 {} 不是 100_0.dat 的充值档位(本次发了 {} 贝壳),不计入 VIP 值",
+            item_id,
+            shells
+        );
+        return;
+    };
+    let thresholds = vip_thresholds();
+    side_ensure_loaded(env);
+    let old = side().vip.unwrap_or(VipVals {
+        level: 0,
+        value: 0,
+        next: 0,
+    });
+    let add = pack.cny_yuan as i64 * VIP_VALUE_PER_YUAN;
+    let value = (old.value.max(0) as i64 + add).min(i32::MAX as i64) as i32;
+    let (level, next) = vip_progress(old.level, value, thresholds);
+    let new = VipVals { level, value, next };
+
+    let obj = local_vip_object(env);
+    if obj != nil {
+        vip_apply(env, obj, new);
+    }
+    let recorded = side().vip == Some(new);
+    if !recorded {
+        {
+            let mut s = side();
+            s.vip = Some(new);
+        }
+        side_save(env);
+        log!(
+            "[MOLEITEMS] ⚠️ VIP 累计:本地 UserVIPInfoData {}未经 setter 记账,已直接写入 {}(下次读 VIP 时注入)",
+            if obj == nil { "还没建好," } else { "" },
+            SIDE_FILE
+        );
+    }
+
+    let force_note = if crate::mole_cheats::is_on("force_vip") {
+        ";强制 VIP 开着:界面仍显示强制值(next 也按满级返回 0),这里只累计真实值,强制值不写进侧档"
+    } else {
+        ""
+    };
+    log!(
+        "[MOLEITEMS] VIP 累计:itemid {}(sale{},{} 贝壳,标价 ${}.{:02},按 App Store 中国区同档 ¥{} 计)→ vipValue {} → {}(单位 0.1 元),VIP{} → VIP{},下一级门槛 {}(门槛为移植者自拟,非原版数据){}",
+        pack.item_id,
+        pack.item_id.saturating_sub(1),
+        pack.shells,
+        pack.usd_cents / 100,
+        pack.usd_cents % 100,
+        pack.cny_yuan,
+        old.value,
+        new.value,
+        old.level,
+        new.level,
+        new.next,
+        force_note
+    );
+    if new.level > old.level {
+        log!(
+            "[MOLEITEMS] VIP 升级:VIP{} → VIP{}(累计充值 ¥{},门槛为移植者自拟,非原版数据)",
+            old.level,
+            new.level,
+            new.value as i64 / VIP_VALUE_PER_YUAN
+        );
+    }
+}
+
+/// objc/messages.rs 的 SHELLHOOK 发完贝壳后调用。离线专属;内部发宿主 msg_send,返回前恢复 r0-r3。
+/// [补完 2026-09-15] 参数扩展:item_id = onBuyVIPGold: 的参数(ShopItemData.itemid);shells = 本次实发贝壳数;
+/// pack = shell_pack(item_id) 查到的档位(含标价),非充值参数(如 itemid 8 免费贝壳格)为 None。
+/// 先补充值解锁物(F2-1),再做 VIP 累计升级——与原版 onPurchaseSuccessful 先本地发贝壳/解锁、
+/// VIP 三值要等服务器回包(parseVipInfo)才写入的先后一致。
+pub fn on_shells_purchased(
+    env: &mut Environment,
+    item_id: u32,
+    shells: i32,
+    pack: Option<ShellPack>,
+) {
+    if env.options.network_access {
+        return;
+    }
+    let saved = save_regs(env);
+    recharge_unlock_side_effects(env);
+    vip_accumulate(env, item_id, shells, pack);
+    restore_regs(env, saved);
+}
+
+/// [扫描修 2026-09-15] F2-1 充值解锁物:补上原版「活动期充值」应有的副作用(由 on_shells_purchased 调用)。
 /// 原版 -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]:canShowADForExchange(服务器 1064/1182 活动开关)
 /// bit31 置位时 gamedataFlag|=0x20(0x7f3bc),bit29 置位时 gamedataFlag|=0x10 并 unlockItem:16283(0x7f438/0x7f458),
 /// 随后 saveToLocal(0x7f3dc/0x7f476)。离线没有活动开关,也绕过了 IAP,这里按"活动期充值"补齐:
@@ -1098,15 +1387,11 @@ fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
 ///    原版只能来自服务器 1001 地图里的 unlockedItemList——这里是模拟服务器下发,非原版客户端路径);
 /// ④ [GameData saveToLocal]:gamedataFlag 存 map.dat 键 "13"、unlockedItemList 存键 "63"(saveMapData:@0x78374/0x78f02)。
 /// 不改 canShowADForExchange_(它还驱动广告墙/免费贝壳/评分弹窗)。离线专属。
-pub fn on_shells_purchased(env: &mut Environment) {
-    if env.options.network_access {
-        return;
-    }
-    let saved = save_regs(env);
+/// [补完 2026-09-15] 从 on_shells_purchased 拆出:行为不变;发宿主 msg_send 但不保存/恢复 r0-r3(由调用方统一做)。
+fn recharge_unlock_side_effects(env: &mut Environment) {
     let gd = shared(env, "GameData", "sharedInstance");
     let wm = shared(env, "WrapperManager", "sharedManager");
     if gd == nil || wm == nil {
-        restore_regs(env, saved);
         return;
     }
     let list_s = sel_of(env, "unlockedItemList");
@@ -1138,7 +1423,6 @@ pub fn on_shells_purchased(env: &mut Environment) {
         flag,
         flag | 0x30
     );
-    restore_regs(env, saved);
 }
 
 // ============================================================================
@@ -1727,3 +2011,42 @@ const FEST_ANNIVERSARY: &[u32] = &[16131, 16132, 17106, 17107, 17108];
 /// 节日·复活节:原始候选 1 条,有美术且可上架 0 条。
 const FEST_EASTER: &[u32] = &[];
 // ===== 生成表结束 =====
+
+// [补完 2026-09-15] VIP 随贝壳购买累计升级的纯函数单测(档位表 / 门槛解析 / 等级推导)。
+// 放在文件最末,避免测试模块之后还有条目(clippy items_after_test_module)。
+#[cfg(test)]
+mod vip_accumulate_tests {
+    use super::*;
+
+    #[test]
+    fn shell_pack_uses_item_id_not_index() {
+        assert_eq!(shell_pack(0), None);
+        assert_eq!(shell_pack(1).map(|p| p.shells), Some(20));
+        assert_eq!(shell_pack(7).map(|p| (p.shells, p.cny_yuan)), Some((3500, 648)));
+        assert_eq!(shell_pack(8), None);
+    }
+
+    #[test]
+    fn parse_thresholds_accepts_and_rejects() {
+        assert_eq!(parse_vip_thresholds("6,100,500,2000"), Ok(vec![6, 100, 500, 2000]));
+        assert_eq!(parse_vip_thresholds(" 10 ，20, "), Ok(vec![10, 20]));
+        assert!(parse_vip_thresholds("").is_err());
+        assert!(parse_vip_thresholds("5,5").is_err());
+        assert!(parse_vip_thresholds("0,10").is_err());
+        assert!(parse_vip_thresholds("abc").is_err());
+        assert!(parse_vip_thresholds("300000000").is_err());
+    }
+
+    #[test]
+    fn progress_is_monotone_and_caps_at_vip4() {
+        let th = [60, 1000, 5000, 20000];
+        assert_eq!(vip_progress(0, 0, &th), (0, 60));
+        assert_eq!(vip_progress(0, 60, &th), (1, 1000));
+        assert_eq!(vip_progress(0, 6480, &th), (3, 20000));
+        assert_eq!(vip_progress(0, 25920, &th), (4, 0));
+        // 只升不降:旧等级高于推导值时保持旧等级
+        assert_eq!(vip_progress(3, 60, &th), (3, 20000));
+        // 门槛表用完(环境变量只给 2 级)时下一级门槛为 0
+        assert_eq!(vip_progress(0, 100, &[60, 90]), (2, 0));
+    }
+}
