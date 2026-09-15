@@ -608,13 +608,17 @@ impl Fs {
             // Special case: Some apps may create save files at
             // Library/Preferences at the start, thus presence of that
             // directory is expected
-            let path = paths::user_data_base_path()
-                .join(paths::SANDBOX_DIR)
-                .join(bundle_id)
-                .join("Library")
-                .join("Preferences");
-            if let Err(e) = std::fs::create_dir_all(&path) {
-                panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
+            // [MoleWorld 2026-09-16] 真机应用容器里 Library/Caches 同样开箱就有:游戏内置的 TalkingData 等 SDK
+            // 直接往 Library/Caches/.talkingdata_ga_* 原子写文件、不先建目录,少了它每次都报 DoesNotExist。
+            for sub in ["Preferences", "Caches"] {
+                let path = paths::user_data_base_path()
+                    .join(paths::SANDBOX_DIR)
+                    .join(bundle_id)
+                    .join("Library")
+                    .join(sub);
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
+                }
             }
         }
 
