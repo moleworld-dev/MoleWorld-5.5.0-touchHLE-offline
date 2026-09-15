@@ -5,7 +5,7 @@
  */
 //! `NSFileManager` etc.
 
-use super::{ns_array, ns_string, NSUInteger};
+use super::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::foundation::ns_error::{NSCocoaErrorDomain, NSFileReadNoSuchFileError};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -23,6 +23,11 @@ const NSDocumentDirectory: NSSearchPathDirectory = 9;
 
 type NSSearchPathDomainMask = NSUInteger;
 const NSUserDomainMask: NSSearchPathDomainMask = 1;
+
+// [扫描修 2026-09-16] F2-02:removeItemAtPath:error: 删除失败时回填的 NSCocoaErrorDomain 错误码,
+// 取值同 Foundation 的 FoundationErrors.h;只有本文件用到,就近定义。
+const NSFileWriteUnknownError: NSInteger = 512;
+const NSFileWriteNoPermissionError: NSInteger = 513;
 
 pub const NSFileModificationDate: &str = "NSFileModificationDate";
 pub const NSFileSize: &str = "NSFileSize";
@@ -195,17 +200,34 @@ pub const CLASSES: ClassExports = objc_classes! {
     match env.fs.remove(GuestPath::new(&path)) {
         Ok(()) => true,
         Err(err) => {
-            if !out_error.is_null() {
-                match err {
-                    FsError::DoesNotExist => {
-                        let domain = get_static_str(env, NSCocoaErrorDomain);
-                        let error = msg_class![env; NSError alloc];
-                        let error = msg![env; error initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
-                        autorelease(env, error);
-                        env.mem.write(out_error, error);
-                    }
-                    _ => unimplemented!()
+            // [扫描修 2026-09-16] F2-02:原来只给 DoesNotExist 造 NSError,其余错误在 error 指针非空时走
+            // unimplemented! 崩溃。原版 -[GameData resetUserGameData]@0x7dec8、-[GameData loadUserInfoData]@0x75a26、
+            // -[WrapperManager deleteFile:]@0x38f79a 发这个消息时都传了非空 NSError**,所以 Fs::remove 一旦返回
+            // 宿主 IoError/无权限,光修 fs.rs 只是把崩溃点挪到这里。按 Foundation 删除失败时的 errno 归类补全:
+            // 无权限 → NSFileWriteNoPermissionError,其余 → NSFileWriteUnknownError;文件或父目录不存在沿用原有的
+            // NSFileReadNoSuchFileError。上述调用处都不读错误码,关键是回 NO 而不是崩。
+            let code: NSInteger = match &err {
+                FsError::DoesNotExist | FsError::NonexistentParentDir => NSFileReadNoSuchFileError,
+                FsError::AccessDenied | FsError::ReadonlyParentDir => NSFileWriteNoPermissionError,
+                FsError::IoError(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    NSFileWriteNoPermissionError
                 }
+                _ => NSFileWriteUnknownError,
+            };
+            if code != NSFileReadNoSuchFileError {
+                log!(
+                    "[NSFileManager] removeItemAtPath {} 失败({:?}),返回 NO,NSCocoaErrorDomain 错误码 {}",
+                    path,
+                    err,
+                    code
+                );
+            }
+            if !out_error.is_null() {
+                let domain = get_static_str(env, NSCocoaErrorDomain);
+                let error = msg_class![env; NSError alloc];
+                let error = msg![env; error initWithDomain:domain code:code userInfo:nil];
+                autorelease(env, error);
+                env.mem.write(out_error, error);
             }
             false
         }

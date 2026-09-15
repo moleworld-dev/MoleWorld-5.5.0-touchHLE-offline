@@ -1357,12 +1357,37 @@ impl Fs {
                     FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => panic!(),
                 };
 
-                handle_open_err(std::fs::remove_file(host_path), host_path);
-                log_dbg!(
-                    "Deleted file at path {:?} (host path: {:?})",
-                    path,
-                    host_path
-                );
+                // [扫描修 2026-09-16] F2-02:宿主删除失败不再经 handle_open_err 直接 panic。
+                // guest 目录树只在启动时建一次,运行中宿主文件被外部删掉(玩家手删存档)后 guest 节点还在;
+                // 原版 -[GameData resetUserGameData]、-[WrapperManager deleteFile:] 都是先 fileExistsAtPath:
+                // 判 YES 再删,宿主于是回 NotFound。调用方要的"文件不在了"已经成立,只是 guest 视图过期,
+                // 所以按成功处理并同步摘掉节点。其余失败(无权限、被占用)返回 IoError 且保留节点,
+                // 由 unlink/remove 回 -1、NSFileManager 回 NO,和真机删不掉文件时一致。
+                match std::fs::remove_file(host_path) {
+                    Ok(()) => {
+                        log_dbg!(
+                            "Deleted file at path {:?} (host path: {:?})",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        log!(
+                            "[fs] 删除 {:?} 时宿主文件 {:?} 已不存在(运行中被外部删除),同步移除 guest 节点",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!(
+                            "[fs] 删除 {:?} 失败:宿主文件 {:?} 报错 {},保留 guest 节点",
+                            path,
+                            host_path,
+                            e
+                        );
+                        return Err(FsError::IoError(e));
+                    }
+                }
             }
             FsNode::Directory {
                 children,
@@ -1378,12 +1403,33 @@ impl Fs {
                     return Err(FsError::AccessDenied);
                 };
 
-                handle_open_err(std::fs::remove_dir(host_path), host_path);
-                log_dbg!(
-                    "Deleted directory at path {:?} (host path: {:?})",
-                    path,
-                    host_path
-                );
+                // [扫描修 2026-09-16] F2-02:同上。宿主目录已不存在 → 同步摘掉 guest 节点;其余失败
+                // (无权限,或宿主目录里有启动后才出现、guest 看不到的文件)返回 IoError 且保留节点。
+                match std::fs::remove_dir(host_path) {
+                    Ok(()) => {
+                        log_dbg!(
+                            "Deleted directory at path {:?} (host path: {:?})",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        log!(
+                            "[fs] 删除目录 {:?} 时宿主目录 {:?} 已不存在(运行中被外部删除),同步移除 guest 节点",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!(
+                            "[fs] 删除目录 {:?} 失败:宿主目录 {:?} 报错 {},保留 guest 节点",
+                            path,
+                            host_path,
+                            e
+                        );
+                        return Err(FsError::IoError(e));
+                    }
+                }
             }
         }
 
