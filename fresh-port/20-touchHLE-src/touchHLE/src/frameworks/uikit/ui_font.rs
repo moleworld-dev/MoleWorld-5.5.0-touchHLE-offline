@@ -195,25 +195,43 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
            (0x3100..=0x312F).contains(&c) || // 注音符号
            (0x31C0..=0x31EF).contains(&c) || // CJK 笔画
            (0xFE30..=0xFE4F).contains(&c) { // CJK 兼容形式(竖排标点)
-            match kind {
-                // CJK has no italic equivalent
-                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
-                    if state.sans_regular_ja.is_none() {
-                        state.sans_regular_ja = Some(Font::sans_regular_ja());
-                    }
-                    return state.sans_regular_ja.as_ref().unwrap();
-                },
-                FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
-                    if state.sans_bold_ja.is_none() {
-                        state.sans_bold_ja = Some(Font::sans_bold_ja());
-                    }
-                    return state.sans_bold_ja.as_ref().unwrap();
-                },
-            }
+            return cjk_fallback_font(state, kind);
         }
     }
 
+    // [MoleWorld 2026-09-16] 非 CJK 符号也要回退:Liberation 没有 ★ ⚠ ▶ ◀ ① ② ✓ ⇒ ∈ 等字形(画成方框),
+    // 思源黑体 SC 有。整串里只要出现 Liberation 缺字形、又不是空白或默认可忽略的字符,就整串改用思源黑体
+    // (与上面 CJK 回退同一粒度;思源黑体的拉丁字母完整,只是字宽略有差别)。
+    let primary_missing = {
+        let primary = state.get_font_by_kind(kind);
+        text.chars().any(|c| {
+            !c.is_whitespace() && !crate::font::is_default_ignorable(c) && !primary.has_glyph(c)
+        })
+    };
+    if primary_missing {
+        return cjk_fallback_font(state, kind);
+    }
+
     state.get_font_by_kind(kind)
+}
+
+#[rustfmt::skip]
+fn cjk_fallback_font(state: &mut State, kind: FontKind) -> &Font {
+    match kind {
+        // CJK has no italic equivalent
+        FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
+            if state.sans_regular_ja.is_none() {
+                state.sans_regular_ja = Some(Font::sans_regular_ja());
+            }
+            state.sans_regular_ja.as_ref().unwrap()
+        },
+        FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
+            if state.sans_bold_ja.is_none() {
+                state.sans_bold_ja = Some(Font::sans_bold_ja());
+            }
+            state.sans_bold_ja.as_ref().unwrap()
+        },
+    }
 }
 
 /// Called by the `sizeWithFont:` method family on `NSString`.
