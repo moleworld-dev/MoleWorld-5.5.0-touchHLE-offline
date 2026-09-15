@@ -45,8 +45,11 @@ mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
+mod mole_activity;
 mod mole_cheats;
+mod mole_dev;
 mod mole_diag;
+mod mole_items;
 mod mole_menu;
 mod mole_sysinfo;
 mod objc;
@@ -179,6 +182,14 @@ pub fn ios_entry() {
         }
     }));
 
+    // [扫描修 2026-09-15] iOS 黑屏脚手架拆除(present.rs 里的 4 个真修复保留不动)。
+    // 这里曾有两类临时改动,都已删除,勿复活:
+    //  ① 分辨率实验三件套(MOLE_FILL / MOLE_HIDPI / --scale-hack=2):把 guest 逻辑屏改成与物理屏
+    //     不匹配的尺寸,dump 出现精确对半黑白,早已注释停用;现在固定用 device-family=ipad 原生尺寸基底。
+    //  ② 强开 MOLE_DIAG:每帧 glReadPixels 截帧,在真机 TBDR GPU 上会 resolve+discard 掉随后
+    //     presentRenderbuffer 要呈现的 renderbuffer → 屏幕黑(见 mole_diag.rs diag_enabled 的注释),
+    //     是真机黑屏元凶之一。桌面截帧仍由外部环境变量 MOLE_DIAG=1 开启,不受影响。
+    // 同时删去冗余的 --scale-hack=1:options.rs 默认值就是 1,默认选项文件也没给本游戏设 scale-hack。
     let base = sdl2::filesystem::base_path().unwrap_or_else(|_| String::from("./"));
     let game = std::path::Path::new(&base).join("MoleWorld.ipa");
     let args = vec![

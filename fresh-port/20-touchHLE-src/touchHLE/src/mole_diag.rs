@@ -26,7 +26,10 @@
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+// [扫描修 2026-09-15] AtomicU32 只剩桌面帧转储计数器在用,iOS 上不导入,免得出现未使用告警。
+#[cfg(not(target_os = "ios"))]
+use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
 
 const DIAG_PATH: &str = "/tmp/mole_diag.log";
@@ -110,47 +113,39 @@ pub fn log_unique(class: &str, selector: &str) {
 //   * next_inject() feeds synthetic taps from /tmp/mole_input ("tap <x> <y>").
 // ===========================================================================
 
+#[cfg(not(target_os = "ios"))]
 const FRAME_PATH: &str = "/tmp/mole_frame.ppm";
 const INPUT_PATH: &str = "/tmp/mole_input";
 
+#[cfg(not(target_os = "ios"))]
 static FRAME_COUNTER: AtomicU32 = AtomicU32::new(0);
-/// Rolling counter for the MOLE_FRAMESEQ frame-by-frame dump (debugging the drag flashing).
-static SEQ_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Snapshot the just-presented window framebuffer to disk every ~30 frames, so
 /// the developer can `Read` it as an image and see the game. Cheap enough at
 /// ~1-2 dumps/sec; glReadPixels is the only real cost.
+///
+/// [扫描修 2026-09-15] 删了两段临时代码,勿复活:
+///  - iOS 分支:每帧无节流全屏 glReadPixels + 约 3MB 分配,写 Documents/mole_frame.ppm。在真机
+///    TBDR GPU 上会 resolve+discard 掉要呈现的 renderbuffer,是真机黑屏元凶之一;而且
+///    debug::write_ppm 遇到不可写路径直接 unwrap panic。iOS 上本函数现在什么都不做。
+///  - MOLE_FRAMESEQ 逐帧序列转储(/tmp/moleframes/NNN.ppm + SEQ_COUNTER):拖动闪烁排查用的,
+///    已经闭环,仓库里没有脚本再用它。
+/// 桌面行为与改动前完全一致:MOLE_DIAG=1 时每 30 帧转储一次到 /tmp/mole_frame.ppm
+/// (主控无头测试依赖这一点),判断顺序也没变。
 pub fn maybe_dump_frame(gles: &mut dyn crate::gles::GLES, viewport: (u32, u32, u32, u32)) {
-    if !diag_enabled() {
-        return;
-    }
-    let (x, y, w, h) = viewport;
-    if w == 0 || h == 0 {
-        return;
-    }
-    // [MoleWorld DIAG] MOLE_FRAMESEQ=1: dump EVERY presented frame to a rolling numbered sequence
-    // (/tmp/moleframes/NNN.ppm, last ~180 frames). Lets a drag be reviewed frame-by-frame to see what
-    // actually alternates ("flashing"). Read newest-first by mtime. Desktop only.
-    #[cfg(not(target_os = "ios"))]
-    if std::env::var_os("MOLE_FRAMESEQ").is_some() {
-        let seq = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 180;
-        let _ = std::fs::create_dir_all("/tmp/moleframes");
-        crate::debug::dump_framebuffer(&format!("/tmp/moleframes/{:03}.ppm", seq), x, y, w, h, gles);
-        return;
-    }
-    // [MoleWorld iOS] /tmp isn't writable in the iOS sandbox; dump into the app's
-    // Documents (pullable via devicectl) so we can see what the DEVICE actually
-    // rendered into its CAEAGLLayer framebuffer. Dump EVERY presented frame
-    // (overwrite) — the interpreter is slow (~1 fps) so glReadPixels is cheap here
-    // and pulling mole_frame.ppm always yields the very latest present.
     #[cfg(target_os = "ios")]
     {
-        let path = crate::paths::user_data_base_path().join("mole_frame.ppm");
-        crate::debug::dump_framebuffer(&path.to_string_lossy(), x, y, w, h, gles);
-        return;
+        let _ = (gles, viewport);
     }
     #[cfg(not(target_os = "ios"))]
     {
+        if !diag_enabled() {
+            return;
+        }
+        let (x, y, w, h) = viewport;
+        if w == 0 || h == 0 {
+            return;
+        }
         let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
         if n % 30 != 0 {
             return;
