@@ -389,7 +389,7 @@ fn pages() -> Vec<Page> {
                 // [扫描修 2026-09-15] F10-9:原「直达终点(弃用)」「打开加勒比黄金岛(弃用)」移出本页——它们和「一键进入黄金岛」
                 // 并列容易误点,名字又和可建筑黄金岛混淆。加勒比寻宝活动离线只能从菜单打开,所以不删,改名后放进「旧活动观赏」子页。
                 // —— 调试工具 ——
-                ("✖ 关闭召唤层(GM面板等)", CloseSummoned),
+                ("× 关闭召唤层(GM面板等)", CloseSummoned),
                 ("GM面板 TestLayer", SummonClass("TestLayer", 99999)),
                 ("黄金岛GM面板 NewSceneTestLayer", SummonClass("NewSceneTestLayer", 99999)),
                 ("切到夜晚", SingletonCall("CommonEffectController", "sharedManager", "formDayToNight")),
@@ -410,7 +410,7 @@ fn pages() -> Vec<Page> {
                 ("1", Dev(D::RegDigit(1))),
                 ("2", Dev(D::RegDigit(2))),
                 ("3", Dev(D::RegDigit(3))),
-                ("⌫ 退格", Dev(D::RegBackspace)),
+                ("← 退格", Dev(D::RegBackspace)),
                 ("4", Dev(D::RegDigit(4))),
                 ("5", Dev(D::RegDigit(5))),
                 ("6", Dev(D::RegDigit(6))),
@@ -474,7 +474,7 @@ fn pages() -> Vec<Page> {
             parent: Some(PAGE_SUMMON),
             buttons: vec![
                 ("◀ 返回召唤", SwitchPage(PAGE_SUMMON)),
-                ("✖ 关闭召唤层", CloseSummoned),
+                ("× 关闭召唤层", CloseSummoned),
                 ("打开加勒比寻宝(观赏)", OpenCaribbean),
                 ("加勒比寻宝·直达终点", ToggleCheat("golden_win")),
                 ("圣诞主活动", SummonClass("XmasMainLayer", 88888)),
@@ -608,7 +608,7 @@ fn build(env: &mut Environment, fade: bool) {
             },
         };
         let (label, action, bg) = if i == 0 {
-            ("✕ 关闭", Action::Close, color(env, 0.62, 0.18, 0.18, 1.0))
+            ("× 关闭", Action::Close, color(env, 0.62, 0.18, 0.18, 1.0))
         } else {
             let p = tab_pages[i - 1];
             let selected = p == highlight;
