@@ -4310,6 +4310,14 @@ fn ui43_stretch_child(env: &mut Environment, ch: id, off: f32, real_w: f32, s: &
     if !(ui43_is_kind(env, ch, "CCSprite") || ui43_is_kind(env, ch, "CCLayerColor")) {
         return;
     }
+    // [2026-09-16] 文字标签不是底图:CCLabelTTF/CCLabelBMFont/CCLabelAtlas 都继承 CCSprite 链,按 1024 宽
+    //   dimensions 建的整行文字(实测一行 w=1024 的 CCLabelTTF)会被当成全宽底图横向拉 16%,字形变宽、居中点偏移。
+    if ui43_is_kind(env, ch, "CCLabelTTF")
+        || ui43_is_kind(env, ch, "CCLabelBMFont")
+        || ui43_is_kind(env, ch, "CCLabelAtlas")
+    {
+        return;
+    }
     let cs: CGSize = msg_send(env, (ch, s.cs));
     let sx: f32 = msg_send(env, (ch, s.sx));
     let kids: id = msg_send(env, (ch, s.children));
@@ -4324,6 +4332,37 @@ fn ui43_stretch_child(env: &mut Environment, ch: id, off: f32, real_w: f32, s: &
     let pos: CGPoint = msg_send(env, (ch, s.pos));
     let ap: CGPoint = msg_send(env, (ch, s.ap));
     let rel: bool = msg_send(env, (ch, s.rel_ap));
+    // [2026-09-16] 只拉宽、不压窄:本来就不窄于真实宽的底图(宽屏宽版底图 X_wide.png 是 1792 宽;
+    //   头像面板底图游戏自己拉到 1228.8)以前也按 real_w/cs.w 重设 scaleX,会被横向压扁——
+    //   钓鱼 fishbgiPad_wide.png 被压到 0.66 倍。这类图保持原缩放,只在没盖住整屏时平移补齐
+    //   (局部坐标需要盖住 [−off, real_w−off]);左右边缘按与下面同一套 nodeToParentTransform 公式、
+    //   用当前 scaleX 推算。居中的宽图本来就盖满 → 不动,幂等。
+    let eff_w = cs.width * sx;
+    if eff_w >= real_w - 0.5 {
+        let left = if rel {
+            pos.x - ap.x * eff_w
+        } else {
+            pos.x + ap.x * cs.width * (1.0 - sx)
+        };
+        let shift = if left > -off {
+            -off - left
+        } else if left + eff_w < real_w - off {
+            real_w - off - (left + eff_w)
+        } else {
+            0.0
+        };
+        if shift != 0.0 {
+            let _: () = msg_send(env, (ch, s.set_pos, CGPoint { x: pos.x + shift, y: pos.y }));
+        }
+        if ui43_debug() {
+            let cname = ui43_cls_name(env, ch);
+            log!(
+                "[UI43]     child {} WIDE-KEEP eff_w={} sx={} left={} shift={}",
+                cname, eff_w, sx, left, shift
+            );
+        }
+        return;
+    }
     let nx = if rel {
         ap.x * real_w - off
     } else {
