@@ -7,7 +7,9 @@
 
 use super::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::frameworks::core_graphics::cg_color::{CGColorRef, CGColorRelease, CGColorRetain};
-use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
+use crate::frameworks::core_graphics::cg_context::{
+    CGContextSetRGBFillColor, CGContextSetRGBStrokeColor,
+};
 use crate::frameworks::core_graphics::{cg_color, CGFloat};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSInteger;
@@ -192,16 +194,37 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
+// [审查修 2026-09-13] E22:-set 按 iOS 原版语义同时设置填充色和描边色。
+// 根因:此前 -set 只调 setFill(留有 TODO)。路径描边补上之后,
+// "[color set] 后接 StrokePath" 的代码(如 SBTableViewSectionHeaderView -drawRect:)
+// 会用默认黑色或该复用层上次残留的描边色画线,真机上则是 set 设的颜色。
+// 上下文为 nil(不在 drawRect: 里)时 setFill/setStroke 都直接返回:真 iOS 只打
+// "invalid context 0x0" 日志,不会崩。所以把 setFill 原来的 assert 也改成返回,
+// 否则 -set 会先在 setFill 里 panic,setStroke 的容错就没用了。
 - (())set {
-    msg![env; this setFill]
-    // TODO: set stroke color as well
+    () = msg![env; this setFill];
+    () = msg![env; this setStroke];
 }
 
 - (())setFill {
     let context = UIGraphicsGetCurrentContext(env);
-    assert_ne!(context, nil);
+    if context == nil {
+        log_dbg!("[(UIColor*){:?} setFill] without current context, ignored", this);
+        return;
+    }
     let (r, g, b, a) = get_rgba(&env.objc, this);
     CGContextSetRGBFillColor(env, context, r, g, b, a);
+}
+
+// [审查修 2026-09-13] E22:新增 -setStroke,写法同 -setFill,只是改设描边色。
+- (())setStroke {
+    let context = UIGraphicsGetCurrentContext(env);
+    if context == nil {
+        log_dbg!("[(UIColor*){:?} setStroke] without current context, ignored", this);
+        return;
+    }
+    let (r, g, b, a) = get_rgba(&env.objc, this);
+    CGContextSetRGBStrokeColor(env, context, r, g, b, a);
 }
 
 - (CGColorRef)CGColor {

@@ -19,6 +19,7 @@ pub mod ui_color;
 pub mod ui_device;
 pub mod ui_event;
 pub mod ui_font;
+pub mod ui_gesture_recognizer;
 pub mod ui_geometry;
 pub mod ui_graphics;
 pub mod ui_image;
@@ -43,6 +44,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_device::CLASSES,
         ui_event::CLASSES,
         ui_font::CLASSES,
+        ui_gesture_recognizer::CLASSES,
         ui_image::CLASSES,
         ui_image_picker_controller::CLASSES,
         ui_local_notification::CLASSES,
@@ -64,6 +66,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_picker_view::CLASSES,
         ui_view::ui_scroll_view::CLASSES,
         ui_view::ui_scroll_view::ui_text_view::CLASSES,
+        ui_view::ui_table_view::CLASSES,
         ui_view::ui_web_view::CLASSES,
         ui_view::ui_window::CLASSES,
         ui_view_controller::CLASSES,
@@ -97,6 +100,17 @@ pub struct State {
     ui_touch: ui_touch::State,
     pub ui_view: ui_view::State,
     ui_responder: ui_responder::State,
+    /// [扫描修 2026-09-15] F12-1:系统弹框(UIAlertView)的显示队列与覆盖层。
+    ui_alert_view: ui_view::ui_alert_view::State,
+}
+
+/// [扫描修 2026-09-15] F12-1:触摸先问系统弹框(模态,显示中会吞掉),没被吞才交给游戏。
+/// [复核修 2026-09-15] R1-2:按手指拆分——弹框只拿走"按下时落在弹框上"的手指,同一事件里其余手指
+/// (弹框出现前就按下、已交给游戏的)照常交给游戏,不再整包吞掉或整包放行。
+fn route_touch(env: &mut Environment, event: crate::window::Event) {
+    if let Some(event) = ui_view::ui_alert_view::filter_touch_event(env, event) {
+        ui_touch::handle_event(env, event);
+    }
 }
 
 /// For use by `NSRunLoop`: handles any events that have queued up.
@@ -107,10 +121,15 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     use crate::window::Event;
     use crate::window::TextInputEvent;
 
+    // [扫描修 2026-09-15] F12-1:队首系统弹框还没挂上就在这里挂到 keyWindow
+    // (show 时只入队;keyWindow 未建好 / 作弊菜单开着时下一轮再试)。
+    ui_view::ui_alert_view::pump(env);
+
     // [MoleWorld DIAG] Inject a synthetic tap from /tmp/mole_input so the game
     // can be driven without host input (the window is on its own macOS Space and
     // can't be clicked via the host). One Down/Up step per call; coordinates are
     // guest screen points.
+    // [扫描修 2026-09-15] 注入的触摸同样先经过系统弹框(route_touch),脚本可以点弹框按钮。
     if let Some(inject) = crate::mole_diag::next_inject() {
         match inject {
             crate::mole_diag::Inject::Menu => crate::mole_menu::toggle(env),
@@ -118,7 +137,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 if crate::mole_menu::is_open() {
                     crate::mole_menu::handle_touch(env, x, y);
                 } else {
-                    ui_touch::handle_event(
+                    route_touch(
                         env,
                         Event::TouchesDown(std::collections::HashMap::from([(
                             crate::window::FingerId::Mouse,
@@ -129,7 +148,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             }
             crate::mole_diag::Inject::Move(x, y) => {
                 if !crate::mole_menu::is_open() {
-                    ui_touch::handle_event(
+                    route_touch(
                         env,
                         Event::TouchesMove(std::collections::HashMap::from([(
                             crate::window::FingerId::Mouse,
@@ -140,7 +159,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             }
             crate::mole_diag::Inject::Up(x, y) => {
                 if !crate::mole_menu::is_open() {
-                    ui_touch::handle_event(
+                    route_touch(
                         env,
                         Event::TouchesUp(std::collections::HashMap::from([(
                             crate::window::FingerId::Mouse,
@@ -170,10 +189,29 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::TouchesMove(..) | Event::TouchesUp(..) if crate::mole_menu::is_open() => {
                 // Swallow move/up while the menu is open.
             }
-            Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
-                ui_touch::handle_event(env, event)
+            // [复核修 2026-09-15] R1-3:取消事件(滚轮虚拟捏合结束)不走上面"菜单开着就吞掉"的分支:
+            // 被取消的触点只可能是菜单打开前就交给游戏的(菜单开着时按下的触摸进了菜单、ui_touch 没有记录,
+            // 虚拟捏合也不会在菜单开着时开始),照常交给游戏收尾,免得游戏里残留只有 began 的触点。
+            Event::TouchesDown(..)
+            | Event::TouchesMove(..)
+            | Event::TouchesUp(..)
+            | Event::TouchesCancel(..) => {
+                // [扫描修 2026-09-15] F12-1:系统弹框显示中先由弹框处理(模态)。
+                route_touch(env, event)
             }
+            // [扫描修 2026-09-15] F12-3:桌面窗口最小化/还原(W2 在 window.rs 发出)→ 原版失活/激活回调
+            // 与对应通知;不发 DidEnterBackground/WillEnterForeground。细节见 ui_application.rs。
+            Event::WindowMinimized => ui_application::handle_window_minimized(env),
+            Event::WindowRestored => ui_application::handle_window_restored(env),
             Event::AppWillResignActive => {
+                // [扫描修 2026-09-15] F12-3 核实:移动端(Android 等)切后台【仍保持退出】,不改。原因:
+                // ① window.rs 收到 SDL AppWillEnterBackground 时把 enable_event_polling 置 false,
+                //    且没有回到前台后重新打开的机制——不退出的话回来后永远收不到输入;
+                // ② 据复核结论,SDL 在 Android 暂停时会销毁 EGL surface,touchHLE 目前没有
+                //    "后台停渲染"的 GL 闸门,继续渲染会崩;
+                // ③ 原版 applicationWillResignActive: 在 LogoLayer/LoadingScene 场景下本身就 exit(0)。
+                // ①② 在 window.rs / GL 层(不归本包)。现有 exit 路径会先发 resignActive + terminate,
+                // 游戏的 saveToLocal:/saveSettings 能落盘。桌面最小化见上面的 WindowMinimized 分支。
                 // Getting this event means touchHLE is becoming inactive, e.g.
                 // due to switching apps. The obvious way to handle this would
                 // be to just send `applicationWillResignActive:` to the

@@ -225,6 +225,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     todo_objc_setter!(this, enables);
 }
 
+// [复核修 2026-09-15] 邀请码/兑换码输入框(-[VerifyInviteCodeLayer showRequestTextField]
+// @0x37a4ea~0x37a55a、-[ActionCodeLayer showActionTextField]@0x3c7022~)依次调下面 4 个 setter,
+// 原来 UITextField 都不响应,日志报 "does not respond"。先接成空 setter(只打 TODO 日志,不存值、
+// 不影响绘制):setBackground: 传 UIImage(request_back_input.png 输入框底图);setLeftView: 传
+// 5x20 的留白 UIView(这里不 retain 也不保存,不会留下悬空引用);setLeftViewMode: 传 3
+// (UITextFieldViewModeAlways);setContentVerticalAlignment: 传 0(居中,另有 AvatarLayer/
+// RegisterView 等多处文本框调用)。
+- (())setBackground:(id)background { // UIImage*
+    todo_objc_setter!(this, background);
+}
+- (())setLeftView:(id)view { // UIView*
+    todo_objc_setter!(this, view);
+}
+- (())setLeftViewMode:(NSInteger)mode { // UITextFieldViewMode
+    todo_objc_setter!(this, mode);
+}
+- (())setContentVerticalAlignment:(NSInteger)alignment { // UIControlContentVerticalAlignment
+    todo_objc_setter!(this, alignment);
+}
+
 - (())touchesBegan:(id)_touches // NSSet* of UITouch*
          withEvent:(id)_event { // UIEvent*
     log!("[改名诊断] UITextField {:?} 被点中(touchesBegan)→ 请求 becomeFirstResponder", this);

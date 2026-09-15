@@ -14,9 +14,11 @@ pub mod ui_image_view;
 pub mod ui_label;
 pub mod ui_picker_view;
 pub mod ui_scroll_view;
+pub mod ui_table_view;
 pub mod ui_web_view;
 pub mod ui_window;
 
+use super::ui_gesture_recognizer::{self, TouchStage};
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
@@ -27,8 +29,8 @@ use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSInteger, NSUInteger};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter, Class,
-    ClassExports, HostObject, NSZonePtr, ObjC, SEL,
+    autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
+    todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
 use std::cell::RefCell;
@@ -38,6 +40,12 @@ pub struct State {
     /// List of views for internal purposes. Non-retaining!
     pub(super) views: Vec<id>,
     pub ui_window: ui_window::State,
+    /// [深扫修 2026-09-11] #23(a):当前 `needs_layout == true` 的视图个数。
+    /// 合成前的布局遍历先看它,为 0 时零开销直接返回(游戏大部分时间走
+    /// CAEAGLLayer 快路径,没有任何 UIKit 视图打脏标记)。
+    dirty_layout_count: usize,
+    /// [深扫修 2026-09-11] #23(a):合成前布局遍历的重入保护。
+    in_layout_pass: bool,
 }
 
 pub(super) struct UIViewHostObject {
@@ -53,6 +61,11 @@ pub(super) struct UIViewHostObject {
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
+    /// [深扫修 2026-09-11] #23(a):`setNeedsLayout` 打的脏标记,由合成前的
+    /// 布局遍历或 `layoutIfNeeded` 消费。
+    needs_layout: bool,
+    /// [扫描修 2026-09-15] F8-2:挂在本视图上的手势识别器(强引用;识别器的 view 是弱引用)。
+    gesture_recognizers: Vec<id>,
 }
 impl HostObject for UIViewHostObject {}
 impl Default for UIViewHostObject {
@@ -68,6 +81,8 @@ impl Default for UIViewHostObject {
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
+            needs_layout: false,
+            gesture_recognizers: Vec::new(),
         }
     }
 }
@@ -199,6 +214,213 @@ fn commit_animations(env: &mut Environment) {
             () = msg![env; layer addAnimation:anim forKey:kp];
         }
         release(env, from_box);
+    }
+}
+
+/// [深扫修 2026-09-11] #23(a):给视图打"需要布局"脏标记(幂等),并维护脏计数。
+fn mark_needs_layout(env: &mut Environment, view: id) {
+    let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
+    if !host_obj.needs_layout {
+        host_obj.needs_layout = true;
+        env.framework_state.uikit.ui_view.dirty_layout_count += 1;
+    }
+}
+
+/// [深扫修 2026-09-11] #23(a):取走脏标记。返回该视图此前是否需要布局。
+/// 在调用 layoutSubviews **之前**清标记:若 layoutSubviews 内部又对自己
+/// setNeedsLayout,标记会保留到下一帧,而不会在同一轮里无限循环。
+fn take_needs_layout(env: &mut Environment, view: id) -> bool {
+    let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
+    if host_obj.needs_layout {
+        host_obj.needs_layout = false;
+        let state = &mut env.framework_state.uikit.ui_view;
+        state.dirty_layout_count = state.dirty_layout_count.saturating_sub(1);
+        true
+    } else {
+        false
+    }
+}
+
+/// [深扫修 2026-09-11] #23(a):自顶向下布局 `view` 子树里所有脏视图
+/// (父视图先布局,因为父的 layoutSubviews 常会改子视图 frame / 添加子视图)。
+/// 返回本次是否真的调用过 layoutSubviews。
+fn layout_subtree_if_needed(env: &mut Environment, view: id, depth: u32) -> bool {
+    // 防御异常深/成环的层级,正常 UIKit 层级远达不到。
+    const MAX_DEPTH: u32 = 64;
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let mut did_layout = false;
+    if take_needs_layout(env, view) {
+        () = msg![env; view layoutSubviews];
+        did_layout = true;
+    }
+    // layoutSubviews 可能增删子视图,所以此时才取子视图列表;遍历期间 retain
+    // 住,避免某个子视图的 layoutSubviews 把兄弟视图移除并释放后访问悬垂对象。
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for &subview in &subviews {
+        retain(env, subview);
+    }
+    for &subview in &subviews {
+        did_layout |= layout_subtree_if_needed(env, subview, depth + 1);
+    }
+    for subview in subviews {
+        release(env, subview);
+    }
+    did_layout
+}
+
+/// [深扫修 2026-09-11] #23(a):UIKit 合成前布局所有可见窗口层级里的脏视图。
+///
+/// 仅供 `core_animation::composition::recomposite_if_necessary` 在
+/// display_layers(即 drawRect:)之前调用 —— 它由 NSRunLoop 每轮调用,
+/// 不在游戏 drawScene/mainLoop 帧栈里,因此在这里给 guest 发 layoutSubviews
+/// 是安全的(与 display_layers 发 drawRect: 同一上下文)。
+///
+/// 无脏视图时零开销返回;有重入保护;多轮遍历有上限,防止
+/// "布局 A 弄脏 B、布局 B 又弄脏 A"式的无限循环(剩下的留到下一帧)。
+pub fn layout_dirty_views_before_composition(env: &mut Environment) {
+    {
+        let state = &env.framework_state.uikit.ui_view;
+        if state.dirty_layout_count == 0 || state.in_layout_pass {
+            return;
+        }
+    }
+    env.framework_state.uikit.ui_view.in_layout_pass = true;
+    const MAX_PASSES: usize = 4;
+    for _ in 0..MAX_PASSES {
+        let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+        let mut did_layout = false;
+        for window in windows {
+            // 窗口列表不持有引用;上一个窗口的布局可能改变了窗口列表,
+            // 只处理仍在列表中的窗口。
+            if !env
+                .framework_state
+                .uikit
+                .ui_view
+                .ui_window
+                .windows
+                .contains(&window)
+            {
+                continue;
+            }
+            did_layout |= layout_subtree_if_needed(env, window, 0);
+        }
+        // [审查修 2026-09-13] E12:这一轮一个视图都没布局、计数却仍 > 0,说明剩下的
+        // 计数要么来自不在任何窗口里的脏视图,要么是子类 dealloc 泄漏的。
+        // 用全局视图表重新统计来校准(见 recount_dirty_views)。
+        if !did_layout && env.framework_state.uikit.ui_view.dirty_layout_count > 0 {
+            recount_dirty_views(env);
+        }
+        if !did_layout || env.framework_state.uikit.ui_view.dirty_layout_count == 0 {
+            break;
+        }
+    }
+    env.framework_state.uikit.ui_view.in_layout_pass = false;
+}
+
+/// [审查修 2026-09-13] E12:用全局视图表重新统计 `needs_layout == true` 的视图个数,
+/// 校准 `dirty_layout_count`。
+///
+/// 根因:计数只在 take_needs_layout 和 UIView dealloc 里扣减。UIControl、UIButton、
+/// UISwitch、UITextField、UITextView 的 dealloc 会先对整个子类宿主对象做
+/// std::mem::take,把内嵌的 UIViewHostObject(连同 needs_layout)清成 Default,再
+/// msg_super 到 UIView dealloc。那里读到的 needs_layout 恒为 false,不会扣减,于是计数
+/// 永久多 1,"计数为 0 零开销返回"的短路从此失效,每轮 run loop 都要走一遍窗口树。
+///
+/// 取舍:不改这 5 个子类的 dealloc。把 superclass 放回去会让 UIView dealloc 开始真正
+/// release layer/subviews 并执行 superview == nil 断言,可能暴露别的原有问题。这里只在
+/// "一轮遍历没布局任何视图而计数仍 > 0"时做一次宿主侧校准,泄漏的计数当轮就能自愈;
+/// 确实还脏着、但不在任何窗口里的视图仍会计入,语义不变。
+///
+/// 安全性:views 表不持有引用,但每个条目都会在 UIView dealloc 里移除(uikit 里所有
+/// 视图子类的 dealloc 都 msg_super 到 UIView,没有绕过它直接 dealloc_object 的),所以
+/// 表里都是存活对象。ObjC::borrow 会沿 as_superclass 链往下找,子类宿主对象内嵌
+/// superclass 时也能取到 UIViewHostObject(与本文件遍历子视图的现有写法一致)。
+/// 全程只做宿主侧读取,不发任何消息,不会跑 guest 代码。
+fn recount_dirty_views(env: &mut Environment) {
+    let dirty_count = {
+        let objc: &ObjC = &env.objc;
+        env.framework_state
+            .uikit
+            .ui_view
+            .views
+            .iter()
+            .filter(|&&view| objc.borrow::<UIViewHostObject>(view).needs_layout)
+            .count()
+    };
+    let state = &mut env.framework_state.uikit.ui_view;
+    if state.dirty_layout_count != dirty_count {
+        log_dbg!(
+            "dirty_layout_count recalibrated: {} -> {}",
+            state.dirty_layout_count,
+            dirty_count
+        );
+    }
+    state.dirty_layout_count = dirty_count;
+}
+
+/// [扫描修 2026-09-15] F8-2:从 `view` 起沿父视图链收集挂着的手势识别器(不改引用计数)。
+/// 供 ui_gesture_recognizer 在按下阶段找候选识别器。只做宿主侧读取,不发消息。
+pub(super) fn gesture_recognizers_in_chain(env: &Environment, view: id) -> Vec<id> {
+    // 防御异常深/成环的层级,正常 UIKit 层级远达不到。
+    const MAX_DEPTH: u32 = 64;
+    let mut result = Vec::new();
+    let mut current = view;
+    let mut depth: u32 = 0;
+    while current != nil && depth < MAX_DEPTH {
+        let host = env.objc.borrow::<UIViewHostObject>(current);
+        result.extend_from_slice(&host.gesture_recognizers);
+        current = host.superview;
+        depth += 1;
+    }
+    result
+}
+
+/// [扫描修 2026-09-15] F8-2:按 UIResponder 默认语义把触摸消息转给下一响应者。
+///
+/// Began/Moved/Ended 与 UIResponder 的默认实现完全一致(直接发给 nextResponder)。
+/// touchHLE 的 UIResponder / UIViewController / UIApplication 没有 touchesCancelled:withEvent:,
+/// 取消消息沿响应链找第一个响应它的对象再发(UIKit 里 UIResponder 默认实现就是一路往上转发,
+/// 结果相同),找不到就丢弃。
+pub(super) fn forward_touches(
+    env: &mut Environment,
+    this: id,
+    stage: TouchStage,
+    touches: id,
+    event: id,
+) {
+    let next: id = msg![env; this nextResponder];
+    if next == nil {
+        return;
+    }
+    match stage {
+        TouchStage::Began => {
+            () = msg![env; next touchesBegan:touches withEvent:event];
+        }
+        TouchStage::Moved => {
+            () = msg![env; next touchesMoved:touches withEvent:event];
+        }
+        TouchStage::Ended => {
+            () = msg![env; next touchesEnded:touches withEvent:event];
+        }
+        TouchStage::Cancelled => {
+            const MAX_DEPTH: u32 = 64;
+            let sel: SEL = env
+                .objc
+                .register_host_selector("touchesCancelled:withEvent:".to_string(), &mut env.mem);
+            let mut responder = next;
+            let mut depth: u32 = 0;
+            while responder != nil && depth < MAX_DEPTH {
+                let responds: bool = msg![env; responder respondsToSelector:sel];
+                if responds {
+                    () = msg_send(env, (responder, sel, touches, event));
+                    return;
+                }
+                responder = msg![env; responder nextResponder];
+                depth += 1;
+            }
+        }
     }
 }
 
@@ -397,6 +619,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     // nothing.
 }
 
+// [深扫修 2026-09-11] #23(a):补 -setNeedsLayout / -layoutIfNeeded。
+// 根因:此前两者都不存在(找不到选择子 = 空操作),touchHLE 只在启动时对当时
+// 已有的 view 调一次 layoutSubviews,之后创建的 view 永远不会再布局。
+// MBProgressHUD 的底框宽高(width/height ivar)、指示器居中 frame 全在
+// layoutSubviews 里算,它靠 setNeedsLayout 触发 → HUD 整个不可见。
+// 修法(按对抗复核):setNeedsLayout 只打脏标记,**不**同步调 layoutSubviews
+// (MBProgressHUD 在 init 半途就调它,那时 labelFont 等属性尚未设好,同步调
+// 还有重入风险);真正的布局放到 UIKit 合成阶段(composition.rs 在
+// display_layers 之前调 layout_dirty_views_before_composition),保证先布局
+// 后 drawRect:。layoutIfNeeded 按原版语义同步布局本视图子树里的脏视图。
+- (())setNeedsLayout {
+    mark_needs_layout(env, this);
+}
+
+- (())layoutIfNeeded {
+    let _: bool = layout_subtree_if_needed(env, this, 0);
+}
+
 - (id)superview {
     env.objc.borrow::<UIViewHostObject>(this).superview
 }
@@ -574,7 +814,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
+        needs_layout,
+        gesture_recognizers,
     } = std::mem::take(env.objc.borrow_mut(this));
+
+    // [深扫修 2026-09-11] #23(a):脏视图被释放时同步扣减计数,避免计数漂移
+    // 导致每帧空跑布局遍历。
+    if needs_layout {
+        let state = &mut env.framework_state.uikit.ui_view;
+        state.dirty_layout_count = state.dirty_layout_count.saturating_sub(1);
+    }
 
     release(env, layer);
     assert!(view_controller == nil);
@@ -582,6 +831,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     for subview in subviews {
         env.objc.borrow_mut::<UIViewHostObject>(subview).superview = nil;
         release(env, subview);
+    }
+
+    // [扫描修 2026-09-15] F8-2:视图持有识别器的强引用;释放前清空识别器的弱引用 view 并中止跟踪。
+    for recognizer in gesture_recognizers {
+        ui_gesture_recognizer::detach_from_view(env, recognizer);
+        release(env, recognizer);
     }
 
     let state = &mut env.framework_state.uikit.ui_view.views;
@@ -764,6 +1019,124 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     this
+}
+
+// [扫描修 2026-09-15] F8-2:手势识别器挂载。视图持有识别器的强引用,识别器的 view 是弱引用。
+// 根因:此前没有这些方法(也没有识别器类),ATPagingView 的单击识别器挂不上,VIP 教程
+// 第 3 页点击关闭永远触发不了。
+- (())addGestureRecognizer:(id)recognizer { // UIGestureRecognizer*
+    if recognizer == nil {
+        // 缺类时 [XxxGestureRecognizer alloc] 得 nil(例如广告 SDK 引用的 UIPanGestureRecognizer)。
+        log_dbg!("Tolerating [(UIView*){:?} addGestureRecognizer:nil]", this);
+        return;
+    }
+    if !ui_gesture_recognizer::is_gesture_recognizer(env, recognizer) {
+        log!(
+            "[扫描修 2026-09-15] 忽略 [(UIView*){:?} addGestureRecognizer:{:?}]:不是 UIGestureRecognizer",
+            this,
+            recognizer
+        );
+        return;
+    }
+    if env
+        .objc
+        .borrow::<UIViewHostObject>(this)
+        .gesture_recognizers
+        .contains(&recognizer)
+    {
+        return;
+    }
+    // 一个识别器只能挂在一个视图上:先从旧视图摘下(UIKit 语义)。
+    let old_view: id = msg![env; recognizer view];
+    if old_view != nil && old_view != this {
+        () = msg![env; old_view removeGestureRecognizer:recognizer];
+    }
+    retain(env, recognizer);
+    env.objc
+        .borrow_mut::<UIViewHostObject>(this)
+        .gesture_recognizers
+        .push(recognizer);
+    ui_gesture_recognizer::attach_to_view(env, recognizer, this);
+}
+
+- (())removeGestureRecognizer:(id)recognizer { // UIGestureRecognizer*
+    if recognizer == nil {
+        return;
+    }
+    let host = env.objc.borrow_mut::<UIViewHostObject>(this);
+    let Some(idx) = host
+        .gesture_recognizers
+        .iter()
+        .position(|&r| r == recognizer)
+    else {
+        return;
+    };
+    host.gesture_recognizers.remove(idx);
+    ui_gesture_recognizer::detach_from_view(env, recognizer);
+    release(env, recognizer);
+}
+
+- (id)gestureRecognizers {
+    let recognizers = env
+        .objc
+        .borrow::<UIViewHostObject>(this)
+        .gesture_recognizers
+        .clone();
+    if recognizers.is_empty() {
+        // UIKit:没有识别器时返回 nil。
+        return nil;
+    }
+    for &recognizer in &recognizers {
+        retain(env, recognizer);
+    }
+    let array = ns_array::from_vec(env, recognizers);
+    autorelease(env, array)
+}
+
+// [扫描修 2026-09-15] F8-2:UIView 层的触摸处理 = 手势识别挂点 + UIResponder 默认转发。
+// 此前 UIView 没有这些方法,消息直接落到 UIResponder 的转发;现在转发行为不变,只是先让
+// 沿途识别器看到触摸。视图链上没有识别器时只多一次父视图遍历。覆盖了这些方法的游戏类
+// (如 cocos2d 的 EAGLView)和 UIControl 系不受影响。
+- (())touchesBegan:(id)touches // NSSet* of UITouch*
+         withEvent:(id)event { // UIEvent*
+    // 识别器委托回调与转发都会跑游戏代码,可能把本视图拆下释放,处理期间 retain 住。
+    retain(env, this);
+    let _ = ui_gesture_recognizer::process_touches(env, touches, TouchStage::Began);
+    forward_touches(env, this, TouchStage::Began, touches, event);
+    release(env, this);
+}
+
+- (())touchesMoved:(id)touches // NSSet* of UITouch*
+         withEvent:(id)event { // UIEvent*
+    retain(env, this);
+    let _ = ui_gesture_recognizer::process_touches(env, touches, TouchStage::Moved);
+    forward_touches(env, this, TouchStage::Moved, touches, event);
+    release(env, this);
+}
+
+- (())touchesEnded:(id)touches // NSSet* of UITouch*
+         withEvent:(id)event { // UIEvent*
+    retain(env, this);
+    let recognized = ui_gesture_recognizer::process_touches(env, touches, TouchStage::Ended);
+    // 识别成功且 cancelsTouchesInView:沿响应链改发 touchesCancelled:(UIKit 语义)。
+    // 先转发、后派发 action:action 可能同步拆掉视图树,先派发会让取消送不到 EAGLView,
+    // cocos2d 的 CCMenu 会卡在跟踪态。
+    let stage = if ui_gesture_recognizer::cancels_touches_in_view(env, &recognized) {
+        TouchStage::Cancelled
+    } else {
+        TouchStage::Ended
+    };
+    forward_touches(env, this, stage, touches, event);
+    ui_gesture_recognizer::fire_recognized(env, recognized);
+    release(env, this);
+}
+
+- (())touchesCancelled:(id)touches // NSSet* of UITouch*
+             withEvent:(id)event { // UIEvent*
+    retain(env, this);
+    let _ = ui_gesture_recognizer::process_touches(env, touches, TouchStage::Cancelled);
+    forward_touches(env, this, TouchStage::Cancelled, touches, event);
+    release(env, this);
 }
 
 // Ending a view-editing session

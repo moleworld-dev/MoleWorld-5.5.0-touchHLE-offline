@@ -268,8 +268,73 @@ pub enum FingerId {
     ButtonToTouch(crate::options::Button),
     StickToTouch,
     DpadToTouch,
+    /// [扫描修 2026-09-15] 鼠标滚轮/触控板滑动合成的虚拟捏合手指 A(见 poll_for_events 的滚轮处理)。
+    PinchA,
+    /// [扫描修 2026-09-15] 虚拟捏合手指 B,与 A 关于两指中点对称。
+    PinchB,
 }
 pub type Coords = (f32, f32);
+
+/// [扫描修 2026-09-15] 滚轮模拟双指捏合的参数(长度单位均为 guest 点)。
+/// 根因(F12-2):桌面上鼠标只有一根手指,而游戏 -[GameManager processTouch:withType:]@0x1a680
+/// 与 -[NewGameManager processTouch:withType:]@0x245474 要求“本次触点数 ≥2 且类型为移动”才调
+/// zoom:touch2:,所以村庄/黄金岛在桌面上无法缩放。-[VillageLayer zoom:touch2:]@0x35668 按两指
+/// “当前间距/上次间距”算缩放比、以两指中点为锚点,自带 isMaxZoomed/isMinZoomed 与 checkBounding
+/// 边界,故合成两根对称的虚拟手指即可走原版缩放逻辑,不改游戏语义。
+const PINCH_HALF_START: f32 = 60.0; // 初始半间距 → 两指间距 120pt
+const PINCH_HALF_MIN: f32 = 20.0; // 最小半间距 → 两指间距 40pt
+const PINCH_HALF_MAX: f32 = 240.0; // 最大半间距 → 两指间距 480pt(另受画面边界限制)
+const PINCH_EDGE_MARGIN: f32 = 150.0; // 中点离画面边缘至少这么远(画面够大时),给张开留余量
+const PINCH_HALF_PER_NOTCH: f32 = 6.0; // 每格滚轮半间距变 6pt → 间距 ±12pt(约 ±10% 缩放)
+const PINCH_MAX_NOTCHES_PER_EVENT: f32 = 5.0; // 单个滚轮事件最多按 5 格算,防触控板猛甩一下到头
+const PINCH_IDLE_TIMEOUT: Duration = Duration::from_millis(150); // 停止滚动多久后抬起双指
+
+/// [扫描修 2026-09-15] 进行中的滚轮捏合手势:一段手势内两根虚拟手指一直按住,只发移动。
+struct PinchState {
+    /// 两指中点(guest 竖屏坐标系,整数点);一段手势内固定不动。
+    center: Coords,
+    /// 捏合轴:窗口水平方向在 guest 坐标系里的单位向量(分量取 ±1 或 0)。
+    axis: Coords,
+    /// 当前半间距(整数点)。保持整数,保证每次变化时两指坐标都各动 ≥1 点——ui_touch 会跳过
+    /// 位置没变的触点,只动一根会让游戏收到单指移动,误走拖动地图的分支。
+    half: f32,
+    /// 本段手势允许的最大半间距(受画面边界限制)。
+    max_half: f32,
+    /// 不足 1 点的滚动累积(触控板会给小数增量)。
+    pending: f32,
+    /// 最近一次滚轮输入的时刻。
+    last_input: Instant,
+}
+impl PinchState {
+    fn touch_map(&self) -> HashMap<FingerId, Coords> {
+        let (cx, cy) = self.center;
+        let (ax, ay) = self.axis;
+        HashMap::from([
+            (FingerId::PinchA, (cx - ax * self.half, cy - ay * self.half)),
+            (FingerId::PinchB, (cx + ax * self.half, cy + ay * self.half)),
+        ])
+    }
+}
+
+/// [扫描修 2026-09-15] 滚轮捏合总开关:环境变量 MOLE_WHEEL_PINCH=0 关闭(默认开启)。
+fn wheel_pinch_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_WHEEL_PINCH")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+/// [扫描修 2026-09-15] MOLE_WHEEL_PINCH_INVERT=1 反转缩放方向。默认按 SDL 给出的增量:
+/// 向上滚(y>0)= 两指张开 = 放大;SDL 的数值已含系统“自然滚动”设置,这里不再看 direction 字段。
+fn wheel_pinch_inverted() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_WHEEL_PINCH_INVERT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
 
 struct DpadState {
     left: bool,
@@ -299,12 +364,23 @@ pub enum Event {
     TouchesDown(HashMap<FingerId, Coords>),
     TouchesMove(HashMap<FingerId, Coords>),
     TouchesUp(HashMap<FingerId, Coords>),
+    /// [复核修 2026-09-15] R1-3:触摸被取消(UIKit 的 touchesCancelled:withEvent: / UITouchPhaseCancelled)。
+    /// 目前只用来结束滚轮虚拟捏合:以抬起结束时,被 cocos2d 目标代理(如 HUD 上的 CCMenu)认领的那根
+    /// 虚拟手指会走 ccTouchEnded → activate,被当成一次点击;取消只走 ccTouchCancelled(不 activate)。
+    /// 不认取消的 cocos2d 代理由 ui_touch 的 handle_touches_cancelled 收尾([复核修 2026-09-15] R1-3 返修)。
+    TouchesCancel(HashMap<FingerId, Coords>),
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
     /// [MoleWorld] User pressed T, requesting the debug/cheat menu be toggled.
     ToggleMoleMenu,
     TextInput(TextInputEvent),
+    /// [扫描修 2026-09-15] F12-3:桌面窗口被最小化/隐藏(SDL Minimized/Hidden)。只在状态变化时
+    /// 发一次;由 frameworks/uikit.rs 转成 applicationWillResignActive: 与对应通知。
+    WindowMinimized,
+    /// [扫描修 2026-09-15] F12-3:桌面窗口从最小化/隐藏还原(SDL Restored/Shown/Maximized)。只在此前
+    /// 发过 WindowMinimized 时发一次;由 frameworks/uikit.rs 转成 applicationDidBecomeActive: 与对应通知。
+    WindowRestored,
 }
 
 pub enum BatteryState {
@@ -406,6 +482,12 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    /// [扫描修 2026-09-15] F12-2:滚轮合成的虚拟双指捏合;None = 虚拟手指未按下。
+    pinch: Option<PinchState>,
+    /// [扫描修 2026-09-15] F12-2:左键是否按住(按 SDL 事件顺序跟踪),左键拖动中的滚轮直接忽略。
+    mouse_left_down: bool,
+    /// [扫描修 2026-09-15] F12-3:上一次发出的窗口最小化状态,用来给 WindowMinimized/WindowRestored 去重。
+    window_minimized: bool,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -604,6 +686,9 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
+            pinch: None,
+            mouse_left_down: false,
+            window_minimized: false,
             on_main_stack: true,
         };
 
@@ -718,8 +803,164 @@ impl Window {
             let (screen_width, screen_height) = window.window.drawable_size();
             (screen_width as f32 * x, screen_height as f32 * y)
         }
+        /// [扫描修 2026-09-15] F12-2:结束进行中的滚轮捏合。两根虚拟手指放进同一个事件一起结束:
+        /// 游戏 processTouch:withType: 对“触点数 ≥2 且不是移动”的事件直接返回,不会被当成点击
+        /// (若分两次结束,后结束的那根会以单指身份走点击/拖动分支)。
+        /// [复核修 2026-09-15] R1-3:改用 TouchesCancel 结束,不再用 TouchesUp。两指落在 cocos2d 目标代理上时
+        /// (HUD 的 CCMenu 按钮、可点物件),CCTouchDispatcher 让代理认领并吞掉其中一根,游戏只收到单指;
+        /// 以抬起结束会走 -[CCMenu ccTouchEnded:withEvent:]@0x2ceac8 → [selectedItem activate](误点按钮),
+        /// 剩下那根单指走 processTouch:withType:2 → ObjSelector/ActorManager 的 touchEnd(误点建筑/角色)。
+        /// 取消走 -[EAGLView touchesCancelled:withEvent:]@0x2f7750 → CCTouchDispatcher 类型 3:
+        /// -[CCMenu ccTouchCancelled:withEvent:]@0x2ceb10 只 unselected;VillageLayer@0x3558c/InGameLayer@0x2403f8
+        /// 以 processTouch:withType:3 进 GameManager/NewGameManager,各子处理器只对类型 2 做点击。
+        /// [复核修 2026-09-15] R1-3 返修:游戏里有几个目标代理不认取消(没有 ccTouchCancelled:withEvent:),
+        /// 却在 ccTouchBegan: 置门控、只在 ccTouchEnded: 清零(OutputHanlder.state_、TreasureRewardLayer /
+        /// FinalRewardAnimation._touchState),被取消后门控永远停在 1,产出图标 / 奖励层再也点不动;村庄
+        /// ObjSelector 的 isMoved/isSelected 也会残留,下一次点建筑丢一次。这些收尾放在
+        /// frameworks/uikit/ui_touch.rs 的 handle_touches_cancelled(发取消前清门控、发完清 ObjSelector 残留),
+        /// 这里仍然以取消结束,不回退成抬起(抬起会让 CCMenu 误点按钮)。
+        fn end_wheel_pinch(window: &mut Window, reason: &str) {
+            if let Some(p) = window.pinch.take() {
+                log!(
+                    "[滚轮捏合] 结束双指(取消,{}),最终间距 {}pt",
+                    reason,
+                    p.half * 2.0
+                );
+                window
+                    .event_queue
+                    .push_back(Event::TouchesCancel(p.touch_map()));
+            }
+        }
+        /// [扫描修 2026-09-15] F12-2:以光标为中心算一段新捏合手势的初始状态。
+        /// 中点先走 transform_input_coords(与左键点击同一条变换,自动适配窗口拉伸、
+        /// --fill-screen/--logical-size、letterbox 与旋转),两指偏移直接在 guest 点空间里加,
+        /// 与窗口缩放倍率无关。画面太小或坐标异常(如最小化时视口为 0)返回 None,不合成。
+        fn begin_wheel_pinch(window: &Window, cursor: Coords, now: Instant) -> Option<PinchState> {
+            let (gw, gh) = window.size_unrotated_unscaled();
+            let (gw, gh) = (gw as f32, gh as f32);
+            let (_, _, vw, vh) = window.viewport();
+            if gw < 4.0 || gh < 4.0 || vw == 0 || vh == 0 {
+                return None;
+            }
+            let c = transform_input_coords(window, cursor, false);
+            // 窗口水平方向对应 guest 坐标系的哪根轴:取光标右侧一段位移做差(横屏时是 guest 的 y 轴)。
+            let probe = transform_input_coords(
+                window,
+                (cursor.0 + (vw as f32 / 4.0).max(8.0), cursor.1),
+                false,
+            );
+            if !(c.0.is_finite() && c.1.is_finite() && probe.0.is_finite() && probe.1.is_finite()) {
+                return None;
+            }
+            let (dx, dy) = (probe.0 - c.0, probe.1 - c.1);
+            let axis: Coords = if dx.abs() >= dy.abs() {
+                (if dx < 0.0 { -1.0 } else { 1.0 }, 0.0)
+            } else {
+                (0.0, if dy < 0.0 { -1.0 } else { 1.0 })
+            };
+            let along_x = axis.0 != 0.0;
+            // 沿捏合轴:中点离边缘至少 PINCH_EDGE_MARGIN(画面不够大时取一半),给张开留余量;
+            // 另一根轴只保证不出画面。结果取整,保证两指坐标都是整数点。
+            let clamp_along = |v: f32, dim: f32| -> f32 {
+                let margin = PINCH_EDGE_MARGIN.min((dim / 2.0 - 1.0).floor()).max(0.0);
+                v.clamp(margin, (dim - 1.0 - margin).max(margin)).round()
+            };
+            let clamp_cross = |v: f32, dim: f32| -> f32 { v.clamp(1.0, dim - 2.0).round() };
+            let center: Coords = if along_x {
+                (clamp_along(c.0, gw), clamp_cross(c.1, gh))
+            } else {
+                (clamp_cross(c.0, gw), clamp_along(c.1, gh))
+            };
+            let (pos, dim) = if along_x {
+                (center.0, gw)
+            } else {
+                (center.1, gh)
+            };
+            // 两指都不越出画面:最大半间距受中点到两侧边缘的较近距离限制。
+            let max_half = PINCH_HALF_MAX.min(pos.min(dim - 1.0 - pos).floor());
+            if max_half < PINCH_HALF_MIN + 1.0 {
+                return None;
+            }
+            Some(PinchState {
+                center,
+                axis,
+                half: PINCH_HALF_START.min(max_half),
+                max_half,
+                pending: 0.0,
+                last_input: now,
+            })
+        }
+        /// [扫描修 2026-09-15] F12-2:一个滚轮事件(鼠标一格,或触控板的一段小数增量)→ 虚拟双指捏合。
+        /// 状态机:没有进行中的手势时,两根虚拟手指放进同一个 TouchesDown 一起按下(游戏对 ≥2 指的
+        /// 按下事件直接返回,不会误判点击);之后每次滚动只发 TouchesMove(半间距按增量变化);
+        /// 滚轮停下 PINCH_IDLE_TIMEOUT 后由 poll_for_events 末尾统一结束([复核修 2026-09-15] R1-3:
+        /// 以 TouchesCancel 结束,见 end_wheel_pinch)。已按下的虚拟手指绝不再发 Down。
+        fn handle_wheel_pinch(window: &mut Window, notches_int: i32, notches_precise: f32) {
+            // 不合成的情形:开关关闭 / 正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
+            if !wheel_pinch_enabled()
+                || MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                || crate::mole_menu::is_open()
+            {
+                return;
+            }
+            let mouse = window.event_pump.mouse_state();
+            // 左键拖动中收到滚轮:直接忽略(否则鼠标手指 + 两根虚拟手指 = 三指)。
+            if window.mouse_left_down && mouse.left() {
+                return;
+            }
+            let mut delta = if notches_precise != 0.0 && notches_precise.is_finite() {
+                notches_precise
+            } else {
+                notches_int as f32
+            };
+            if wheel_pinch_inverted() {
+                delta = -delta;
+            }
+            let delta = delta.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
+            if delta == 0.0 {
+                return;
+            }
+            let now = Instant::now();
+            if window.pinch.is_none() {
+                let cursor = (mouse.x() as f32, mouse.y() as f32);
+                let Some(p) = begin_wheel_pinch(window, cursor, now) else {
+                    return;
+                };
+                log!(
+                    "[滚轮捏合] 按下双指:中点 {:?} 轴 {:?} 间距 {}pt",
+                    p.center,
+                    p.axis,
+                    p.half * 2.0
+                );
+                window
+                    .event_queue
+                    .push_back(Event::TouchesDown(p.touch_map()));
+                window.pinch = Some(p);
+            }
+            let p = window.pinch.as_mut().unwrap();
+            p.last_input = now;
+            p.pending += delta * PINCH_HALF_PER_NOTCH;
+            let step = p.pending.trunc();
+            if step == 0.0 {
+                return;
+            }
+            p.pending -= step;
+            let new_half = (p.half + step).clamp(PINCH_HALF_MIN, p.max_half);
+            if new_half == p.half {
+                // 已到最大/最小间距:抬起双指,下一次滚动从初始间距重新按下(重握),实现连续缩放。
+                // 游戏按相邻两次间距之比缩放,重握不会让画面跳变。
+                end_wheel_pinch(window, "间距到头,重握");
+                return;
+            }
+            p.half = new_half;
+            let map = p.touch_map();
+            log_dbg!("[滚轮捏合] 移动:间距 {}pt", new_half * 2.0);
+            window.event_queue.push_back(Event::TouchesMove(map));
+        }
 
         let mut controller_updated = false;
+        // [扫描修 2026-09-15] F12-3:只有桌面窗口才把最小化/还原翻译成事件(见循环里的 E::Window 分支)。
+        let desktop_window = !Self::rotatable_fullscreen() && !cfg!(target_os = "ios");
         // event_pump doesn't have a method to peek on events
         // so, we keep track of an unconsumed one from a previous loop iteration
         // FIXME: use peek_event() from even_subsystem
@@ -813,6 +1054,69 @@ impl Window {
                         self.max_height = self.max_height.max(fh);
                         self.viewport_y_offset = self.max_height - fh;
                     }
+                }
+                _ => {}
+            }
+
+            // [扫描修 2026-09-15] F12-2 / F12-3:需要一次推入多个事件、或只改状态的输入先在这里处理。
+            // (下面 `self.event_queue.push_back(match …)` 的匹配臂里不能再往队列里推事件。)
+            match event {
+                E::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    self.mouse_left_down = true;
+                    // 左键按下前先抬起虚拟双指,避免与鼠标手指叠成三指。
+                    end_wheel_pinch(self, "左键按下");
+                }
+                E::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    self.mouse_left_down = false;
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::T),
+                    ..
+                } if !MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) => {
+                    // 菜单打开后 uikit.rs 会吞掉 Move/Up,先抬起虚拟双指,免得游戏里残留按住的触点。
+                    end_wheel_pinch(self, "切换修改器菜单");
+                }
+                E::MouseWheel { y, precise_y, .. } => {
+                    handle_wheel_pinch(self, y, precise_y);
+                    continue;
+                }
+                // F12-3:窗口最小化/隐藏 → WindowMinimized;还原/显示/最大化 → WindowRestored。
+                // 只在状态真正变化时发一次(Hidden+Minimized、Shown+Restored 常成对出现;启动时的
+                // Shown 与普通最大化因此不会误发)。普通失焦(FocusLost)不发:点一下别的窗口就暂停、
+                // 停音乐太打扰。只在桌面发:安卓/iOS 切后台走 AppWillEnterBackground(目前直接退出并
+                // 停止事件轮询),在那里再发只会与退出流程重复。
+                E::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::Minimized | sdl2::event::WindowEvent::Hidden,
+                    ..
+                } => {
+                    if desktop_window && !self.window_minimized {
+                        end_wheel_pinch(self, "窗口最小化");
+                        self.window_minimized = true;
+                        log!("[窗口] 最小化/隐藏,发出 WindowMinimized");
+                        self.event_queue.push_back(Event::WindowMinimized);
+                    }
+                    continue;
+                }
+                E::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::Restored
+                        | sdl2::event::WindowEvent::Shown
+                        | sdl2::event::WindowEvent::Maximized,
+                    ..
+                } => {
+                    if desktop_window && self.window_minimized {
+                        self.window_minimized = false;
+                        log!("[窗口] 还原/显示,发出 WindowRestored");
+                        self.event_queue.push_back(Event::WindowRestored);
+                    }
+                    continue;
                 }
                 _ => {}
             }
@@ -1129,6 +1433,17 @@ impl Window {
                 }
                 _ => continue,
             })
+        }
+
+        // [扫描修 2026-09-15] F12-2:滚轮停下 PINCH_IDLE_TIMEOUT(约 150ms)后结束两根虚拟手指
+        // ([复核修 2026-09-15] R1-3:以取消结束,见 end_wheel_pinch)。
+        // 必须放在 controller_updated 分支之前——那个分支的 match 里有 `_ => return`。
+        if self
+            .pinch
+            .as_ref()
+            .is_some_and(|p| p.last_input.elapsed() >= PINCH_IDLE_TIMEOUT)
+        {
+            end_wheel_pinch(self, "滚轮停止");
         }
 
         if controller_updated {
