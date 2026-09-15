@@ -197,6 +197,10 @@ pub fn ios_entry() {
         game.to_string_lossy().into_owned(),
         String::from("--landscape-right"),
         String::from("--device-family=ipad"),
+        // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:对齐桌面「启动摩尔庄园-宽屏.command」,按真机屏幕比例自动算
+        // guest 逻辑屏(短边锁 768、长边随屏比、钳在 [4:3, 2.4])→ 全面屏铺满无黑边、不拉伸;iPad(4:3)算出来
+        // 仍是 1024x768,与原路径一致。
+        String::from("--fill-screen"),
     ];
     match main(args.into_iter()) {
         Ok(_) => echo!("touchHLE finished"),

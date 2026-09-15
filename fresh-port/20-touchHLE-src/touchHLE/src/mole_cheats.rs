@@ -3542,10 +3542,12 @@ fn apply_crack_patches(env: &mut Environment) {
 fn fix_mapextend_on() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
+    // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面启动器已把 MOLE_FIX_MAPEXTEND 默认置 1;iOS 没有启动器
+    // 和环境变量,默认开(MOLE_FIX_MAPEXTEND=0 可关)。其它平台行为不变。
     *V.get_or_init(|| {
         std::env::var("MOLE_FIX_MAPEXTEND")
             .map(|v| v != "0")
-            .unwrap_or(false)
+            .unwrap_or(cfg!(target_os = "ios"))
     })
 }
 
@@ -4324,7 +4326,13 @@ fn ui43_on_add_child(env: &mut Environment) {
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化] MOLE_UI43=1 是否开启(winSize 返回 1024x768)。仅解析一次。
 fn ui43_mode() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("MOLE_UI43").map(|v| v != "0").unwrap_or(false))
+    // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面靠启动器 export MOLE_UI43=1;iOS 没有环境变量,
+    // 宽屏(--fill-screen 算出的逻辑屏比 4:3 宽)时自动开。MOLE_UI43=0/1 仍可覆盖;非 iOS 平台默认值不变。
+    *S.get_or_init(|| {
+        std::env::var("MOLE_UI43")
+            .map(|v| v != "0")
+            .unwrap_or_else(|_| cfg!(target_os = "ios") && crate::window::is_widescreen())
+    })
 }
 
 /// [扫描修 2026-09-15] F9-4/F9-8 取游戏本地化文案:[[NSBundle mainBundle] localizedStringForKey:key value:@"" table:nil]
