@@ -225,3 +225,11 @@ com.StarByte.NEX: --landscape-left --force-composition
 # Galaxy on Fire
 # In Game controls A = Weapon Select, X = Boost, B = Fire, Y = Missle, Start = Pause
 www.fishlabs.net.GalaxyOnFire: --landscape-right --button-to-touch=A,427,274 --button-to-touch=X,380,254 --button-to-touch=Y,124,291 --button-to-touch=B,444,221 --button-to-touch=Start,444,20
+
+# MoleWorld 摩尔庄园 5.5.0
+# Force Simplified Chinese. Under English the game caps quests/story by language in -[NewSceneQuest activate:],
+# -[Quest activate:] and -[NewSceneStory activate]: Golden Island stops at quest 70 / story chapter 23 and the
+# main village at quest 310 / chapter 116, after which no new quests or story ever appear (silently), and NPC
+# quest markers are hidden. Placed here so every platform, launcher and release bundle gets it. To keep an English
+# UI, override in touchHLE_options.txt (applied after this file): com.taomee.MoleWorld: --preferred-languages=en
+com.taomee.MoleWorld: --preferred-languages=zh-Hans
