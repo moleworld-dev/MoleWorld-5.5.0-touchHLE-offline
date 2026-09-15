@@ -26,6 +26,7 @@ echo "  · --fullscreen --fill-screen 按屏比铺满整屏,无黑边不拉伸�
 echo "  · 想窗口模式: 去掉本文件最后一行的 --fullscreen"
 echo "  · 退出全屏: 关掉窗口 或 Cmd+Q / 在此终端 Ctrl+C"
 echo "  · 超宽屏(32:9)想要更满: 追加 --max-aspect=3.5"
+echo "  · 时区: MOLE_TZ=${MOLE_TZ:-未设置(默认北京时间 Asia/Shanghai，export MOLE_TZ=host 可跟随本机时区)}"
 echo ""
 
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"

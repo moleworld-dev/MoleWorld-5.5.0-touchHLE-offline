@@ -34,6 +34,7 @@ fi
 echo "============================================================"
 echo "🎮  摩尔庄园 5.5.0 · ★账号菜单模式"
 echo "    私服   : $MOLE_SERVER"
+echo "    时区   : MOLE_TZ=${MOLE_TZ:-未设置(默认北京时间 Asia/Shanghai，MOLE_TZ=host 跟随本机)}"
 echo "    passport: 连私服 host:80,Host=account-mapi.61.com → web passport"
 echo "    玩法   : 点标题的登录/切换账号 → 应弹出原版账号管理菜单"
 echo "    日志   : $LOG  (grep '[MOLECHEAT] passport 代理' 看代理是否触发)"

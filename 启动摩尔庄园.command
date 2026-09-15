@@ -20,6 +20,7 @@ fi
 echo "正在启动 摩尔庄园 5.5.0 ..."
 echo "  模拟器: touchHLE (arm64)"
 echo "  游戏:   MoleWorld.app"
+echo "  时区:   MOLE_TZ=${MOLE_TZ:-未设置(默认北京时间 Asia/Shanghai，export MOLE_TZ=host 可跟随本机时区)}"
 echo ""
 echo "操作提示:"
 echo "  · 鼠标左键 = 触摸(点击/拖动)"

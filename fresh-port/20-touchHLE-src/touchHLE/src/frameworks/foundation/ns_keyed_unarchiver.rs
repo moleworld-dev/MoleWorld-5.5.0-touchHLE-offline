@@ -76,21 +76,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)unarchiveObjectWithData:(id)data { // NSData *
-    let dlen: NSUInteger = if data == nil { 0 } else { msg![env; data length] };
+    // [2026-09-16] B-03 删掉排查 map.dat 解档时留下的 DIAG 块(先发 length,再对大于 4KB 的档发 count
+    // 并打日志),恢复上游写法。只把日志降级不够:那两次 msg_send 仍会每次执行,根对象不是集合时
+    // count 还会落进「does not respond」兜底。
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initForReadingWithData:data];
     let root_key = get_static_str(env, NSKeyedArchiveRootObjectKey);
     let result: id = msg![env; new decodeObjectForKey:root_key];
-    // DIAG (map.dat is the big one, ~11.7KB): is the unarchive result nil or a real dict?
-    if dlen > 4096 {
-        let cnt: i64 = if result == nil {
-            -1
-        } else {
-            let c: NSUInteger = msg![env; result count];
-            c as i64
-        };
-        log!("[MOLECHEAT] unarchiveObjectWithData: {}B -> count={}", dlen, cnt);
-    }
     autorelease(env, result)
 }
 
@@ -517,6 +509,8 @@ pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id
     // [扫描修 2026-09-15] F10-6:原来用 eprintln! 直接写 stderr,绕过 echo!/log! 的日志文件
     // (touchHLE_log.txt 里看不到,排查读档时只在终端可见),每轮进村打 9 行。读档诊断已闭环,
     // 改成 log_dbg!:平时不打印,需要时把本模块加进 log.rs 的 ENABLED_MODULES 即可,且会进日志文件。
+    // [2026-09-16] A1-03 现在不用重编也能打开:TOUCHHLE_LOG_MODULES 或
+    // --log-modules=touchHLE::frameworks::foundation::ns_keyed_unarchiver。
     if keys.len() > 8 {
         log_dbg!(
             "decode_current_dict: NS.keys={} NS.objects={}",

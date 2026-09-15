@@ -42,17 +42,17 @@ impl std::fmt::Display for DeviceFamily {
 }
 impl DeviceFamily {
     pub fn portrait_size(&self) -> (u32, u32) {
-        // [MoleWorld 智能分辨率·测试分支] MOLE_GUEST_PORTRAIT=WxH 覆盖 guest 逻辑屏(点,portrait 维度)。
+        // [MoleWorld 智能分辨率] 第一层:--logical-size=WxH 显式覆盖 guest 逻辑屏(点,portrait 维度)。
         // 用途="物理满屏不黑边"折中:喂一个更宽的 winSize → 游戏世界场景(村庄/岛,checkBounding 读
         // winSize)自然扩视野铺满 + winSize 相对 UI(底部菜单/弹窗)自动重锚;顶部 HUD 等写死坐标保持
         // 老位(后续 targeted 重锚 + present 模糊填缝补)。★portrait 维度:landscape 时 size_for_orientation
         // 交换宽高,故"加宽 landscape"=加大这里的 height(如 768x1366 → landscape 1366x768=16:9)。
         // ui_screen bounds(guest winSize)与 window size 都走本函数 → 窗口自动匹配 guest 宽高比=无 letterbox。
-        // 仅 env 显式设置时生效;默认(不设)逐字节不变,零回归。
+        // 仅显式传参时生效;默认(不传)逐字节不变,零回归。
         if let Some(sz) = guest_portrait_override() {
             return sz;
         }
-        // [MoleWorld 智能分辨率] 第二层:MOLE_FILL=1 时由 Window::new 按目标屏宽高比自动算的 guest 逻辑屏。
+        // [MoleWorld 智能分辨率] 第二层:--fill-screen 时由 Window::new 按目标屏宽高比自动算的 guest 逻辑屏。
         if let Some(&sz) = AUTO_PORTRAIT.get() {
             return sz;
         }
@@ -63,14 +63,14 @@ impl DeviceFamily {
     }
 }
 
-/// [MoleWorld 智能分辨率] 自动适配(--fill-screen / MOLE_FILL)时,Window::new 按目标屏宽高比
+/// [MoleWorld 智能分辨率] 自动适配(--fill-screen)时,Window::new 按目标屏宽高比
 /// 算好的 guest portrait 逻辑屏。
 static AUTO_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
 
 /// [MoleWorld 智能分辨率] CLI `--logical-size=WxH` 显式指定的 guest portrait 逻辑屏(点,已归一
-/// 成 portrait=(短,长))。优先级高于 env `MOLE_GUEST_PORTRAIT`。由 [apply_cli_resolution] 写入。
+/// 成 portrait=(短,长))。优先级高于 --fill-screen 自动算的尺寸。由 [apply_cli_resolution] 写入。
 static CLI_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-/// [MoleWorld 智能分辨率] CLI `--fill-screen` 开关(等价 MOLE_FILL=1,一等公民)。
+/// [MoleWorld 智能分辨率] CLI `--fill-screen` 开关(自动铺屏适配的唯一入口)。
 static CLI_FILL_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// [MoleWorld 智能分辨率] CLI `--max-aspect=F` 覆盖(自动适配时 guest landscape 宽高比上限)。
 static CLI_MAX_ASPECT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -108,36 +108,17 @@ pub fn apply_cli_resolution(
     }
 }
 
-/// [MoleWorld 智能分辨率] 显式 guest portrait 逻辑屏覆盖:CLI `--logical-size` 优先,其次
-/// env `MOLE_GUEST_PORTRAIT=WxH`(portrait 点尺寸,仅解析一次)。
+/// [MoleWorld 智能分辨率] 显式 guest portrait 逻辑屏覆盖:只认 CLI `--logical-size`。
+/// [2026-09-16] B-06 删掉了分辨率实验期留下的环境变量入口:它早被 --logical-size 收编(CLI 优先),
+/// 启动器、安卓、iOS 入口都不用它,留着只是一个能绕过启动器参数改 guest 逻辑屏的隐藏旋钮。
 fn guest_portrait_override() -> Option<(u32, u32)> {
-    if let Some(&sz) = CLI_PORTRAIT.get() {
-        return Some(sz);
-    }
-    static OVERRIDE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        let s = std::env::var("MOLE_GUEST_PORTRAIT").ok()?;
-        let (w, h) = s.split_once('x')?;
-        let w: u32 = w.trim().parse().ok()?;
-        let h: u32 = h.trim().parse().ok()?;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        log!(
-            "[MOLE-RES] guest 逻辑屏覆盖 MOLE_GUEST_PORTRAIT={}x{}(landscape={}x{})",
-            w,
-            h,
-            h,
-            w
-        );
-        Some((w, h))
-    })
+    CLI_PORTRAIT.get().copied()
 }
 
-/// [MoleWorld 智能分辨率] 是否请求自动铺屏适配(--fill-screen 或 MOLE_FILL=1)。
+/// [MoleWorld 智能分辨率] 是否请求自动铺屏适配(只认 CLI `--fill-screen`)。
+/// [2026-09-16] B-06 同上,删掉了等价的环境变量入口。
 fn fill_screen_requested() -> bool {
     CLI_FILL_SCREEN.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("MOLE_FILL").map(|v| v != "0").unwrap_or(false)
 }
 
 /// [MoleWorld 智能分辨率] 自动适配时 guest landscape 宽高比上限。默认 2.4(≈21.6:9,覆盖
@@ -170,7 +151,7 @@ fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
     (base_short, landscape_long)
 }
 
-/// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size/env,或自动 fill 已算出)。
+/// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size,或 --fill-screen 已自动算出)。
 /// [Window::viewport] 据此:定制时走【等比缩放】(不变形,且 guest 比例≈屏比例故无黑边);默认
 /// (无定制)保持窗口模式自由拉伸铺满(零回归)。
 fn custom_guest_size_active() -> bool {
@@ -593,11 +574,11 @@ impl Window {
         apply_cli_resolution(options.logical_size, options.fill_screen, options.max_aspect);
         set_ambient_fill(options.ambient_fill);
 
-        // [MoleWorld 智能分辨率] --fill-screen / MOLE_FILL:按目标屏(主显示器/真机设备屏)宽高比
+        // [MoleWorld 智能分辨率] --fill-screen:按目标屏(主显示器/真机设备屏)宽高比
         // 【自动】算 guest 逻辑屏,实现"物理满屏不黑边、不拉伸"——guest winSize 与屏幕同比例(钳制后)
         // → 世界场景(村庄/岛)扩视野铺满 + winSize 相对 UI 自动重锚,无 letterbox。短边按 device-family
         // 固定(iPad=768/iPhone=320),长边按屏宽高比缩放并夹在 [4:3, max_aspect](见 compute_fill_portrait)。
-        // 仅当未显式指定 guest 逻辑屏(--logical-size / MOLE_GUEST_PORTRAIT)时生效(显式优先)。结果存
+        // 仅当未显式指定 guest 逻辑屏(--logical-size)时生效(显式优先)。结果存
         // AUTO_PORTRAIT,供 portrait_size(ui_screen bounds + 窗口尺寸都走它)读取。默认(不请求)零回归。
         if fill_screen_requested() && guest_portrait_override().is_none() {
             if let Ok(db) = video_ctx.display_bounds(0) {
@@ -771,7 +752,9 @@ impl Window {
         }
         window.default_framebuffer = window_default_fbo;
         window.default_renderbuffer = window_default_rbo;
-        log!("[ios-present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
+        // [2026-09-16] B-08 前缀从 [ios-present] 改成 [present]:这行没有 cfg 门控,全平台都打(桌面/安卓值为 0),
+        // 不是 iOS 专属;仍保留这一行,因为排查 iOS 真机 present 黑屏要看这个非 0 的默认 FBO。
+        log!("[present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
         window.internal_gl_ins = Some(gl_ins);
 
         if window.splash_image.is_some() {
@@ -2375,7 +2358,7 @@ impl Window {
         // [MoleWorld] 「自由铺满」分支(返回整个 drawable,无 letterbox):
         //   (a) 窗口模式 + 无定制 guest 逻辑屏 = 旧默认「自由调节适配屏幕拉伸」,drawable==app 原生
         //       尺寸时逐字节等同旧行为 → 零回归;
-        //   (b) ★有定制 guest 逻辑屏时(--fill-screen / --logical-size / MOLE_FILL / MOLE_GUEST_PORTRAIT)
+        //   (b) ★有定制 guest 逻辑屏时(--fill-screen / --logical-size)
         //       也走这里【无条件铺满、绝不 letterbox】——因为窗口已被 resize 事件钉死在 guest 比例
         //       (见 poll_for_events 的 E::Window 分支,custom_guest_size_active() 触发锁比例),且 fullscreen
         //       下 --fill-screen 的 guest 比例=屏比例 → 铺满即等比、不变形、【永远无黑边(连拖拽瞬间都不闪)】。

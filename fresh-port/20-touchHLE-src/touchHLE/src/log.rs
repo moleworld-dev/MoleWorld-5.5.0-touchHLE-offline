@@ -6,7 +6,8 @@
 //! Logging and terminal output macros.
 
 use std::fs::File;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
 /// Get a handle to the log file. This is only for use by logging macros!
 ///
@@ -42,9 +43,16 @@ macro_rules! log_no_panic {
 /// Like [log], but prints the message only if debugging is enabled for the
 /// module where it is used. This can be used for verbose things only needed
 /// when debugging.
+///
+/// [2026-09-16] A1-03 除了编译期常量表 `ENABLED_MODULES`,还能在运行时打开:环境变量
+/// `TOUCHHLE_LOG_MODULES` 或选项 `--log-modules=`(见 `init_dbg_modules`)。objc_msgSend 热路径上
+/// 每条消息都会走到这里,所以运行时表没开时只多读一次原子量 `DBG_ANY` 就短路,不做字符串比较。
 macro_rules! log_dbg {
     ($($arg:tt)+) => {
-        if $crate::log::ENABLED_MODULES.contains(&module_path!()) {
+        if $crate::log::ENABLED_MODULES.contains(&module_path!())
+            || ($crate::log::DBG_ANY.load(::std::sync::atomic::Ordering::Relaxed)
+                && $crate::log::dbg_enabled(module_path!()))
+        {
             log!($($arg)*);
         }
     }
@@ -120,3 +128,46 @@ macro_rules! echo_no_panic {
 /// Put modules to enable [log_dbg] for here, e.g. "touchHLE::mem" to see when
 /// memory is allocated and freed.
 pub const ENABLED_MODULES: &[&str] = &[];
+
+/// [2026-09-16] A1-03 运行时 log_dbg! 总开关:只有 `init_dbg_modules` 装进了非空模块表才置真。
+/// 单独留一个原子量,是为了让默认关闭时的判断只读这一个值就短路,不去碰 OnceLock 和字符串表。
+pub static DBG_ANY: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-16] A1-03 运行时打开 log_dbg! 的模块前缀表(如 `touchHLE::mole_cheats`)。
+/// 启动时由 `init_dbg_modules` 写入一次,之后只读。
+pub static DBG_MODULES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// [2026-09-16] A1-03 模块是否在运行时模块表里。按前缀匹配,这样 `touchHLE::mole_` 能一次打开所有
+/// mole_* 模块。log_dbg! 只在 `DBG_ANY` 为真时才调用它。
+pub fn dbg_enabled(module: &str) -> bool {
+    DBG_MODULES
+        .get()
+        .is_some_and(|list| list.iter().any(|prefix| module.starts_with(prefix.as_str())))
+}
+
+/// [2026-09-16] A1-03 初始化运行时 log_dbg! 模块表,整个进程只调用一次(lib.rs 在全部选项应用完之后)。
+/// 两个来源合并生效,都是逗号分隔的模块路径前缀:
+/// - 环境变量 `TOUCHHLE_LOG_MODULES`:桌面上临时排查最方便;
+/// - 选项 `--log-modules=`:能写进 touchHLE_options.txt,安卓 / iOS 设不了环境变量时靠它。
+///
+/// ★不要对 `touchHLE::objc::messages` 整模块打开(或 `touchHLE::objc` 这类覆盖它的前缀):
+/// 每条 Objective-C 消息都会打一行,日志暴涨、帧率骤降。
+pub fn init_dbg_modules(from_options: &[String]) {
+    let from_env = std::env::var("TOUCHHLE_LOG_MODULES").unwrap_or_default();
+    let mut list: Vec<String> = from_env
+        .split(',')
+        .chain(from_options.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    list.sort();
+    list.dedup();
+    if list.is_empty() {
+        return;
+    }
+    log!("运行时打开 log_dbg! 的模块前缀:{}", list.join(", "));
+    if DBG_MODULES.set(list).is_ok() {
+        DBG_ANY.store(true, Ordering::Relaxed);
+    }
+}

@@ -184,8 +184,9 @@ pub fn ios_entry() {
 
     // [扫描修 2026-09-15] iOS 黑屏脚手架拆除(present.rs 里的 4 个真修复保留不动)。
     // 这里曾有两类临时改动,都已删除,勿复活:
-    //  ① 分辨率实验三件套(MOLE_FILL / MOLE_HIDPI / --scale-hack=2):把 guest 逻辑屏改成与物理屏
-    //     不匹配的尺寸,dump 出现精确对半黑白,早已注释停用;现在固定用 device-family=ipad 原生尺寸基底。
+    //  ① 分辨率实验三件套(用 set_var 强开的铺屏环境变量 / MOLE_HIDPI / --scale-hack=2):把 guest 逻辑屏改成
+    //     与物理屏不匹配的尺寸,dump 出现精确对半黑白,早已注释停用。[2026-09-16] B-06 铺屏的环境变量入口已从
+    //     window.rs 删除;现在只由下面的 --fill-screen 按真机屏比算逻辑屏,尺寸与屏幕一致,不是当年的错配。
     //  ② 强开 MOLE_DIAG:每帧 glReadPixels 截帧,在真机 TBDR GPU 上会 resolve+discard 掉随后
     //     presentRenderbuffer 要呈现的 renderbuffer → 屏幕黑(见 mole_diag.rs diag_enabled 的注释),
     //     是真机黑屏元凶之一。桌面截帧仍由外部环境变量 MOLE_DIAG=1 开启,不受影响。
@@ -256,9 +257,11 @@ unsafe extern "system" fn native_exception_filter(
         .append(true)
         .open(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
     {
+        // [2026-09-16] B-08 文案里的定位标记要与日志里实际输出的一致:早期的 [marker] 已被
+        // mole_sysinfo::milestone 输出的 [足迹] 取代,并补上 environment.rs 加载主程序前后的 [boot]。
         let _ = writeln!(
             f,
-            "FATAL native exception 0x{:08X} ({}) at 0x{:016X} — 崩溃点见上方最后一条 [marker]/[splash]/[appframe] 日志",
+            "FATAL native exception 0x{:08X} ({}) at 0x{:016X} — 崩溃点见上方最后一条 [足迹]/[boot]/[splash]/[appframe] 日志",
             code, kind, addr
         );
         let _ = f.flush();
@@ -539,6 +542,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
     }
+
+    // [2026-09-16] A1-03 选项文件和命令行都应用完了才初始化运行时 log_dbg! 模块表:--log-modules 可能写在
+    // touchHLE_options.txt 里(安卓 / iOS 只有这个入口),更早初始化会漏掉它。
+    crate::log::init_dbg_modules(&options.log_modules);
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())

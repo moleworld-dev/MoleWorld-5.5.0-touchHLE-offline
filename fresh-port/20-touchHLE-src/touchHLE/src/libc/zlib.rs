@@ -140,8 +140,10 @@ fn inflate(env: &mut Environment, strm: MutPtr<u8>, _flush: i32) -> i32 {
             st.started = true;
             match inflate_all(&input, st.window_bits) {
                 Some(out) => {
-                    log!(
-                        "[MOLECHEAT] inflate: {} bytes in -> {} bytes out (windowBits={})",
+                    // [2026-09-16] B-03 成功行降为 log_dbg!:每个流都打一行,读档、进岛、联网收包时反复出现,
+                    // 平时没有排查价值。去掉 [MOLECHEAT] 前缀:这里是引擎 libc 层,不是游戏作弊层。
+                    log_dbg!(
+                        "inflate: {} bytes in -> {} bytes out (windowBits={})",
                         input.len(),
                         out.len(),
                         st.window_bits
@@ -149,7 +151,8 @@ fn inflate(env: &mut Environment, strm: MutPtr<u8>, _flush: i32) -> i32 {
                     st.out = out;
                 }
                 None => {
-                    log!("[MOLECHEAT] inflate: FAILED to decompress {} bytes", input.len());
+                    // 解压失败是错误路径,照常打印。
+                    log!("inflate: FAILED to decompress {} bytes", input.len());
                     return Z_DATA_ERROR;
                 }
             }
@@ -317,8 +320,10 @@ fn deflate(env: &mut Environment, strm: MutPtr<u8>, _flush: i32) -> i32 {
         if !st.started {
             st.started = true;
             let out = deflate_all(&input, st.window_bits, st.level);
-            log!(
-                "[MOLECHEAT] deflate: {} bytes in -> {} bytes out (windowBits={})",
+            // [2026-09-16] B-03 同 inflate:成功行降为 log_dbg!、去掉 [MOLECHEAT] 前缀。联网时游戏约每 30 秒
+            // 经 gzipDeflate 压一次地图上传,这一行会把 F10-6 已经降噪的上传日志又刷回来。
+            log_dbg!(
+                "deflate: {} bytes in -> {} bytes out (windowBits={})",
                 input.len(),
                 out.len(),
                 st.window_bits
