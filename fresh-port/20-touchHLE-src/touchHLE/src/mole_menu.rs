@@ -88,7 +88,8 @@ pub enum Action {
     SetAvatar(i32),
     /// `[[GameData sharedInstance] <sel>:val]` then save (e.g. setRewardTickets:).
     GameDataSetInt(&'static str, i32),
-    /// Mature + harvest every Farm via `ObjectManager.farms` -> cropMatureHandler.
+    /// 一键收获全部:已成熟的地块走原版 -[WrapperManager harvestOnekey:] 真收获,生长中的只催熟,空地/枯萎地跳过,岛会话中拒绝。
+    /// [2026-09-16] G-03 以前对每块地发 cropMatureHandler,只挂收获旗、不收获,详见 harvest_all。
     HarvestAll,
     /// Open the Golden Island (Caribbean) activity offline: enable the fix,
     /// build+set its data, create the layer and force `displayUI`.
@@ -414,16 +415,19 @@ fn pages() -> Vec<Page> {
                 ("关反作弊检测", ToggleCheat("kill_anticheat")),
                 ("作物瞬熟", ToggleCheat("instant_crop")),
                 ("永不枯萎", ToggleCheat("no_wither")),
-                ("冷却归零", ToggleCheat("no_cooldown")),
-                ("建筑瞬完成", ToggleCheat("instant_build")),
-                ("工人房间补满", ToggleCheat("max_facility")),
+                // [2026-09-16] G-07 标签注明作用范围:冷却归零/建筑瞬完成/任务秒完成已补上黄金岛与日常、VIP 任务的同名方法;
+                // 工人房间补满在岛上不做(全局拦岛上工人 getter 会把 99 写进岛档),只管主村。按钮位置与开关键名不变。
+                ("冷却归零(主村+黄金岛)", ToggleCheat("no_cooldown")),
+                ("建筑瞬完成(主村+黄金岛)", ToggleCheat("instant_build")),
+                ("工人房间补满(仅主村)", ToggleCheat("max_facility")),
                 ("产出×10(收菜)", ToggleCheat("harvest_mult")),
-                ("任务秒完成免费", ToggleCheat("free_quest")),
+                ("任务秒完成免费(主村+黄金岛)", ToggleCheat("free_quest")),
                 ("小游戏奖励满", ToggleCheat("minigame_reward")),
                 ("海底寻宝必中稀有", ToggleCheat("seabed_best")),
                 ("等级", LevelInc),
                 ("全物品解锁", ToggleCheat("all_unlock")),
-                ("全成就通过", ToggleCheat("all_achieve")),
+                // [2026-09-16] G-05 开关只让成就面板显示全亮,不再挡住真实成就判定,也不会发奖;标签照实说明。开关键名不变。
+                ("成就面板全亮(仅显示,不发奖)", ToggleCheat("all_achieve")),
                 ("魔法密码任意过", ToggleCheat("magic_bypass")),
                 ("头像 = 1", SetAvatar(1)),
                 ("头像 = 10", SetAvatar(10)),
@@ -1576,36 +1580,112 @@ fn mini_game(env: &mut Environment, id_: i32) {
     log!("[MOLEMENU] startMiniGame {}", id_);
 }
 
-/// Mature + harvest every farm. `ObjectManager.farms` is the game's own farm
-/// collection (cleaner than the tweak's injected gFarmTable). Each Farm gets
-/// `cropMatureHandler` (the matured-crop event → reward). Safe if `farms` is
-/// nil or not index-able (objectAtIndex: just no-ops to nil → skipped).
+/// 一键收获全部。`ObjectManager.farms` 是游戏自己的地块数组(比 tweak 注入的 gFarmTable 干净)。
+/// [2026-09-16] G-03 改成「已成熟的真收获、生长中的只催熟、空地和枯萎地跳过、岛会话中拒绝」。
+/// 以前对每一项发 cropMatureHandler:-[Farm cropMatureHandler]@0x4a030 只写 cropStage_=4、[ActorManager releaseActor:]、
+/// 挂 AlarmFlag 收获旗,没有任何发奖,也不看地块状态,空地和枯萎地一样挂旗;beginTime 没改,重进游戏又变回生长中。
+/// 现在按 farmState_(+376)/cropStage_(+368) 分三类(偏移由 mole_cheats::farm_state_stage 从 ivar 槽现读):
+///   · 已成熟(farmState_==4 且 cropStage_==4):走原版一键收获入口 -[WrapperManager harvestOnekey:]@0x38fb98。它判断
+///     FlowerFarm/FruitFarm 之后一律 [farm harvest:YES](0x38fc04,YES=不逐块播收获音效)。-[Farm harvest:]@0x49a44 自己再判一次
+///     cropStage_==4(0x49a60),然后做成就/任务判定、showOutGoldXP: 发金币经验、优惠券掉落,最后 [self reset];
+///     -[Farm reset]@0x482b0 只清地块自身状态,不把地块移出 farms 数组,所以按下标遍历安全。
+///   · 生长中(farmState_==4 且 cropStage_!=4):只调 mole_cheats::farm_instant_mature_at 把 beginTime 拨到刚过成熟点,
+///     由原版 -[Farm innerupdate:] 下一拍自己走成熟流程挂旗(不直接发 cropMatureHandler),toast 提示稍后再点一次收获。
+///   · 其它(farmState_!=4:空地、枯萎地等):跳过。
+/// island_session_active() 为真,或 curSceneId 不等于 1(在线进岛、切场景过场)时直接拒绝:岛上没有农田,
+/// 岛会话里 ObjectManager.farms 指向什么未核实,不去碰。
+/// 只在菜单点击事件里执行(不在 drawScene/mainLoop 帧栈上);发消息前快照寄存器,结束后恢复 r0–r3。
 fn harvest_all(env: &mut Environment) {
+    if crate::mole_cheats::island_session_active() {
+        log!("[MOLEMENU] 一键收获全部:岛会话中,拒绝");
+        set_toast("「一键收获全部」只在主村可用,请先回主村".to_string());
+        return;
+    }
+    let saved = *env.cpu.regs();
+    // [2026-09-16] G-03 复审修:只看 island_session_active() 不够。那几个标志只由离线进岛钩子置位,在线模式
+    // (--allow-network-access)下离线岛总闸被强制关闭,在线进岛走私服 1062 原版路径,标志恒为 false,
+    // 岛上点这个按钮会对岛场景下的 ObjectManager.farms 逐个发 harvest:。与召唤 TestLayer 同一口径再判一次
+    // curSceneId:不等于 1(10 = 黄金岛,2 = 切场景过场,-1 = 单例还没建)一律拒绝。cur_scene_id 会发宿主消息,
+    // 放在快照之后,拒绝路径同样恢复 r0–r3。
+    let cur = cur_scene_id(env);
+    if cur != 1 {
+        env.cpu.regs_mut()[0..4].copy_from_slice(&saved[0..4]);
+        log!("[MOLEMENU] 一键收获全部:curSceneId={},不在主村,拒绝", cur);
+        set_toast("「一键收获全部」只在主村可用,请先回主村".to_string());
+        return;
+    }
+    let text = harvest_farms(env);
+    env.cpu.regs_mut()[0..4].copy_from_slice(&saved[0..4]);
+    set_toast(text);
+}
+
+/// [2026-09-16] G-03 harvest_all 的主体,返回给玩家看的 toast 文案。
+fn harvest_farms(env: &mut Environment) -> String {
     let om = game_singleton(env, "ObjectManager", "sharedManager");
     if om == nil {
         log!("[MOLEMENU] ObjectManager == nil");
-        return;
+        return "一键收获全部:还没进村,找不到农田".to_string();
     }
     let farms_sel = sel(env, "farms");
     let farms: id = msg_send(env, (om, farms_sel));
     if farms == nil {
         log!("[MOLEMENU] ObjectManager.farms == nil");
-        return;
+        return "一键收获全部:还没进村,找不到农田".to_string();
+    }
+    let wm = game_singleton(env, "WrapperManager", "sharedManager");
+    if wm == nil {
+        log!("[MOLEMENU] WrapperManager == nil");
+        return "一键收获全部:WrapperManager 还没初始化,什么都没做".to_string();
     }
     let count_sel = sel(env, "count");
     let count: u32 = msg_send(env, (farms, count_sel));
     let obj_at = sel(env, "objectAtIndex:");
-    let handler = sel(env, "cropMatureHandler");
-    let mut done = 0u32;
+    let harvest_onekey = sel(env, "harvestOnekey:");
+    let mut harvested = 0u32;
+    let mut ripening = 0u32;
+    let mut skipped = 0u32;
     for i in 0..count {
         let farm: id = msg_send(env, (farms, obj_at, i));
-        if farm != nil {
-            let _: () = msg_send(env, (farm, handler));
-            done += 1;
+        if farm == nil {
+            skipped += 1;
+            continue;
+        }
+        match crate::mole_cheats::farm_state_stage(env, farm.to_bits()) {
+            Some((4, 4)) => {
+                let _: () = msg_send(env, (wm, harvest_onekey, farm));
+                harvested += 1;
+            }
+            Some((4, _)) => {
+                if crate::mole_cheats::farm_instant_mature_at(env, farm.to_bits()) {
+                    ripening += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            _ => skipped += 1,
         }
     }
-    save_user_info(env);
-    log!("[MOLEMENU] harvested {} / {} farms", done, count);
+    if harvested > 0 {
+        save_user_info(env);
+    }
+    log!(
+        "[MOLEMENU] 一键收获全部:共 {} 块地,收获 {},催熟 {},跳过 {}",
+        count,
+        harvested,
+        ripening,
+        skipped
+    );
+    if ripening > 0 {
+        format!(
+            "一键收获:收获 {} 块,催熟 {} 块(稍后再点一次收获),跳过 {} 块(空地/枯萎)",
+            harvested, ripening, skipped
+        )
+    } else {
+        format!(
+            "一键收获:收获 {} 块,跳过 {} 块(空地/枯萎)",
+            harvested, skipped
+        )
+    }
 }
 
 /// Open the Golden Island (加勒比寻宝) activity offline. Directly summoning the

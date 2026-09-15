@@ -75,15 +75,19 @@ static INSTANT_CROP: AtomicBool = AtomicBool::new(false);
 static NO_WITHER: AtomicBool = AtomicBool::new(false);
 static NO_COOLDOWN: AtomicBool = AtomicBool::new(false);
 static INSTANT_BUILD: AtomicBool = AtomicBool::new(false);
-/// 工人/空闲工人/房间数 getter 恒返回 99(收菜建造不卡人力/容量)。
+/// 主村工人/空闲工人/房间数 getter 恒返回 99(收菜建造不卡人力/容量)。
+/// [2026-09-16] G-07 只管主村 UserInfoData,岛上不做(见 intercept 里的说明)。
 static MAX_FACILITY: AtomicBool = AtomicBool::new(false);
 /// 收菜结算建筑加成倍率 getter 恒返回 1000(=10倍经验/金币,走原生管线无溢出)。
 static HARVEST_MULT: AtomicBool = AtomicBool::new(false);
 /// 任务/催熟所需贝壳数 → 0(秒完成免费)。
+/// [2026-09-16] G-07 覆盖主线/限时/黄金岛/日常/VIP 任务(Quest/TimeQuest/NewSceneQuest/DailyQuest/VipQuest)。
 static FREE_QUEST: AtomicBool = AtomicBool::new(false);
 /// 海底寻宝必中稀有:generateRandomRewardId 恒返回最稀档 id(roll6-10 档 = 31169)。
 static SEABED_BEST: AtomicBool = AtomicBool::new(false);
-/// 小游戏奖励满:钓鱼/挖矿 getRewardCoin:/getRewardXp: 恒返回大值(类方法 hook)。
+/// 小游戏奖励满。
+/// [2026-09-16] A2-03+G-04 改成在 -[MiniGameManager enterAchivement:] 结算读 gainCoin/gainXP 时放大 10 倍(封顶 99999),
+/// 对所有经这个结算点入账的小游戏生效;原来钩的 getRewardCoin:/getRewardXp: 已删。
 static MINIGAME_REWARD: AtomicBool = AtomicBool::new(false);
 /// VIP level reported while force_vip is on (cycled 1..=VIP_LEVEL_MAX by the menu).
 static VIP_LEVEL: AtomicI32 = AtomicI32::new(VIP_LEVEL_MAX);
@@ -92,7 +96,8 @@ static VIP_LEVEL: AtomicI32 = AtomicI32::new(VIP_LEVEL_MAX);
 static FORCE_LEVEL: AtomicI32 = AtomicI32::new(0);
 /// All shop / collection items reported as unlocked.
 static ALL_UNLOCK: AtomicBool = AtomicBool::new(false);
-/// All achievements reported as already in the unlocked list.
+/// 成就面板全亮:只让 -[AchievementItems unlocked:] 返回 YES(纯显示)。
+/// [2026-09-16] G-05 不再拦 checkInAlreadyUnlockList:,真实成就判定、记录与发奖照常进行。
 static ALL_ACHIEVE: AtomicBool = AtomicBool::new(false);
 /// Tripped when a save field that should be an NSDictionary
 /// (UserInfoData.achieveUnlock / attributeValue, or mapData) decoded as an
@@ -2236,47 +2241,76 @@ fn cf_fix_residue(v: f64, now_cf: f64) -> Option<f64> {
 /// 已成熟,之后按原版计时枯萎(与"瞬熟"语义一致)。
 fn farm_instant_mature(env: &mut Environment) {
     let recv = env.cpu.regs()[0];
-    if recv == 0 {
-        return;
-    }
+    // [2026-09-16] G-03 主体拆成单地块接口 farm_instant_mature_at(菜单「一键收获全部」共用),钩子行为不变。
+    let _ = farm_instant_mature_at(env, recv);
+}
+
+/// [2026-09-16] G-03 Farm 相关 ivar 偏移 [beginTime, farmState_, cropStage_, matureTime, witherTime],从 guest 的 _OBJC_IVAR 槽现读
+/// (兼容 touchHLE 非脆弱 ivar 修正写回)。原样从 farm_instant_mature 里抽出来给钩子和菜单共用;槽内容不符或偏移越界返回 None。
+fn farm_ivar_offsets(env: &Environment) -> Option<[u32; 5]> {
     // __nl_symbol_ptr 0x9c8064 静态绑定到 _OBJC_IVAR_$_Object.beginTime(0xb03358);不符说明二进制不对,直接放弃。
     let begin_slot: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0x9c8064));
     if begin_slot != 0xb03358 {
-        return;
+        return None;
     }
-    let off_begin: u32 = env.mem.read(ConstPtr::<u32>::from_bits(begin_slot));
-    let off_state: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb033e0));
-    let off_stage: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb033d8));
-    let off_mature: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb033d0));
-    let off_wither: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb033d4));
+    let offs: [u32; 5] = [
+        env.mem.read(ConstPtr::<u32>::from_bits(begin_slot)),
+        env.mem.read(ConstPtr::<u32>::from_bits(0xb033e0)),
+        env.mem.read(ConstPtr::<u32>::from_bits(0xb033d8)),
+        env.mem.read(ConstPtr::<u32>::from_bits(0xb033d0)),
+        env.mem.read(ConstPtr::<u32>::from_bits(0xb033d4)),
+    ];
     // Farm instanceSize=404;偏移越界说明槽没按预期初始化,放弃(宁可不瞬熟也不乱写内存)。
-    if [off_begin, off_state, off_stage, off_mature, off_wither]
-        .iter()
-        .any(|&o| o == 0 || o >= 0x1000)
-    {
-        return;
+    if offs.iter().any(|&o| o == 0 || o >= 0x1000) {
+        return None;
     }
+    Some(offs)
+}
+
+/// [2026-09-16] G-03 读地块的 (farmState_, cropStage_),菜单「一键收获全部」据此分类。只读内存、不发消息;偏移读不到返回 None。
+pub(crate) fn farm_state_stage(env: &Environment, recv: u32) -> Option<(i32, i32)> {
+    if recv == 0 {
+        return None;
+    }
+    let [_, off_state, off_stage, _, _] = farm_ivar_offsets(env)?;
+    let state: i32 = env.mem.read(ConstPtr::<i32>::from_bits(recv + off_state));
+    let stage: i32 = env.mem.read(ConstPtr::<i32>::from_bits(recv + off_stage));
+    Some((state, stage))
+}
+
+/// [2026-09-16] G-03 单地块「作物瞬熟」,算法与原 farm_instant_mature 逐行相同(说明见上)。
+/// 返回 true = 这块地生长中、未成熟,且 beginTime 已在成熟点之前(本来就过了,或刚拨过去),下一次 innerupdate: 就会成熟;
+/// 返回 false = 不是生长中、已成熟、偏移或时长异常,什么都没写。
+pub(crate) fn farm_instant_mature_at(env: &mut Environment, recv: u32) -> bool {
+    if recv == 0 {
+        return false;
+    }
+    let Some([off_begin, off_state, off_stage, off_mature, off_wither]) = farm_ivar_offsets(env)
+    else {
+        return false;
+    };
     let state: i32 = env.mem.read(ConstPtr::<i32>::from_bits(recv + off_state));
     if state != 4 {
-        return; // 非生长中:真方法自己 unschedule,不关我们的事
+        return false; // 非生长中:真方法自己 unschedule,不关我们的事
     }
     let stage: i32 = env.mem.read(ConstPtr::<i32>::from_bits(recv + off_stage));
     if stage == 4 {
-        return; // 已成熟
+        return false; // 已成熟
     }
     let mature: f32 = env.mem.read(ConstPtr::<f32>::from_bits(recv + off_mature));
     let wither: f32 = env.mem.read(ConstPtr::<f32>::from_bits(recv + off_wither));
     if !(mature > 0.0) || !(wither > 2.0) {
-        return;
+        return false;
     }
     let begin_ptr: MutPtr<f64> = Ptr::from_bits(recv + off_begin);
     let begin: f64 = env.mem.read(begin_ptr);
     // now_cf_secs 与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源(SystemTime::now + 时间旅行偏移,见 F7-5),真方法紧接着取的 now 只会≥它。
     let target = now_cf_secs() - mature as f64 - 0.5;
     if begin <= target {
-        return; // 本来就已过成熟点,交给原版
+        return true; // 本来就已过成熟点,交给原版
     }
     env.mem.write(begin_ptr, target);
+    true
 }
 
 fn island_sel(env: &mut Environment, name: &str) -> SEL {
@@ -4080,6 +4114,16 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         || (sel == "winSize" && WINSIZE_STALE.load(O))
         // [2026-09-16] 宽屏宽版底图锚点对齐(不依赖 UI43;is_widescreen() 只读两个 OnceLock)。
         || (sel == "addChild:z:tag:" && crate::window::is_widescreen())
+        // [2026-09-16] G-07 / A2-03+G-04 作弊开关新增臂的粗筛,按 F10-2「受开关门控的 sel」写法:只在对应开关开着时放行这几个选择子。
+        //   没把 NewSceneQuest/DailyQuest/VipQuest/NewSceneShop/Bridge/Ladder/SpacialObject/YellowDuck、CutFruit/BugGame/Plow/WashRoomGame
+        //   加进上面的 CLASSES:那样开关关着时,这些类的每条消息(地图对象每帧的 innerupdate:/visit、小游戏每帧的更新)也要 to_string 两次、
+        //   走完整条比较链,还会被 mole_dev/mole_items/mole_activity 的子拦截看到,改变现有路由。门控写法下关着时只多几次原子读。
+        //   臂本身仍按类名精确匹配(小游戏按调用点 LR 匹配),别的类的同名方法进来只会被放行。
+        //   CLASSES 里的 FishingGame/MinerGame 原本只给已删掉的 getRewardCoin:/getRewardXp: 臂用,现在没有臂再用;保留是为了不改变消息路由。
+        || (FREE_QUEST.load(O) && sel == "shellsNeeded")
+        || (INSTANT_BUILD.load(O) && sel == "getBuildTime:")
+        || (NO_COOLDOWN.load(O) && sel == "getLastCooldownTime")
+        || (MINIGAME_REWARD.load(O) && matches!(sel, "gainCoin" | "gainXP"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -6429,7 +6473,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //   未购买的扩地区域也能盖建筑、还被写回 island_map.dat。排除后这两个类落到下面 `_ => {}`,intercept 返回 false、
                 //   放行真方法:本臂之前没有任何 msg_send,r0(self)/r1(_cmd)原样未动,真方法读 self 正确。
                 //   不改成"类自己实现了 isReachable 就放行":NetworkManager 自己也实现了(imp 0xed2fc),那样会把进岛最关键的门放掉。
-                (c, "isReachable") if c != "NewScenePorter" && c != "Porter" => {
+                // [2026-09-16] E-01 再按调用点排除商店主菜单「免费贝壳」按钮:-[NewStyleStoreMainLayer onItemsMenuSelected:]@0x3b2378
+                //   对 0x11 号菜单项在 0x3b23c0 `blx [NetworkManager isReachable]`(LR=0x3b23c5,带 Thumb 位),为真才在 0x3b23ce 以
+                //   itemid 8 调 onBuyVIPGold:(广告墙「免费贝壳」),为假弹原版 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」。以前岛上
+                //   这里通配成 1,岛上点它会进 SHELLHOOK 白送贝壳并误触发充值副作用,主村却弹离线提示。排除后落到下面 `_ => {}`,放行真
+                //   isReachable(本臂之前没有 msg_send,寄存器未动),岛上与主村一样弹原版离线提示。只精确排除这一个 LR,进岛链上其它门不受影响。
+                (c, "isReachable")
+                    if c != "NewScenePorter" && c != "Porter" && env.cpu.regs()[14] != 0x3b23c5 =>
+                {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
                 }
@@ -6811,6 +6862,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     }
 
     // 工人/房间补满:三个 ivar getter 恒返回 99 → 收菜/建造永不卡人力、房间不卡容量。
+    // [2026-09-16] G-07 只管主村,菜单标签注明「仅主村」。岛上工人走 -[NewSceneUserInfoData curTotalWorkersCount]@0x3239c4,不在这里全局拦:
+    //   save_island_userinfo 用宿主 msg_send 读这个 getter 写进 island_userinfo.dat,读档时再 setCurTotalWorkersCount: 写回,
+    //   恒返回 99 会把 99 永久存进岛档。另外已核实主村有同类问题(本包不改,另记):-[UserInfoData encodeWithCoder:]@0xb9f98
+    //   在 0xba0e2/0xba108/0xba17a 就是经 totalWorkers/availableWorkers/totalRooms 这三个 getter 取值编码的,开着开关时存档,
+    //   99 会写进 userinfo.dat,关掉开关后不会回退。
     if MAX_FACILITY.load(O) {
         match (class, sel) {
             ("UserInfoData", "totalWorkers")
@@ -6837,9 +6893,18 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     }
 
     // 任务秒完成免费:用贝壳立即完成任务/催熟所需的贝壳数 → 0。
+    // [2026-09-16] G-07 补上黄金岛任务 NewSceneQuest、日常任务 DailyQuest、VIP 任务 VipQuest。intercept 拿到的是接收者 isa 的
+    //   精确类名、不沿父类链,而这三个类都不继承 Quest(NewSceneQuest : CCNode,DailyQuest/VipQuest : NSObject),各有自己的
+    //   shellsNeeded(0x32ab40/0x341d48/0x389268,返回 int)。以前只列 Quest/TimeQuest,岛上、日常、VIP 任务面板的「立即完成」
+    //   照样收贝壳。调用者只有各任务层的 updateTimeInfo:/onShellButtonPressed/quickFinish,只读不落盘。
+    //   粗筛走 intercept_wants 末尾的 FREE_QUEST 门控,没把类名加进 CLASSES。
     if FREE_QUEST.load(O) {
         match (class, sel) {
-            ("Quest", "shellsNeeded") | ("TimeQuest", "shellsNeeded") => {
+            ("Quest", "shellsNeeded")
+            | ("TimeQuest", "shellsNeeded")
+            | ("NewSceneQuest", "shellsNeeded")
+            | ("DailyQuest", "shellsNeeded")
+            | ("VipQuest", "shellsNeeded") => {
                 env.cpu.regs_mut()[0] = 0;
                 return true;
             }
@@ -6857,32 +6922,66 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         return true;
     }
 
-    // 小游戏奖励满:钓鱼/挖矿小游戏的发奖 getter(类方法)恒返回大值。
-    if MINIGAME_REWARD.load(O) {
-        match (class, sel) {
-            ("FishingGame", "getRewardCoin:")
-            | ("MinerGame", "getRewardCoin:")
-            | ("MinerGame", "getRewardXp:") => {
-                env.cpu.regs_mut()[0] = 99999;
+    // 小游戏奖励满:在所有小游戏共用的结算点把本局摩尔豆/经验放大。
+    // [2026-09-16] A2-03+G-04 原来钩的是 +[FishingGame getRewardCoin:](0x15e3b4,全二进制零调用)和
+    //   +[MinerGame getRewardCoin:/getRewardXp:](挖矿每块矿石初始化、MinerAchivement 显示也读):结果只有挖矿石变,矿石初始数值还被
+    //   改成 99999;切水果、钓鱼、拍虫子、敲木桩、左左右右完全不变。三个臂已删。
+    //   所有小游戏结算都汇入 -[MiniGameManager enterAchivement:]@0xf4544:0xf458c `[m_curMiniGame gainXP]`、0xf45a2
+    //   `[m_curMiniGame gainCoin]`(继承自 -[MiniBase gainXP]@0xf3234 / gainCoin@0xf3260,返回 int ivar m_gainXP/m_gainCoin),
+    //   写进 m_achivementData,之后 -[Building onMiniGameFinished] 据此 addGold:/addXp: 入账。
+    //   只在 LR 精确等于这两处 blx 的返回地址(0xf4591/0xf45a7,带 Thumb 位)时放大:selref gainCoin 的另一处在
+    //   -[MinerGame caculateReward],DivineGame 走 enterDivineGameAchivement,都不受影响。接收者类名是子类(CutFruit/BugGame/
+    //   Plow/FishingGame/MinerGame/WashRoomGame),ivar 用 object_lookup_ivar 沿父类链按名字查,不写死 +304/+308(兼容非脆弱 ivar
+    //   修正写回)。放大规则:原值 >0 时 ×10、封顶 99999、且不小于原值;用倍数不用定值,是怕一次给太多触发 isHackData 反作弊弹框。
+    //   会与「金币 x10」「经验 x10」叠乘。前置拦截,没发宿主消息,吞掉后自写 r0;查不到 ivar 就放行真 getter。
+    //   粗筛走 intercept_wants 末尾的 MINIGAME_REWARD 门控。
+    if MINIGAME_REWARD.load(O) && (sel == "gainCoin" || sel == "gainXP") {
+        const LR_ENTER_ACHIVEMENT_GAIN_XP: u32 = 0xf4591;
+        const LR_ENTER_ACHIVEMENT_GAIN_COIN: u32 = 0xf45a7;
+        let lr = env.cpu.regs()[14];
+        if lr == LR_ENTER_ACHIVEMENT_GAIN_XP || lr == LR_ENTER_ACHIVEMENT_GAIN_COIN {
+            let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
+            let ivar_name = if sel == "gainCoin" {
+                "m_gainCoin"
+            } else {
+                "m_gainXP"
+            };
+            let slot = env
+                .objc
+                .object_lookup_ivar(&env.mem, recv, &ivar_name.to_string());
+            if let Some(slot) = slot {
+                let raw: u32 = env.mem.read(slot);
+                let orig = raw as i32;
+                let boosted: i32 = if orig > 0 {
+                    orig.saturating_mul(10).min(99999).max(orig)
+                } else {
+                    orig
+                };
+                log!(
+                    "[MOLECHEAT] 小游戏结算放大:{} {} {} → {}",
+                    class,
+                    sel,
+                    orig,
+                    boosted
+                );
+                env.cpu.regs_mut()[0] = boosted as u32;
                 return true;
             }
-            _ => {}
         }
     }
 
     // Achievements shown as already unlocked. ONLY the BOOL "is in the unlocked
     // list" getters — NEVER the void checkAchieve_* methods (wrong signature ->
     // EXC_BAD_ACCESS; the original tweak hit this and backed off).
-    if ALL_ACHIEVE.load(O) {
-        match (class, sel) {
-            ("AchievementControl", "checkInAlreadyUnlockList:")
-            | ("NewSceneAchievement", "checkInAlreadyUnlockList:")
-            | ("AchievementItems", "unlocked:") => {
-                env.cpu.regs_mut()[0] = 1;
-                return true;
-            }
-            _ => {}
-        }
+    // [2026-09-16] G-05 只保留纯显示的 -[AchievementItems unlocked:](唯一调用点 table:cellAtIndex:+0x2a6@0x319bd6)。
+    //   删掉 AchievementControl / NewSceneAchievement 的 checkInAlreadyUnlockList: 两臂:这个选择子的 14 处调用全是判定入口
+    //   (13 个 -[AchievementControl checkAchieve_*],加 -[NewSceneAchievement checkConditions:itemId:]@0x334a74)。以 checkAchieve_ReqLevel
+    //   为例,0x1f551e 调用后返回非 0 就 cbnz 跳过,只有返回 0 才走到 0x1f5538 saveAchieveUnlockData:(记录解锁)和 0x1f5540
+    //   updateInfoToServer。恒返回 1 等于开着开关期间一个新成就都不记录、不发奖,和「全成就」的字面意思正好相反。
+    //   菜单标签同步改成「成就面板全亮(仅显示,不发奖)」。下面的坏档止血臂用同一个选择子,只在 SAVE_HAS_DICT_AS_ARRAY 时生效,保留不动。
+    if ALL_ACHIEVE.load(O) && class == "AchievementItems" && sel == "unlocked:" {
+        env.cpu.regs_mut()[0] = 1;
+        return true;
     }
 
     // 坏档止血(P0:玩家报"批量收菜/快速连收必崩")。某些旧存档因 NSKeyedArchiver 去重
@@ -6976,7 +7075,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             }
         }
     }
-    if INSTANT_BUILD.load(O) && class == "Building" && sel == "getBuildTime:" {
+    // [2026-09-16] G-07 建筑瞬完成补上 NewSceneShop(黄金岛商铺等)、Bridge、Ladder:三者都直接继承 Object、不是 Building 子类,
+    //   各有自己的 getBuildTime:(0x31ecc8/0xd94a0/0xdfd28,与 Building 0xb07c0 同构:build_time × objectCount:type: 转浮点,返回 double)。
+    //   调用点只在各自的 initWithTile:sprite:size:data:(0x31cf74/0xd8668/0xdf0a0)里,所以已经放下的建筑要重进场景才生效。
+    //   CropInfoView getBuildTime: 是信息面板自己的方法,不在此列。粗筛走 intercept_wants 末尾的 INSTANT_BUILD 门控。
+    if INSTANT_BUILD.load(O)
+        && matches!(class, "Building" | "NewSceneShop" | "Bridge" | "Ladder")
+        && sel == "getBuildTime:"
+    {
         ret_double(env, 0.0);
         return true;
     }
@@ -6984,6 +7090,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         match (class, sel) {
             ("Building", "getCurLevelCoolTime")
             | ("Building", "getLastCooldownTime")
+            // [2026-09-16] G-07 特殊装饰 SpacialObject(0x14b154)与小黄鸭 YellowDuck(0x3ac42c)都直接继承 Object,各有自己的
+            //   getLastCooldownTime(取 outputHanlder 的 lastCoolDownTime 时间戳,返回 double),与上面 Building 臂同一语义:
+            //   上次冷却开始时刻 → 0,即早就冷却完。和 Building 臂一样,-[GameData saveMapData:](0x76d58 取这个选择子)会把 0 写进
+            //   map.dat,关掉开关后这批装饰保持已冷却。不加 NewSceneRestaurant getLastCooldownTime:岛餐厅冷却已由下面的
+            //   getOutCoolTime 臂覆盖,再加会经 +[NewGameManager saveTMMapDataFromObject:](0x244382 等)把 0 写进岛档。
+            //   粗筛走 intercept_wants 末尾的 NO_COOLDOWN 门控。
+            | ("SpacialObject", "getLastCooldownTime")
+            | ("YellowDuck", "getLastCooldownTime")
             | ("Building", "getLastGameCoolTime")
             | ("NewSceneRestaurant", "getOutCoolTime")
             | ("MCNpcActor", "getCurLevelCooltime:") => {

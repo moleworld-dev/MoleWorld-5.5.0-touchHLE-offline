@@ -617,8 +617,16 @@ fn objc_msgSend_inner(
             // it a free local purchase: credit shells via
             // -[GameData addVipGoldForBuy:UIUpdate:] (adds to vip_gold + refreshes
             // the HUD) and skip the dead IAP path entirely.
+            // [2026-09-16] E-01 只接管 100_0.dat 里真有的充值档位(shell_pack 查得到的 itemid 1..7)。itemid 8 是广告墙「免费贝壳」格:
+            // onItemsMenuSelected: 在 0x3b23ce 固定传 8,资源页 onButtonBuyItemSelected: 在 _selectedObjectId−1≤7 时也可能传 8。
+            // 以前它落到兜底白送 20 贝壳:岛上(isReachable 被通配成 1)和联机时每点一次送一次,还经 on_shells_purchased 误触发
+            // gamedataFlag|=0x30、解锁 16283/14974 这些「充值成功」副作用;主村离线却弹「没有连接网络」,同一个按钮两种表现。
+            // 现在查不到档位就不进这一臂:条件里只读 r2,不发任何 msg_send,寄存器原样,落到下面的放行分支和真 onBuyVIPGold:。
+            // 原版 0x3b29c4 `cmp r2,#8` → [[WrapperManager sharedManager] checkAdWallAvailable]@0x262274,canShowADForExchange 只由服务器
+            // 1064/1182 回包写入,离线和私服下恒为 NO → 直接收尾,即原版离线的空操作。广告墙类在 classes.rs 里整类伪造,不复活。
             if name == "NewStyleStoreMainLayer"
                 && selector.as_str(&env.mem) == "onBuyVIPGold:"
+                && crate::mole_items::shell_pack(env.cpu.regs()[2]).is_some()
             {
                 // onBuyVIPGold:(int):按原版各档真实贝壳数发放,不再死值 1000。
                 // 必须在任何 msg_send 前读 regs[2],否则被覆盖。
@@ -628,7 +636,8 @@ fn objc_msgSend_inner(
                 // 三个调用方传的都是 itemid:-[NewStyleStoreItemsView onButtonBuyItemSelected:]@0x3bd9c0(_selectedObjectId−1 ≤ 7 才发,
                 // 0 永远到不了这里)、-[DiscountInfoLayer onButtonShop:]@0x1ec46a(goodsId ≤ 7)、onItemsMenuSelected:@0x3b23ce(固定 8)。
                 // 旧代码按下标取 [20,105,…,3500]:每档都多发一档,itemid 7(3500 贝壳档)越界落到兜底只发 20。
-                // 档位表(贝壳数 + 标价)移到 mole_items::SHELL_PACKS,与 VIP 累计共用一份;查不到的参数沿用旧兜底 20 贝壳。
+                // 档位表(贝壳数 + 标价)移到 mole_items::SHELL_PACKS,与 VIP 累计共用一份。
+                // [2026-09-16] E-01 查不到档位的参数已被上面的条件挡在外面,这里 pack 恒为 Some;map_or 的 20 只是避免写 unwrap。
                 let item_id = env.cpu.regs()[2];
                 let pack = crate::mole_items::shell_pack(item_id);
                 let shells = pack.map_or(20, |p| p.shells);
@@ -645,11 +654,11 @@ fn objc_msgSend_inner(
                     let amount: i32 = shells;
                     let do_update: bool = true;
                     let _: () = crate::objc::msg_send(env, (gd, add_sel, amount, do_update));
+                    // [2026-09-16] E-01 去掉「不是充值档位,按旧兜底发放」那半句:这种参数已不会进来。有档位时输出与改动前逐字相同。
                     log!(
-                        "[SHELLHOOK] granted {} shells (pack idx {} = ShopItemData.itemid{}, offline IAP bypass)",
+                        "[SHELLHOOK] granted {} shells (pack idx {} = ShopItemData.itemid, offline IAP bypass)",
                         amount,
-                        item_id,
-                        if pack.is_some() { "" } else { ",不是 100_0.dat 充值档位,按旧兜底发放" }
+                        item_id
                     );
                     // [扫描修 2026-09-15] F2-1:这个钩子吞掉了原版 IAP 流程,原版「充值成功」的副作用
                     // (-[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]@0x7f3bc:gamedataFlag |= 0x20/0x10、
@@ -662,6 +671,16 @@ fn objc_msgSend_inner(
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
+            }
+            // [2026-09-16] E-01 上面没接管的 onBuyVIPGold:(查不到充值档位,即广告墙「免费贝壳」itemid 8):不吞、不发贝壳,
+            // 只记一行日志,然后照常派发真方法(原版离线空操作)。只读寄存器,不发消息。
+            if name == "NewStyleStoreMainLayer"
+                && selector.as_str(&env.mem) == "onBuyVIPGold:"
+            {
+                log!(
+                    "[SHELLHOOK] onBuyVIPGold:{} 不是 100_0.dat 充值档位(广告墙「免费贝壳」),离线/私服下不可用,放行原版:checkAdWallAvailable 为 NO 时什么都不做",
+                    env.cpu.regs()[2]
+                );
             }
             // -[MagicNumberView onButtonYesSelected:]: the "magic number" gate
             // (a secret-content password prompt). With the bypass on, skip the
