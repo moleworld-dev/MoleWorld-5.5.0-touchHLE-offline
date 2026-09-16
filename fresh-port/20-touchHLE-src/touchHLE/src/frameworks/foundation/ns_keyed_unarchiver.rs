@@ -370,15 +370,39 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
         // The most general kind of item: a dictionary that contains the info
         // needed to invoke `initWithCoder:` on a class implementing NSCoding.
         Value::Dictionary(dict) => {
-            let class_key = dict["$class"].as_uid().copied().unwrap();
+            // [2026-09-16 黄金岛审查修] 坏档护栏。上面已为 `key` 做了「UID 越界 → 记日志返 nil」,
+            // 但 `$class` 这一串取值原来全是 unwrap/裸下标:`$class` 缺失或不是 UID、类 UID 越界、
+            // 类条目不是字典、`$classname` 不是字符串 —— 任一条都会 Rust panic 整个模拟器退出。
+            // 而 panic 发生在 `unarchiveObjectWithFile:` 内部,mole_cheats 的坏档隔离(改名 .corrupt
+            // + 置保护位)永远轮不到 → 玩家每次进黄金岛都当场崩,不手删 Documents 里的档就再也进不去。
+            // 全部改成「记一行日志、这个对象解成 nil」,与 `key` 越界同一口径:解出的对象图少一个条目,
+            // 上层的 `dict == nil` / 字段缺失分支能正常走到坏档隔离。
+            let Some(class_key) = dict.get("$class").and_then(|v| v.as_uid()).copied() else {
+                log!("[!] NSKeyedUnarchiver: UID {} 的条目缺 $class 或它不是 UID(坏档?)— 返回 nil", key.get());
+                return nil;
+            };
+            if class_key.get() as usize >= host_obj.already_unarchived.len() {
+                log!(
+                    "[!] NSKeyedUnarchiver: $class UID {} 超出 $objects 范围({} 项,坏档?)— 返回 nil",
+                    class_key.get(),
+                    host_obj.already_unarchived.len()
+                );
+                return nil;
+            }
             let class;
             if let Some(existing) = host_obj.already_unarchived[class_key.get() as usize] {
                 class = existing;
             } else {
                 let class_dict = &objects[class_key.get() as usize];
-                let class_dict = class_dict.as_dictionary().unwrap();
+                let Some(class_dict) = class_dict.as_dictionary() else {
+                    log!("[!] NSKeyedUnarchiver: $class UID {} 指向的不是字典(坏档?)— 返回 nil", class_key.get());
+                    return nil;
+                };
 
-                let class_name = class_dict["$classname"].as_string().unwrap();
+                let Some(class_name) = class_dict.get("$classname").and_then(|v| v.as_string()) else {
+                    log!("[!] NSKeyedUnarchiver: $class UID {} 的条目缺 $classname 或它不是字符串(坏档?)— 返回 nil", class_key.get());
+                    return nil;
+                };
 
                 class = {
                     // get_known_class needs &mut ObjC, so we can't call it
@@ -655,12 +679,50 @@ pub fn decode_current_number(env: &mut Environment, unarchiver: id) -> id {
     msg![env; num initWithLongLong:zero]
 }
 
+/// [2026-09-16 黄金岛审查修] 坏档护栏:原来这里 `current_key.unwrap()` / `as_dictionary().unwrap()` /
+/// `[key].as_array().unwrap()` / 每个元素 `as_uid().unwrap()` 全会 panic。NS.keys / NS.objects 被改坏
+/// (磁盘坏块、外部工具编辑、旧版非原子写留下的半新半旧内容)就整个模拟器退出,坏档隔离轮不到。
+/// 现在任一环节不符合预期就记一行日志、返回空集合 —— 容器解成空,与「档里本来就是空容器」同构,
+/// 上层的 count==0 / 字段缺失护栏能正常接管。
 fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {
     let host_obj = borrow_host_obj(env, unarchiver);
     let objects = host_obj.plist["$objects"].as_array().unwrap();
-    let item = &objects[host_obj.current_key.unwrap().get() as usize];
-    let keys = item.as_dictionary().unwrap()[key].as_array().unwrap();
-    keys.iter()
-        .map(|value| value.as_uid().copied().unwrap())
-        .collect()
+    let Some(current_key) = host_obj.current_key else {
+        log!("[!] NSKeyedUnarchiver keys_for_key({}): 没有当前解档对象 — 按空集合处理", key);
+        return Vec::new();
+    };
+    let Some(item) = objects.get(current_key.get() as usize) else {
+        log!(
+            "[!] NSKeyedUnarchiver keys_for_key({}): 当前 UID {} 超出 $objects 范围(坏档?)— 按空集合处理",
+            key,
+            current_key.get()
+        );
+        return Vec::new();
+    };
+    let Some(keys) = item
+        .as_dictionary()
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_array())
+    else {
+        log!(
+            "[!] NSKeyedUnarchiver keys_for_key({}): UID {} 的条目不是字典或缺该键/它不是数组(坏档?)— 按空集合处理",
+            key,
+            current_key.get()
+        );
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(keys.len());
+    for value in keys {
+        let Some(uid) = value.as_uid().copied() else {
+            log!(
+                "[!] NSKeyedUnarchiver keys_for_key({}): UID {} 的 {} 数组里有非 UID 元素(坏档?)— 丢弃该元素",
+                key,
+                current_key.get(),
+                key
+            );
+            continue;
+        };
+        out.push(uid);
+    }
+    out
 }
