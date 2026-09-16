@@ -1837,12 +1837,18 @@ fn save_island_userinfo(env: &mut Environment) -> Option<String> {
     }
     let arch_cls = env.objc.get_known_class("NSKeyedArchiver", &mut env.mem);
     if arch_cls == nil {
+        // [2026-09-16 黄金岛审查修] dict 是本函数 island_alloc_init 出来的 +1,四个出口原来全都直接 return,
+        //   于是岛上每 1.5 秒的节拍落盘就泄漏一个 NSMutableDictionary 连同里面约 10 个 NSNumber。
+        release(env, dict);
         return None;
     }
     let arch_s = env
         .objc
         .register_host_selector("archivedDataWithRootObject:".to_string(), &mut env.mem);
     let data: id = msg_send(env, (arch_cls, arch_s, dict));
+    // dict 的最后一次使用就是上面这次归档,归档结果 data 与它无所有权关系 → 这里放掉,
+    // 后面 data==nil / path==nil / 正常写盘三条出口就都平衡了。
+    release(env, dict);
     if data == nil {
         return None;
     }
@@ -1951,13 +1957,24 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
             let _: () = msg_send(env, (ui, s, v));
         }
     }
-    for (setter, key) in [
-        ("setNpcs:", "npcs"),
-        ("setAchieveAlreadyUnlock:", "achieveAlreadyUnlock"),
+    for (setter, key, needs_retain) in [
+        // ★ -[NewSceneUserInfoData setNpcs:]@0x323ac0 是**裸赋值**(`str r2,[r0,r1]; bx lr`,属性
+        //   `T@"NSMutableArray",N,Vnpcs_` 没有 `&`)→ 不 retain。而这里给它的数组是解档出来的、
+        //   只被 NSKeyedUnarchiver 持有;解档器一 dealloc(或它自己的对象表被释放)数组就没了,
+        //   岛上 NPC 数据变野指针。以前不崩只是因为解档器本身泄漏、从来没 dealloc 过——那个泄漏
+        //   现在已修(ns_keyed_unarchiver.rs unarchiveObjectWithData:),这里必须自己补上所有权。
+        //   [2026-09-16 黄金岛审查修]
+        ("setNpcs:", "npcs", true),
+        // -[NewSceneUserInfoData setAchieveAlreadyUnlock:]@0x323ae0 走 _objc_setProperty(属性带 `&`),
+        //   自带 retain,不能再补一次,否则泄漏。
+        ("setAchieveAlreadyUnlock:", "achieveAlreadyUnlock", false),
     ] {
         let k = crate::frameworks::foundation::ns_string::get_static_str(env, key); // [扫描修 2026-09-15] F10-7
         let o: id = msg_send(env, (dict, ofk, k));
         if o != nil {
+            if needs_retain {
+                retain(env, o);
+            }
             let s = env.objc.register_host_selector(setter.to_string(), &mut env.mem);
             let _: () = msg_send(env, (ui, s, o));
         }

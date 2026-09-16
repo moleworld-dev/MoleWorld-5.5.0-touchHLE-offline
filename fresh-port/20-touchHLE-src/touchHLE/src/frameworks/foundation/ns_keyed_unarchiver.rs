@@ -79,11 +79,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     // [2026-09-16] B-03 删掉排查 map.dat 解档时留下的 DIAG 块(先发 length,再对大于 4KB 的档发 count
     // 并打日志),恢复上游写法。只把日志降级不够:那两次 msg_send 仍会每次执行,根对象不是集合时
     // count 还会落进「does not respond」兜底。
-    let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initForReadingWithData:data];
+    // [2026-09-16 黄金岛审查修] 原来 alloc 出来的 unarchiver 从不释放:它的 host object 持有整份 plist
+    // 与 already_unarchived 表(解出来的每一个对象都被它强引用),于是**每解一次档,整张对象图就永久留在内存里**。
+    // 黄金岛每次进岛解四个侧档、主存档每次读档也走这里,长时间游玩会持续堆积。
+    // 注意 initForReadingWithData: 在 data 为 nil 时返回 nil,这条路径也要把 alloc 出来的那份释放掉。
+    // decodeObjectForKey:(见本文件 `- (id)decodeObjectForKey:`)已经代调用方 retain+autorelease 过了,
+    // 所以这里**不再**对 result 追加 autorelease —— 原来那一下是多余的一对,且会让读者误以为它返回 +0。
+    let allocated: id = msg![env; this alloc];
+    let new: id = msg![env; allocated initForReadingWithData:data];
+    if new == nil {
+        release(env, allocated);
+        return nil;
+    }
     let root_key = get_static_str(env, NSKeyedArchiveRootObjectKey);
     let result: id = msg![env; new decodeObjectForKey:root_key];
-    autorelease(env, result)
+    // ★用 autorelease 而不是立即 release:本方法的 `- (())dealloc` 会把 already_unarchived 里
+    //   **每一个**解出来的对象都 release 一遍。立即释放等于让「没被任何父容器 retain 的图成员」
+    //   当场消失,时序比以前提前了一帧;放进自动释放池则把它们的存活窗口保持成和以前完全一样
+    //   (活到本帧池排空),只是不再永久留着。调用方(四个 island_*.dat 的读档)都在同一次宿主
+    //   调用内用完结果,窗口足够。
+    autorelease(env, new);
+    result
 }
 
 // TODO: other init methods.
