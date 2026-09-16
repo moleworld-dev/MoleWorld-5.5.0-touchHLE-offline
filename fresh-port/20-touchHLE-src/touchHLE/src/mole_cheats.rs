@@ -6739,18 +6739,25 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //   =1、门没挡、数据照样加载(count=35),空格子是【渲染/明细】问题不是门。门改动多余
                 //   且疑似把建设庄园推进到会崩的渲染路径,整条移除。(上面那段 currentGameMode 注释为
                 //   历史记录;食材商店若日后真需放行,用 gmdiag 抓到的真 LR 再加。)
-                // ★岛屿可建面积扩大(workflow 实证,方案①低风险):网格其实 47×117 很大,可建区由陆地
-                // tile 表(环岛形≈833格)+ checkCanPut:(0x271051)的水域/海岸禁建门决定。掐这两道门
-                // (NewScenePorter 独有,岛专属)→ 可建区从环岛窄带扩到环带内侧/浅水。仍受 per-tile
-                // property 门约束(不放开),故只在原岛轮廓内放宽、不让纯海可建=零美术穿帮。
-                ("NewScenePorter", "inRectOfAquaticAreaOrNot:") => {
-                    env.cpu.regs_mut()[0] = 0; // 不在水域禁建矩形
-                    return true;
-                }
-                ("NewScenePorter", "checkBeyoundLeftCircleBeach:") => {
-                    env.cpu.regs_mut()[0] = 0; // 未越过左侧海岸圈
-                    return true;
-                }
+                // ★【2026-09-16 黄金岛审查修 I3-03 / I3-05:这两条臂已整体删除】
+                //   原来这里把 -[NewScenePorter inRectOfAquaticAreaOrNot:] 与 checkBeyoundLeftCircleBeach:
+                //   双双顶成 0,写的理由是「岛屿可建面积扩大(低风险)」。两条都查错了:
+                //
+                //   ① inRectOfAquaticAreaOrNot:(I3-03,中)——它不是「禁建门」,是**水上物件的准入门**。
+                //      -[NewScenePorter checkCanPut:]@0x271051 里,type==36(水上物件)走的是「必须在水域矩形内」
+                //      这一支,顶成 0 = 恒「不在水域」= 判定失败。后果:33001-33010 这 11 件水上物件
+                //      (鲸鱼/海豚/灯塔/红枫号/游泳摩尔/莲花灯/水上气垫床/水上浮桌/潜水摩尔/彩色游泳摩尔,
+                //      贵的要 85~100 贝壳)买下来进入放置模式后,拖到岛周任何一片水面确认键都是灰的,
+                //      放不下去;而钱在进入放置模式前就已经扣了,取消不退款 = 纯亏。
+                //      陆地建筑根本不发这个选择子(陆地分支在 0x271264 走 isReachable + checkBeyoundLeftCircleBeach:),
+                //      所以删掉它对陆地可建面积零影响。
+                //
+                //   ② checkBeyoundLeftCircleBeach:(I3-05,低)——这才是陆地边界门。顶成 0 之后建筑可以放到
+                //      岛轮廓之外的空白格/海面上,视觉穿帮,而且会随 island_map.dat 固化,下次进岛还在那儿。
+                //      它同样不带来任何岛内可建收益,保留只剩穿帮。
+                //
+                //   两条臂内都没有宿主 msg_send,r0/r1 原样未动,直接落到下面的 `_ => {}` 放行真方法即可。
+                //   已经放到图外的老档建筑不会被删(loadMapObjects: 照常实例化),只是不能再往外放新的,无需迁移。
                 // 曾有 (_,"archivedDataWithRootObject:") 归 nil 兜底,因把岛会话内自动存档写成 36 字节空壳坏档(下次启动崩)而删除,勿复活。
                 _ => {}
             }
