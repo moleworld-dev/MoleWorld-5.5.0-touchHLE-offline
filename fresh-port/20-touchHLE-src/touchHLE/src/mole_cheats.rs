@@ -169,6 +169,9 @@ static ISLAND_GATE1_HIT: AtomicBool = AtomicBool::new(false);
 static ISLAND_DIRTY: AtomicBool = AtomicBool::new(false);
 /// moleIslandTick 定时器是否在跑(防重复排程)。
 static ISLAND_TICK_RUNNING: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16 黄金岛审查修 I5-01] 岛农场任务 4「雇一只摩尔」的完成信号本次进岛是否已补发(一次性)。
+/// 进岛(loadNewScene:10)时清零,补发成功后置位,避免每拍重发。
+static ISLAND_QUEST4_SENT: AtomicBool = AtomicBool::new(false);
 /// [审计修] 岛存档正在落盘(island_flush 内部会调 saveUserinfoToLocal 等,别让它们反过来置脏形成 1.5s 循环)。
 static ISLAND_FLUSHING: AtomicBool = AtomicBool::new(false);
 /// [审计修] 进岛加载中:[LoadingManager enterLoadingWithDelegate:nextSceneId:10] 起,到 [SceneMannager loadNewScene:10] 止。
@@ -2140,6 +2143,22 @@ fn island_mapdata(env: &mut Environment) -> id {
     msg_send(env, (nsd, md_s))
 }
 
+/// [2026-09-16 黄金岛审查修] 取 [NewSceneData sharedInstance].userInfoDataInNewScene(nil 安全),
+/// 与 island_mapdata 同构。岛上的等级/任务/剧情/工人/建设值都挂在这个对象上。
+fn island_userinfo_data(env: &mut Environment) -> id {
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return nil;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return nil;
+    }
+    let ui_s = island_sel(env, "userInfoDataInNewScene");
+    msg_send(env, (nsd, ui_s))
+}
+
 /// [P2b 经营进度回写] 升级餐厅/雇用公寓/出海等改的是活建筑,游戏把快照喂 setModObjectToServer:
 /// (离线被吞、从不写回 mapData)→ 退岛 archive 的只是进岛初始态、经营进度丢。这里把快照按
 /// objectSequenceId 写回 [NewSceneData mapData][key] 数组(find→replace,无则 add),使 island_map.dat
@@ -2664,6 +2683,62 @@ fn fix_stuck_ships(env: &mut Environment) {
             );
         }
     }
+}
+
+/// [2026-09-16 黄金岛审查修 I5-01] 补发岛农场任务 4 的完成动作 action 13。
+///
+/// **病根**:farmquestHV.dat 的 ID=4(「雇一只摩尔」)既没有 req_*、也没有 cli_step,于是
+/// `-[QuestData initWithDict:needLevel:timeQuest:]`@0x1126e4 给它的 questType_=0、requireThings 为空。
+/// `-[NewSceneQuest checkAction:object:]`@0x32a758 在 0x32a822 用
+/// `cmp r4,#0xd / it eq / cmpeq.w r10,#4 / beq finish` 把 **action 13 + curQuestId 4** 写成这条任务的
+/// **唯一**完成判据(后面 0x32a8ea 起的泛化段没有任何一项配 action 13,questType 0 更是全不命中)。
+/// 而 action 13 全二进制只有两个发出点,都要求 `currentProduceMoleNums >= 1`:
+/// `-[ApartmentView innerupdate:]`@0x3256c8(0x3257d8 `cmp r0,#1`)与 `-[ApartmentView onChooseUse]`@0x325344
+/// (0x32537e `cmp r0,#1`)。我们的「公寓雇用即时出摩尔」钩子把在产数压回旧值(恒 0),这两条路径永久不可达
+/// → **91 条岛任务链在第 4 条硬停**,后面 87 条任务、story 4 起的全部剧情、任务 81/83 奖励的沙原碎片
+/// 31005/31007 全部拿不到。原版 accept 里那条旁路(0x329378,curQuestId∈{3,4} 且工人数 ≥ 80)新号不可达。
+///
+/// **做法**:不动「即时出摩尔」这个已拍板的设计等价(见 2026-06 记录),只把它吃掉的那个信号补回来。
+/// 每拍廉价自检「在岛 + curQuestId==4 + 工人数 ≥1」,满足就对 `+[NewSceneQuest sharedInstance]` 发一次
+/// `checkAction:13 object:0`(签名 `v16@0:4i8i12`,**两个参数都是 int**,与游戏自己的 0x325b7c `movs r2,#0xd`
+/// / 0x325b82 `movs r3,#0` 完全一致),然后置一次性标志。这样「先雇摩尔后接任务 4」的顺序也能覆盖
+/// (原版只在产出完成那一刻发,顺序反了就永远卡死)。
+/// checkAction:object: 是纯本地状态机(gameMode∈{0,6} 早退、questState!=1 早退),不发包;
+/// action 13 只与 curQuestId==4 配对,别的任务不受影响。
+fn island_resend_quest4_action(env: &mut Environment) {
+    if ISLAND_QUEST4_SENT.load(O) || !ON_ISLAND.load(O) {
+        return;
+    }
+    let ui = island_userinfo_data(env);
+    if ui == nil {
+        return;
+    }
+    let cq_s = island_sel(env, "curQuestId");
+    let cur_quest: i32 = msg_send(env, (ui, cq_s));
+    if cur_quest != 4 {
+        return; // 不是这条任务,不做任何事(也不置位:玩家可能还没走到)
+    }
+    let tw_s = island_sel(env, "curTotalWorkersCount");
+    let workers: i32 = msg_send(env, (ui, tw_s));
+    if workers < 1 {
+        return; // 还没雇到摩尔,原版此时也不该完成
+    }
+    let q_cls = env.objc.get_known_class("NewSceneQuest", &mut env.mem);
+    if q_cls == nil {
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    // +[NewSceneQuest sharedInstance]@0x327e08 在 curSceneId==1 时返回 nil;岛上 curSceneId 已被现有钩子
+    // 强制成 10,但仍旧 nil 守卫。
+    let quest: id = msg_send(env, (q_cls, sh));
+    if quest == nil {
+        return;
+    }
+    let ca_s = island_sel(env, "checkAction:object:");
+    let _: () = msg_send(env, (quest, ca_s, 13i32, 0i32));
+    ISLAND_QUEST4_SENT.store(true, O);
+    island_mark_dirty();
+    log!("[MOLECHEAT] island: 岛任务 4(雇一只摩尔)完成信号补发 checkAction:13 —— 即时雇用钩子吃掉了原版的发出点,任务链不再卡在第 4 条");
 }
 
 /// [2026-09-06 审计修] 岛存档统一落盘。原来这四件套只挂在 `gobackMainVillage` 一个点上,
@@ -6347,6 +6422,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             ON_ISLAND.store(true, O);
             ISLAND_LOADING.store(false, O);
             ISLAND_EXITING.store(false, O);
+            ISLAND_QUEST4_SENT.store(false, O); // [I5-01] 每次进岛重新判一次任务 4
             ISLAND_SCENE_MGR.store(env.cpu.regs()[0], O);
             // ★【已回滚】曾在此 load_island_shop_atlases 补加载 4 个建筑商店图集——实测它把黄金岛渲染搞坏成全绿场地。
             log!("[MOLECHEAT] island: >> loadNewScene (建 GameNewScene),ON_ISLAND=true");
@@ -6372,6 +6448,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 return true;
             }
             ISLAND_LAST_TICK.with(|c| c.set(Some(Instant::now())));
+            // [2026-09-16 黄金岛审查修 I5-01] 岛农场任务链第 4 条的完成信号补发,见 island_resend_quest4_action。
+            //   放在这里而不是放在 setCurrentProduceMoleNums: 钩子里:本臂是宿主自排的选择子、return true 吞掉,
+            //   栈上没有任何游戏方法体(island_flush 本来就在这里发大量 msg_send),是全文件发消息最安全的点;
+            //   而 finish 会对正打开的 ApartmentView 发 detech(卸载面板 + 回调),在 setter 钩子里触发它等于
+            //   在 onButtonCallSelected: 方法体中段把 self 拆了,后面还要读 self->itemmoney,窗口危险且可能重入。
+            island_resend_quest4_action(env);
             if ON_ISLAND.load(O) && ISLAND_DIRTY.load(O) {
                 let due = ISLAND_LAST_FLUSH
                     .with(|c| c.get())
