@@ -6714,14 +6714,26 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
                 }
-                // ★Bug C(岛商店商品锁)修复:getLockType4ShopItem:shop:(imp 0x21eec1)返
-                // 0=解锁 / 1,2,3,5=等级/前置/雇工锁。离线无服务器等级权威 + 玩家可能未达门 → 全顶 0
-                // 解锁。纯本地等级门,只放宽不破坏;onChooseUse 不经此条,不误伤。(注:这解决"能否买";
-                // 空格子是目录未填、另行诊断——锁只灰格不删格。)
-                ("NewSceneData", "getLockType4ShopItem:shop:") => {
-                    env.cpu.regs_mut()[0] = 0;
-                    return true;
-                }
+                // ★[2026-09-16 黄金岛审查修 I3-02] 这里原来无条件 `regs[0]=0` 把岛食材商品锁全放开,
+                //   当时写的理由是「纯本地等级门,只放宽不破坏」—— 这个判断是错的。
+                //   -[NewSceneData getLockType4ShopItem:shop:]@0x21eec0 的返回码实抠:
+                //     5 = 前置建筑不足(0x21ef2c)  1 = item.level > shop.currentUpgradeLevel(0x21ef5c)
+                //     2 = need_worker > 空闲工人(0x21ef9a)  3 = cost_gold > 金币(0x21f000)
+                //     4 = cost_vip_gold > 贝壳(0x21f06e)
+                //   也就是说 3/4 是**余额门**,不是等级门。而唯一的消费门 -[ShopItemsLayer table:cellTouched:]@0x24af7c
+                //   只看 `lock != 0 → showMessageBox:`,lock==0 就一路走到 -[NewSceneShop onSaleItemSelected]@0x31f5a8
+                //   → showCostGold:@0x31ea68 → addGoldInNewScene:(-cost_gold),**后面再没有任何余额校验**;
+                //   而 -[UserInfoData addGold:]@0xbb1d8 在 0xbb20e 只是 `gold_ += delta`,**没有下限钳位**
+                //   (对比 addVipGold:@0xbb418 在 0xbb49c 有 ≤-1→0 的钳位)。
+                //   后果:钱不够也能下单 → 摩尔豆被扣成负数 → -[NewSceneData addGoldInNewScene:]@0x21f7a2
+                //   立刻 saveUserinfoToLocal 写进主存档 → 回主村后所有商店/种地全被「钱不够」锁死,不刷钱出不来。
+                //   贝壳价食材(木瓜 30201/榛果冰淇淋 30208/汉堡 30210/草莓蛋糕 30216/烤鸡 30220)则是贝壳被钳到 0
+                //   但货照样上架 = 凭空刷货。另外商店升级解锁高级食材这条玩法也被整个跳过。
+                //   propertyHV 实证食材没有 need_worker 也没有 req_id,锁 2/5 本就不会触发,这条臂实际只在
+                //   放行【等级门】与【余额门】—— 两个都应该保留。直接删臂放行真方法(本臂之前没有 msg_send,
+                //   r0/r1 原样未动,真方法读 self 正确)。
+                //   前置条件已实测:岛商店升级链离线可用(点升级扣金 → 12 小时倒计时 → 跨退岛/重进续算 →
+                //   贝壳加速扣 12 贝壳 → ★1 变 ★2 且外观更新),所以「新店只能卖 1 级食材」是原版节奏而不是死锁。
                 // ★Bug C 真修(岛商店点分类格子全空)——workflow 二进制实证:格子空【不是桶空】(桶在
                 // 主村启动期 loadPropertyWithType:1 andSceneId:10 已填满 20 食材),而是 ShopItemsLayer
                 // showWithTarget:(imp 0x24be81)开头一道 `[[WrapperManager sharedManager] currentGameMode]
