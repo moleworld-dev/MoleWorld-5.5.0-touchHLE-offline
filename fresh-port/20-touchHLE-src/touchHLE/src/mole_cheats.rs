@@ -4183,6 +4183,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "getMatureTime"
             | "isReachable"
             | "sendPacket:commandId:"
+            // [2026-09-16 黄金岛审查修 I9-01] 岛上吞掉原版重发队列的入队(接收者 NewSceneNetworkBuffer 不在 CLASSES,
+            //   不加进 SELS 这条臂就是死代码)
+            | "pushOneObjectIn:withCommandId:andSendFlag:"
             | "sendAllBufferDatas"
             | "sendAllBuffDataInNewSceneLoading"
             | "generateRandomRewardId"
@@ -6665,6 +6668,22 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 // (a2) 缓冲回放包装也一并吞(belt-and-suspenders;其三调用方全空过)。
                 (_, "sendAllBufferDatas") | (_, "sendAllBuffDataInNewSceneLoading") => {
                     return true; // 离线无服务器,缓冲回放无意义且必卡 → 吞掉
+                }
+                // (a3) ★[2026-09-16 黄金岛审查修 I9-01] 入队也一并吞:发包被 (a) 吞掉,但**入队没被吞**。
+                //   -[NewSceneNetworkBuffer pushOneObjectIn:withCommandId:andSendFlag:]@0x22e8d0 被
+                //   NetworkManager 的 add*/setMod*/delete* 全族调用(selref 33 处),它末尾 0x22eaaa 无条件
+                //   `[self saveToFile]`,而 -[NewSceneNetworkBuffer saveToFile]@0x22e164 = 把**整条队列**
+                //   NSKeyedArchiver 归档(0x22e27c)→ AES 加密(0x22e2c2)→ 整文件重写(0x22e2ee)。
+                //   出队只有三处、全在收包回调里(HolidayVillageLayer/LoadingHoliday 的 onNewScene*Received:),
+                //   离线一个都不会跑;push 路径也没有任何队列长度上限。
+                //   于是岛上**每放一个建筑 / 每买卖一件食材 / 每接一个任务 / 每解一个成就**都要把历史全队列
+                //   重新归档+加密+写盘一次 → 卡顿随本档累计动作数线性增长、跨会话不复位,沙盒里那个 md5 名的
+                //   文件也无限变大,进岛一次比一次慢。离线岛的全部状态已由我们自己的四个 island_*.dat 持久化,
+                //   这条重发队列没有任何消费者。方法返回 void、所有调用方都丢弃返回值,吞掉零副作用。
+                //   在线模式下整块被 ENABLE_NEWSCENE_ISLAND 关掉(见 5191 起),私服的断线重发凭据不受影响。
+                (_, "pushOneObjectIn:withCommandId:andSendFlag:") => {
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
                 }
                 // ★Bug A(布兰的家面板不弹)修复——LR 收窄,绝不冻岛:
                 // RestaurantView showWithTarget:selector:(imp 0x249769)开头有门
