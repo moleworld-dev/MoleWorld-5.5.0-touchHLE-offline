@@ -1069,14 +1069,21 @@ impl Fs {
                 match fs::rename(&tmp_host_path, &target_host_path) {
                     Ok(()) => Ok(()),
                     Err(e) => {
+                        // [2026-09-16 黄金岛审查修] rename 失败**不再**回落成「File::create 截断目标再写」。
+                        // 原因:rename 失败时目标还是完好的旧版本,而截断重写一旦中途再失败(磁盘满、被
+                        // 杀进程),好档就变成 0 字节或半截 —— 这正是 write_atomic 要防的事,回落把它亲手
+                        // 做了一遍。同目录 rename 在正常情况下不会失败(跨设备不可能),真失败了说明环境
+                        // 已经异常,此时「保住旧档 + 报错」永远优于「赌一把重写」。
+                        // 调用方(save_island_*、GameData 存档等)看到 Err 会记日志并跳过本次落盘,
+                        // 下一个节拍会再试,不丢数据。
                         log!(
-                            "[fs] 原子写 rename {:?} -> {:?} 失败({}),回落为非原子写",
+                            "[fs] 原子写 rename {:?} -> {:?} 失败({}),目标保持原样未改动(不回落截断重写)",
                             tmp_host_path,
                             target_host_path,
                             e
                         );
                         let _ = fs::remove_file(&tmp_host_path);
-                        File::create(&target_host_path).and_then(|mut f| f.write_all(data))
+                        Err(e)
                     }
                 }
             }
