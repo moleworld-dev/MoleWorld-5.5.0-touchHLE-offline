@@ -4073,6 +4073,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "GameDataCompareLayer"
             // [扫描修 2026-09-15] F9-4 离线点好友入口给"需要联网"提示
             | "VillageMenuLayer"
+            // [2026-09-16 黄金岛审查修] 岛上底部菜单条的同名好友入口(与主村是两个并列类,精确比较不走父类链)
+            | "NewSceneVillageMenuLayer"
             // [扫描修 2026-09-15] F9-8 离线微博分享给"连不上网"提示,不进 ShareKit OAuth
             | "SharedInterfaceLayer"
             // [扫描修 2026-09-15] F12-10 左左右右(沙滩WC)开始前一次性操作提示
@@ -5445,7 +5447,15 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   全程无网络门,先 saveToLocal + 卸载主村地图再进空好友图,之后 getFriendsInfo 因 isReachable=0 静默 return,
     //   玩家只看到一张只有自己的空图、没有任何提示。改为在卸图之前弹游戏自带文案 ACTION_CENTER_NETWARNING
     //   (「该功能需要联网才能使用哦!」,与活动中心离线体验一致),吞掉按钮回调。菜单回调不在 drawScene 帧栈上,可以发消息。
-    if class == "VillageMenuLayer" && sel == "onButtonFriendSelected:" && !env.options.network_access {
+    // [2026-09-16 黄金岛审查修] 黄金岛底部菜单条是另一个类 NewSceneVillageMenuLayer,它的
+    //   -[NewSceneVillageMenuLayer onButtonFriendSelected:]@0x25a4bc 与主村同构:一路过 gameMode/hasTopView 等
+    //   本地门后,0x25a70a 调 [NewSceneData saveUserinfoToLocal]、0x25a728 调 startNewSceneFrom:toScene: 离岛去好友村,
+    //   同样没有任何网络门 → 离线点了就被甩进只有自己的空好友图,且岛也退了。原来这道拦截只认主村的类名,
+    //   岛上这个入口是漏的。两个类的这个选择子行为一致,合并进同一道拦截即可(弹框失败仍旧恢复寄存器走原版)。
+    if (class == "VillageMenuLayer" || class == "NewSceneVillageMenuLayer")
+        && sel == "onButtonFriendSelected:"
+        && !env.options.network_access
+    {
         let saved = [
             env.cpu.regs()[0],
             env.cpu.regs()[1],
@@ -5459,6 +5469,32 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             return true;
         }
         // 弹框没发出去(类/文案缺失):不静默吞按钮,恢复寄存器走原版(最坏只是进空好友图,能正常回村)。
+        env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+    }
+
+    // [2026-09-16 黄金岛审查修] 离线点「免费贝壳」(HUD 菜单条上的 buttonFreeShells.png,ivar buttonAdwall):
+    //   -[NewSceneVillageMenuLayer onButtonAdwallSelected:]@0x25cb28 与主村 -[VillageMenuLayer …] 同构,
+    //   先 setGameMode:1(0x25cb56,没人还原)再打开淘米广告墙 ShowFreeShellsLayer —— 离线时广告墙拉不到
+    //   任何数据,玩家看到一张空板,关掉之后 gameMode 已被改过,岛上交互跟着不对。
+    //   照 F9-4 的写法在【按钮回调】这一层拦:既掐掉 setGameMode,也掐掉关闭时跨场景的那次 onButtonBuildSelected:。
+    //   ★不拦 ShowFreeShellsLayer.open 本身 —— 作弊菜单的「免费贝壳墙」正是主动调它,拦了就废。
+    if (class == "NewSceneVillageMenuLayer" || class == "VillageMenuLayer")
+        && sel == "onButtonAdwallSelected:"
+        && !env.options.network_access
+    {
+        let saved = [
+            env.cpu.regs()[0],
+            env.cpu.regs()[1],
+            env.cpu.regs()[2],
+            env.cpu.regs()[3],
+        ];
+        let msg = game_localized_string(env, "ACTION_CENTER_NETWARNING");
+        if show_game_message_box(env, msg, 6, nil, SEL::null()) {
+            log!("[MOLECHEAT] 离线:免费贝壳(广告墙)需要联网 → 弹「该功能需要联网」提示,不进空广告墙、不改 gameMode");
+            env.cpu.regs_mut()[0] = 0;
+            return true;
+        }
+        // 弹框没发出去:恢复寄存器走原版(不静默吞)。
         env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
     }
 
