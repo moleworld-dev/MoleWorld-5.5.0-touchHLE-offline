@@ -3556,6 +3556,71 @@ pub fn island_lifecycle_flush(env: &mut Environment, reason: &str, only_if_dirty
     island_flush_final(env, reason);
 }
 
+/// [2026-09-24 第四轮 K3 I5-04] 「关键操作即时落盘」已排队(moleIslandFlushNow 还没触发)。置位期间不再重复排队,
+/// 由 moleIslandFlushNow 臂(或岛功能总闸关闭时的兜底)清零。
+static ISLAND_FLUSH_NOW_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I5-04] 这条消息是不是「关键操作」:原版在这些点上已经【立即】写了主档(或改了只存在岛档里的进度指针),
+/// 岛档却要等节拍(每秒一拍、距上次 ≥1.5 秒)才写,窗口内强杀就会出现"钱扣了/奖励领了、岛上没变"或任务指针回滚可重复领奖。
+///   · -[NewSceneData addGoldInNewScene:]@0x21f748 → 0x21f7a2 saveUserinfoToLocal;addVipGoldInNewScene:@0x21f600 → 0x21f65a
+///     saveUserinfoBothInLocalAndRemote;addXpInNewScene:@0x21f6a4 同样立即存主档;addBuildValueInNewScene:@0x21f7cc 本身不存,人气值只靠岛档。
+///     调用方含 -[NewSceneQuest postFinish]@0x32a2a0(0x32a30e rewardXP:vipGold:buildValue: 先发奖,0x32a334 才 setCurQuestId:0)、
+///     -[NewScenePorter finishBuild:] 扣款 0x26d428/0x26d502、商铺进货 -[NewSceneShop showCostGold:] 等。
+///   · -[NewSceneUserInfoData setCurQuestId:/setNextQuestId:/setExtendMap:]:任务指针与扩地(0x25c28a)只存在 island_userinfo.dat。
+///   · -[NetworkManager addObjectToServer:]:新放置建筑(finishBuild: 0x26d790、finishEdit 0x26fc98 等)要靠落盘时的合并才进 mapData。
+fn island_is_key_op(class: &str, sel: &str) -> bool {
+    match class {
+        "NewSceneData" => matches!(
+            sel,
+            "addGoldInNewScene:"
+                | "addVipGoldInNewScene:"
+                | "addXpInNewScene:"
+                | "addBuildValueInNewScene:"
+        ),
+        "NewSceneUserInfoData" => matches!(sel, "setCurQuestId:" | "setNextQuestId:" | "setExtendMap:"),
+        "NetworkManager" => sel == "addObjectToServer:",
+        _ => false,
+    }
+}
+
+/// [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘:把 [GameManager moleIslandFlushNow] 用 performSelector:withObject:afterDelay:0
+/// 排到运行循环的 perform 相位——在当前这条游戏调用栈整个返回之后才跑,postFinish 后续的 setCurQuestId:0/setCurQuestResult:、
+/// finishBuild: 之后的 addObjectToServer: 等都已完成,一次写盘全收;窗口从 ≤2.5 秒缩到约一帧。
+/// 不复用 moleIslandTick(会被 <600ms 的重复节拍去重吞掉),也不拦 saveUserinfoBothInLocalAndRemote(同步写盘会卡在游戏方法中段)。
+/// 由置脏臂调用(之后还要放行真方法):这里发了宿主消息,必须整体快照/恢复 r0-r3,否则真方法会拿上一次 msg_send 的返回值当 self。
+/// 只发 sharedManager 与 performSelector 两条轻量消息(afterDelay 是宿主实现,只登记 perform 请求,不同步跑任何游戏逻辑)。
+fn island_request_flush_now(env: &mut Environment) {
+    // 落盘过程中(island_flush 自己会触发 add*/set*)不排;时间旅行中落盘闸反正不写,也不排。
+    if ISLAND_FLUSHING.load(O) || crate::libc::time::time_offset_secs() != 0 {
+        return;
+    }
+    if ISLAND_FLUSH_NOW_PENDING.swap(true, O) {
+        return; // 已经排过一次,这条调用栈返回后那一次会把本次变化一起写掉
+    }
+    let saved = [
+        env.cpu.regs()[0],
+        env.cpu.regs()[1],
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+    ];
+    let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+    let gm: id = if gm_cls != nil {
+        let smgr = island_sel(env, "sharedManager");
+        msg_send(env, (gm_cls, smgr))
+    } else {
+        nil
+    };
+    if gm == nil {
+        // 排不上就清掉排队标志,下次关键操作再试;这次的变化仍由节拍兜底。
+        ISLAND_FLUSH_NOW_PENDING.store(false, O);
+    } else {
+        let now_s = island_sel(env, "moleIslandFlushNow");
+        let perform = island_sel(env, "performSelector:withObject:afterDelay:");
+        let _: () = msg_send(env, (gm, perform, now_s, nil, 0.0f64));
+    }
+    env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+}
+
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
 fn island_mark_dirty() {
     if ON_ISLAND.load(O) && !ISLAND_FLUSHING.load(O) {
@@ -5697,6 +5762,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         || (cfg!(target_os = "ios") && matches!(sel, "getFriendsInfo" | "loadMapFromData:"))
         // ════ [2026-09-24 第四轮骨架] 粗筛槽位:各实施包只在自己的槽位注释下方追加 `|| (...)` 行,不动别的槽位 ════
         // ── [K3] ──
+        // [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘的宿主自排选择子(接收者 GameManager 已在 CLASSES,这里按裸 sel 再放一道,
+        //   与 intercept 里不绑类的 `sel == "moleIslandFlushNow"` 臂对应)。
+        || sel == "moleIslandFlushNow"
         // ── [K7] ──
         // ── [K8] ──
         // [2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口吞掉打工归还的臂(ActorManager changeAvailableMolerForTask:)。按「受门控的 sel」
@@ -7908,6 +7976,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 全部 hook 仅在 ENABLE_NEWSCENE_ISLAND 开时生效;网络门强制仅在进岛窗口内,
     // 不污染主村离线行为(铁律:别动已修好的东西)。从 host 嵌套调 guest 的操作只在
     // 运行时就绪后发生(drawScene / 进岛序列),避开启动早期 yielder=None 的坑。
+    // [2026-09-24 第四轮 K3 I5-04] 即时落盘兜底:排队后开关被关掉,那一拍落到开关块外 → 吞掉并清排队标志(不落盘,
+    //   与下面节拍兜底同理)。GameManager 不实现该选择子,必须 return true;不清标志的话以后再也排不上。
+    if sel == "moleIslandFlushNow" && !ENABLE_NEWSCENE_ISLAND.load(O) {
+        ISLAND_FLUSH_NOW_PENDING.store(false, O);
+        return true;
+    }
     // ★[审查修 2026-09-11] 节拍兜底:处理臂在 ENABLE_NEWSCENE_ISLAND 块内,开关关着时排队的那一拍会被跳过、当 no-op 丢掉,
     //   闩锁卡在 true。这里吞掉并清闩锁(开关关着时不碰岛档,所以不落盘)。GameManager 不实现该选择子,必须 return true。
     if sel == "moleIslandTick" && !ENABLE_NEWSCENE_ISLAND.load(O) {
@@ -8218,6 +8292,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             return true;
         }
 
+        // [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘(由置脏臂里的 island_request_flush_now 用 afterDelay:0 排进来)。
+        //   GameManager 不实现该选择子,必须 return true 吞掉。宿主自排的选择子、栈上没有游戏方法体,可自由发消息。
+        //   不看 1.5 秒节流(这正是要绕开的窗口),但看写盘失败的退避(免得连续失败时每次操作都重跑整套落盘)。
+        if sel == "moleIslandFlushNow" {
+            ISLAND_FLUSH_NOW_PENDING.store(false, O);
+            if ON_ISLAND.load(O)
+                && ISLAND_DIRTY.load(O)
+                && !ISLAND_FLUSHING.load(O)
+                && island_retry_ready()
+            {
+                island_flush(env, "关键操作即时落盘");
+            }
+            return true;
+        }
+
         // ★[审计修 2026-09-11] 置脏:岛上经营/任务/剧情/成就/扩地/工人数都落在 NewSceneUserInfoData 的 set*/add*,
         //   经验/贝壳/金币/建设值/碎片走 NewSceneData 的 add*InNewScene:/addAdventureMapFragment:/setMapFragments:,
         //   新放置走 NetworkManager addObjectToServer:(这里只置脏不拦截,seqId 在它内部分配)。纯原子操作。
@@ -8231,6 +8320,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 || (class == "NetworkManager" && sel == "addObjectToServer:"))
         {
             island_mark_dirty();
+            // [2026-09-24 第四轮 K3 I5-04] 关键操作(扣款/发奖/任务指针/扩地/新放置)再排一次即时落盘,见 island_request_flush_now。
+            //   它内部发宿主消息前后整体快照/恢复 r0-r3,本臂之后照旧往下走、按原逻辑放行真方法。
+            if island_is_key_op(class, sel) {
+                island_request_flush_now(env);
+            }
         }
 
         // ★[审计修 2026-09-11] 在岛上直接关窗口/Cmd+Q:touchHLE 的干净退出链(uikit.rs → ui_application::exit)
