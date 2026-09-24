@@ -3140,6 +3140,128 @@ fn island_userinfo_data(env: &mut Environment) -> id {
     msg_send(env, (nsd, ui_s))
 }
 
+// ════════ [2026-09-24 第四轮 K11] 超级贝壳树(32015)离线复活 ════════
+// 原版这棵树的「成长值 / 36 小时倒计时起点 / 可收获标志」全部由服务器下发:
+//   · 1085 回包 -[NetworkManager parseSuperShellTreeInfoFromServer:pos:len:]@0x1c0790 按 0x1c07ea
+//     getUniqueObjectByObjectId:32015 找到活树,0x1c0862 setGrowthValue:、0x1c08ba setBeginCountDownTime:,
+//     然后 parseData 在 0xe74e8 起把回包分发给 NetworkManager.delegateSuperShellTree 的 onCommandReceived:;
+//   · 可收获标志 GameData.canHarvestSuperShellTree_ 全二进制唯一写入点是圣诞奖励回包
+//     -[NetworkManager parseChristmasRewardFlagFromServer:pos:len:]@0x1c074a。
+// 离线三者都没人写 → 树点了只 unselect(processTouched 0x36acee beq)、面板永不弹、头顶永不出收获图标。
+// 这里补一个离线等价的「服务器应答」,让原版 onCommandReceived:/updateView/收获链自己跑。
+
+/// 超级贝壳树的物品号(propertyHV 32015,limit_count=1;原版回包解析在 0x1c07de `movw r2,#0x7d0f` 查活表)。
+const SHELLTREE_OBJECT_ID: i32 = 32015;
+/// 成长值满值:-[NewGameManager activateWaterSuperShellTree]@0x2469c2 `cmp r0,#0x13` + `it hi` + `pophi`,>19 即浇满。
+const SHELLTREE_FULL_GROWTH: u32 = 20;
+/// [2026-09-24 第四轮 K11 I2-01] 离线「服务器侧」贝壳树状态:倒计时起点(CFAbsoluteTime 秒,0=没有进行中的倒计时)
+///   与成长值。只在应答(moleIslandShellTreeInfo)、收获/删除时的重置(resetSuperShellTreeInfo)与读档时改写。
+static SHELLTREE_BC: AtomicU32 = AtomicU32::new(0);
+static SHELLTREE_GV: AtomicU32 = AtomicU32::new(0);
+
+/// [2026-09-24 第四轮 K11 I2-01] 取活表里的超级贝壳树,与原版 1085 回包解析同法:0x1c07d6 [ObjectManager sharedManager]
+///   → 0x1c07ea getUniqueObjectByObjectId:32015(签名 @12@0:4i8;@0x41dbc 只返回 isFinished 的唯一物件)
+///   → 0x1c0820 isKindOfClass:[SuperShellTree class]。没有(还没建好/已删除/不在岛上)返回 nil。
+fn island_shelltree_live(env: &mut Environment) -> id {
+    let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
+    let tree_cls = env.objc.get_known_class("SuperShellTree", &mut env.mem);
+    if om_cls == nil || tree_cls == nil {
+        return nil;
+    }
+    let sm = island_sel(env, "sharedManager");
+    let om: id = msg_send(env, (om_cls, sm));
+    if om == nil {
+        return nil;
+    }
+    let g = island_sel(env, "getUniqueObjectByObjectId:");
+    let obj: id = msg_send(env, (om, g, SHELLTREE_OBJECT_ID));
+    if obj == nil {
+        return nil;
+    }
+    let isk = island_sel(env, "isKindOfClass:");
+    let is_tree: bool = msg_send(env, (obj, isk, tree_cls));
+    if is_tree {
+        obj
+    } else {
+        nil
+    }
+}
+
+/// [2026-09-24 第四轮 K11 I2-01 / I3-3] 离线等价的 1085「贝壳树信息」回包。由 getSuperShellTreeInfo: 臂用
+///   performSelector:withObject:afterDelay:0 排到运行循环 perform 相位,接收者是 NetworkManager(r0),栈上没有游戏方法体,
+///   可以自由发宿主消息;选择子由 intercept 无条件接住(NetworkManager 不实现它)。
+///   ① 复刻 parseSuperShellTreeInfoFromServer: 的写入:有活树时 setGrowthValue:(0x36af14,v12@0:4L8)、
+///      setBeginCountDownTime:(0x36b870,v12@0:4L8)。取值 = 离线「服务器侧」状态;倒计时起点为 0(新树或刚收获)时
+///      开始新一轮:起点=当前岛时钟、成长值=20。原版成长值要靠好友来浇水(activateWaterSuperShellTree 只在串门
+///      gameMode 6 生效),离线没有好友,这里是移植者自拟的设计等价「好友已浇满」,不是原版数据。
+///      purchaseTime_ 一律不碰:它是「首次收获时刻」,只由原版 setHarvestTimes:@0x36af46 写(树的寿命从它起算)。
+///   ② 复刻 parseData 的分发(0xe74e8-0xe751e):对 NetworkManager.delegateSuperShellTree 发 onCommandReceived:(代理不在
+///      或不响应时退回活树本身)。原版 onCommandReceived:@0x36b784 自己收加载遮罩(0x36b7b4 hideLoadingLayer)→ [nil errorID]
+///      为 0 → m_view 在(showInfoView 路径)就 showWithTarget:self selector:onViewClosed 弹面板 → updateView 刷新
+///      倒计时/收获图标 → activateWaterSuperShellTree(自家岛 0x246968 gameMode!=6 早退)。参数传 nil:
+///      唯一读它的是 0x36b7c6 [r5 errorID],nil 消息返回 0 = 「成功」。
+///   ③ 既没有代理也没有活树:只收掉 showInfoView 在 0x36aea6 挂上的加载遮罩,不留永不消失的转圈。
+fn island_shelltree_answer(env: &mut Environment) {
+    let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+    let tree = island_shelltree_live(env);
+    if tree != nil {
+        let mut bc = SHELLTREE_BC.load(O);
+        let mut gv = SHELLTREE_GV.load(O);
+        let fresh = bc == 0;
+        if fresh {
+            bc = now_cf_secs().max(1.0) as u32;
+        }
+        // 倒计时一旦开始,原版的成长值必然已浇满(满了服务器才开始 36 小时),离线同样保持满值。
+        if gv < SHELLTREE_FULL_GROWTH {
+            gv = SHELLTREE_FULL_GROWTH;
+        }
+        let s_gv = island_sel(env, "setGrowthValue:");
+        let _: () = msg_send(env, (tree, s_gv, gv));
+        let s_bc = island_sel(env, "setBeginCountDownTime:");
+        let _: () = msg_send(env, (tree, s_bc, bc));
+        SHELLTREE_BC.store(bc, O);
+        SHELLTREE_GV.store(gv, O);
+        island_mark_dirty();
+        log!(
+            "[MOLECHEAT] island: 贝壳树应答 bc={} gv={}{}",
+            bc,
+            gv,
+            if fresh { "(开始新一轮 36 小时倒计时)" } else { "(续上已有倒计时)" }
+        );
+    } else {
+        log!("[MOLECHEAT] island: 贝壳树应答:活表里没有已建好的贝壳树(32015),只做回包分发/收加载遮罩");
+    }
+    let ocr = island_sel(env, "onCommandReceived:");
+    let mut target: id = nil;
+    if nm != nil && env.objc.object_has_method_named(&env.mem, nm, "delegateSuperShellTree") {
+        let g = island_sel(env, "delegateSuperShellTree");
+        let d: id = msg_send(env, (nm, g));
+        if d != nil {
+            let rs = island_sel(env, "respondsToSelector:");
+            let responds: bool = msg_send(env, (d, rs, ocr));
+            if responds {
+                target = d;
+            }
+        }
+    }
+    if target == nil {
+        target = tree;
+    }
+    if target != nil {
+        let _: () = msg_send(env, (target, ocr, nil));
+    } else {
+        let ll_cls = env.objc.get_known_class("LoadingLayer", &mut env.mem);
+        if ll_cls != nil {
+            let sh = island_sel(env, "sharedInstance");
+            let ll: id = msg_send(env, (ll_cls, sh));
+            if ll != nil {
+                let hide = island_sel(env, "hideLoadingLayer");
+                let _: () = msg_send(env, (ll, hide));
+            }
+        }
+    }
+}
+
 /// [P2b 经营进度回写] 升级餐厅/雇用公寓/出海等改的是活建筑,游戏把快照喂 setModObjectToServer:
 /// (离线被吞、从不写回 mapData)→ 退岛 archive 的只是进岛初始态、经营进度丢。这里把快照按
 /// objectSequenceId 写回 [NewSceneData mapData][key] 数组(find→replace,无则 add),使 island_map.dat
@@ -7445,6 +7567,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   写法:没把 ActorManager 加进 CLASSES(那样它每帧的消息都要 to_string 两次、走完整条比较链);岛外只多一次原子读。
         || (ON_ISLAND.load(O) && sel == "changeAvailableMolerForTask:")
         // ── [K11] ──
+        // [2026-09-24 第四轮 K11 I2-01] 贝壳树离线应答是不绑类的裸 sel(intercept 里无条件接住,NetworkManager 不实现),
+        //   按不变量必须放进粗筛;另外三臂挂在 GameData/NetworkManager 上,两类已在 CLASSES。SuperShellTree 不加进 CLASSES。
+        || sel == "moleIslandShellTreeInfo"
         // ── [K13] ──
         // [2026-09-24 第四轮 K13 N-D2-3] 冷却归零覆盖宠物:(Animal, callAnimalSchedule:) 前置清 lastCoolDownTime(Animal 不进 CLASSES)。
         || (NO_COOLDOWN.load(O) && sel == "callAnimalSchedule:")
@@ -9663,6 +9788,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         return true;
     }
 
+    // [2026-09-24 第四轮 K11 I2-01] 贝壳树离线应答(自用选择子,NetworkManager 不实现)同理:开关关着(含在线模式强制关)时
+    //   排队到达的那一拍也必须吞掉,否则落到真派发 = 未实现的选择子。开关开着时由岛块里的同名臂处理。
+    if sel == "moleIslandShellTreeInfo" && !ENABLE_NEWSCENE_ISLAND.load(O) {
+        return true;
+    }
+
     // ★[审计修 2026-09-11·取证纠错] 离线时钟:拦 -[NewSceneTimer getCurrentServerTime](0x22f60c)直接返回宿主真实时间,
     //   且**必须是 CFAbsoluteTime(2001 纪元)而非 unix 秒**:原版 -[NetworkManager parseServerTime:pos:len:] 收到 1065 的
     //   u32 unix 秒后先减 kCFAbsoluteTimeIntervalSince1970(978307200)再存(0x226fea vsub.f64)。离线从没人调
@@ -9874,6 +10005,59 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             }
             // 未命中"雇用(new>old)"分支(tick/道具走的减法路径)同样要恢复:上面已做过两次 msg_send。
             env.cpu.regs_mut()[0..4].copy_from_slice(&saved_regs);
+        }
+
+        // ════ [2026-09-24 第四轮 K11 I2-01 / I3-3] 超级贝壳树(32015)离线复活 ════
+        // 放在网络门 match 之前、公寓雇用臂之后的独立块(不贴着 showWithTarget:selector: 防崩块,那里是 K8 的插入点);
+        // 四个选择子与前后任何臂都不重名,顺序无关。只在岛上且离线时生效(在线模式下整个 ENABLE 块已被关掉,
+        // 这里再判一次 network_access 作双保险)。
+        // 自用选择子:getSuperShellTreeInfo: 臂排到运行循环的离线应答,无条件接住(NetworkManager 不实现它);
+        //   不在岛上/在线时到达就只吞掉。粗筛见 intercept_wants 的 K11 槽位(不绑类的裸 sel)。
+        if sel == "moleIslandShellTreeInfo" {
+            if ON_ISLAND.load(O) && !env.options.network_access {
+                island_shelltree_answer(env);
+            }
+            return true;
+        }
+        if ON_ISLAND.load(O) && !env.options.network_access {
+            match (class, sel) {
+                // ① 收获门:-[GameData canHarvestSuperShellTree](getter 0x8b914,c8@0:4,纯 ivar 读)。原版唯一写入者是
+                //   圣诞奖励回包 parseChristmasRewardFlagFromServer:pos:len:@0x1c074a,GameData init@0x6c18c 写 0,离线恒 NO →
+                //   processTouched@0x36acee 只 unselect、updateView@0x36b242 不挂收获图标。等价「服务器已下发可收获」返回 1。
+                //   本臂之前没有任何宿主消息,直接写 r0 早返回。另一个读点 -[NewGameManager generateSuperShellTreeReward:]
+                //   只在串门 gameMode 6 的浇水链上,离线不可达;不改成进岛时 setCanHarvestSuperShellTree:YES,GameData
+                //   在岛会话里若被重建会丢。
+                ("GameData", "canHarvestSuperShellTree") => {
+                    env.cpu.regs_mut()[0] = 1;
+                    return true;
+                }
+                // ② 1085 请求:-[NetworkManager getSuperShellTreeInfo:](imp 0x1cb6e8,v12@0:4L8,发 0x437),调用点
+                //   -[SuperShellTree initWithMapData:type:] 0x36a846(读档建树)与 showInfoView 0x36aef6(点树,之前 0x36aea6
+                //   已 showLoadingLayer)。离线包被吞、没有回包 → 面板不弹、转圈不收、成长值/倒计时永远是 0。
+                //   吞掉 void 方法,把离线应答 moleIslandShellTreeInfo 排到运行循环(与原版回包同样异步到达),
+                //   由 island_shelltree_answer 复刻 1085 的解析与分发。只发一条宿主消息且 return true,不需要恢复寄存器。
+                ("NetworkManager", "getSuperShellTreeInfo:") => {
+                    let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+                    let s_info = island_sel(env, "moleIslandShellTreeInfo");
+                    let pf = island_sel(env, "performSelector:withObject:afterDelay:");
+                    let _: () = msg_send(env, (nm, pf, s_info, nil, 0.0f64));
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
+                // ③ 收获/删除时的重置:-[NetworkManager resetSuperShellTreeInfo](imp 0x1cb730,v8@0:4,发 0x438)。调用点
+                //   -[SuperShellTreeView onButtonGainSelected:] 0x36a014、-[SuperShellTree onHarverstIconClicked] 0x36b5a2、
+                //   onChooseDelete 0x36b688。前两处紧接着把活树 beginCountDownTime 置 0、setHarvestTimes:+1(首次写 purchaseTime
+                //   并经 setModObjectToServer: 回写布局)、outputVipGold 出贝壳,这些都照原版跑。这里等价「服务器已清零」:
+                //   离线状态清成 (0,0),下次查询(再点树/下次进岛)自动开始新一轮 36 小时(updateView 0x36b0fa+0x36b0fe=129600 秒)。
+                ("NetworkManager", "resetSuperShellTreeInfo") => {
+                    SHELLTREE_BC.store(0, O);
+                    SHELLTREE_GV.store(0, O);
+                    island_mark_dirty();
+                    log!("[MOLECHEAT] island: 贝壳树重置(收获/删除,等价 0x438 已被服务器受理)→ 离线倒计时与成长值清零,下次查询开始新一轮");
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         // ★解 state1 等服务器回包的活锁(进岛加载卡死的根因):LoadingHoliday.updateLoading
