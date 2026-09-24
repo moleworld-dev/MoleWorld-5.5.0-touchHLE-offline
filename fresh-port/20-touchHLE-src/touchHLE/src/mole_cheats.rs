@@ -1697,6 +1697,9 @@ fn island_save_blocked(env: &mut Environment, path: id, bit: u32, fname: &str) -
             "[MOLECHEAT] island: 跳过落盘 {}(原路径仍是未隔离的坏档,绝不用当前内存里的默认数据覆盖)",
             fname
         );
+        // [2026-09-24 第四轮 K3 I7-07] 首次跳过某文件时只挂一个"待提示",不在这里弹框:本函数跑在 island_flush 里,
+        //   而 island_flush 还在退出链(失活/终止)与离岛 startNewSceneFrom 10→1 的换场边界上跑。由 moleIslandTick 在岛上弹一次。
+        ISLAND_BLOCK_PROMPT_PENDING.store(true, O);
     }
     true
 }
@@ -3619,6 +3622,77 @@ fn island_request_flush_now(env: &mut Environment) {
         let _: () = msg_send(env, (gm, perform, now_s, nil, 0.0f64));
     }
     env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+}
+
+/// [2026-09-24 第四轮 K3 I7-07] 岛档因坏档保护被禁写(原路径是解档失败、又没能改名隔离的坏档)时给玩家的一次性提示:
+/// island_save_blocked 首次跳过某文件时置位,由 moleIslandTick 在岛上弹原版 MessageBox 后清零。
+/// 以前只有一行日志,玩家整局照常玩、退出后岛上进度全没,而交任务的经验/贝壳已进主档,下次还能再领。
+static ISLAND_BLOCK_PROMPT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I7-07] 坏档保护位 → 文件名(提示里列出具体是哪几份)。
+const ISLAND_FILE_NAMES: [(u32, &str); 8] = [
+    (ISLAND_FILE_MAP, "island_map.dat"),
+    (ISLAND_FILE_USERINFO, "island_userinfo.dat"),
+    (ISLAND_FILE_SHIPS, "island_ships.dat"),
+    (ISLAND_FILE_FRAGMENTS, "island_fragments.dat"),
+    (ISLAND_FILE_STORAGE, "island_storage.dat"),
+    (ISLAND_FILE_CAFE, "island_cafe.dat"),
+    (ISLAND_FILE_SHELLTREE, "island_shelltree.dat"),
+    (ISLAND_FILE_MISC, "island_misc.dat"),
+];
+
+/// [2026-09-24 第四轮 K3 I7-07] 在岛上弹一次「岛档损坏且无法隔离,本次进度不会保存」。只在 moleIslandTick 臂里调用
+/// (宿主自排的选择子、perform 相位,栈上没有游戏方法体,不在 drawScene/mainLoop 帧栈上)。
+/// 调用序列照原版同类提示:[[MessageBox sharedInstance] showWithTarget:nil selector:0 title:nil message:msg type:6 vipgold:0]
+/// (type 6 只有「确定」、关框无回调),见 show_game_message_box。
+///   · 保护位已全部解除(玩家修好/删掉了文件,island_save_blocked 或读档已自愈)→ 不弹,直接清待提示;
+///   · 正有别的提示框在显示([mb parent] 非 nil,原版 -[MessageBox showWithTarget:…object:] 0xca672 此时直接返回、什么都不做)
+///     → 留着待提示,下一拍再试,免得这次提示被静默丢掉;
+///   · 不把 ISLAND_DIRTY 放回 true(否则每 1.5 秒重跑一次含主档 AES 的整套落盘);靠 island_save_blocked 已有的
+///     「原路径坏档没了就解除保护」在玩家下一次真实操作置脏时自愈。
+///   · 文案区分两种恢复方式:删掉文件 → 本会话下一次落盘时 island_save_blocked 发现原路径已空即解除保护(当场恢复);
+///     修好文件(原路径仍有文件)→ 本会话仍按保护跳过,要等下次进岛解档成功(island_note_load_ok)才解除。
+fn island_show_block_prompt(env: &mut Environment) {
+    let bits = ISLAND_LOAD_FAILED.load(O);
+    if bits == 0 {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        return;
+    }
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if mb_cls == nil {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        return;
+    }
+    let parent_s = island_sel(env, "parent");
+    let parent: id = msg_send(env, (mb, parent_s));
+    if parent != nil {
+        return; // 别的提示框还开着,下一拍再弹
+    }
+    let names: Vec<&str> = ISLAND_FILE_NAMES
+        .iter()
+        .filter(|(b, _)| (bits & *b) != 0)
+        .map(|(_, n)| *n)
+        .collect();
+    let text = format!(
+        "黄金岛存档文件损坏且无法隔离({}),本次岛上进度不会保存。删掉游戏 Documents 目录下对应的 .dat 文件后会自动恢复保存;修好文件则下次进岛时恢复。",
+        names.join("、")
+    );
+    let msg = crate::frameworks::foundation::ns_string::from_rust_string(env, text);
+    let shown = show_game_message_box(env, msg, 6, nil, SEL::null());
+    // MessageBox 只把文案 setString: 给自己的 CCLabelTTF(0xca6ee),不持有这个串 → 用完释放 from_rust_string 的 +1。
+    release(env, msg);
+    if shown {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        log!(
+            "[MOLECHEAT] island: 已弹「黄金岛存档文件损坏且无法隔离,本次岛上进度不会保存」提示({})",
+            names.join("、")
+        );
+    }
 }
 
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
@@ -8283,6 +8357,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     // [扫描修 2026-09-15] F10-6 节拍落盘只打一行:原因文本并入 island_flush 的汇总行(含「节拍落盘」与各「存盘 island_xxx.dat」)。
                     island_flush(env, "节拍落盘(岛上有未保存的变化)");
                 }
+            }
+            // [2026-09-24 第四轮 K3 I7-07] 岛档被坏档保护禁写时,在岛上(不在进岛加载/离岛过渡中)弹一次提示,见 island_show_block_prompt。
+            if ON_ISLAND.load(O)
+                && !ISLAND_EXITING.load(O)
+                && !ISLAND_LOADING.load(O)
+                && ISLAND_BLOCK_PROMPT_PENDING.load(O)
+            {
+                island_show_block_prompt(env);
             }
             if island_session_active() {
                 schedule_island_tick(env);
