@@ -7874,6 +7874,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // ── [K13] ──
         // [2026-09-24 第四轮 K13 N-D2-3] 冷却归零覆盖宠物:(Animal, callAnimalSchedule:) 前置清 lastCoolDownTime(Animal 不进 CLASSES)。
         || (NO_COOLDOWN.load(O) && sel == "callAnimalSchedule:")
+        // [2026-09-24 第五轮补挖 M-M3-2] 冷却归零的两条帧内前置臂(GameRoomState / OutputHanlder innerupdate:),开关关着时零成本。
+        || (NO_COOLDOWN.load(O) && sel == "innerupdate:")
         // [2026-09-24 第四轮 K13 I4-04] 探险船三段时长:(DiscoveryShip, checkIsFixShipFinished/checkIsDiscoverFinished) 前置改 ivar
         //   (DiscoveryShip 不进 CLASSES;臂里还要求 ON_ISLAND)。
         || ((NO_COOLDOWN.load(O) || INSTANT_BUILD.load(O))
@@ -11729,6 +11731,74 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             ("YaliNpcActor", "checkCooltimeOver") => {
                 env.cpu.regs_mut()[0] = 1; // YES — cooldown over
                 return true;
+            }
+            // [2026-09-24 第五轮补挖 M-M3-2] 建筑小游戏(沙滩WC、健身馆等)的游戏冷却当场归零。
+            //   根因:上面 Building getLastGameCoolTime 臂只影响快照/面板进度,真正的判定 -[GameRoomState innerupdate:]@0xda3f8 在
+            //   0xda504 直接读 ivar lastGameTime_(槽 0xb04368,+28,double),0xda51c 用 now−lastGameTime_ 与 gameDuration_ 比,
+            //   够了才 showGameIcon;isReady4Game 读同一个 ivar。开关写着「主村+黄金岛」,本局 12 小时内却一直不出游戏图标,
+            //   点开面板进度又按 0 显示「已冷却完」,前后矛盾。
+            //   做法:前置把 lastGameTime_ 写成 0.0(与重进场景读档到 0 的效果相同,不需要取 now),原版随即自己出图标;
+            //   玩完 setStateGamePlayed@0xdad18 写 now,下一拍再次清零。偏移从槽现读,为 0 或超出实例大小(44)就不写。
+            //   跑在 CCScheduler 帧栈上:只读写内存,不发消息、不动寄存器,照旧放行真方法。粗筛走 intercept_wants 末尾的
+            //   NO_COOLDOWN 门控 innerupdate:,没把 GameRoomState 加进 CLASSES。
+            ("GameRoomState", "innerupdate:") => {
+                const GAMEROOMSTATE_INSTANCE_SIZE: u32 = 44;
+                let recv = env.cpu.regs()[0];
+                let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04368));
+                if recv != 0 && off != 0 && off <= GAMEROOMSTATE_INSTANCE_SIZE - 8 {
+                    let p: MutPtr<f64> = Ptr::from_bits(recv + off);
+                    if env.mem.read(p) != 0.0 {
+                        env.mem.write(p, 0.0f64);
+                        static LOG1_GAMEROOM_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                        log_first_then_dbg!(
+                            LOG1_GAMEROOM_COOLDOWN,
+                            "[MOLECHEAT] 冷却归零:GameRoomState innerupdate: 前置清 lastGameTime → 0(建筑小游戏立即可玩)"
+                        );
+                    }
+                }
+                return false;
+            }
+            // [2026-09-24 第五轮补挖 M-M3-2] 装饰/建筑产出(水上物件每日经验、特殊装饰、小黄鸭等)的产出冷却当场归零。
+            //   根因:-[OutputHanlder innerupdate:]@0x14b600 在 0x14b68a 直接读 ivar lastCoolDownTime_(槽 0xb04ba4,+240,double)
+            //   判冷却,上面 Building/SpacialObject/YellowDuck getLastCooldownTime 臂只经快照写进存档,本局不生效(退岛重进或在编辑
+            //   模式里挪一下才能领,而且每挪一次领一次)。
+            //   做法:只处理 objectTarget_(槽 0xb04b9c,+236)的运行时类恰好是 Building / SpacialObject / YellowDuck 的处理器,
+            //   与上面 getter 臂同一口径;不碰 NewSceneRestaurant(走 0x14b790 分支按 getOutCoolTime 判,K13 已刻意不把 0 写进餐厅档)。
+            //   前置把 lastCoolDownTime_ 写成 0.0;领奖后 -[OutputHanlder onGifFlagTouched] 在 0x14c750 重新调度 innerupdate:,
+            //   下一拍再次清零。类名经 isa 在宿主侧读,不发 guest 消息;偏移从槽现读,越界(实例大小 260)就不写。只读写内存。
+            ("OutputHanlder", "innerupdate:") => {
+                const OUTPUTHANLDER_INSTANCE_SIZE: u32 = 260;
+                let recv = env.cpu.regs()[0];
+                let off_t: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04b9c));
+                let off_c: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04ba4));
+                if recv != 0
+                    && off_t != 0
+                    && off_t <= OUTPUTHANLDER_INSTANCE_SIZE - 4
+                    && off_c != 0
+                    && off_c <= OUTPUTHANLDER_INSTANCE_SIZE - 8
+                {
+                    let target: id = env.mem.read(ConstPtr::<id>::from_bits(recv + off_t));
+                    if target != nil {
+                        let cls = crate::objc::ObjC::read_isa(target, &env.mem);
+                        let hit = cls != nil
+                            && matches!(
+                                env.objc.get_class_name(cls),
+                                "Building" | "SpacialObject" | "YellowDuck"
+                            );
+                        if hit {
+                            let p: MutPtr<f64> = Ptr::from_bits(recv + off_c);
+                            if env.mem.read(p) != 0.0 {
+                                env.mem.write(p, 0.0f64);
+                                static LOG1_OUTPUT_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                                log_first_then_dbg!(
+                                    LOG1_OUTPUT_COOLDOWN,
+                                    "[MOLECHEAT] 冷却归零:OutputHanlder innerupdate: 前置清 lastCoolDownTime → 0(装饰/建筑产出立即可领)"
+                                );
+                            }
+                        }
+                    }
+                }
+                return false;
             }
             _ => {}
         }
