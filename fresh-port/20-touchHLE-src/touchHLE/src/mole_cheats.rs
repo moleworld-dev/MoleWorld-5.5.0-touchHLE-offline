@@ -1118,6 +1118,14 @@ fn load_island_map(env: &mut Environment) -> bool {
         .register_host_selector("count".to_string(), &mut env.mem);
     let cnt: crate::mem::GuestUSize = msg_send(env, (loaded, count_s));
     if cnt == 0 {
+        // [2026-09-24 第四轮 K1 I6-3] 空布局档按坏档处理。以前直接 return false 回退默认岛,而上面 island_note_load_ok 已清了
+        //   MAP 位、默认岛分支又不读船档 → 首个节拍 save_island_map 把默认岛写进 island_map.dat、save_island_ships 把默认岛那艘
+        //   「需修船」写进 island_ships.dat,玩家真实船态/待领奖品/咖啡馆 isNew 一起被覆盖,两份档都没留 .corrupt。
+        //   save_island_map 自己「空不写」,正常流程不会产出空档,出现即写残/外部改坏。现走与解档失败同一条路:文件仍在原路径
+        //   → 改名 .corrupt 并连带隔离 island_ships.dat(island_note_load_failure 里 bit==MAP 那段);隔离失败 → 保持 MAP 位,
+        //   save_island_map 与 save_island_ships 双双拒写。上面的 island_note_load_ok 不挪(先清后置,结果一样)。
+        log!("[MOLECHEAT] island: ⚠️ island_map.dat 解档出空布局(count=0)→ 按坏档处理");
+        island_note_load_failure(env, path, ISLAND_FILE_MAP, "island_map.dat");
         return false;
     }
     let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
