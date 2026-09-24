@@ -3084,6 +3084,57 @@ fn fix_stuck_ships(env: &mut Environment) {
         let begin: f64 = msg_send(env, (obj, s2));
         let smid: i32 = msg_send(env, (obj, s3));
         let onb: i32 = msg_send(env, (obj, s4));
+        // [2026-09-24 第四轮 K2 I4-06] 待领礼物与航线/人数对不上 → 复位成原版「礼物领完」的干净可出海态。
+        //   根因:load_island_ships 把船档里的 rewardObjId 原样 new 成 DiscoverRewardData 塞回 showGiftsList,不校验。
+        //   -[DiscoveryShip initWithMapData:type:] 见列表非空(0x360a52-0x360aac)就调 initShowGiftsListData:@0x361844,
+        //   它拿每个 rewardObjId 去 getDiscoveryRewardsListWithMapId:searchMapId_ sailMoleNum:onBoardMoleNum_ 返回的那行里配,
+        //   配不上就不加(列表变空),但 0x361a9a 照样无条件挂领奖旗;onAlarmFlagTouched@0x3610d8 空列表也弹 NewRewardsLayer,
+        //   没有 cell 可点 → 永远不回调 minusGiftOfShowGiftsList:@0x363470 摘旗 → 船挂着消不掉的旗、再也点不出航海面板。
+        //   240_0.dat 只有 801/802/803 × molenumber 1-4;航线/人数落在外面就必然配不上。原版里「有待领礼物」只出现在
+        //   getSailGifts@0x361ad0 之后,它入口就要求 onBoardMoleNum≥1(0x361b04)且 searchMapId∈801..=804(0x361b18 subw #0x321/
+        //   cmp #3),并把 isSailing/beginDiscoverTime 清 0(0x361d4e/0x361d58);两字段一直保留到礼物领完才由
+        //   minusGiftOfShowGiftsList:(0x36357c/0x363592)清 0。所以「礼物非空 + 航线/人数非法」原版不可达,只来自档不一致。
+        //   上界取 804 与 onButtonDiscoverSelected 0x36231e `cmp #3` 一致(收得比原版严会误伤)。只做范围校验,
+        //   不发 getDiscoveryRewardsListWithMapId: 逐项比对(多一次 guest 消息换一点精度不值,范围已挡住已知触发路径)。
+        //   复位 = 礼物领完后的原版终态:showGiftsList 给空 NSMutableArray(不传 nil,免得 initWithMapData:type: 0x360b84
+        //   「二次读为 nil」的异常分支可达;setShowGiftsList: 走 _objc_setProperty 自带 retain,新建的 +1 用后 release)、
+        //   searchMapId/onBoardMoleNum 置 0、isSailing 置 NO,beginDiscoverTime 也置 0(getSailGifts 本就清它;若残留 >0,
+        //   checkIsDiscoverFinished@0x361f98 会把 isSailing 又置回 1、船重新「出海」)。此时 checkIsDiscoverFinished 走
+        //   begin<=0 && isSailing==0 返回 YES,不挂旗,船回到可出海态。必须在建筑实例化之前做(本函数就在
+        //   load_island_ships 之后、实例化之前;实例化后旗已挂上,改 TMMapData 没用)。
+        {
+            let sg = island_sel(env, "showGiftsList");
+            let gifts: id = msg_send(env, (obj, sg));
+            let gn: crate::mem::GuestUSize = if gifts != nil {
+                let cnt_s = island_sel(env, "count");
+                msg_send(env, (gifts, cnt_s))
+            } else {
+                0
+            };
+            if gn > 0 && (!(801..=804).contains(&smid) || !(1..=4).contains(&onb)) {
+                let empty = island_alloc_init(env, "NSMutableArray");
+                if empty != nil {
+                    let ssg = island_sel(env, "setShowGiftsList:");
+                    let _: () = msg_send(env, (obj, ssg, empty));
+                    release(env, empty);
+                    let ssm = island_sel(env, "setSearchMapId:");
+                    let _: () = msg_send(env, (obj, ssm, 0i32));
+                    let sob = island_sel(env, "setOnBoardMoleNum:");
+                    let _: () = msg_send(env, (obj, sob, 0i32));
+                    let sis = island_sel(env, "setIsSailing:");
+                    let _: () = msg_send(env, (obj, sis, false));
+                    let sbd = island_sel(env, "setBeginDiscoverTime:");
+                    let _: () = msg_send(env, (obj, sbd, 0.0f64));
+                    log!(
+                        "[MOLECHEAT] island: 船礼物校验复位(待领 {} 件,但 searchMapId={} onBoard={} 配不上 240_0.dat 奖励行)→ 清空礼物/航线/人数、isSailing=0,船回到可出海态",
+                        gn,
+                        smid,
+                        onb
+                    );
+                    continue;
+                }
+            }
+        }
         if sailing != 0 && begin <= 0.0 && (smid < 1 || onb <= 0) {
             let set = island_sel(env, "setIsSailing:");
             let _: () = msg_send(env, (obj, set, false));
