@@ -1495,9 +1495,35 @@ fn ensure_island_userinfo(env: &mut Environment, nsd: id) {
     // 从 _OBJC_IVAR_$_NewSceneData.userInfoDataInNewScene_ 读偏移=4)。原来 msg setUserInfoDataInNewScene:
     // 是【不存在的 selector】→ touchHLE no-op 静默丢弃 → ivar 仍 nil、新对象泄漏、内容持久化整条失效。
     // 改直写 ivar(self+4):alloc-init 的 +1 转给 ivar(NewSceneData dealloc 时 -1 平衡)。
-    let slot: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(nsd.to_bits() + 4);
+    // [2026-09-24 第四轮 K2 I7-08] 偏移不再写死 4,改从 _OBJC_IVAR 槽 0xb05d4c 现读(re.py ivar NewSceneData 实读:
+    //   userInfoDataInNewScene_ +4、槽 0xb05d4c;getter@0x223cf4 同样读这个槽),与 guard_userinfo_before_load
+    //   (槽 0xb038c4)/farm_ivar_offsets 同一规矩:引擎的非脆弱 ivar 修正若改了偏移,getter 读的是修正后的槽,
+    //   写死 4 就会写错位置 → ivar 仍 nil,内容持久化整条静默失效(C1 故障重现,见 feedback_touchhle_nonfragile_ivar_fixup)。
+    //   槽读到 0 或 ≥0x1000 视为异常:回退静态真值 4(从二进制实核),不放弃——放弃 = ivar 保持 nil = 原样搬回 C1。
+    //   写完用真 getter 回读确认,不一致就报警(本函数在进岛注入序列里,不在帧栈钩子上,可发消息)。
+    let mut off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05d4c));
+    if off == 0 || off >= 0x1000 {
+        log!(
+            "[MOLECHEAT] island: ⚠️ NewSceneData.userInfoDataInNewScene_ 的 ivar 槽 0xb05d4c 读到异常偏移 {:#x} → 回退静态真值 4",
+            off
+        );
+        off = 4;
+    }
+    let slot: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(nsd.to_bits() + off);
     env.mem.write(slot, newui.to_bits());
-    log!("[MOLECHEAT] island: 补建 NewSceneUserInfoData(直写 ivar self+4,载体挂上)");
+    log!(
+        "[MOLECHEAT] island: 补建 NewSceneUserInfoData(直写 ivar self+{},载体挂上)",
+        off
+    );
+    let back: id = msg_send(env, (nsd, ui_s));
+    if back != newui {
+        log!(
+            "[MOLECHEAT] island: ⚠️ 补建 NewSceneUserInfoData 后 getter 回读不一致(写入 {:?} @+{},读回 {:?})→ 岛任务/剧情/成就/扩地/NPC 持久化可能失效",
+            newui,
+            off,
+            back
+        );
+    }
 }
 
 /// [P5 内容持久化] 通用存档路径 = Documents/<fname>(走 GameData.pathForDataFile:)。失败回 nil。
