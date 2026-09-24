@@ -381,18 +381,22 @@ fn pages() -> Vec<Page> {
             layout: Layout::ColumnFirst3,
             parent: None,
             buttons: vec![
-                ("Mini: 切水果", MiniGame(1)),
-                ("Mini: 拍虫子", MiniGame(2)),
-                ("Mini: 挖矿石", MiniGame(3)),
-                ("Mini: 敲木桩", MiniGame(4)),
-                ("Mini: 钓鱼", MiniGame(5)),
+                // [2026-09-24 第五轮补挖 M-M3-3] 菜单召唤是「试玩」:callbackTarget 传 nil,-[MiniGameManager callCallback]@0xf48dc
+                //   在 0xf48f0 判空跳过,摩尔豆和经验只在建筑回调 -[Building onMiniGameFinished]@0xb22c4(0xb254e addGold: /
+                //   0xb25cc addXp:)里入账,所以不发奖励、也不计建筑冷却;结算界面上的数值只是显示。标签照实写明。
+                ("Mini试玩: 切水果(不发奖励)", MiniGame(1)),
+                ("Mini试玩: 拍虫子(不发奖励)", MiniGame(2)),
+                ("Mini试玩: 挖矿石(不发奖励)", MiniGame(3)),
+                ("Mini试玩: 敲木桩(不发奖励)", MiniGame(4)),
+                ("Mini试玩: 钓鱼(不发奖励)", MiniGame(5)),
                 // [扫描修 2026-09-15] F9-3:-[MiniGameManager enterMiniGame:stage:]@0xf3fe8 共 8 个小游戏,补上 7 和 8。
                 //   7 占卜屋:和建筑入口走同一条已打补丁的分支(依赖「修复占卜功能」,默认开);
-                //   8 左左右右 = 黄金岛 18 级建筑「沙滩WC」的 WashRoomGame,图集自己加载;在主村召唤时奖励记进主村账本,
-                //     不完全忠实但可接受。
+                //   8 左左右右 = 黄金岛 18 级建筑「沙滩WC」的 WashRoomGame,图集自己加载。
                 //   不加 6 涂鸦馆:图集缺失,大概率黑屏或空精灵帧。
-                ("Mini: 占卜屋", MiniGame(7)),
-                ("Mini: 左左右右(沙滩WC)", MiniGame(8)),
+                // [2026-09-24 第五轮补挖 M-M3-3] 8 号在岛上不召唤:-[WashRoomGame updateTop3Record]@0x35c230 会把试玩成绩写进
+                //   NewSceneData.top3RecordOfMiniGame_,岛上会随 island_misc.dat 落盘,混进岛上沙滩WC的真实前三名(见 mini_game)。
+                ("Mini试玩: 占卜屋(不发奖励)", MiniGame(7)),
+                ("Mini试玩: 左左右右(沙滩WC,不发奖励)", MiniGame(8)),
                 // [2026-09-16] G-02 丝尔特三键先止损:原实现丢弃了 -[GameData loadMapdataFromResource:]@0x7e11c /
                 // loadUserInfoFromResource:@0x7df8c 的返回值(两者只解档返回、不写 mapdata_),无参 saveMapData 存的是当前场景
                 // 对象,reloadMapFromNewSceneData@0x24642c 在 nextSceneId_==0 时直接返回——什么都没做,「拷贝」还报成功。
@@ -1675,6 +1679,13 @@ fn summon_class(env: &mut Environment, name: &str, z: i32) {
 }
 
 fn mini_game(env: &mut Environment, id_: i32) {
+    // [2026-09-24 第五轮补挖 M-M3-3] 左左右右在岛上(或进出岛过场中)不试玩:成绩会写进岛上沙滩WC的前三名并随 island_misc.dat 落盘。
+    //   主村召唤不受影响(主村这份 NewSceneData 前三名回岛前会被 island_misc.dat 覆盖,不落盘)。
+    if id_ == 8 && outside_main_village(env).is_some() {
+        set_toast("岛上请点已建成的沙滩WC游玩(菜单试玩的成绩会混进岛上前三名)".to_string());
+        log!("[MOLEMENU] 拒绝岛上试玩左左右右(免得试玩成绩写进岛上前三名)");
+        return;
+    }
     let mgr = game_singleton(env, "MiniGameManager", "shareInstance");
     if mgr == nil {
         log!("[MOLEMENU] MiniGameManager == nil");
@@ -1686,6 +1697,7 @@ fn mini_game(env: &mut Environment, id_: i32) {
     let select: u32 = 0; // NULL SEL
     let _: () = msg_send(env, (mgr, s, id_, play_type, target, select));
     log!("[MOLEMENU] startMiniGame {}", id_);
+    set_toast("试玩模式:结算界面上的摩尔豆/经验不入账,要拿奖励请点已建成的对应建筑".to_string());
 }
 
 /// 一键收获全部。`ObjectManager.farms` 是游戏自己的地块数组(比 tweak 注入的 gFarmTable 干净)。
