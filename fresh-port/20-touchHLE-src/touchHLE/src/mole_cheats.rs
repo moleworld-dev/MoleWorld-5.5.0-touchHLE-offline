@@ -6491,6 +6491,54 @@ fn sync_remote_upgrade_percent(env: &mut Environment) {
     );
 }
 
+// ───── [2026-09-24 第四轮 K5] 岛会话网络门「按调用点放行」表 ─────
+// 岛会话期(ISLAND_ENTER_WINDOW>0 || ON_ISLAND || ISLAND_LOADING)intercept 把 (任意类, isReachable) 与
+// (NetworkManager, isConnected) 顶成在线,这是进岛链与岛上触摸的刚需;但岛 HUD / 面板上一批纯联网按钮的原版离线分支
+// 也被一起顶掉了。下面两张表收的就是这些按钮回调里的门:调用方 LR 命中就不顶,落到 match 的 `_ => {}` 放行真 getter
+// (两条臂写 r0 之前都没有宿主 msg_send,r0/r1 原样),玩家在岛上看到的就是主村离线时同一句原版提示。
+// 只收按钮回调里的点:进岛链(HolidayVillageLayer/SceneMannager/LoadingHoliday/NewSceneEditMenuLayer)与岛上触摸派发上的门一个不收。
+// 写法:LR = blx 指令地址 + 4,带 Thumb 位;严格升序(binary_search);每条注释写「类.方法 + blx 地址 + 假分支原版文案」。
+// 下面的编译期自检保证升序与 Thumb 位(历史上 0x24bec2 漏 Thumb 位让整条门静默失效)。
+
+/// [2026-09-24 第四轮 K5] 岛会话期 (c, "isReachable") 通配臂【不】顶成 1 的调用点。
+const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
+    // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e46;假分支 0x376eaa
+    //   showMessage: GET_EXCHANGE_INFO_ERROR + showTable:(无转圈层、不发包)。
+    0x376e4b,
+    // [2026-09-16 E-01,本轮并入表] -[NewStyleStoreMainLayer onItemsMenuSelected:] 0x11 号菜单项「免费贝壳」blx@0x3b23c0;
+    //   假分支弹 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」,不进 onBuyVIPGold:。
+    0x3b23c5,
+];
+
+/// [2026-09-24 第四轮 K5] 岛会话期 (NetworkManager, isConnected) 臂【不】顶成 1 的调用点。
+const ISLAND_OFFLINE_CONNECTED_LRS: &[u32] = &[
+    // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e64;假分支同上 GET_EXCHANGE_INFO_ERROR。
+    0x376e69,
+];
+
+/// [2026-09-24 第四轮 K5] 编译期自检:LR 表严格升序且每条带 Thumb 位,不满足就编译失败。
+const fn island_lr_table_ok(t: &[u32]) -> bool {
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] & 1 == 0 {
+            return false;
+        }
+        if i > 0 && t[i - 1] >= t[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(island_lr_table_ok(ISLAND_OFFLINE_REACHABLE_LRS));
+const _: () = assert!(island_lr_table_ok(ISLAND_OFFLINE_CONNECTED_LRS));
+
+/// [2026-09-24 第四轮 K5] 调用方 LR 是否命中表。LR 先补 Thumb 位再查(Thumb 代码里的 blx 返回址本就是奇数,补位只为容错)。
+/// 只读寄存器,不发消息。
+fn island_lr_in(env: &Environment, table: &[u32]) -> bool {
+    table.binary_search(&(env.cpu.regs()[14] | 1)).is_ok()
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // ★[2026-06-22 飞机进岛卡死修复] 离线黄金岛总开关 ENABLE_NEWSCENE_ISLAND 默认 ON(飞机/作弊菜单
     // 两条进岛路径等价)。仅【在线模式】(--allow-network-access)强制 OFF——在线下岛 hook(网络门强制
@@ -7887,7 +7935,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //   读到离线就走 showNetConnectErrorMessage;以前只靠帧窗口,加载一慢就踩到。
         if ISLAND_ENTER_WINDOW.load(O) > 0 || ON_ISLAND.load(O) || ISLAND_LOADING.load(O) {
             match (class, sel) {
-                ("NetworkManager", "isConnected") => {
+                // [2026-09-24 第四轮 K5 I9-02] 与下面 isReachable 通配臂同一套「按调用点放行」:LR 命中
+                //   ISLAND_OFFLINE_CONNECTED_LRS(兑换中心等纯联网按钮的门)就不顶,落到 `_ => {}` 放行真 getter
+                //   (-[NetworkManager isConnected]@0xe152c 只读 connected ivar +68,离线为 0)。本臂之前没有宿主 msg_send,
+                //   r0/r1 原样。只排 isReachable 挡不住:-[NetworkManager isReachable]@0xed2fc 读的是 isReachable_ ivar(+180),
+                //   一旦被置过 1(可达性回调 updateReachable: / setIsReachable:),第一道门就放过去了,只剩这道门能拦回离线分支。
+                ("NetworkManager", "isConnected")
+                    if !island_lr_in(env, ISLAND_OFFLINE_CONNECTED_LRS) =>
+                {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
                 }
@@ -7990,8 +8045,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //   itemid 8 调 onBuyVIPGold:(广告墙「免费贝壳」),为假弹原版 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」。以前岛上
                 //   这里通配成 1,岛上点它会进 SHELLHOOK 白送贝壳并误触发充值副作用,主村却弹离线提示。排除后落到下面 `_ => {}`,放行真
                 //   isReachable(本臂之前没有 msg_send,寄存器未动),岛上与主村一样弹原版离线提示。只精确排除这一个 LR,进岛链上其它门不受影响。
+                // [2026-09-24 第四轮 K5 I9-02] 按调用点排除改成查 ISLAND_OFFLINE_REACHABLE_LRS 表(E-01 的 0x3b23c5 并入表,判据不再分两处写),
+                //   表里只收岛 HUD/面板上纯联网按钮回调里的门(每条的类.方法与假分支文案见表注释),命中就落到下面 `_ => {}` 放行真 getter。
                 (c, "isReachable")
-                    if c != "NewScenePorter" && c != "Porter" && env.cpu.regs()[14] != 0x3b23c5 =>
+                    if c != "NewScenePorter"
+                        && c != "Porter"
+                        && !island_lr_in(env, ISLAND_OFFLINE_REACHABLE_LRS) =>
                 {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
