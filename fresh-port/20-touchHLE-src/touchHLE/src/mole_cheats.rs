@@ -4950,6 +4950,86 @@ fn island_loader_is_current(env: &Environment, loader: u32) -> bool {
     cur == 0 || cur == loader
 }
 
+/// [2026-09-24 第四轮 K7 I9-04] 本次进岛 state2 的 mapData 补注入是否已经判过(一次性闸;enterLoading:10 臂复位)。
+static ISLAND_REINJECT_TRIED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K7 I9-04] 本次进岛已吞掉的 LoadingHoliday 弹框数:前 4 次打完整诊断(log!),之后只打 log_dbg!。
+static ISLAND_ALERT_SWALLOWED: AtomicU32 = AtomicU32::new(0);
+
+/// [2026-09-24 第四轮 K7 I9-04] [[NewSceneData sharedInstance] mapData] 的 count;单例拿不到返回 None,mapData 为 nil 算 0。
+/// 会发宿主消息,调用方负责护住寄存器。
+fn island_mapdata_count(env: &mut Environment) -> Option<u32> {
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    let md = island_sel(env, "mapData");
+    let map: id = msg_send(env, (nsd, md));
+    if map == nil {
+        return Some(0);
+    }
+    let c = island_sel(env, "count");
+    let n: crate::mem::GuestUSize = msg_send(env, (map, c));
+    Some(n)
+}
+
+/// [2026-09-24 第四轮 K7 I9-04] state2(-[LoadingHoliday updateLoading:] 跳表 index2 = 0x252e3e,进入时 curStep_==3)判
+/// [[NewSceneData sharedInstance] mapData].count(0x252e68/0x252e7c cbnz)之前的兜底:此刻为 0 就补跑一次
+/// build_default_island_mapdata(读档岛/默认岛两条路径它自己选),本次进岛只判一次。正常进岛 state1 的
+/// getAllObjectsListFromServerWithStartId: 臂早已注入过,这里只读一次 count 就走;兜住的是 state1 注入没生效
+/// (ISLAND_INJECTED 残留、index1 走了 0x253a70 连接失败分支没发 getAllObjects、注入被别的调用清空)的情形——
+/// 原版在这里 count==0 会去 showNetConnectErrorMessage,而那时 curStep_ 已自增成 4,方法在 0x25210a(curStep_>3)直接返回、
+/// 什么都不弹,加载带着空 mapData 继续 → 进的是一座空岛。相位与 state1 注入相同(都在 updateLoading: 的调用栈上,
+/// 不在 drawScene 前置臂里),调用方负责快照/恢复 r0-r3。
+fn island_state2_reinject_if_empty(env: &mut Environment) {
+    if ISLAND_REINJECT_TRIED.swap(true, O) {
+        return;
+    }
+    if island_mapdata_count(env) != Some(0) {
+        return;
+    }
+    log!(
+        "[MOLECHEAT] island: state2 判 mapData 前 count=0(state1 注入 ISLAND_INJECTED={})→ 补注入一次(build_default_island_mapdata)",
+        ISLAND_INJECTED.with(|c| c.get())
+    );
+    ISLAND_INJECTED.with(|c| c.set(true));
+    let ok = build_default_island_mapdata(env);
+    let after = island_mapdata_count(env);
+    log!(
+        "[MOLECHEAT] island: state2 补注入结束 ok={} mapData.count={:?}",
+        ok,
+        after
+    );
+}
+
+/// [2026-09-24 第四轮 K7 I9-04] 吞 LoadingHoliday 三个断网/登录弹框之前留痕:把真实原因一起打出来,别让坏档/注入失败
+/// 被「网络连接中断」掩盖成无迹可查。本次进岛前 4 次打完整诊断(log!,会发几条宿主消息),之后只打一行 log_dbg!。
+fn island_loading_alert_swallow_log(env: &mut Environment, sel: &str) {
+    let n = ISLAND_ALERT_SWALLOWED.fetch_add(1, O);
+    if n >= 4 {
+        log_dbg!("[MOLECHEAT] island: 吞掉 LoadingHoliday {}(本次进岛第 {} 次)", sel, n + 1);
+        return;
+    }
+    let cnt = island_mapdata_count(env);
+    let path = island_map_path(env);
+    let map_exists = guest_file_exists(env, path);
+    let failed = ISLAND_LOAD_FAILED.load(O);
+    log!(
+        "[MOLECHEAT] island: 吞掉 LoadingHoliday {}(离线进岛不弹「网络连接中断」,也不走 reconnectUsingNewHD)诊断:mapData.count={:?} island_map.dat 存在={} 布局坏档保护={} ISLAND_LOAD_FAILED={:#x} ISLAND_INJECTED={} state2 补注入已判={}",
+        sel,
+        cnt,
+        map_exists,
+        (failed & ISLAND_FILE_MAP) != 0,
+        failed,
+        ISLAND_INJECTED.with(|c| c.get()),
+        ISLAND_REINJECT_TRIED.load(O)
+    );
+}
+
 // 曾有 force_gamemode_standby(把岛上 NewGameManager.gameMode 顶成 1),因会暂停 cocos2d director 冻结整岛而删除,勿复活。
 
 // ===== 死循环看门狗(进岛卡死定位)=====
@@ -8790,12 +8870,54 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                         env.mem.write(pause_ptr, 0u8);
                     }
                 }
+                // [2026-09-24 第四轮 K7 I9-04] 这一拍真方法要跑 state2(跳表 index2,进入时 curStep_==3;tbh 表 0x252c84 第 3 项
+                //   0x00dd → 0x252e3e,实抠)判 mapData.count 时,先查一次、为 0 就补注入(见 island_state2_reinject_if_empty)。
+                //   只在暂停已解开(真方法这一拍确实会往下跑)时判,本次进岛只判一次。发过宿主消息,放行前整体恢复 r0-r3
+                //   (真方法要用 r0=self、r2=dt)。
+                if cur == 3 && !ISLAND_REINJECT_TRIED.load(O) {
+                    let pause_now: u8 = env.mem.read(ConstPtr::<u8>::from_bits(self_bits + 0xc));
+                    if pause_now == 0 {
+                        let saved_regs = [
+                            env.cpu.regs()[0],
+                            env.cpu.regs()[1],
+                            env.cpu.regs()[2],
+                            env.cpu.regs()[3],
+                        ];
+                        island_state2_reinject_if_empty(env);
+                        env.cpu.regs_mut()[0..4].copy_from_slice(&saved_regs);
+                    }
+                }
             } else if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_STALE_LOADER, O) & K7_LOG_STALE_LOADER) == 0 {
                 log!(
                     "[MOLECHEAT] island: 旧的(已中止的)LoadingHoliday {:#x} 仍挂在调度器上 → 保持原版暂停,不解冻",
                     self_bits
                 );
             }
+        }
+
+        // [2026-09-24 第四轮 K7 I9-04] 进岛加载期吞掉 LoadingHoliday 自己的三个断网/登录弹框,与上面 HolidayVillageLayer 三框对称。
+        //   调用点(selref 实证):showNetConnectErrorMessage 5 处 = updateLoading: 0x252e86(state2 mapData 空)/0x253a66(index0 连接失败)/
+        //   0x253a78(index1 连接失败)+ onNewSceneLoadingCommandChangedTo: 0x253fcc + onNewSceneLoadingCommandReceived: 0x254274;
+        //   showLoginErrorMessage 0x253fd8/0x25410c、showMultiLoginErrorInNewScene 0x253f76 都在两个 NetworkManager 委托回调里。
+        //   离线单机弹「网络连接中断」是误报,且它的收尾 -[LoadingHoliday alertView:didDismissWithButtonIndex:]@0x251de0
+        //   index1(RETRY)会去 isReachable/isConnected/reconnectUsingNewHD(0x251f02)、index0 走中止分支。吞掉后加载按原步骤继续
+        //   (网络门在加载期把 isConnected/state 强制在线;index0/1 在 show 前已置的暂停由上面的臂下一拍解开),state2 的空 mapData
+        //   由上面的补注入兜底。吞之前必留痕(island_loading_alert_swallow_log,用 log! 打 mapData.count / island_map.dat / 保护位 /
+        //   ISLAND_INJECTED),坏档或注入失败不会再被「网络连接中断」掩盖。方法签名 v8@0:4(无参 void),r0 置 0 后 return true。
+        //   LoadingHoliday 已在 intercept_wants 的 CLASSES 里。
+        //   连带后果(有意):离线进岛加载期这三框不再出现,原版 CANCEL 中止分支与 RETRY 分支也就不会再被触发;下面的
+        //   setIsChangeSceneButtonSelected:0 中止臂、上面 updateLoading: 臂的 alert_pending_for_delegate 判据与「只清当前加载器」判定,
+        //   从此只作防御兜底(别的代码弹出的系统框、ISLAND_LOADING 为假时才到的迟到回调)。测它们要临时去掉本臂。
+        if class == "LoadingHoliday"
+            && matches!(
+                sel,
+                "showNetConnectErrorMessage" | "showLoginErrorMessage" | "showMultiLoginErrorInNewScene"
+            )
+            && ISLAND_LOADING.load(O)
+        {
+            island_loading_alert_swallow_log(env, sel);
+            env.cpu.regs_mut()[0] = 0;
+            return true;
         }
 
         // ★[审计修 2026-09-11] 进岛/在岛标志改为【事件驱动】(纯原子操作 + 读寄存器,无 msg_send):
@@ -8812,6 +8934,9 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 // [2026-09-24 第四轮 K7 I1-02] r0 = LoadingManager 单例;updateLoading: 臂据它认当前加载器。
                 ISLAND_LOADING_MGR.store(env.cpu.regs()[0], O);
                 ISLAND_K7_LOGGED.store(0, O);
+                // [2026-09-24 第四轮 K7 I9-04] 每次进岛重新开 state2 补注入闸、重置吞框诊断计数。
+                ISLAND_REINJECT_TRIED.store(false, O);
+                ISLAND_ALERT_SWALLOWED.store(0, O);
                 log!("[MOLECHEAT] island: >> enterLoading (加载场景开始,ISLAND_LOADING=true)");
             }
         } else if class == "SceneMannager" && sel == "loadNewScene:" && env.cpu.regs()[2] == 10 {
