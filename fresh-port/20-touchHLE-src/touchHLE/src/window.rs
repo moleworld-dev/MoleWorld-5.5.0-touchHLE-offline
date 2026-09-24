@@ -635,13 +635,14 @@ impl Window {
             // [MoleWorld] 窗口可自由改变大小、拉伸适配屏幕(用户要求)。.resizable()
             // 开放拖拽缩放;set_minimum_size 防止缩到 0。画面缩放在 viewport() 里按窗口
             // 实际 drawable_size 算(自由拉伸铺满),触摸映射沿用 viewport() 自动跟随。
-            let mut window = video_ctx
-                .window(title, width, height)
-                .position_centered()
-                .resizable()
-                .opengl()
-                .build()
-                .unwrap();
+            let mut builder = video_ctx.window(title, width, height);
+            builder.position_centered().resizable().opengl();
+            // [同步 iOS 5e2c481 · 2026-09-24] iOS 开 high-DPI:否则 SDL 的 iOS GL view backing 只有【点】尺寸,
+            // 游戏帧 present 后由系统放大到原生像素 = 糊。触摸走 finger 路径(归一化坐标 × drawable_size),
+            // viewport()/present/touch 都按 drawable_size 自动跟随。桌面不开,行为不变。
+            #[cfg(target_os = "ios")]
+            builder.allow_highdpi();
+            let mut window = builder.build().unwrap();
             window.set_minimum_size(256, 192).ok();
             window
         };

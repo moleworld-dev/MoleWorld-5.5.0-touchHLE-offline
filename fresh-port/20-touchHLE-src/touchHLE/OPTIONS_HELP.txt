@@ -501,8 +501,9 @@ Other options:
         宽屏 UI43 逐节点日志,非 0 开,0 关。未设置时桌面关、iOS 开。
 
     MOLE_HIDPI
-        目前只在安卓的全屏建窗路径读取:非 0 按设备原生像素呈现
-        (allow_highdpi),0 关闭,未设置时关。
+        只在安卓和 iOS 的全屏建窗路径读取(桌面窗口不读):非 0 按设备原生
+        像素呈现(allow_highdpi),0 关闭。未设置时安卓关、iOS 开(真机没有
+        环境变量,关了会按点分辨率渲染再被系统放大而发糊)。
 
     MOLE_REAL_KEYCHAIN
         设为 1 时不再伪造 TMA_SSKeychain,让淘米账号 SDK 真用钥匙串(试验
