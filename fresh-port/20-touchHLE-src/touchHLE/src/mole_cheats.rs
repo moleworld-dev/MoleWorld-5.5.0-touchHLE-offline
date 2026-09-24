@@ -8140,6 +8140,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 (_, "sendPacket:commandId:") => {
                     return true; // 离线无服务器,发包=空过且每包序列化必卡 → 吞掉
                 }
+                // (a1) [2026-09-24 第四轮 K5 I9-05] 三参发包 -[NetworkManager sendPacket:commandId:sendFlag:](imp 0xe1e88,
+                //   签名 v20@0:4@8L12L16:r2=包数据、r3=commandId、sendFlag 在栈上)是另一条独立实现,上面 (a) 吞不到它。
+                //   岛上会走到的是 -[NetworkManager deleteAppendObjectsListWithSceneId:andObjectsList:]@0xea880 在 blx@0xeab6a
+                //   发的 1072(0xeab5c `mov.w r3,#0x430`,存档里有 sceneId=10 的附加物件时)。真方法在 isReachable_ ivar 为 1 时
+                //   (0xe1ea8 那道判断)会经 isTimeoutControllingPacketWithPacketCommandID:andSendFlag:(0xe1f34)把包登记进
+                //   UnreadPacketsDic_,之后 -[NetworkManager checkTimeOut]@0xe0748 判超时 → changeStateTo:withMessage: + disconnect,
+                //   岛上网络状态机被打成断线态。离线没有服务器,直接吞掉;方法返回 void,调用方不看返回值。
+                //   护栏:r3 为登录命令族(0x3e8 / 1234=0x4d2;-[NetworkManager loginWithDeviceInfoAndUserIDInfoInSendType:] 的三参
+                //   调用 r3 恒为 0x4d2)时不吞,落到 `_ => {}` 放行(臂内没发宿主 msg_send,寄存器原样)。在线模式整块本就不执行。
+                ("NetworkManager", "sendPacket:commandId:sendFlag:")
+                    if !matches!(env.cpu.regs()[3], 0x3e8 | 0x4d2) =>
+                {
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
                 // (a2) 缓冲回放包装也一并吞(belt-and-suspenders;其三调用方全空过)。
                 (_, "sendAllBufferDatas") | (_, "sendAllBuffDataInNewSceneLoading") => {
                     return true; // 离线无服务器,缓冲回放无意义且必卡 → 吞掉
