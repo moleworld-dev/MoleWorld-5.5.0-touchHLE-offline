@@ -4922,6 +4922,33 @@ pub fn island_gate1_hit() -> bool {
     ISLAND_GATE1_HIT.load(O)
 }
 
+/// [2026-09-24 第四轮 K7 I1-02] 本次进岛的 LoadingManager 单例指针:[LoadingManager enterLoadingWithDelegate:nextSceneId:10]
+/// 前置臂里记下 r0。updateLoading: 臂据它读 baseLoading_,只给【当前】加载器强清暂停(见 island_loader_is_current)。
+static ISLAND_LOADING_MGR: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 K7] 进岛加载期的「每次进岛只打一次」日志位(enterLoading:10 臂清零)。
+const K7_LOG_STALE_LOADER: u32 = 1 << 0;
+static ISLAND_K7_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// [2026-09-24 第四轮 K7 I1-02] loader 是不是 LoadingManager 当前持有的加载器(baseLoading_)。
+///   原版中止分支 -[LoadingHoliday alertView:didDismissWithButtonIndex:]@0x251de0 在 0x252064 发
+///   unscheduleSelector:forTarget: 时 r2 取的是 [sp+8] = 自己的 _cmd(alertView:didDismissWithButtonIndex:),不是 updateLoading:
+///   → 被中止的 LoadingHoliday 仍挂在调度器上(restartUpdateLoading@0x241eaa 用 scheduleSelector:forTarget:interval:paused: 挂的),
+///   每帧照跑 updateLoading:,原版全靠 showNetConnectErrorMessage 在 0x25213e 置的 updatePause_=1 把它冻住;LoadingManager
+///   也不释放它(下次 enterLoading 在 0x2382c0 直接覆盖 baseLoading_)。所以中止后再进岛时场上同时有新旧两个 LoadingHoliday,
+///   强清暂停只能作用于新的那个,否则旧的被解冻,会再跑一遍 freeCommonResources/endLoading,把新加载器的 exitLoading 抢先打掉。
+///   纯内存读:偏移从 _OBJC_IVAR_$_LoadingManager.baseLoading_ 槽(0xb05f3c)现读,读不到用 4(re.py ivar 实证 +4)。
+///   不知道管理器(0)或 baseLoading_ 为空时一律当作当前 —— 宁可沿用旧行为,也不冒「永远不清暂停 = 永久卡加载」的险。
+fn island_loader_is_current(env: &Environment, loader: u32) -> bool {
+    let mgr = ISLAND_LOADING_MGR.load(O);
+    if mgr == 0 {
+        return true;
+    }
+    let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f3c));
+    let off = if off != 0 && off < 0x100 { off } else { 4 };
+    let cur: u32 = env.mem.read(ConstPtr::<u32>::from_bits(mgr + off));
+    cur == 0 || cur == loader
+}
+
 // 曾有 force_gamemode_standby(把岛上 NewGameManager.gameMode 顶成 1),因会暂停 cocos2d director 冻结整岛而删除,勿复活。
 
 // ===== 死循环看门狗(进岛卡死定位)=====
@@ -6286,6 +6313,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // ── [K7] ──
         // [2026-09-24 第四轮 K7 N-D5-2] SceneMannager 不在 CLASSES:离岛过渡中才放行 loadMainVillageScene(每次回村一次)。
         || (ISLAND_EXITING.load(O) && sel == "loadMainVillageScene")
+        // [2026-09-24 第四轮 K7 I1-02] 进岛加载期才放行 setIsChangeSceneButtonSelected:(中止善后臂,SceneMannager 不在 CLASSES)。
+        || (ISLAND_LOADING.load(O) && sel == "setIsChangeSceneButtonSelected:")
         // ── [K8] ──
         // [2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口吞掉打工归还的臂(ActorManager changeAvailableMolerForTask:)。按「受门控的 sel」
         //   写法:没把 ActorManager 加进 CLASSES(那样它每帧的消息都要 to_string 两次、走完整条比较链);岛外只多一次原子读。
@@ -8730,13 +8759,27 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // ★[审计修 2026-09-11] 去掉 ISLAND_ENTER_WINDOW>0 前置:窗口按【帧】倒计时(1200 帧),进岛加载一慢(首次解图集/
         //   慢机器/掉帧)就先耗尽 → updatePause_ 不再被强清 → 永久卡在加载画面,且看门狗同谓词一起哑掉、不留痕迹。
         //   LoadingHoliday 只在 nextSceneId==10(进黄金岛)时才会被创建,仅按类名门控零回归。
-        if class == "LoadingHoliday" && sel == "updateLoading:" {
+        // [2026-09-24 第四轮 K7 I1-02] 改为只在进岛加载期(ISLAND_LOADING)、且只对 LoadingManager 当前持有的加载器强清。
+        //   原版中止(弹框 CANCEL)后被中止的 LoadingHoliday 并没有真正卸下调度(unschedule 传错了选择子,见 island_loader_is_current),
+        //   原版靠 updatePause_=1 把它永久冻住;以前这里只按类名强清,中止后它会被解冻,接着跑 index3 的 freeCommonResources
+        //   (0x252ebe,拆主村 NPC/公共资源)一路跑到 endLoading,把玩家留在的主村拆掉。中止臂(setIsChangeSceneButtonSelected:0)
+        //   清了 ISLAND_LOADING,这里就不再碰它;中止后再进岛时新旧两个加载器并存,只清新的。正常进岛 LoadingHoliday 只在
+        //   enterLoading:10 之后分配(0x238264 cmp r3,#0xa),到 loadNewScene:10 为止 ISLAND_LOADING 恒为真,对正常路径零回归。
+        //   仍不给 ISLAND_LOADING 加帧数超时(09-11 回滚过:超时清标志 = 网络门关闭 = 慢机器永久卡加载)。
+        if class == "LoadingHoliday" && sel == "updateLoading:" && ISLAND_LOADING.load(O) {
             let self_bits = env.cpu.regs()[0];
-            let cur_ptr: ConstPtr<i32> = Ptr::from_bits(self_bits + 0x10);
-            let cur: i32 = env.mem.read(cur_ptr);
-            if cur >= 2 {
-                let pause_ptr: MutPtr<u8> = Ptr::from_bits(self_bits + 0xc);
-                env.mem.write(pause_ptr, 0u8);
+            if island_loader_is_current(env, self_bits) {
+                let cur_ptr: ConstPtr<i32> = Ptr::from_bits(self_bits + 0x10);
+                let cur: i32 = env.mem.read(cur_ptr);
+                if cur >= 2 {
+                    let pause_ptr: MutPtr<u8> = Ptr::from_bits(self_bits + 0xc);
+                    env.mem.write(pause_ptr, 0u8);
+                }
+            } else if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_STALE_LOADER, O) & K7_LOG_STALE_LOADER) == 0 {
+                log!(
+                    "[MOLECHEAT] island: 旧的(已中止的)LoadingHoliday {:#x} 仍挂在调度器上 → 保持原版暂停,不解冻",
+                    self_bits
+                );
             }
         }
 
@@ -8745,11 +8788,15 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //     已过网络门之后(0x24155e),LoadingHoliday 也只在此、仅 nextSceneId==10 时分配;r2=SceneMannager 自身。
         //   · ON_ISLAND:[SceneMannager loadNewScene:] 且 r2==10(唯一调用方 endLoadingScene;真方法入口第一件事写 curSceneId_=r2)。
         //     以前还要求 ISLAND_ENTER_WINDOW>0:加载超过 1200 帧就永远置不上 → 岛上全部 hook 静默失效。
-        //   · LoadingHoliday alertView:didDismissWithButtonIndex: 且 buttonIndex(r3)==0:原版的加载中止路径(不切场景)。
+        //   · [2026-09-24 第四轮 K7 I1-02] 加载中止:[SceneMannager setIsChangeSceneButtonSelected:0] 且 ISLAND_LOADING
+        //     (原版中止分支 0x252012 的真标记;以前挂在 LoadingHoliday alertView:didDismissWithButtonIndex: r3==0 上,不等价,见该臂)。
         if class == "LoadingManager" && sel == "enterLoadingWithDelegate:nextSceneId:" {
             if env.cpu.regs()[3] == 10 {
                 ISLAND_LOADING.store(true, O);
                 ISLAND_SCENE_MGR.store(env.cpu.regs()[2], O);
+                // [2026-09-24 第四轮 K7 I1-02] r0 = LoadingManager 单例;updateLoading: 臂据它认当前加载器。
+                ISLAND_LOADING_MGR.store(env.cpu.regs()[0], O);
+                ISLAND_K7_LOGGED.store(0, O);
                 log!("[MOLECHEAT] island: >> enterLoading (加载场景开始,ISLAND_LOADING=true)");
             }
         } else if class == "SceneMannager" && sel == "loadNewScene:" && env.cpu.regs()[2] == 10 {
@@ -8760,20 +8807,54 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             ISLAND_SCENE_MGR.store(env.cpu.regs()[0], O);
             // ★【已回滚】曾在此 load_island_shop_atlases 补加载 4 个建筑商店图集——实测它把黄金岛渲染搞坏成全绿场地。
             log!("[MOLECHEAT] island: >> loadNewScene (建 GameNewScene),ON_ISLAND=true");
-        } else if class == "LoadingHoliday"
-            && sel == "alertView:didDismissWithButtonIndex:"
-            && env.cpu.regs()[3] == 0
+        } else if class == "SceneMannager"
+            && sel == "setIsChangeSceneButtonSelected:"
+            && (env.cpu.regs()[2] & 0xff) == 0
             && ISLAND_LOADING.load(O)
         {
+            // [2026-09-24 第四轮 K7 I1-02] 进岛被中止时的完整善后,改挂在中止的真标记上。
+            //   ① 触发点:原来挂在 (LoadingHoliday, alertView:didDismissWithButtonIndex:) 且 r3==0 上,并不等价于中止——原方法
+            //     index0 还要先匹配 NEW_SCENE_NETWORK_DISCONNECT / LOGIN_ERROR_IN_NEWSCENE / MULTI_LOGIN_ERROR_IN_NEWSCENE 三条文案
+            //     才走善后(0x251f08-0x251fe4),匹配不上落到 0x2520c8 直接返回、加载继续,那时却已把标志清了。
+            //     setIsChangeSceneButtonSelected: 全二进制 9 个调用点(selref 实证):GameManager 5 处——onStateChangedTo:(0x21a24/0x21bfa)
+            //     与 onCommandReceived:(0x2311c/0x238ce)4 处都在 isDownloadDataForEnterNewScene_(+313)为真的分支里,该位只由
+            //     updateGameDateForEnterNewSceneWithTarget:andCallback: 置(0x25d6e),它自己在 0x25d30 另有一处清 0,而整个方法离线被 gate#1
+            //     吞掉、从不执行,所以该位从不置位;VillageLayer enterNewIslands(0x37692)与 HolidayVillageLayer gobackMainVillage(0x23d1b8)传 1;
+            //     -[NewBaseLoading switchToNewScene](0x241d64)清 0 时已在 performSelector:(exitLoading)→endLoadingScene→loadNewScene:10
+            //     之后(该 performSelector 在 0x241d16/0x241d26 以 targetCallback_/selector_ 非空为前提,LoadingManager enterLoading 在
+            //     0x2382ea 恒以 setCallBack:self selector:exitLoading 设好),ISLAND_LOADING 已为假;宿主菜单的复位(mole_menu)要求
+            //     island_session_active() 为假。所以加载期只有中止分支
+            //     (-[LoadingHoliday alertView:didDismissWithButtonIndex:] 0x252012)会走到这里。
+            //   ② curSceneId_:中止分支只 setIsChangeSceneButtonSelected:0 / hideLoadingLayer / unscheduleSelector(传错了选择子)/
+            //     清两个 NetworkManager 委托,不恢复场景号;唯一的复位函数 -[SceneMannager restoreLastScene]@0x2415d8 零引用。
+            //     curSceneId_ 永卡 startNewSceneFrom@0x241520 写的 2 → -[NewStyleStoreItemsView loadObjectsDataByType:]@0x3b9534 按场景号
+            //     选数据源(1→GameData、10→NewSceneData、其余 nil)→ 主村建设庄园/食材店全空格,-[WrapperManager currentGameMode] 也路由错,
+            //     且不会自愈。照 -[SceneMannager endLoadingScene]@0x241660/0x241664 的语义写 curSceneId_=1、nextSceneId_=0
+            //     (进岛 from 恒为 1 = lastSceneId_,等价于 restoreLastScene)。r0 就是 SceneMannager 本体(sharedManager 的返回值),
+            //     偏移从 _OBJC_IVAR 槽 0xb05f94/0xb05f98 现读(兼容非脆弱 ivar 修正写回),读不到用 12/16(re.py ivar 实证)。
+            //   ③ 会话标志:清 ISLAND_LOADING 与 ISLAND_ENTER_WINDOW。[2026-09-16 I9-03] 的理由照旧:窗口 >0 会让岛网络门在主村继续生效
+            //     (isConnected=1/state=6/isReachable=1/吞 sendPacket),island_session_active() 为真还会让离线活动回环停摆约 20 秒。
+            //     被中止的加载器从此由 updateLoading: 臂的 ISLAND_LOADING 门与当前加载器判定保持原版暂停。
+            //   全程纯内存读写,不发消息、不改寄存器,return false 放行真 setter(它照原版把 isChangeSceneButtonSelected_ 清 0)。
+            let sm = env.cpu.regs()[0];
+            let off_cur: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f94));
+            let off_cur = if off_cur != 0 && off_cur < 0x100 { off_cur } else { 12 };
+            let off_next: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f98));
+            let off_next = if off_next != 0 && off_next < 0x100 { off_next } else { 16 };
+            let cur_ptr: MutPtr<i32> = Ptr::from_bits(sm + off_cur);
+            let next_ptr: MutPtr<i32> = Ptr::from_bits(sm + off_next);
+            let old_cur: i32 = env.mem.read(cur_ptr);
+            let old_next: i32 = env.mem.read(next_ptr);
+            env.mem.write(cur_ptr, 1i32);
+            env.mem.write(next_ptr, 0i32);
             ISLAND_LOADING.store(false, O);
-            // [2026-09-16 黄金岛审查修 I9-03] 网络窗口也要一起清。原来 ISLAND_ENTER_WINDOW 只在离岛臂
-            //   (startNewSceneFrom 10→1)清零,进岛半路被中止时它还揣着最多 1200 帧(约 20 秒)。
-            //   窗口 >0 会让岛网络门在【主村】继续生效:isConnected=1 / state=6 / isReachable=1 / 吞掉所有
-            //   sendPacket,同时 island_session_active() 为真会让整个离线活动回环停摆(mole_activity.rs:334)。
-            //   玩家表现:一次没进成的进岛之后,主村有约 20 秒「活动中心/签到/折扣点不开也不弹离线提示」的抽风期,
-            //   而且这期间接/交任务走的是在线分支。中止时清零,是这条路径上唯一安全且充分的收敛点。
             ISLAND_ENTER_WINDOW.store(0, O);
-            log!("[MOLECHEAT] island: 进岛加载被中止(LoadingHoliday 弹框 index0)→ 清加载标志与网络窗口");
+            log!(
+                "[MOLECHEAT] island: 进岛加载被中止(setIsChangeSceneButtonSelected:0)→ curSceneId 复位 1(原 {})、nextSceneId 清 0(原 {}),清加载标志与网络窗口",
+                old_cur,
+                old_next
+            );
+            return false;
         } else if class == "SceneMannager" && sel == "loadMainVillageScene" {
             // [2026-09-24 第四轮 K7 N-D5-2] 离岛标志的结束点改成事件驱动。回村整条链在同一次调度器 tick 里同步跑完:
             //   -[NewBaseLoading endLoading]@0x241cce → switchToNewScene → 0x241d34 performSelector:(exitLoading)
