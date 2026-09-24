@@ -6284,6 +6284,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   与 intercept 里不绑类的 `sel == "moleIslandFlushNow"` 臂对应)。
         || sel == "moleIslandFlushNow"
         // ── [K7] ──
+        // [2026-09-24 第四轮 K7 N-D5-2] SceneMannager 不在 CLASSES:离岛过渡中才放行 loadMainVillageScene(每次回村一次)。
+        || (ISLAND_EXITING.load(O) && sel == "loadMainVillageScene")
         // ── [K8] ──
         // [2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口吞掉打工归还的臂(ActorManager changeAvailableMolerForTask:)。按「受门控的 sel」
         //   写法:没把 ActorManager 加进 CLASSES(那样它每帧的消息都要 to_string 两次、走完整条比较链);岛外只多一次原子读。
@@ -8772,6 +8774,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //   而且这期间接/交任务走的是在线分支。中止时清零,是这条路径上唯一安全且充分的收敛点。
             ISLAND_ENTER_WINDOW.store(0, O);
             log!("[MOLECHEAT] island: 进岛加载被中止(LoadingHoliday 弹框 index0)→ 清加载标志与网络窗口");
+        } else if class == "SceneMannager" && sel == "loadMainVillageScene" {
+            // [2026-09-24 第四轮 K7 N-D5-2] 离岛标志的结束点改成事件驱动。回村整条链在同一次调度器 tick 里同步跑完:
+            //   -[NewBaseLoading endLoading]@0x241cce → switchToNewScene → 0x241d34 performSelector:(exitLoading)
+            //   → -[LoadingManager exitLoading]@0x23848a endLoadingScene → -[SceneMannager endLoadingScene] 0x241660 写
+            //   curSceneId_=1、0x241664 写 nextSceneId_=0 → 0x241668 loadMainVillageScene(全二进制唯一调用点,selref 实证)
+            //   → 0x241092/0x241138 startGame → startGame:。而 -[CCDirectorIOS drawScene] 先进前置臂、后 [CCScheduler tick:],
+            //   上面 drawScene 臂在这一帧只能读到 cur=2,ISLAND_EXITING 要到下一帧才清 → startGame: 被拦时
+            //   island_session_active() 仍为真,mole_activity 的进村补发(1074 日常/1058 公告/1112 烟花/1049 折扣)整段跳过,
+            //   回环队列也被清掉:回村后日常任务 NPC 头顶的「!」不再出现、公告星标不重置、春节回村不补放烟花。
+            //   在这里(写完 cur=1 之后、startGame: 之前)清掉它。纯原子操作:不发消息、不动寄存器、不 return,放行真方法。
+            //   此刻 ON_ISLAND 早已在离岛出口清掉,curSceneId 强制 10 的臂不受影响;drawScene 的 cur==1/10 判定与 3600 帧超时兜底保留。
+            //   SceneMannager 不在 intercept_wants 的 CLASSES 里,粗筛靠 [K7] 槽位的受门控 sel(ISLAND_EXITING 为真才放行)。
+            if ISLAND_EXITING.swap(false, O) {
+                log!("[MOLECHEAT] island: 离岛完成(loadMainVillageScene)→ curSceneId 已写 1,清离岛标志(startGame: 的进村补发照常)");
+            }
         }
         // 曾有 gobackMainVillage 前置钩子清离岛标志,因真方法 0x23d19c 读到 isChangeSceneButtonSelected 会早退、抢跑会误判离岛而删除,勿复活
         // (离岛统一走网络门块里 startNewSceneFrom:toScene: 10→1 全局出口)。
