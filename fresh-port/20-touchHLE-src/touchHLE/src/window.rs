@@ -1418,8 +1418,12 @@ impl Window {
                 #[cfg(not(target_os = "ios"))]
                 E::AppWillEnterBackground { .. } => {
                     log!("Received app-will-resign-active event.");
-                    assert!(self.high_priority_event.is_none());
-                    self.high_priority_event = Some(Event::AppWillResignActive);
+                    // [同步 iOS 6b93bc1 · 2026-09-24] 不再 assert:单帧 drawScene 跑很久时生命周期事件会在
+                    //   pop_event 消费前接连到达,旧 assert 在第二个事件上 panic(iOS 上实测为画面定格)。
+                    //   改为优先级语义:失活不覆盖已挂起的更高优先级事件(终止)。
+                    if self.high_priority_event.is_none() {
+                        self.high_priority_event = Some(Event::AppWillResignActive);
+                    }
                     // For some reason, if we don't pause event polling, we will
                     // never finish handling the event.
                     // [补完 2026-09-15] 上游 TODO(回到前台后重新打开轮询)已实现:Android 上
@@ -1435,7 +1439,7 @@ impl Window {
                 #[cfg(not(target_os = "ios"))]
                 E::AppTerminating { .. } => {
                     log!("Received app-will-terminate event.");
-                    assert!(self.high_priority_event.is_none());
+                    // [同步 iOS 6b93bc1 · 2026-09-24] 终止优先级最高:直接覆盖挂起中的失活事件,不再 assert。
                     self.high_priority_event = Some(Event::AppWillTerminate);
                     self.enable_event_polling = false;
                     continue;
