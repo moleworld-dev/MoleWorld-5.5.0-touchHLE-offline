@@ -2071,6 +2071,9 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
 const ISLAND_MISC_FILE: &str = "island_misc.dat";
 /// 根字典键:NSMutableDictionary<NSNumber 成就号 → NSNumber 累计数/状态位>,原样照抄 NewSceneData.achievementStateRecord_。
 const ISLAND_MISC_KEY_ACH: &str = "achievementStateRecord";
+/// [2026-09-24 第四轮 K12 I7-05] 根字典键:NSMutableArray<NSNumber>,原样照抄 NewSceneData.top3RecordOfMiniGame_
+/// (岛上沙滩 WC 小游戏「左左右右」的前三名成绩)。
+const ISLAND_MISC_KEY_TOP3: &str = "top3RecordOfMiniGame";
 
 /// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛成就累计计数落盘 → island_misc.dat(挂在 island_flush_extras 的 K12 槽位)。
 ///
@@ -2093,6 +2096,7 @@ const ISLAND_MISC_KEY_ACH: &str = "achievementStateRecord";
 /// island_userinfo.dat 持久化的 achieveAlreadyUnlock),0x334abc `bne` 直接跳过已解锁项,不会重复发奖。
 /// 在线模式由私服 1062 下发,这里一律不动。归档对象是 NewSceneData 上的活表,不是 userInfoDataInNewScene
 /// (后者没有这个字段)。返回落盘摘要并入 island_flush 的汇总日志。
+/// [2026-09-24 第四轮 K12 I7-05] 同一份档再存 top3RecordOfMiniGame 键(小游戏前三名,病根与读回见 island_misc_restore_top3)。
 fn island_misc_flush(env: &mut Environment) -> Option<String> {
     if env.options.network_access || ONLINE_MODE.load(O) || !ON_ISLAND.load(O) {
         return None;
@@ -2109,22 +2113,42 @@ fn island_misc_flush(env: &mut Environment) -> Option<String> {
     // -[NewSceneData achievementStateRecord]@0x223cb0(@8@0:4,纯 ivar 读)
     let ach_s = island_sel(env, "achievementStateRecord");
     let ach: id = msg_send(env, (nsd, ach_s));
-    if ach == nil {
+    // [2026-09-24 第四轮 K12 I7-05] -[NewSceneData top3RecordOfMiniGame]@0x223e44(@8@0:4,纯 ivar 读 +152,
+    //   槽 0xb05de0;0xb05de4 是 mapFragments_,别弄混)。元素是 -[WashRoomGame updateTop3Record] 0x35c40e
+    //   numberWithInt: 出来的 NSNumber,原样归档。
+    let top3_s = island_sel(env, "top3RecordOfMiniGame");
+    let top3: id = msg_send(env, (nsd, top3_s));
+    if ach == nil && top3 == nil {
         return None;
     }
     let cnt_s = island_sel(env, "count");
-    let ach_n: crate::mem::GuestUSize = msg_send(env, (ach, cnt_s));
+    let ach_n: crate::mem::GuestUSize = if ach != nil {
+        msg_send(env, (ach, cnt_s))
+    } else {
+        0
+    };
+    let top3_n: crate::mem::GuestUSize = if top3 != nil {
+        msg_send(env, (top3, cnt_s))
+    } else {
+        0
+    };
     let root = island_alloc_init(env, "NSMutableDictionary");
     if root == nil {
         return None;
     }
     let sfk = island_sel(env, "setObject:forKey:");
-    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
-    let _: () = msg_send(env, (root, sfk, ach, k));
+    if ach != nil {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
+        let _: () = msg_send(env, (root, sfk, ach, k));
+    }
+    if top3 != nil {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_TOP3);
+        let _: () = msg_send(env, (root, sfk, top3, k));
+    }
     let r = island_sidecar_save(env, ISLAND_MISC_FILE, ISLAND_FILE_MISC, root);
-    // root 是本函数 alloc-init 的 +1,归档已结束;活表 ach 是 getter 取回的,不 release。
+    // root 是本函数 alloc-init 的 +1,归档已结束;活表 ach/top3 是 getter 取回的,不 release。
     release(env, root);
-    r.map(|s| format!("{}[成就累计 {} 项]", s, ach_n))
+    r.map(|s| format!("{}[成就累计 {} 项/小游戏前三 {} 条]", s, ach_n, top3_n))
 }
 
 /// [2026-09-24 第四轮 K12 I7-03/I6-01] 进岛读回 island_misc.dat(挂在 island_after_layout_ready 的 K12 槽位)。
@@ -2136,16 +2160,10 @@ fn island_misc_flush(env: &mut Environment) -> Option<String> {
 ///   灌进一张新 alloc 的 NSMutableDictionary,发 -[NewSceneData setAchievementStateRecord:]@0x223cc0
 ///   (v12@0:4@8,属性 `&,N`,0x223cdc 走 _objc_setProperty 自带 retain 并释放旧表)后放掉我们的 +1。
 ///   setter 必须给可变容器:checkReqConditionOk: 会直接对它 setObject:forKey:。接收者是 NewSceneData。
+/// · [2026-09-24 第四轮 K12 I7-05] 小游戏前三名由 island_misc_restore_top3 读回,与成就计数互不依赖。
 fn island_misc_restore(env: &mut Environment) {
     if env.options.network_access || ONLINE_MODE.load(O) {
         return;
-    }
-    fn is_kind(env: &mut Environment, obj: id, cls: id) -> bool {
-        if obj == nil || cls == nil {
-            return false;
-        }
-        let s = island_sel(env, "isKindOfClass:");
-        msg_send(env, (obj, s, cls))
     }
     let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
     if nsd_cls == nil {
@@ -2163,13 +2181,15 @@ fn island_misc_restore(env: &mut Environment) {
     }
     let dict_cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
     let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
-    if !is_kind(env, root, dict_cls) {
+    if !island_misc_is_kind(env, root, dict_cls) {
         log!("[MOLECHEAT] island: island_misc.dat 根对象不是字典,忽略(下次落盘按当前进度重写)");
         return;
     }
     let ofk = island_sel(env, "objectForKey:");
     let cnt_s = island_sel(env, "count");
     let oai_s = island_sel(env, "objectAtIndex:");
+    // [2026-09-24 第四轮 K12 I7-05] 小游戏前三名先恢复(与成就计数互不依赖;成就段有多处提前 return)。
+    island_misc_restore_top3(env, nsd, root);
     let sfk = island_sel(env, "setObject:forKey:");
     let uiv = island_sel(env, "unsignedIntValue");
     let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
@@ -2177,7 +2197,7 @@ fn island_misc_restore(env: &mut Environment) {
     if ach_in == nil {
         return; // 老档没有这个键
     }
-    if !is_kind(env, ach_in, dict_cls) {
+    if !island_misc_is_kind(env, ach_in, dict_cls) {
         log!("[MOLECHEAT] island: island_misc.dat 的 achievementStateRecord 不是字典,跳过");
         return;
     }
@@ -2201,7 +2221,7 @@ fn island_misc_restore(env: &mut Environment) {
         } else {
             nil
         };
-        if !is_kind(env, key, num_cls) || !is_kind(env, val, num_cls) {
+        if !island_misc_is_kind(env, key, num_cls) || !island_misc_is_kind(env, val, num_cls) {
             dropped += 1;
             continue;
         }
@@ -2228,6 +2248,77 @@ fn island_misc_restore(env: &mut Environment) {
         "[MOLECHEAT] island: 读回 island_misc.dat 岛成就累计 {} 项 [{}]{}",
         kept.len(),
         desc.join(","),
+        if dropped > 0 {
+            format!("(丢弃非数字项 {} 个)", dropped)
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// [2026-09-24 第四轮 K12] island_misc.dat 读档校验用:`[obj isKindOfClass:cls]`(c12@0:4#8),obj/cls 为 nil 时返回 false。
+fn island_misc_is_kind(env: &mut Environment, obj: id, cls: id) -> bool {
+    if obj == nil || cls == nil {
+        return false;
+    }
+    let s = island_sel(env, "isKindOfClass:");
+    msg_send(env, (obj, s, cls))
+}
+
+/// [2026-09-24 第四轮 K12 I7-05] 读回岛上沙滩 WC 小游戏「左左右右」的前三名成绩(island_misc_restore 调用)。
+///
+/// **病根**:前三名存在 NewSceneData.top3RecordOfMiniGame_(+152,槽 0xb05de0;紧挨着的 0xb05de4 是
+/// mapFragments_,写错槽会把玩家的探险碎片数组指针覆盖掉)。唯一的填充来源是服务器 1062
+/// -[NewSceneCommand parseMapDataWithPackageData:atIndex:](0x22b0ca 取选择子);玩法侧 -[WashRoomGame updateTop3Record]
+/// (0x35c2a0 取表,0x35c40e numberWithInt: + insertObject:atIndex: 写入)与 -[WashRoomLevelChoose init](0x35cfa0 取表,
+/// 0x35d1dc 按 count 判界后 stringWithFormat:"%d" 贴标签)只读写内存;回主村时 resetNewSceneDataExceptObjectData 在
+/// 0x21e0c4 removeAllObjects。离线没有 1062 → 退岛重进就只剩本次会话打出来的成绩。
+///
+/// **做法**(补全原版该由服务器保管的数据):缺 top3RecordOfMiniGame 键 = 老档,跳过;有键就只保留 NSNumber 元素
+/// (保持原顺序)灌进一张新 alloc 的 NSMutableArray——等价于「先清空再灌」,不会每次进岛翻倍——然后发
+/// -[NewSceneData setTop3RecordOfMiniGame:]@0x223e54(v12@0:4@8,属性 `&,N`,0x223e70 走 _objc_setProperty 自带 retain
+/// 并释放旧数组)再放掉我们的 +1。必须给可变数组:updateTop3Record 会对它 removeObjectAtIndex:/insertObject:atIndex:。
+/// 接收者是 NewSceneData(不是 userInfoDataInNewScene),不直写 ivar。落盘见 island_misc_flush。
+fn island_misc_restore_top3(env: &mut Environment, nsd: id, root: id) {
+    let ofk = island_sel(env, "objectForKey:");
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_TOP3);
+    let src: id = msg_send(env, (root, ofk, k));
+    if src == nil {
+        return; // 老档没有这个键
+    }
+    let arr_cls = env.objc.get_known_class("NSArray", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if !island_misc_is_kind(env, src, arr_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 的 top3RecordOfMiniGame 不是数组,跳过");
+        return;
+    }
+    let fresh = island_alloc_init(env, "NSMutableArray");
+    if fresh == nil {
+        return;
+    }
+    let cnt_s = island_sel(env, "count");
+    let oai_s = island_sel(env, "objectAtIndex:");
+    let add_s = island_sel(env, "addObject:");
+    let iv = island_sel(env, "intValue");
+    let n: crate::mem::GuestUSize = msg_send(env, (src, cnt_s));
+    let mut kept: Vec<i32> = Vec::new();
+    let mut dropped = 0u32;
+    for i in 0..n {
+        let o: id = msg_send(env, (src, oai_s, i));
+        if !island_misc_is_kind(env, o, num_cls) {
+            dropped += 1;
+            continue;
+        }
+        let _: () = msg_send(env, (fresh, add_s, o));
+        let v: i32 = msg_send(env, (o, iv));
+        kept.push(v);
+    }
+    let set_s = island_sel(env, "setTop3RecordOfMiniGame:");
+    let _: () = msg_send(env, (nsd, set_s, fresh));
+    release(env, fresh);
+    log!(
+        "[MOLECHEAT] island: 读回 island_misc.dat 小游戏前三 {:?}{}",
+        kept,
         if dropped > 0 {
             format!("(丢弃非数字项 {} 个)", dropped)
         } else {
@@ -3025,7 +3116,7 @@ fn island_after_layout_ready(env: &mut Environment) {
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
     // ── [K11] 超级贝壳树侧档读入缓存 ──
     // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
-    island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01] island_misc.dat 读回岛成就累计计数
+    island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] island_misc.dat 读回岛成就累计计数与小游戏前三名
     let _ = env;
 }
 
@@ -3045,7 +3136,7 @@ fn island_flush_extras(env: &mut Environment) -> Vec<String> {
     // ── [K10] 咖啡馆 island_cafe.dat ──
     // ── [K11] 超级贝壳树 island_shelltree.dat ──
     // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
-    out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01] 只在岛上落盘,摘要并入汇总
+    out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] 只在岛上落盘,摘要并入汇总
     let _ = &mut *env;
     out
 }
