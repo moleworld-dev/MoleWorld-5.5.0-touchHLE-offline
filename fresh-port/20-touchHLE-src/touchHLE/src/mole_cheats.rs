@@ -2616,11 +2616,14 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
         .objc
         .register_host_selector("objectForKey:".to_string(), &mut env.mem);
     let mut arr: id = msg_send(env, (md, ofk, keystr));
+    // [2026-09-24 第四轮 K2 I2-4] 新建分支的 +1 由本函数平衡,见下方 release。
+    let mut created = false;
     if arr == nil {
         arr = island_alloc_init(env, "NSMutableArray");
         if arr == nil {
             return;
         }
+        created = true;
         let sfk = env
             .objc
             .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
@@ -2630,6 +2633,14 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
         .objc
         .register_host_selector("addObject:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (arr, add, snap));
+    // [2026-09-24 第四轮 K2 I2-4] island_alloc_init 给的是 alloc+init 的 +1;可变字典 setObject:forKey: 已自己 retain,
+    //   这份 +1 原来无人平衡,每新建一个类型桶就泄漏一个数组。只在新建分支放(objectForKey: 取回的既有数组是 +0,
+    //   绝不能 release)。放在 addObject: 之后而不是紧跟 setObject:forKey::mapData 若是坏档塌成的伪字典
+    //   (NSMutableArray 的 setObject:forKey: 是吞掉不存的空操作,见 ns_array.rs)就没人 retain,先放会让
+    //   addObject: 打到已释放对象;放在最后则两种情况都平衡(正常时 md 持有,伪字典时数组连同 snap 的那次 retain 一起释放)。
+    if created {
+        release(env, arr);
+    }
     log_dbg!(
         "[MOLECHEAT] island: 经营态写回 mapData[key={}] seqId={} (add)",
         key,
