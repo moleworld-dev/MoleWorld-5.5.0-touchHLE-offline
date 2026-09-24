@@ -2107,6 +2107,13 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
                 // (UILabel 单行不裁剪,居中后两侧溢出屏外),缩短后能放下。
                 shown.push_str("(需不在 gameMode 0/6、等级≥needLevel,由雅丽激活)");
             }
+            if matches!(tool, DevTool::Quest(QuestFamily::Island)) {
+                // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转也补发了 [[NewSceneQuest sharedInstance] activate:0](见 mole_dev::quest_jump)。
+                // -[NewSceneQuest activate:]@0x328190 的门:NewGameManager.gameMode 不为 0(0x3281d0)/6(0x3281e6);
+                // checkCanActivate 里岛等级≥needLevel(0x32841e)。等级不够时置不上 canActivate 是原版行为。
+                // toast 超宽会自动折行(add_toast),不必再缩短 quest_jump 的正文。
+                shown.push_str("(需不在 gameMode 0/6、岛等级≥needLevel;布兰头顶出感叹号后点击接任务)");
+            }
             set_toast(shown);
         }
         Err(e) => {

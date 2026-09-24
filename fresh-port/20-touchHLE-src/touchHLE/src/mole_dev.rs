@@ -510,7 +510,20 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
             game_data_call(env, "saveUserInfoData");
             game_data_call(env, "saveMapData");
         }
-        QuestFamily::Island => {}
+        // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转后补发激活,照原版 -[NewGameManager checkActiveStoryQuest] 在 0x246850-0x246866
+        // 发的 [[NewSceneQuest sharedInstance] activate:0]。根因:quickStart:@0x32b510 只写 questState=0(0x32b532)、
+        // setCurQuestId:0(0x32b54a)、setNextQuestId:N(0x32b564),不碰 canActivate(ivar +244);点 NPC 走
+        // -[ActorManager touchEnd:] 发 activate:1,-[NewSceneQuest activate:]@0x328190 在参数为 1 时(0x3281ea/0x3281ee)
+        // 跳过 checkCanActivate,0x32820e-0x328212 读到 canActivate==0 就整条返回——点布兰没反应,要退岛重进才恢复。
+        // activate:0 走 checkCanActivate@0x328380 → setCanActivate:1@0x32847c(刷 NPC 101 头顶感叹号)。activate: 自己的门
+        // 照原版执行:NewGameManager.gameMode 不为 0/6(0x3281d0/0x3281e6)、岛等级≥needLevel(0x32841e);等级不够置不上
+        // canActivate 是原版行为,不绕。任务是 isAutomatic 且等级够时,原版这一发会直接 nextQuest 开始任务(0x32833a-0x328376)。
+        // 签名 v12@0:4c8,BOOL 参数按仓库惯例传 false。菜单点击/文本命令回调,不在帧栈也不在 intercept 里,不需要恢复 r0-r3。
+        // quickStart: 自己已调 saveUserinfoBothInLocalAndRemote(0x32b5b0),这里不再额外存盘。
+        QuestFamily::Island => {
+            let s = sel(env, "activate:");
+            let _: () = msg_send(env, (quest, s, false));
+        }
     }
     log!(
         "[MOLEDEV] 任务跳转 {} → {}(表内共 {} 条)",
@@ -522,7 +535,8 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     // -[VipQuest activate:]@0x38722c 没有语言门;-[TimeQuest activate:] 的语言门在 zh-Hans 下放行(见上)。
     let note = match family {
         // 文案保持短:菜单还会在后面追加激活条件,toast 只有 992 宽。
-        QuestFamily::Time => ";已补发激活",
+        // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转同样补发了激活(见上)。
+        QuestFamily::Time | QuestFamily::Island => ";已补发激活",
         _ => "",
     };
     Ok(format!(
