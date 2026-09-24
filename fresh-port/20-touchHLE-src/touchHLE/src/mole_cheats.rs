@@ -1480,6 +1480,372 @@ fn load_island_fragments(env: &mut Environment) {
     }
 }
 
+// ════════ [2026-09-24 第四轮 K10] 咖啡馆许愿任务链:三张状态表持久化 ════════
+// 咖啡任务的全部状态挂在 NewSceneData 的三张本地表上(re.py ivar NewSceneData):
+//   acceptedNotifyQusetListInLocal_(+124,元素 NSMutableDictionary{notifyQuestId, notifyQuestRequireThingsCount})、
+//   unrewardNotifyQuestListInLocal_(+132,元素 NSMutableDictionary{notifyQuestId, unrewardObjectsListArr})、
+//   finishedNotifyQuestListInLocal_(+140,元素 NSNumber)。
+// 原版它们只靠上行包(-[NetworkManager updateLocalAcceptedNotifyQuestData]@0x224104 等)留在服务器,进岛由 1062 回包
+// -[NewSceneCommand parseMapDataWithPackageData:atIndex:] 经三个本地入口灌回(0x22b0d8 addAcceptedNotifyQusetListInLocal:
+// wihtFinishedRequireThingsCount: / 0x22b228 updateUnrewardNotifyQuest:andUnrewardObjectsIds: / 0x22b5e0
+// addFinishedNotifyQuestWithQuestId:);回主村时 -[NewSceneData resetNewSceneDataExceptObjectData] 在 0x21e086/0x21e098/0x21e0aa
+// 把三张表清空。离线没有这两头 → 接了的任务退岛即丢、完成的任务下次还能重接重复领奖。
+// 这里用侧档 island_cafe.dat 充当「服务器那一份」:落盘在 island_flush(离岛出口早于 0x2543fe 的 reset,此刻表还满),
+// 读回在 island_after_layout_ready(早于 CafeShop 两个 init 读 getAllShownNotifyQuestIds 算 hasQuest)。
+
+/// [2026-09-24 第四轮 K10 I5-3] 咖啡馆许愿任务侧档(保护位 ISLAND_FILE_CAFE)。
+/// 根字典:accepted / unreward / finished(即上面三张表原样归档)+ savedAt(落盘时刻 CFAbsoluteTime,仅诊断用)。
+const ISLAND_CAFE_FILE: &str = "island_cafe.dat";
+/// cafeQuestHV.dat 共 17 条咖啡任务,ID 1..=17。
+const CAFE_QUEST_MAX_ID: i32 = 17;
+/// cafeQuestHV.dat 里 req_work(派遣摩尔打工)的任务:2/8/11/13/16/17。-[CafeQuestData initWithDict:] 0x36d4fc 把
+/// req_work 解析成 questType 7;这类任务接取时 -[CafeQuest acceptWithQuestId:] 0x36c608 取 getCurrentServerTime 当
+/// notifyQuestRequireThingsCount 存(开始时刻),-[CafeQuestData innerUpdate:]@0x36d7f0 用「现在 − 开始时刻 ≥ 所需秒数」判完成。
+const CAFE_REQ_WORK_IDS: [i32; 6] = [2, 8, 11, 13, 16, 17];
+/// 已接上限:-[NewSceneData addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:] 0x22050c
+/// `cmp r0,#2 / bhi` 已有 3 条就拒绝。
+const CAFE_ACCEPTED_MAX: usize = 3;
+/// 本次进岛 island_cafe_restore_and_offer 是否已跑完。没跑过(在线、表未建好)就不落盘,免得拿空表盖掉玩家进度。
+static CAFE_SESSION_READY: AtomicBool = AtomicBool::new(false);
+
+/// NSArray 的全部元素;不是数组(含 nil)返回空。
+fn cafe_array_items(env: &mut Environment, arr: id) -> Vec<id> {
+    if arr == nil || !crate::mole_items::is_kind_of(env, arr, "NSArray") {
+        return Vec::new();
+    }
+    let cnt_s = island_sel(env, "count");
+    let n: crate::mem::GuestUSize = msg_send(env, (arr, cnt_s));
+    let oai = island_sel(env, "objectAtIndex:");
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let o: id = msg_send(env, (arr, oai, i));
+        out.push(o);
+    }
+    out
+}
+
+/// NSNumber → intValue;不是 NSNumber(含 nil)返回 None,不给坏档里的异类对象发 intValue。
+fn cafe_int(env: &mut Environment, obj: id) -> Option<i32> {
+    if obj == nil || !crate::mole_items::is_kind_of(env, obj, "NSNumber") {
+        return None;
+    }
+    let s = island_sel(env, "intValue");
+    let v: i32 = msg_send(env, (obj, s));
+    Some(v)
+}
+
+/// dict[key](dict 须已确认是 NSDictionary)。
+fn cafe_dict_get(env: &mut Environment, dict: id, key: &'static str) -> id {
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+    let s = island_sel(env, "objectForKey:");
+    msg_send(env, (dict, s, k))
+}
+
+/// 本地表元素(字典)里的 notifyQuestId;不是字典或 id 越界返回 None。
+fn cafe_entry_id(env: &mut Environment, entry: id) -> Option<i32> {
+    if !crate::mole_items::is_kind_of(env, entry, "NSDictionary") {
+        return None;
+    }
+    let v = cafe_dict_get(env, entry, "notifyQuestId");
+    cafe_int(env, v).filter(|q| (1..=CAFE_QUEST_MAX_ID).contains(q))
+}
+
+/// [2026-09-24 第四轮 K10 I5-3/I8-2] 进岛读回 island_cafe.dat,经原版 1062 回包用的同一组本地入口灌回三张表。
+/// 挂在 island_after_layout_ready(读档岛/默认岛两条分支都会调),时序早于 CafeShop 两个 init。
+/// · 无档 → 不动内存里的表(正常离线首进岛,表本来就是空的);坏档 → island_sidecar_load 负责隔离/保护位,同样不动;
+/// · 读到档:先用原版清表方法 cleanAcceptedOldNotifyQuestList@0x220a3c / cleanAllUnrewardNotifyQuestList@0x221e10 /
+///   cleanAllFinishedNotifyQuestList@0x22251c(removeAllObjects,数组本体不换),再逐条走
+///   addFinishedNotifyQuestWithQuestId:@0x22219c(v12@0:4i8)、updateUnrewardNotifyQuest:andUnrewardObjectsIds:@0x2218e8
+///   (v16@0:4i8@12,方法内部新建可变字典 + addObjectsFromArray: 拷一份可变数组)、addAcceptedNotifyQusetListInLocal:
+///   wihtFinishedRequireThingsCount:@0x220478(c16@0:4i8L12,方法内部新建可变字典)。元素全由原版方法重建成可变容器,
+///   之后 modAcceptNotifyQuestData:withRequireThingsCount:@0x220d08 / updateUnrewardNotifyQuest:andCurrentRewardObjectID:
+///   @0x2212f0 对元素 setObject:forKey: 都安全,不依赖解档出来的容器是否可变。
+/// · 校验:任务号 1..=17;同一任务只留状态最靠后的一张表(已完成 > 待领奖 > 已接,对应原版迁移方向);待领奖物品表
+///   必须是非空的 NSNumber 数组(空表在 0x22195a 走 deleteUnrewardNotifyQuest:@0x221104,它只在表里找到同号时才
+///   removeObject:+addFinishedNotifyQuestWithQuestId:(0x221250/0x221280);刚清过的表里找不到 → 原版等于什么也不做,
+///   这里直接丢弃,结果一致);已接最多 3 条。
+/// · req_work 任务的开始时刻若比现在晚 60 秒以上(时间旅行偏移不落盘、回拨过系统时钟),夹到现在,免得倒计时卡住。
+///   [复核修 2026-09-24 K10] 开始时刻 <1(档里缺键 / 手改档 / 坏值)同样夹到现在:-[CafeQuestData innerUpdate:] 0x36d87a
+///   `cmp r0,#1 / blt` 小于 1 永不判完成,而 -[CafeQuest minusNeededWorkers] 0x36cf98 对已接(状态 2)打工任务每次进岛
+///   都扣人手 → 任务与 1 个工人被永久占住。其它类型的进度计数为负时按 0(`L` 参数,负值会被当成超大无符号数)。
+/// · 三个「服务器已有记录」旗标照 1062 回包写 1(0x22b948 / 0x22baac / 0x22bb76 均为 `movs r2,#1`)。旗标只有
+///   updateLocal*NotifyQuestData 用来选上行包是 add 还是 setMod(selref 各 1 处,ivar 无其它直读),离线上行包被吞,不影响玩法。
+/// 在线(network_access)不做:由私服 1062/1081 原版下发。
+fn island_cafe_restore_and_offer(env: &mut Environment) {
+    CAFE_SESSION_READY.store(false, O);
+    if env.options.network_access {
+        return;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return;
+    }
+    // 三个 getter(0x223dc4/0x223de4/0x223e04)裸取 ivar,返回 -[NewSceneData init] 0x2192ac/0x2192da/0x219308 建好的本体。
+    let g_acc = island_sel(env, "acceptedNotifyQusetListInLocal");
+    let g_unr = island_sel(env, "unrewardNotifyQuestListInLocal");
+    let g_fin = island_sel(env, "finishedNotifyQuestListInLocal");
+    let acc: id = msg_send(env, (nsd, g_acc));
+    let unr: id = msg_send(env, (nsd, g_unr));
+    let fin: id = msg_send(env, (nsd, g_fin));
+    if acc == nil || unr == nil || fin == nil {
+        log!("[MOLECHEAT] island: 咖啡馆许愿任务:NewSceneData 的本地任务表还没建好(nil),本次不读档也不落盘");
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE);
+    if root != nil && !crate::mole_items::is_kind_of(env, root, "NSDictionary") {
+        log!("[MOLECHEAT] island: island_cafe.dat 根对象不是字典,按无档处理(不动内存里的咖啡任务表)");
+    } else if root != nil {
+        let now = now_cf_secs().max(0.0);
+        // 已完成
+        let mut fin_ids: Vec<i32> = Vec::new();
+        let fin_arr = cafe_dict_get(env, root, "finished");
+        for o in cafe_array_items(env, fin_arr) {
+            if let Some(q) = cafe_int(env, o) {
+                if (1..=CAFE_QUEST_MAX_ID).contains(&q) && !fin_ids.contains(&q) {
+                    fin_ids.push(q);
+                }
+            }
+        }
+        // 待领奖
+        let mut unr_entries: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut dropped = 0u32;
+        let unr_arr = cafe_dict_get(env, root, "unreward");
+        for o in cafe_array_items(env, unr_arr) {
+            let Some(q) = cafe_entry_id(env, o) else {
+                dropped += 1;
+                continue;
+            };
+            if fin_ids.contains(&q) || unr_entries.iter().any(|e| e.0 == q) {
+                dropped += 1;
+                continue;
+            }
+            let list = cafe_dict_get(env, o, "unrewardObjectsListArr");
+            let items = cafe_array_items(env, list);
+            let mut objs: Vec<i32> = Vec::with_capacity(items.len());
+            for it in items {
+                if let Some(v) = cafe_int(env, it) {
+                    objs.push(v);
+                } else {
+                    objs.clear();
+                    break;
+                }
+            }
+            if objs.is_empty() {
+                dropped += 1;
+                continue;
+            }
+            unr_entries.push((q, objs));
+        }
+        // 已接
+        let mut acc_entries: Vec<(i32, i32)> = Vec::new();
+        let mut clamped = 0u32;
+        let acc_arr = cafe_dict_get(env, root, "accepted");
+        for o in cafe_array_items(env, acc_arr) {
+            let Some(q) = cafe_entry_id(env, o) else {
+                dropped += 1;
+                continue;
+            };
+            if fin_ids.contains(&q)
+                || unr_entries.iter().any(|e| e.0 == q)
+                || acc_entries.iter().any(|e| e.0 == q)
+                || acc_entries.len() >= CAFE_ACCEPTED_MAX
+            {
+                dropped += 1;
+                continue;
+            }
+            let cv = cafe_dict_get(env, o, "notifyQuestRequireThingsCount");
+            let mut cnt = cafe_int(env, cv).unwrap_or(0);
+            if CAFE_REQ_WORK_IDS.contains(&q) {
+                if cnt < 1 || (cnt as f64) > now + 60.0 {
+                    cnt = now.min(i32::MAX as f64).max(1.0) as i32;
+                    clamped += 1;
+                }
+            } else if cnt < 0 {
+                cnt = 0;
+            }
+            acc_entries.push((q, cnt));
+        }
+        // 先清表(原版方法),再走原版 1062 同款入口逐条灌回。
+        for name in [
+            "cleanAcceptedOldNotifyQuestList",
+            "cleanAllUnrewardNotifyQuestList",
+            "cleanAllFinishedNotifyQuestList",
+        ] {
+            let s = island_sel(env, name);
+            let _: () = msg_send(env, (nsd, s));
+        }
+        let add_fin = island_sel(env, "addFinishedNotifyQuestWithQuestId:");
+        for &q in &fin_ids {
+            let _: () = msg_send(env, (nsd, add_fin, q));
+        }
+        let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+        let nwi = island_sel(env, "numberWithInt:");
+        let add_obj = island_sel(env, "addObject:");
+        let upd_unr = island_sel(env, "updateUnrewardNotifyQuest:andUnrewardObjectsIds:");
+        for (q, objs) in &unr_entries {
+            let arr = island_alloc_init(env, "NSMutableArray");
+            if arr == nil {
+                continue;
+            }
+            for &v in objs {
+                let n: id = msg_send(env, (num_cls, nwi, v));
+                let _: () = msg_send(env, (arr, add_obj, n));
+            }
+            let _: () = msg_send(env, (nsd, upd_unr, *q, arr));
+            // 原方法把内容 addObjectsFromArray: 拷进自己新建的数组,这份 +1 用完即放。
+            release(env, arr);
+        }
+        let add_acc = island_sel(env, "addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:");
+        for &(q, cnt) in &acc_entries {
+            let ok: bool = msg_send(env, (nsd, add_acc, q, cnt as u32));
+            if !ok {
+                log!("[MOLECHEAT] island: 咖啡任务 {} 回灌已接表被原版拒绝(已满 3 条或重复)", q);
+            }
+        }
+        for name in [
+            "setHasAcceptedNotifyQusetYetFlag:",
+            "setExistUnrewardNotifyQuests:",
+            "setHasFinishedNotifyQusetYetFlag:",
+        ] {
+            let s = island_sel(env, name);
+            let _: () = msg_send(env, (nsd, s, true));
+        }
+        log!(
+            "[MOLECHEAT] island: 读回 island_cafe.dat 咖啡馆许愿任务 → 已接 {:?} / 待领奖 {:?} / 已完成 {:?}(丢弃坏条目 {} 条,打工开始时刻夹回现在 {} 条)",
+            acc_entries,
+            unr_entries.iter().map(|e| e.0).collect::<Vec<i32>>(),
+            fin_ids,
+            dropped,
+            clamped
+        );
+    }
+    CAFE_SESSION_READY.store(true, O);
+}
+
+/// [2026-09-24 第四轮 K10 I5-3/I8-2] 咖啡馆三张表落盘到 island_cafe.dat,挂在 island_flush_extras。
+/// 只在岛上、离线、且本次进岛已跑过 island_cafe_restore_and_offer 时写(离岛出口在 startNewSceneFrom 10→1 前置臂,
+/// 早于 LoadingMainVillage 0x2543fe 的 reset,此刻三张表还满)。三张活表原样放进根字典归档(与 npcs 同一做法),
+/// 根字典是本函数 +1,归档后放掉。坏档保护由 island_sidecar_save 按 ISLAND_FILE_CAFE 位处理。
+fn island_cafe_flush(env: &mut Environment) -> Option<String> {
+    if env.options.network_access || !ON_ISLAND.load(O) || !CAFE_SESSION_READY.load(O) {
+        return None;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    let g_acc = island_sel(env, "acceptedNotifyQusetListInLocal");
+    let g_unr = island_sel(env, "unrewardNotifyQuestListInLocal");
+    let g_fin = island_sel(env, "finishedNotifyQuestListInLocal");
+    let acc: id = msg_send(env, (nsd, g_acc));
+    let unr: id = msg_send(env, (nsd, g_unr));
+    let fin: id = msg_send(env, (nsd, g_fin));
+    if acc == nil || unr == nil || fin == nil {
+        return None;
+    }
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return None;
+    }
+    let sfk = island_sel(env, "setObject:forKey:");
+    for (key, arr) in [("accepted", acc), ("unreward", unr), ("finished", fin)] {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let _: () = msg_send(env, (root, sfk, arr, k));
+    }
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwd = island_sel(env, "numberWithDouble:");
+    let saved_at: id = msg_send(env, (num_cls, nwd, now_cf_secs()));
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let _: () = msg_send(env, (root, sfk, saved_at, k));
+    let cnt_s = island_sel(env, "count");
+    let na: crate::mem::GuestUSize = msg_send(env, (acc, cnt_s));
+    let nu: crate::mem::GuestUSize = msg_send(env, (unr, cnt_s));
+    let nf: crate::mem::GuestUSize = msg_send(env, (fin, cnt_s));
+    let res = island_sidecar_save(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE, root);
+    release(env, root);
+    res.map(|s| format!("{}[咖啡任务 已接 {} 待领奖 {} 已完成 {}]", s, na, nu, nf))
+}
+
+/// [2026-09-24 第四轮 K10 I5-3] 岛档计时快进:island_cafe.dat 里已接 req_work 任务的开始时刻回拨 secs 秒
+/// (等价于这段时间已经流逝)。由 K4 的 island_ff_extras 在主村、离线、不在岛会话时调用;在岛上不做(活表才是权威,
+/// 下一次落盘会盖掉侧档)。开始时刻最小夹到 1:-[CafeQuestData innerUpdate:] 0x36d87a `cmp r0,#1 / blt` 小于 1 不判完成。
+/// 解档出来的根字典/元素是自动释放对象,这里 mutableCopy(+1)后改、存、放,不改原对象。
+fn island_cafe_ff(env: &mut Environment, secs: f64) {
+    if env.options.network_access || ON_ISLAND.load(O) || !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE);
+    if root == nil || !crate::mole_items::is_kind_of(env, root, "NSDictionary") {
+        return;
+    }
+    let acc_arr = cafe_dict_get(env, root, "accepted");
+    let items = cafe_array_items(env, acc_arr);
+    if items.is_empty() {
+        return;
+    }
+    let new_acc = island_alloc_init(env, "NSMutableArray");
+    if new_acc == nil {
+        return;
+    }
+    let add_obj = island_sel(env, "addObject:");
+    let mcopy = island_sel(env, "mutableCopy");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwi = island_sel(env, "numberWithInt:");
+    let key_cnt = crate::frameworks::foundation::ns_string::get_static_str(env, "notifyQuestRequireThingsCount");
+    let mut shifted: Vec<i32> = Vec::new();
+    for o in items {
+        if let Some(q) = cafe_entry_id(env, o) {
+            let cv = cafe_dict_get(env, o, "notifyQuestRequireThingsCount");
+            if let Some(start) = cafe_int(env, cv) {
+                if CAFE_REQ_WORK_IDS.contains(&q) && start >= 1 {
+                    let copy: id = msg_send(env, (o, mcopy));
+                    if copy != nil {
+                        let nv = ((start as f64) - secs).max(1.0) as i32;
+                        let n: id = msg_send(env, (num_cls, nwi, nv));
+                        let _: () = msg_send(env, (copy, sfk, n, key_cnt));
+                        let _: () = msg_send(env, (new_acc, add_obj, copy));
+                        release(env, copy);
+                        shifted.push(q);
+                        continue;
+                    }
+                }
+            }
+        }
+        let _: () = msg_send(env, (new_acc, add_obj, o));
+    }
+    if shifted.is_empty() {
+        release(env, new_acc);
+        return;
+    }
+    let root2: id = msg_send(env, (root, mcopy));
+    if root2 == nil {
+        release(env, new_acc);
+        return;
+    }
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, "accepted");
+    let _: () = msg_send(env, (root2, sfk, new_acc, k));
+    release(env, new_acc);
+    let res = island_sidecar_save(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE, root2);
+    release(env, root2);
+    log!(
+        "[MOLECHEAT] island: 快进 {} 秒 → island_cafe.dat 已接打工任务 {:?} 开始时刻回拨({})",
+        secs,
+        shifted,
+        res.unwrap_or_else(|| "未写盘".to_string())
+    );
+}
+
 /// [P5 地基] 确保 NewSceneData.userInfoDataInNewScene 存在 —— NPC(createAllNpcs)/任务(NewSceneQuest)/
 /// 剧情(NewSceneStory)/成就 全靠它当【本地载体】。离线首进岛它可能为 nil(原版靠 1001 回包填,离线无)
 /// → 这些系统无处挂。nil 则 alloc-init 一个(init 默认 nextQuestId=1/nextStoryId=1/extendMap=1/空 npcs+
@@ -3771,6 +4137,7 @@ fn island_after_layout_ready(env: &mut Environment) {
     // ── [K9] 仓库/飞鸟/增强道具回灌 mapData 键 8/11/21 ──
     island_storage_inject(env); // [2026-09-24 第四轮 K9] island_storage.dat → mapData,交给原版 loadMapObjects 回填
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
+    island_cafe_restore_and_offer(env);
     // ── [K11] 超级贝壳树侧档读入缓存 ──
     // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
     island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] island_misc.dat 读回岛成就累计计数与小游戏前三名
@@ -3792,6 +4159,9 @@ fn island_flush_extras(env: &mut Environment) -> Vec<String> {
     #[allow(unused_mut)]
     let mut out: Vec<String> = Vec::new();
     // ── [K10] 咖啡馆 island_cafe.dat ──
+    if let Some(sum) = island_cafe_flush(env) {
+        out.push(sum);
+    }
     // ── [K11] 超级贝壳树 island_shelltree.dat ──
     // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
     out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] 只在岛上落盘,摘要并入汇总
@@ -3807,6 +4177,7 @@ fn island_ff_extras(env: &mut Environment, secs: f64) {
     // ── [K9] island_storage.dat 增强道具剩余时间 ──
     island_storage_ff(env, secs); // [2026-09-24 第四轮 K9] savedAt 前拨 secs,下次进岛多扣这段剩余秒
     // ── [K10] island_cafe.dat 已接打工类任务开始时刻 ──
+    island_cafe_ff(env, secs);
     // ── [K11] island_shelltree.dat 倒计时起点 ──
     let _ = env;
 }
