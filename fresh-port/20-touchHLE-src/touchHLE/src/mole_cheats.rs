@@ -6502,11 +6502,37 @@ fn sync_remote_upgrade_percent(env: &mut Environment) {
 
 /// [2026-09-24 第四轮 K5] 岛会话期 (c, "isReachable") 通配臂【不】顶成 1 的调用点。
 const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
+    // [I8-03] -[UserInfoLayer onButtonCustomServiceFunctionsSelected:] 客服入口 blx@0x5aad4;假分支 0x5ab8a
+    //   MessageBox ACTION_CENTER_NETWARNING(不去建 CustomerServiceLayer)。
+    0x5aad9,
+    // [I8-03] -[WrapperManager userSelectedAdWallFromPlatform:] 免费贝壳墙选平台 blx@0x2627ac;假分支 0x262886
+    //   UIAlertView AD_NOT_AVAIL_TITLE / NETWORK_NOT_AVAIL(不去拉起广告墙平台)。
+    0x2627b1,
+    // [I8-03] -[WrapperManager addVipGoldByAllAdWalls] blx@0x262ac8;假分支 0x262b30 直接返回(不去各广告墙查积分)。
+    0x262acd,
+    // [I8-03/I5-05] -[NewSceneQuestLayer onButtonShare] 岛任务面板「分享」blx@0x32d6e2;假分支 0x32d716 SINAWEIBO_NO_CONNECT
+    //   (不走 0x32d70e takeScreenshotGetShareReward: 截图写相册 + 微博分享)。★不收同类 checkErrorMessage 的 0x32d4d9:
+    //   那是接任务前的网络自检,放行会让岛上每次接任务都弹断网框。
+    0x32d6e7,
+    // [I8-03] -[DailyQuestLayer onButtonShare] 日常任务面板「分享」blx@0x3459a6;假分支 0x3459da SINAWEIBO_NO_CONNECT。
+    0x3459ab,
     // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e46;假分支 0x376eaa
     //   showMessage: GET_EXCHANGE_INFO_ERROR + showTable:(无转圈层、不发包)。
     0x376e4b,
+    // [I8-03] -[CustomerServiceLayer onButtonHotQuestionSelected] 热门问题 blx@0x3a4a70;假分支 0x3a4abc MessageBox IAP_NETWORK_ERROR
+    //   (不进 showFeedbackWithModule:)。下面三个按钮同构,各自两道门都已 re.py annot 逐条核对。
+    0x3a4a75,
+    // [I8-03] -[CustomerServiceLayer onButtonOnlineQuestionSelected] 在线提问 blx@0x3a4bb4;假分支 0x3a4c00 IAP_NETWORK_ERROR。
+    0x3a4bb9,
+    // [I8-03] -[CustomerServiceLayer onButtonGameForumSelected] 游戏论坛 blx@0x3a4cf8;假分支 0x3a4d44 IAP_NETWORK_ERROR。
+    0x3a4cfd,
+    // [I8-03] -[CustomerServiceLayer onButtonLookRecallSelected] 找回 blx@0x3a4e3c;假分支 0x3a4e88 IAP_NETWORK_ERROR。
+    0x3a4e41,
     // [2026-09-16 E-01,本轮并入表] -[NewStyleStoreMainLayer onItemsMenuSelected:] 0x11 号菜单项「免费贝壳」blx@0x3b23c0;
     //   假分支弹 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」,不进 onBuyVIPGold:。
+    //   (同类的 -[NewStyleStoreMainLayer onBuyVIPGold:] 门 0x3b2a8f 不收,那道门离线不可达:充值档 itemid 1..7 被 SHELLHOOK
+    //   (objc/messages.rs)整段接管;itemid 8 在 0x3b29c4 `cmp r2,#8` 就转去广告墙分支;其余 itemid 在 0x3b2a5e
+    //   getShopItemData: 取不到(100_0.dat 只有 1..7)、0x3b2a68 直接返回。)
     0x3b23c5,
 ];
 
@@ -6514,6 +6540,15 @@ const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
 const ISLAND_OFFLINE_CONNECTED_LRS: &[u32] = &[
     // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e64;假分支同上 GET_EXCHANGE_INFO_ERROR。
     0x376e69,
+    // [I8-03] CustomerServiceLayer 四个按钮的第二道门(isReachable 为真才走到这里),假分支同上 IAP_NETWORK_ERROR:
+    //   onButtonHotQuestionSelected blx@0x3a4a8e。
+    0x3a4a93,
+    //   onButtonOnlineQuestionSelected blx@0x3a4bd2。
+    0x3a4bd7,
+    //   onButtonGameForumSelected blx@0x3a4d16。
+    0x3a4d1b,
+    //   onButtonLookRecallSelected blx@0x3a4e5a。
+    0x3a4e5f,
 ];
 
 /// [2026-09-24 第四轮 K5] 编译期自检:LR 表严格升序且每条带 Thumb 位,不满足就编译失败。
