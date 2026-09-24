@@ -4920,6 +4920,9 @@ fn island_is_key_op(class: &str, sel: &str) -> bool {
         ),
         "NewSceneUserInfoData" => matches!(sel, "setCurQuestId:" | "setNextQuestId:" | "setExtendMap:"),
         "NetworkManager" => sel == "addObjectToServer:",
+        // [2026-09-24 第五轮补挖 M-M1-2] 岛日常领奖/小游戏直调主村 UserInfoData 发奖(不经 add*InNewScene:,原版不当场存主档,
+        //   而 map.dat 已当场记为领过):排一次即时落盘,island_flush 开头的 saveUserinfoToLocal 把奖励写进 userinfo.dat。
+        "UserInfoData" => matches!(sel, "addGold:" | "addXp:"),
         _ => false,
     }
 }
@@ -10571,6 +10574,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // [2026-09-24 第四轮 集成补漏] 另加咖啡馆许愿任务三张表的写入点(见 island_is_cafe_table_op)与岛上厕所小游戏
         //   -[WashRoomGame updateTop3Record]@0x35c230(前三名只写内存、原版随即发 addTop3MiniGameRecord:/setModTop3MiniGameRecord:,
         //   不经过任何置脏方法;island_misc.dat 由 K12 落盘)。WashRoomGame 不在 CLASSES,粗筛走 intercept_wants 的门控 sel 行。
+        // [2026-09-24 第五轮补挖 M-M1-2] 岛上直接改主村 UserInfoData 金币/经验/贝壳的发奖路径也置脏:岛日常领奖
+        //   -[DailyQuest postCurrentQuest]@0x34229c → rewardXP:gold:@0x342ec4 在 0x342f0c/0x342f6e 直接 [[GameData userInfoData] addXp:/addGold:]
+        //   (-[UserInfoData addGold:]@0xbb1d8、addXp:@0xbb040 本身不存盘),随后 0x342520 saveQuestResults → 0x7b19a 当场把
+        //   「已领/切下一条」写进 map.dat;岛上小游戏 -[Building onMiniGameFinished] 0xb254e/0xb25cc 同样直调。以前这条路不置脏,
+        //   领完奖后岛上没有别的操作就硬崩,map.dat 已记领过、userinfo.dat 却没有这笔奖励。addGold:/addXp: 另列为关键操作
+        //   (即时落盘会先 saveUserinfoToLocal,两份档一帧内对齐)。UserInfoData 已在 CLASSES。
         if ON_ISLAND.load(O)
             && ((class == "NewSceneUserInfoData" && (sel.starts_with("set") || sel.starts_with("add")))
                 || (class == "NewSceneData"
@@ -10580,7 +10589,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                         || sel == "saveUserinfoToLocal"
                         || island_is_cafe_table_op(sel)))
                 || (class == "NetworkManager" && sel == "addObjectToServer:")
-                || (class == "WashRoomGame" && sel == "updateTop3Record"))
+                || (class == "WashRoomGame" && sel == "updateTop3Record")
+                || (class == "UserInfoData" && matches!(sel, "addGold:" | "addXp:" | "addVipGold:")))
         {
             island_mark_dirty();
             // [2026-09-24 第四轮 K3 I5-04] 关键操作(扣款/发奖/任务指针/扩地/新放置)再排一次即时落盘,见 island_request_flush_now。
