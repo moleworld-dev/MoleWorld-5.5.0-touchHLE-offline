@@ -3262,6 +3262,200 @@ fn island_shelltree_answer(env: &mut Environment) {
     }
 }
 
+/// [2026-09-24 第四轮 K11 I2-04] 贝壳树旁路档。取证:TMMapDataSuperShellTree 只有 purchaseTime_(+24)/harvestTimes_(+28)
+///   两个 ivar,encodeWithCoder:@0xce3a8 也只编这两个;+[NewGameManager saveTMMapDataFromObject:] 的 type==0x28 分支
+///   (0x244660 起)同样只写 setPurchaseTime:/setHarvestTimes:。活树的 beginCountDownTime_(+356)与 growthValue_(+360)
+///   原版每次进岛由 1085 回包重新下发,离线没有服务器 → 退岛再进倒计时从头来。这里把离线「服务器侧」状态存成
+///   根字典 {beginCountDownTime: NSNumber(u32,CF 秒), growthValue: NSNumber(u32), savedAt: NSNumber(double,落盘时刻,诊断用)},
+///   树已删除时写空字典。isAvailable_(+364)不存:它是 updateView 从 purchaseTime_ 现算的派生量(0x36b1b2 在重算分支里),
+///   而 purchaseTime/harvestTimes 已随 island_map.dat 的 TMMapDataSuperShellTree 持久化、purchaseTime 已在 ISLAND_TIME_FIELDS。
+///   growthValue 是计数(上限 20),不进纪元迁移;倒计时起点的「未来值」在读档时夹到现在。
+const SHELLTREE_FILE: &str = "island_shelltree.dat";
+
+/// [2026-09-24 第四轮 K11 I2-04] 解析侧档根对象 → (倒计时起点, 成长值)。根不是字典返回 None;缺键或值不是 NSNumber 按 0
+///   (不对非 NSNumber 发数值消息,坏档/手改档不会落到未实现的选择子上)。
+fn island_shelltree_read(env: &mut Environment, root: id) -> Option<(u32, u32)> {
+    if root == nil {
+        return None;
+    }
+    let dict_cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if dict_cls == nil || num_cls == nil {
+        return None;
+    }
+    let isk = island_sel(env, "isKindOfClass:");
+    let is_dict: bool = msg_send(env, (root, isk, dict_cls));
+    if !is_dict {
+        return None;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let uiv = island_sel(env, "unsignedIntValue");
+    let get = |env: &mut Environment, key: &'static str| -> u32 {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let v: id = msg_send(env, (root, ofk, k));
+        if v == nil {
+            return 0;
+        }
+        let is_num: bool = msg_send(env, (v, isk, num_cls));
+        if !is_num {
+            return 0;
+        }
+        msg_send(env, (v, uiv))
+    };
+    let bc = get(env, "beginCountDownTime");
+    let gv = get(env, "growthValue");
+    Some((bc, gv))
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 组侧档根字典(+1 NSMutableDictionary,调用方 release)。entry 为 None = 树已删除,写空字典。
+///   NSNumber 都是自动释放对象,放进字典后不 release;键用 get_static_str(不泄漏 +1 串)。
+fn island_shelltree_root(env: &mut Environment, entry: Option<(u32, u32)>) -> id {
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return nil;
+    }
+    if let Some((bc, gv)) = entry {
+        let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+        let n_u32 = island_sel(env, "numberWithUnsignedInt:");
+        let n_f64 = island_sel(env, "numberWithDouble:");
+        let sfk = island_sel(env, "setObject:forKey:");
+        let bc_num: id = msg_send(env, (num_cls, n_u32, bc));
+        let gv_num: id = msg_send(env, (num_cls, n_u32, gv));
+        let at_num: id = msg_send(env, (num_cls, n_f64, now_cf_secs()));
+        for (key, num) in [
+            ("beginCountDownTime", bc_num),
+            ("growthValue", gv_num),
+            ("savedAt", at_num),
+        ] {
+            if num == nil {
+                continue;
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+            let _: () = msg_send(env, (root, sfk, num, k));
+        }
+    }
+    root
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 进岛读档(K1 的 island_after_layout_ready 挂钩调用):此刻活树还没建(loadMapObjects 在
+///   更晚的 loadNewScene 里),只把侧档读进离线状态,等 initWithMapData:type: 0x36a846 发的 getSuperShellTreeInfo: 应答时
+///   再经真 setter 写到活树上。倒计时起点比现在晚 60 秒以上(改过系统时间/时间旅行后回退)就夹到现在,免得 36 小时永远走不完。
+///   island_map.dat 坏档保护中(内存里是默认岛,没有这棵树)时不读,免得以后新买的树继承旧档的倒计时。
+fn island_shelltree_load(env: &mut Environment) {
+    SHELLTREE_BC.store(0, O);
+    SHELLTREE_GV.store(0, O);
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
+        log!("[MOLECHEAT] island: island_map.dat 坏档保护中(当前是默认岛),不读 island_shelltree.dat");
+        return;
+    }
+    let root = island_sidecar_load(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE);
+    if root == nil {
+        return; // 无档(或坏档已由 island_sidecar_load 隔离/保护):按新树处理
+    }
+    let Some((mut bc, mut gv)) = island_shelltree_read(env, root) else {
+        log!("[MOLECHEAT] island: island_shelltree.dat 根对象不是字典,按无档处理(下次落盘覆盖)");
+        return;
+    };
+    let now = now_cf_secs();
+    if bc != 0 && (bc as f64) > now + 60.0 {
+        let nb = now.max(1.0) as u32;
+        log!("[MOLECHEAT] island: 贝壳树倒计时起点在未来({} > 现在 {:.0})→ 夹到现在 {}", bc, now, nb);
+        bc = nb;
+    }
+    if gv > SHELLTREE_FULL_GROWTH {
+        gv = SHELLTREE_FULL_GROWTH;
+    }
+    SHELLTREE_BC.store(bc, O);
+    SHELLTREE_GV.store(gv, O);
+    log!("[MOLECHEAT] island: 读回 island_shelltree.dat(贝壳树倒计时起点 bc={} 成长值 gv={})", bc, gv);
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 落盘(K1 的 island_flush_extras 挂钩调用;此刻活表仍满载岛对象、新放置的建筑已合并进 mapData)。
+///   · 有活树:读 beginCountDownTime(0x36b860,L8@0:4)/growthValue(0x36b880)。唯一例外:活树起点为 0 而离线状态非 0 ——
+///     只会出现在「读档建树后、getSuperShellTreeInfo: 应答还没跑到」的窗口(initWithMapData:type: 不恢复这两项),
+///     此时以离线状态为准,免得进岛那一拍的节拍落盘把正在走的 36 小时抹成 0。收获时重置臂先把离线状态清零、原版再把
+///     活树起点置 0,两者一致,不受这条影响。
+///   · 布局里没有 TMMapDataSuperShellTree(树已删除/收纳)→ 写空字典并清离线状态,不管活表里还查不查得到树:
+///     -[ObjectManager uniqueObjects_] 只在 addObject:(0x43b12,limit_count==1)写入、removeAllObjects(0x46746)清空,
+///     removeObject:@0x44198 不动它 → onChooseDelete/收纳之后那棵树仍被字典持有,getUniqueObjectByObjectId: 照样返回它
+///     (isFinished 也还是 1)。只看活表会把已删掉的树的倒计时写回侧档,下次买的新树直接继承旧倒计时;
+///     布局是 merge_new_island_objects_into_mapdata 刚并过新放置建筑、删除/收纳已由 deleteObjectFromServer: 臂移除的结果,可信。
+///   · 布局里有但活表里还没有(还没加载成活对象)→ 不写,保留侧档原样。
+///   只在岛上落盘;island_map.dat 坏档保护中(内存是默认岛)不写,与 island_ships.dat 同口径。
+fn island_shelltree_flush(env: &mut Environment) -> Option<String> {
+    if !ON_ISLAND.load(O) {
+        return None;
+    }
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
+        if (ISLAND_BLOCK_LOGGED.fetch_or(ISLAND_FILE_SHELLTREE, O) & ISLAND_FILE_SHELLTREE) == 0 {
+            log!("[MOLECHEAT] island: 跳过落盘 island_shelltree.dat(island_map.dat 坏档保护中,当前是默认岛)");
+        }
+        return None;
+    }
+    let in_layout = island_all_objects(env)
+        .iter()
+        .any(|(_, cname)| cname == "TMMapDataSuperShellTree");
+    let entry = if !in_layout {
+        // 树已删除/收纳(见函数注释:活表里可能还残留着它,不能以活表为准)。
+        SHELLTREE_BC.store(0, O);
+        SHELLTREE_GV.store(0, O);
+        None
+    } else {
+        let tree = island_shelltree_live(env);
+        if tree == nil {
+            return None;
+        }
+        let g_bc = island_sel(env, "beginCountDownTime");
+        let g_gv = island_sel(env, "growthValue");
+        let bc: u32 = msg_send(env, (tree, g_bc));
+        let gv: u32 = msg_send(env, (tree, g_gv));
+        let cache_bc = SHELLTREE_BC.load(O);
+        if bc == 0 && cache_bc != 0 {
+            Some((cache_bc, SHELLTREE_GV.load(O)))
+        } else {
+            Some((bc, gv))
+        }
+    };
+    let root = island_shelltree_root(env, entry);
+    if root == nil {
+        return None;
+    }
+    let r = island_sidecar_save(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE, root);
+    release(env, root);
+    log_dbg!("[MOLECHEAT] island: 贝壳树侧档内容 {:?}(None=树已删除,写空字典)", entry);
+    r
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 岛档计时快进(K4 的 island_ff_extras 挂钩调用,只在主村、离线、不在岛会话时):
+///   把侧档里的倒计时起点回拨 secs 秒,等价于这段时间已经流逝;不低于 1(0 的语义是「没有进行中的倒计时」,
+///   会让下次查询重开一轮)。起点为 0 或无档不动。离线状态不用改:下次进岛 island_after_layout_ready 会重读侧档。
+fn island_shelltree_ff(env: &mut Environment, secs: f64) {
+    if !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE);
+    let Some((bc, gv)) = island_shelltree_read(env, root) else {
+        return;
+    };
+    if bc == 0 {
+        return;
+    }
+    let nb = ((bc as f64) - secs).max(1.0) as u32;
+    let out = island_shelltree_root(env, Some((nb, gv)));
+    if out == nil {
+        return;
+    }
+    let r = island_sidecar_save(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE, out);
+    release(env, out);
+    log!(
+        "[MOLECHEAT] island: 快进 island_shelltree.dat:贝壳树倒计时起点 {} → {}(回拨 {:.0} 秒)→ {}",
+        bc,
+        nb,
+        secs,
+        r.unwrap_or_else(|| "未写入".to_string())
+    );
+}
+
 /// [P2b 经营进度回写] 升级餐厅/雇用公寓/出海等改的是活建筑,游戏把快照喂 setModObjectToServer:
 /// (离线被吞、从不写回 mapData)→ 退岛 archive 的只是进岛初始态、经营进度丢。这里把快照按
 /// objectSequenceId 写回 [NewSceneData mapData][key] 数组(find→replace,无则 add),使 island_map.dat
@@ -4450,6 +4644,7 @@ fn island_after_layout_ready(env: &mut Environment) {
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
     island_cafe_restore_and_offer(env);
     // ── [K11] 超级贝壳树侧档读入缓存 ──
+    island_shelltree_load(env); // [2026-09-24 第四轮 K11 I2-04]
     // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
     island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] island_misc.dat 读回岛成就累计计数与小游戏前三名
     let _ = env;
@@ -4474,6 +4669,7 @@ fn island_flush_extras(env: &mut Environment) -> Vec<String> {
         out.push(sum);
     }
     // ── [K11] 超级贝壳树 island_shelltree.dat ──
+    out.extend(island_shelltree_flush(env)); // [2026-09-24 第四轮 K11 I2-04]
     // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
     out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] 只在岛上落盘,摘要并入汇总
     let _ = &mut *env;
@@ -4490,6 +4686,7 @@ fn island_ff_extras(env: &mut Environment, secs: f64) {
     // ── [K10] island_cafe.dat 已接打工类任务开始时刻 ──
     island_cafe_ff(env, secs);
     // ── [K11] island_shelltree.dat 倒计时起点 ──
+    island_shelltree_ff(env, secs); // [2026-09-24 第四轮 K11 I2-04]
     let _ = env;
 }
 
