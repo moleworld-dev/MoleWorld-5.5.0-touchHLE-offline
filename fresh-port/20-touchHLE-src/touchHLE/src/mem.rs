@@ -350,6 +350,57 @@ impl Mem {
         unsafe { &mut *self.bytes }
     }
 
+    /// [MoleWorld iOS · 内存] 把一段 guest 内存"归零并归还物理页"。
+    ///
+    /// 原实现对释放的大块 / 新分配的 VM 块一律 `fill(0)`——这会**触碰每一页**,把它们变成脏页,
+    /// 而 host 侧从不 madvise,于是进程 footprint 只增不减(= 历史高水位)。真机实测主菜单稳态
+    /// `internal`(guest 脏页)222MB,占 footprint 的 64%,远超 GL 纹理(39MB)。
+    ///
+    /// 做法:对 **host 页对齐的内部区间**用 `mmap(MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE)` 原地重映射——
+    /// 内核立刻回收物理页,且下次访问按需给**零页**(满足"VM 分配总是零初始化"的契约);
+    /// 未对齐的头尾仍 `fill(0)`。区间太小(不足 [`Self::RELEASE_MIN`])时 mmap 系统调用不划算,退回 `fill(0)`。
+    /// 与 4GiB 大映射同属匿名私有映射,子范围重映射是标准做法。
+    fn zero_and_release(&mut self, ptr: MutPtr<u8>, count: GuestUSize) {
+        const RELEASE_MIN: usize = 64 * 1024;
+        #[cfg(unix)]
+        {
+            let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            if host_page > 0 && (count as usize) >= RELEASE_MIN {
+                let base = self.bytes as usize + ptr.to_bits() as usize;
+                let end = base + count as usize;
+                let a_start = (base + host_page - 1) & !(host_page - 1);
+                let a_end = end & !(host_page - 1);
+                if a_end > a_start && (a_end - a_start) >= RELEASE_MIN {
+                    let r = unsafe {
+                        libc::mmap(
+                            a_start as *mut libc::c_void,
+                            a_end - a_start,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                            -1,
+                            0,
+                        )
+                    };
+                    if r != libc::MAP_FAILED {
+                        // 头尾未对齐部分手工清零
+                        let head = a_start - base;
+                        let tail = end - a_end;
+                        if head > 0 {
+                            self.bytes_at_mut(ptr, head as GuestUSize).fill(0);
+                        }
+                        if tail > 0 {
+                            let tp = Ptr::from_bits(ptr.to_bits() + (a_end - base) as u32);
+                            self.bytes_at_mut(tp, tail as GuestUSize).fill(0);
+                        }
+                        return;
+                    }
+                    // mmap 失败(理论上不会):退回逐字节清零
+                }
+            }
+        }
+        self.bytes_at_mut(ptr, count).fill(0);
+    }
+
     // the performance characteristics of this hasn't been profiled, but it
     // seems like a good idea to help the compiler optimise for the fast path
     #[cold]
@@ -576,8 +627,8 @@ impl Mem {
         let ptr = Ptr::from_bits(allocation.base);
 
         // VM allocations are always 0 initialized.
-        // TODO: Can this be done with vm_advise/equivalents
-        self.bytes_at_mut(ptr.cast(), allocation.size.get()).fill(0);
+        // [MoleWorld iOS] 用重映射给零页,不触碰(不提交物理页),见 zero_and_release。
+        self.zero_and_release(ptr.cast(), allocation.size.get());
 
         Ok(ptr)
     }
@@ -601,7 +652,7 @@ impl Mem {
         let alloc_size = alloc.size.get();
         assert!(alloc_size.is_multiple_of(PAGE_SIZE));
         let ptr = Ptr::from_bits(alloc.base);
-        self.bytes_at_mut(ptr.cast(), alloc_size).fill(0);
+        self.zero_and_release(ptr.cast(), alloc_size);
         log_dbg!(
             "Vallocated {:?} ({:#x} bytes requested, {:#x} bytes allocated)",
             ptr,
@@ -666,8 +717,8 @@ impl Mem {
 
         if size > HeapAllocator::HEAP_ALLOCATION_THRESHOLD {
             // VM allocations are always 0 initialized.
-            // TODO: Can this be done with vm_advise/equivalents
-            self.bytes_at_mut(ptr.cast(), size).fill(0);
+            // [MoleWorld iOS] 大块释放:归还物理页而不是逐字节清零(见 zero_and_release)。
+            self.zero_and_release(ptr.cast(), size);
         } else if self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
@@ -680,9 +731,8 @@ impl Mem {
     pub fn vm_free(&mut self, ptr: MutVoidPtr, size: GuestUSize) {
         let freed = self.vm_allocator.deallocate(ptr.to_bits(), size);
         // VM allocations are always 0 initialized.
-        // TODO: Can this be done with vm_advise/equivalents
-        self.bytes_at_mut(Ptr::from_bits(freed.base), freed.size.get())
-            .fill(0);
+        // [MoleWorld iOS] 归还物理页(见 zero_and_release)。
+        self.zero_and_release(Ptr::from_bits(freed.base), freed.size.get());
     }
 
     /// Allocate memory large enough for a value of type `T` and write the value
