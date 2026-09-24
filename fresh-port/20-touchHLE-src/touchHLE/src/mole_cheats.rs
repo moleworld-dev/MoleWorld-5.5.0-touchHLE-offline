@@ -10580,6 +10580,10 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //   「已领/切下一条」写进 map.dat;岛上小游戏 -[Building onMiniGameFinished] 0xb254e/0xb25cc 同样直调。以前这条路不置脏,
         //   领完奖后岛上没有别的操作就硬崩,map.dat 已记领过、userinfo.dat 却没有这笔奖励。addGold:/addXp: 另列为关键操作
         //   (即时落盘会先 saveUserinfoToLocal,两份档一帧内对齐)。UserInfoData 已在 CLASSES。
+        // [2026-09-24 第五轮补挖 M-M2-1] 岛宠物领礼物:-[Animal exitGiftMode:]@0xdd4f0 在 0xdd632 写 NpcData.lastCoolDownTime,
+        //   只有带 update_build_value 的宠物才经 0xdd8a8 addBuildValueInNewScene: 置脏;16012~16016 这 5 只没有,冷却时刻要等
+        //   别的操作才落盘,硬崩后重进礼物又冒出来。0xdd8d0 [NetworkManager setModAnimalsOrNPCsWithData:] 是原版把冷却上报
+        //   服务器的点(只在 0xdd7e4 curSceneId==10 分支),离线当作「服务器已记账」置脏。NetworkManager 已在 CLASSES。
         if ON_ISLAND.load(O)
             && ((class == "NewSceneUserInfoData" && (sel.starts_with("set") || sel.starts_with("add")))
                 || (class == "NewSceneData"
@@ -10588,7 +10592,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                         || sel == "setMapFragments:"
                         || sel == "saveUserinfoToLocal"
                         || island_is_cafe_table_op(sel)))
-                || (class == "NetworkManager" && sel == "addObjectToServer:")
+                || (class == "NetworkManager"
+                    && (sel == "addObjectToServer:" || sel == "setModAnimalsOrNPCsWithData:"))
                 || (class == "WashRoomGame" && sel == "updateTop3Record")
                 || (class == "UserInfoData" && matches!(sel, "addGold:" | "addXp:" | "addVipGold:")))
         {
