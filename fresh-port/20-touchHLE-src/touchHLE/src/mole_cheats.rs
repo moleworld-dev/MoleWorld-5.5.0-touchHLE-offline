@@ -8912,9 +8912,29 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             | ("SpacialObject", "getLastCooldownTime")
             | ("YellowDuck", "getLastCooldownTime")
             | ("Building", "getLastGameCoolTime")
-            | ("NewSceneRestaurant", "getOutCoolTime")
             | ("MCNpcActor", "getCurLevelCooltime:") => {
                 ret_double(env, 0.0);
+                return true;
+            }
+            // [2026-09-24 第四轮 K13 I2-06] 布兰的家(岛餐厅)冷却时长:两个初始化调用点放行真值,其余照旧返回 0。
+            //   根因:-[NewSceneRestaurant initWithMapData:type:] 在 lastCoolTime_(槽 0xb076e8,+368)为 0 时,0x31b61c 取
+            //   getCurrentServerTime、0x31b630 blx getOutCoolTime、0x31b636 `subs r0,r5,r0` → lastCoolTime_ = now − 冷却时长
+            //   (原版 43200 = levelupHV 30002 saleFinishCostTime)= 一进岛立刻可收;-[... initWithTile:sprite:size:data:] 在
+            //   0x31b372/0x31b386/0x31b38a 有同构的一段。这里返回 0 会让 lastCoolTime_ = now = 刚开始冷却:开着开关时无感
+            //   (其余调用点仍返回 0),关掉开关后反而要等满 12 小时;若本局餐厅发过 setModObjectToServer:(升级/领收益),这个坏值
+            //   还会经 getLastCooldownTime → saveTMMapDataFromObject: 落进 island_map.dat。
+            //   做法:LR 为这两次 blx 的返回址(0x31b630+4 → 0x31b635、0x31b386+4 → 0x31b38b,带 Thumb 位)时放行真方法;
+            //   OutputHanlder innerupdate:(0x14b826)/ccTouchBegan:(0x14ca60)/processTouched(0x14cbea)与 onUpgradeFinishHandler
+            //   (0x31c374)照旧返回 0,作弊效果不变。不用「lastCoolTime==now 就回补」:与刚领完收益的正常状态无法区分。
+            //   签名 I8@0:4(返回 unsigned int),以前按 double 写 r0:r1 也等价于 r0=0,这里改成只写 r0。纯改寄存器,不发消息。
+            ("NewSceneRestaurant", "getOutCoolTime") => {
+                const LR_INIT_WITH_MAPDATA: u32 = 0x31b635;
+                const LR_INIT_WITH_TILE: u32 = 0x31b38b;
+                let lr = env.cpu.regs()[14];
+                if lr == LR_INIT_WITH_MAPDATA || lr == LR_INIT_WITH_TILE {
+                    return false;
+                }
+                env.cpu.regs_mut()[0] = 0;
                 return true;
             }
             ("YaliNpcActor", "checkCooltimeOver") => {
