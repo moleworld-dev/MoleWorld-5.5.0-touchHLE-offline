@@ -317,6 +317,36 @@ fn wheel_pinch_inverted() -> bool {
     })
 }
 
+/// [2026-09-24 第四轮 K15 I1-8] 桌面鼠标左键的一次性起拖阈值(guest 点),默认 8 点(iOS 常用的起拖容差量级)。
+/// 根因:-[ObjSelector touchMove:]@0x4b270 整个方法就是 `isMoved(+234) = 1`,没有任何位移阈值;
+/// -[ObjSelector touchEnd:]@0x4b284 在 0x4b2c2 读 isMoved、0x4b2c8 `bne.w 0x4bcde` 见到就跳到尾部只清
+/// isSelected/isMoved、不处理点击(-[ObjSelector specialObjectTouchEnd:]@0x4b064 在 0x4b094 `bne 0x4b164`
+/// 同样,只 unselect 后清标志)。移动由 -[VillageLayer ccTouchesMoved:withEvent:]@0x35504 /
+/// -[HolidayVillageLayer ccTouchesMoved:withEvent:]@0x23d4f0(0x23d51c `movs r3,#1` → processTouch:withType:1)
+/// 无条件转发。桌面上按下期间鼠标抖 1 像素就会发出一次 TouchesMove(坐标先取整到 guest 点),这次点击就被吞掉。
+/// 只对 FingerId::Mouse 做:触屏手指、手柄映射的触点、滚轮合成的虚拟双指都不挂这个状态,保持原版零容差语义;
+/// ui_touch 的通用派发与 UIScrollView 等自带的起拖判定不动。环境变量 MOLE_MOUSE_DRAG_SLOP 可改阈值(点),
+/// 0 = 关闭(恢复为任何移动都下发)。
+const MOUSE_DRAG_SLOP_DEFAULT: f32 = 8.0;
+fn mouse_drag_slop() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_MOUSE_DRAG_SLOP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(MOUSE_DRAG_SLOP_DEFAULT)
+    })
+}
+
+/// [2026-09-24 第四轮 K15 I1-8] 鼠标左键一次按下的起拖状态(只用于 FingerId::Mouse)。
+struct MouseDragState {
+    /// 按下点(transform_input_coords 之后的 guest 整数点,与发给游戏的 TouchesDown 坐标相同)。
+    down: Coords,
+    /// 本次按下内是否已越过起拖阈值;越过之后的移动全部原样下发,不再抑制。
+    broke: bool,
+}
+
 struct DpadState {
     left: bool,
     right: bool,
@@ -507,6 +537,9 @@ pub struct Window {
     pinch: Option<PinchState>,
     /// [扫描修 2026-09-15] F12-2:左键是否按住(按 SDL 事件顺序跟踪),左键拖动中的滚轮直接忽略。
     mouse_left_down: bool,
+    /// [2026-09-24 第四轮 K15 I1-8] 鼠标左键本次按下的起拖状态;None = 没有在跟踪的按下
+    /// (此时左键移动按原样下发)。见 [MouseDragState]、mouse_drag_slop。
+    mouse_drag: Option<MouseDragState>,
     /// [扫描修 2026-09-15] F12-3:上一次发出的窗口最小化状态,用来给 WindowMinimized/WindowRestored 去重。
     window_minimized: bool,
     /// Whether or not we are on the "main" environment stack (rather than
@@ -718,6 +751,7 @@ impl Window {
             virtual_accelerometer_last: None,
             pinch: None,
             mouse_left_down: false,
+            mouse_drag: None,
             window_minimized: false,
             on_main_stack: true,
         };
@@ -1153,6 +1187,16 @@ impl Window {
                     }
                     continue;
                 }
+                // [2026-09-24 第四轮 K15 I1-8] 窗口失焦:丢掉鼠标起拖状态,不跨焦点沿用上一次按下的判定
+                // (之后若左键仍按着移动,按原样下发;下一次按下重新开始判定)。窗口事件在下面的翻译里本来
+                // 就走 `_ => continue` 不入队,这里 continue 不改变其它行为。
+                E::Window {
+                    win_event: sdl2::event::WindowEvent::FocusLost,
+                    ..
+                } => {
+                    self.mouse_drag = None;
+                    continue;
+                }
                 _ => {}
             }
 
@@ -1166,6 +1210,11 @@ impl Window {
                 } => {
                     let coords = transform_input_coords(self, (x as f32, y as f32), false);
                     log_dbg!("INPUT MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
+                    // [2026-09-24 第四轮 K15 I1-8] 记下按下点,开始本次按下的起拖判定(每次按下都重置)。
+                    self.mouse_drag = Some(MouseDragState {
+                        down: coords,
+                        broke: false,
+                    });
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {
@@ -1173,6 +1222,28 @@ impl Window {
                 } if mousestate.left() => {
                     let coords = transform_input_coords(self, (x as f32, y as f32), false);
                     log_dbg!("INPUT MouseMotion x {}, y {}, coords {:?}", x, y, coords);
+                    // [2026-09-24 第四轮 K15 I1-8] 一次性起拖阈值:还没越过阈值时,离按下点不足阈值的移动
+                    // 不入队(也不更新按下点),游戏收不到 Move,ObjSelector.isMoved 保持 0,点击不被
+                    // -[ObjSelector touchEnd:] 的 0x4b2c8 吞掉;一旦越过就把【本帧真实坐标】作为第一个 Move
+                    // 下发,此后本次按下内不再抑制。ui_touch 的 previous_location 是上一次下发的位置(即按下点),所以第一个 Move
+                    // 的位移包含了被抑制的那几个点,地图平移不会永久少走这段距离,只是起拖晚了一点。
+                    // mouse_drag 为 None(没看到按下,例如在窗口外按下再拖进来)时按原样下发。
+                    let slop = mouse_drag_slop();
+                    if let Some(drag) = self.mouse_drag.as_mut() {
+                        if !drag.broke {
+                            let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
+                            if (dx * dx + dy * dy).sqrt() < slop {
+                                continue;
+                            }
+                            drag.broke = true;
+                            log_dbg!(
+                                "[鼠标起拖] 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
+                                slop,
+                                drag.down,
+                                coords
+                            );
+                        }
+                    }
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseButtonUp {
@@ -1183,6 +1254,24 @@ impl Window {
                 } => {
                     let coords = transform_input_coords(self, (x as f32, y as f32), false);
                     log_dbg!("INPUT MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
+                    // [2026-09-24 第四轮 K15 I1-8] 本次按下结束,清掉起拖状态。没越过阈值(游戏一个 Move 也没收到)
+                    // 时,抬起按【按下点】上报:游戏看到的是按下、抬起同点的原地点击,与无头注入的点击完全一致;
+                    // 否则 UITouch 的 previous_location(按下点)与抬起点之间会凭空多出几点位移。
+                    // 越过阈值的拖动按真实坐标抬起。
+                    let coords = match self.mouse_drag.take() {
+                        Some(MouseDragState { down, broke: false }) => {
+                            if down != coords {
+                                log_dbg!(
+                                    "[鼠标起拖] 未越过 {}pt 阈值,抬起按按下点 {:?} 上报(实际 {:?})",
+                                    mouse_drag_slop(),
+                                    down,
+                                    coords
+                                );
+                            }
+                            down
+                        }
+                        _ => coords,
+                    };
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::ControllerDeviceAdded { which, .. } => {
@@ -1544,6 +1633,9 @@ impl Window {
         // (补发的话队列里又多一条游戏已经不认识的取消)。
         self.pinch = None;
         self.mouse_left_down = false;
+        // [2026-09-24 第四轮 K15 I1-8] 游戏里的鼠标手指由调用方随后的 cancel_tracked_touches 以取消结束,
+        // 窗口侧的起拖状态在这里一并清掉(回来后第一次按下重新开始判定)。
+        self.mouse_drag = None;
         self.dpad_state.left = false;
         self.dpad_state.right = false;
         self.dpad_state.up = false;
