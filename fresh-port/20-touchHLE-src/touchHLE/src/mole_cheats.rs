@@ -3809,7 +3809,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     // [审查修 2026-09-13] D2 删掉读档前算的 userinfo_on_disk。根因:load 遇到坏档会先改名隔离,隔离成功后内存里已是
     //   init 默认进度,按"读档前磁盘上有档"判成老玩家就不补 newGame;首个节拍把默认进度写成新 island_userinfo.dat 后,
     //   以后每次进岛 had_userinfo 恒真,开场剧情永久不播。newGame 判据改为读档之后看 ISLAND_FILE_USERINFO 保护位(见下)。
-    let had_userinfo = load_island_userinfo(env);
+    // [2026-09-24 第四轮 K1 I6-04/I4-3] 返回值不再用:newGame 判据改看读档后的 nextStoryId(见 load_island_map 之前那段)。
+    load_island_userinfo(env);
     // [P3 商店空白治本] 建设庄园(NewStyleStoreMainLayer)读 NewSceneData.storeBuildingsArray_/
     //   storeDecorationsArray_、食材商店(ShopItemsLayer)读 5 个食材桶——这些桶 init 时全空,【只由
     //   LoadingHoliday case11 的 loadFileWithType:1 andSceneId:10 解 propertyHV.dat 本地填】(★岛的
@@ -3903,6 +3904,59 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
             );
         }
     }
+    // ★[审计修 2026-09-11] 开场剧情没播完的岛补"新岛"标志 newGame|=1。原版置位点是 -[NewSceneCommand parseMapDataWithPackageData:atIndex:]
+    //   (0x22bd34 setNewGame: 旧值|1,条件:服务器下发的岛剧情进度 nextStoryId==0 且非串门);唯一消费者 -[NewGameManager checkActiveStoryQuest]
+    //   (0x246710,endLoadMap 末尾调用)在 0x2467c8 见到 bit0 就 [[NewSceneStory sharedInstance] startFromScratch](0x32f30c = nextSection:1)
+    //   播开场剧情并清位。离线 NewSceneUserInfoData init(0x323228)的 nextStoryId 默认是 1,永远满足不了原版 ==0 的条件;
+    //   而不置位时 checkActiveStoryQuest 走 -[NewSceneStory activate](0x32f324),它在 0x32f438/0x32f440 要 [section triggerLevel]>=1,
+    //   farmstoryHV 第 1 节没有 level 键 → 恒返回 NO,开场剧情永远不播。
+    // [2026-09-24 第四轮 K1 I6-04/I4-3] 判据由「没读到 island_userinfo.dat」改为「读档后 nextStoryId<=1」,并从默认岛分支上移到
+    //   这里,读档岛/默认岛两条路径共用。根因:原判据下首个节拍(约 1.5 秒)就把 island_userinfo.dat 写出去了,开场剧情(第 1 节 8 步)
+    //   中途退出/关窗/崩溃后,下次进岛 had_userinfo 恒真、且 island_map.dat 已存在走读档岛分支早返回,newGame 再也不置 → 第 1 节永久丢失。
+    //   nextStoryId 离线唯一写点是 -[NewSceneStory nextStep](0x32f5c4):0x32f5fc 判「当前步==stepCount」整节播完才在 0x32f748
+    //   setNextStoryId:(curSection+1),所以「nextStoryId<=1」精确等价于「开场第 1 节还没播完」;与原版服务器判据 ==0 等价(离线默认值是 1)。
+    //   播完的老档 nextStoryId>=2,绝不重播、不回退进度;剧情本身不发奖,重播第 1 节无副作用,播完 setNextStoryId:2 自动关掉条件。
+    //   前置保留两条:① 主村 GameManager.gameMode ∉ {0,6}(对应 checkActiveStoryQuest 0x24674a/0x24675a 的 currentGameMode 0/6 门;
+    //   沿用原写法读主村 GameManager——NewGameManager.gameMode 已被上面的 seed 段写成 1,读它判不出什么);
+    //   ② ISLAND_FILE_USERINFO 保护位未置:坏档改名隔离失败、原坏档仍在原路径时(本会话落盘被阻塞,玩家修好文件还能恢复旧进度)
+    //   内存里是 init 默认进度,nextStoryId=1 不可信,不补,免得给老玩家重播。
+    //   反之坏档改名隔离成功(原档已挪到 .corrupt、位已清)时,内存与之后落盘的都是默认进度(任务链也从第 1 条重来),
+    //   按新岛补播开场剧情,与 [审查修 2026-09-13] D2 的定案一致。以前读档岛分支早返回走不到这里,所以坏档注入 T6
+    //   (只截断 island_userinfo.dat、布局档完好)从来看不到 newGame;现在会出现一次,属预期。
+    //   nextStoryId 必须在 load_island_userinfo 之后读,读到的才是档里的值。置脏让首个节拍尽快写出 island_userinfo.dat。
+    //   不动 activate 的等级门、不往 farmstoryHV 加 level:第 2-24 节同样没有 level,靠 -[NewSceneQuest postFinish] 调 nextSection: 推进。
+    //   唯一残留窗口:第 1 节刚播完但 1.5 秒内退出会多播一次,可接受。
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_USERINFO) == 0 {
+        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+        let sm_s = island_sel(env, "sharedManager");
+        let gm: id = msg_send(env, (gm_cls, sm_s));
+        let gmode: i32 = if gm != nil {
+            let g = island_sel(env, "gameMode");
+            msg_send(env, (gm, g))
+        } else {
+            -1
+        };
+        let ui_s = island_sel(env, "userInfoDataInNewScene");
+        let ui: id = msg_send(env, (nsd, ui_s));
+        // -[NewSceneUserInfoData nextStoryId]@0x323a44 属性 Ti(i32)。载体缺失时读不到进度,不补。
+        let next_story: i32 = if ui != nil {
+            let ns = island_sel(env, "nextStoryId");
+            msg_send(env, (ui, ns))
+        } else {
+            i32::MAX
+        };
+        if gmode != 0 && gmode != 6 && next_story <= 1 {
+            let ng = island_sel(env, "newGame");
+            let cur: i32 = msg_send(env, (nsd, ng));
+            let sng = island_sel(env, "setNewGame:");
+            let _: () = msg_send(env, (nsd, sng, cur | 1));
+            ISLAND_DIRTY.store(true, O);
+            log!(
+                "[MOLECHEAT] island: 开场剧情第 1 节未播完(nextStoryId={})→ newGame|=1,进岛将播开场剧情",
+                next_story
+            );
+        }
+    }
     // [P1 离线持久化] 先试读 island_map.dat;读到有效布局就用它、跳过默认岛注入(沙原碎片仍补)。
     if load_island_map(env) {
         assign_island_seqids(env); // [P2b/P3a 修] 读档对象没有 seqId(不在 NSCoding 键里)→ 补发,否则回写/合并全被 seqId==0 守卫跳过
@@ -3915,35 +3969,6 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         restore_seqid_cursor(env); // [P3-a] 抬 seqId 游标到已存最大,防新放置撞号
         island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(读档岛)
         return true;
-    }
-    // ★[审计修 2026-09-11] 全新岛补"新岛"标志 newGame|=1。原版置位点是 -[NewSceneCommand parseMapDataWithPackageData:atIndex:]
-    //   (0x22bd34,条件:服务器下发的岛剧情进度 nextStoryId==0 且非串门);唯一消费者 -[NewGameManager checkActiveStoryQuest]
-    //   (endLoadMap 末尾调用)见到 bit0 就 [[NewSceneStory sharedInstance] startFromScratch] 播开场剧情并清位。离线 NewSceneUserInfoData
-    //   init 的 nextStoryId 默认是 1,永远满足不了原版条件 → 新玩家的开场剧情走 activate 路径还要过等级/任务门,可能不播。
-    //   读档岛绝不能设:startFromScratch 会强播第 1 节、播完 setNextStoryId:2 把进度回退。置脏让首个节拍尽快写出
-    //   island_userinfo.dat,防止崩溃后再进岛重播。
-    // [审查修 2026-09-13] D2 判据改为(读档之后):没读到有效 island_userinfo.dat,且 ISLAND_FILE_USERINFO 保护位未置位。
-    //   · 文件不存在,或坏档已改名隔离成功(原档挪到 .corrupt,内存与之后落盘的都是全新进度)→ 位已清,按全新岛补 newGame;
-    //   · 隔离失败、原坏档仍在原路径(本会话落盘被阻塞,玩家修好文件后还能恢复旧进度)→ 位保持置位,不补,免得给老玩家重播。
-    //   顺带省掉一次读档前的 pathForDataFile: + fileExistsAtPath:。
-    if !had_userinfo && (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_USERINFO) == 0 {
-        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
-        let sm_s = island_sel(env, "sharedManager");
-        let gm: id = msg_send(env, (gm_cls, sm_s));
-        let gmode: i32 = if gm != nil {
-            let g = island_sel(env, "gameMode");
-            msg_send(env, (gm, g))
-        } else {
-            -1
-        };
-        if gmode != 0 && gmode != 6 {
-            let ng = island_sel(env, "newGame");
-            let cur: i32 = msg_send(env, (nsd, ng));
-            let sng = island_sel(env, "setNewGame:");
-            let _: () = msg_send(env, (nsd, sng, cur | 1));
-            ISLAND_DIRTY.store(true, O);
-            log!("[MOLECHEAT] island: 全新岛(无 island_userinfo.dat 或坏档已隔离)→ newGame|=1,进岛将播开场剧情");
-        }
     }
     let dict = island_alloc_init(env, "NSMutableDictionary");
     if dict == nil {
