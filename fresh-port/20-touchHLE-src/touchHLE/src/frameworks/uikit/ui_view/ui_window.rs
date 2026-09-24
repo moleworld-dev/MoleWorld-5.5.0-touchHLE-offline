@@ -247,6 +247,17 @@ pub const UIKeyboardDidShowNotification: &str = "UIKeyboardDidShowNotification";
 pub const UIKeyboardWillHideNotification: &str = "UIKeyboardWillHideNotification";
 pub const UIKeyboardDidHideNotification: &str = "UIKeyboardDidHideNotification";
 pub const UIKeyboardBoundsUserInfoKey: &str = "UIKeyboardBoundsUserInfoKey";
+/// [2026-09-16] C-02:键盘通知 userInfo 的其余键。根因:此前没导出,dyld 把游戏的非懒指针槽留成 0
+/// (FrameEnd@0x9c8238、FrameBegin@0x9c8664、AnimationDuration@0x9c8660),
+/// -[RegisterView keyboardWasShown:]@0x191cd6 取槽后 `ldr r2,[r3]` 读地址 0 → 在线新号注册页一点输入框就
+/// panic;LeaveMessageLayer / GiftAndMessageLayer / CrowPriestMessageLayer 的观察者是同一种解引用。
+/// 键值(userInfo 内容)由 UITextField 发通知时填,见 ui_text_field.rs 的 new_keyboard_notification_user_info。
+pub const UIKeyboardFrameBeginUserInfoKey: &str = "UIKeyboardFrameBeginUserInfoKey";
+pub const UIKeyboardFrameEndUserInfoKey: &str = "UIKeyboardFrameEndUserInfoKey";
+pub const UIKeyboardAnimationDurationUserInfoKey: &str = "UIKeyboardAnimationDurationUserInfoKey";
+pub const UIKeyboardAnimationCurveUserInfoKey: &str = "UIKeyboardAnimationCurveUserInfoKey";
+pub const UIKeyboardCenterBeginUserInfoKey: &str = "UIKeyboardCenterBeginUserInfoKey";
+pub const UIKeyboardCenterEndUserInfoKey: &str = "UIKeyboardCenterEndUserInfoKey";
 
 pub const CONSTANTS: ConstantExports = &[
     (
@@ -272,5 +283,29 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "_UIKeyboardBoundsUserInfoKey",
         HostConstant::NSString(UIKeyboardBoundsUserInfoKey),
+    ),
+    (
+        "_UIKeyboardFrameBeginUserInfoKey",
+        HostConstant::NSString(UIKeyboardFrameBeginUserInfoKey),
+    ),
+    (
+        "_UIKeyboardFrameEndUserInfoKey",
+        HostConstant::NSString(UIKeyboardFrameEndUserInfoKey),
+    ),
+    (
+        "_UIKeyboardAnimationDurationUserInfoKey",
+        HostConstant::NSString(UIKeyboardAnimationDurationUserInfoKey),
+    ),
+    (
+        "_UIKeyboardAnimationCurveUserInfoKey",
+        HostConstant::NSString(UIKeyboardAnimationCurveUserInfoKey),
+    ),
+    (
+        "_UIKeyboardCenterBeginUserInfoKey",
+        HostConstant::NSString(UIKeyboardCenterBeginUserInfoKey),
+    ),
+    (
+        "_UIKeyboardCenterEndUserInfoKey",
+        HostConstant::NSString(UIKeyboardCenterEndUserInfoKey),
     ),
 ];

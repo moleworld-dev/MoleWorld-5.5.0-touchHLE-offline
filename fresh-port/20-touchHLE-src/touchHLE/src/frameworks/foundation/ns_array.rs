@@ -13,13 +13,13 @@ use super::{
     _nib_archive_decoder, ns_keyed_unarchiver, ns_string, ns_url, NSComparisonResult, NSNotFound,
     NSRange, NSUInteger,
 };
-use crate::abi::{CallFromHost, GuestFunction};
+use crate::abi::{CallFromHost, DotDotDot, GuestFunction};
 use crate::frameworks::foundation::ns_keyed_archiver::{
     encode_object, get_value_to_encode_for_current_key,
 };
 use crate::fs::GuestPath;
 use crate::libc::stdlib::qsort::qsort_generic;
-use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, Class,
     ClassExports, HostObject, NSZonePtr, SEL,
@@ -82,25 +82,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, array)
 }
 
+// [深扫修 2026-09-11] 根因:原 +arrayWithObject: / 变参 +arrayWithObjects: 调 from_vec,
+// 里面写死 `NSArray alloc`,不看接收者类。NSMutableArray 没覆盖 arrayWithObject:,于是
+// `[NSMutableArray arrayWithObject:x]` 返回不可变的 _touchHLE_NSArray,后续 addObject:
+// 被 messages.rs 当 no-op 吞掉。实证:-[NewSceneData loadObjectUpgradeDataWithFileName:]
+// (0x21a10c 建数组 / 0x21a11a 追加)加载 levelupHV.dat 时,每个建筑 ID 只剩 1 级数据,
+// 布兰的家 2-6 级、商店 2-4 级查表恒 nil → 升级免费秒完成、餐厅 2 级起停产、雇佣上限不涨。
+// 修法:改为 `[[this alloc] initWithObjects:count:]`(与下面 +arrayWithObjects:count: 同一写法),
+// 由接收者类决定可变性;_touchHLE_NSMutableArray 已补齐 initWithObjects:count:(见下)。
+// 注意不能直接 borrow_mut 刚 alloc 出的对象:guest 自定义子类 alloc 出来的对象没有 ArrayHostObject。
 + (id)arrayWithObject:(id)object {
-    retain(env, object);
-    let objects = vec![object];
-    let array = from_vec(env, objects);
+    let array = new_array_of_receiver_class(env, this, &[object]);
     autorelease(env, array)
 }
 + (id)arrayWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
+    // 先收集(helper 会 retain),构造时 init 会再 retain 一次,所以随后逐个 release 抵消。
+    let objects = retained_objects_from_varargs(env, firstObj, args);
+    let array = new_array_of_receiver_class(env, this, &objects);
+    for object in objects {
+        release(env, object);
     }
-    let array = from_vec(env, objects);
     autorelease(env, array)
 }
 + (id)arrayWithObjects:(ConstPtr<id>)objects_ptr count:(NSUInteger)count {
@@ -258,6 +259,46 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, result)
 }
 
+// [深扫修 2026-09-11] 根因:subarrayWithRange: / sortedArrayUsingSelector: 原先只挂在
+// _touchHLE_NSArray 上,_touchHLE_NSMutableArray(继承链 NSMutableArray→NSArray)拿不到,
+// 对可变数组调用会静默返回 nil。修法:上移到抽象 NSArray,只用 count / objectAtIndex: /
+// mutableCopy 等消息实现、不碰 ArrayHostObject,因此对 guest 自定义子类也安全。
+// 返回值按 Apple 语义一律是不可变 NSArray(与上面 sortedArrayUsingFunction:context: 一致)。
+- (id)subarrayWithRange:(NSRange)range {
+    let count: NSUInteger = msg![env; this count];
+    // NSRange 是 packed 结构体,格式化宏会取字段引用,先拷到局部变量。
+    let (location, length) = (range.location, range.length);
+    let end = location.saturating_add(length);
+    if location > count || end > count {
+        // 真机会抛 NSRangeException;原实现是切片越界直接 panic 整个模拟器。
+        // 这里显式检查,打日志后截到合法区间,避免一次越界拖垮整个游戏。
+        log!(
+            "[深扫修] -[NSArray subarrayWithRange:] 越界: location={} length={} count={},截断到合法区间",
+            location,
+            length,
+            count
+        );
+    }
+    let start = location.min(count);
+    let end = end.min(count);
+    let mut objects = Vec::new();
+    for i in start..end {
+        let object: id = msg![env; this objectAtIndex:i];
+        retain(env, object);
+        objects.push(object);
+    }
+    let res = from_vec(env, objects);
+    autorelease(env, res)
+}
+
+- (id)sortedArrayUsingSelector:(SEL)comparator {
+    let array: id = msg![env; this mutableCopy];
+    () = msg![env; array sortUsingSelector:comparator];
+    let array_imm: id = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
+}
+
 @end
 
 // NSMutableArray is an abstract class. A subclass must provide everything
@@ -291,17 +332,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)arrayWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
-    }
+    // [深扫修 2026-09-11] 改用共享 helper:首个参数为 nil 时按 Apple 语义得到空数组
+    // (原实现会把 nil 当成第 1 个元素,count 变成 1)。
+    let objects = retained_objects_from_varargs(env, firstObj, args);
     let array = mutable_from_vec(env, objects);
     autorelease(env, array)
 }
@@ -392,29 +425,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+// [深扫修 2026-09-11] 两个 init 的主体抽成共享 helper,与 _touchHLE_NSMutableArray 共用。
 - (id)initWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
-    }
+    let objects = retained_objects_from_varargs(env, firstObj, args);
     env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
     this
 }
 
 - (id)initWithObjects:(ConstPtr<id>)objects_ptr count:(NSUInteger)count {
-    let mut objects = Vec::new();
-    for i in 0..count {
-        let obj: id = env.mem.read(objects_ptr + i);
-        retain(env, obj);
-        objects.push(obj);
-    }
+    let objects = retained_objects_from_ptr(env, objects_ptr, count);
     env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
     this
 }
@@ -470,23 +489,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     build_description(env, this)
 }
 
-- (id)subarrayWithRange:(NSRange)range {
-    let mut tmp = Vec::new();
-    tmp.extend_from_slice(
-        &env.objc.borrow::<ArrayHostObject>(this).array[range.location as usize..(range.location + range.length) as usize]
-    );
-    for &obj in &tmp {
-        retain(env, obj);
-    }
-    let res = from_vec(env, tmp);
-    autorelease(env, res)
-}
-
-- (id)sortedArrayUsingSelector:(SEL)comparator {
-    let new = msg![env; this mutableCopy];
-    () = msg![env; new sortUsingSelector:comparator];
-    autorelease(env, new)
-}
+// [深扫修 2026-09-11] subarrayWithRange: / sortedArrayUsingSelector: 已上移到抽象 NSArray
+// (可变数组也能用,且越界不再 panic),这里不再重复定义。
 
 @end
 
@@ -528,6 +532,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithCapacity:(NSUInteger)capacity {
     env.objc.borrow_mut::<ArrayHostObject>(this).array.reserve(capacity as usize);
+    this
+}
+
+// [深扫修 2026-09-11] 根因:initWithObjects: / initWithObjects:count: 原先只在兄弟类
+// _touchHLE_NSArray 上,本类继承链是 NSMutableArray→NSArray→NSObject,拿不到,于是
+// `[[NSMutableArray alloc] initWithObjects:...]` 与 `[NSMutableArray arrayWithObjects:count:]`
+// 都落到"不响应选择子"→ 返回 nil(alloc 出的对象还泄漏)。实证可达点:-[TMAHTTPRequest init]
+// (0x4b072c)用它初始化 13 个 passport 请求参数表,全为 nil → 账号菜单模式下请求表单字段全丢。
+// 修法:在本类显式实现(不上移到抽象 NSArray:guest 子类如 JKArray 没有 ArrayHostObject,
+// 在抽象层 borrow_mut 会 panic),主体与 _touchHLE_NSArray 共用 helper。
+- (id)initWithObjects:(id)firstObj, ...args {
+    let objects = retained_objects_from_varargs(env, firstObj, args);
+    env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
+    this
+}
+
+- (id)initWithObjects:(ConstPtr<id>)objects_ptr count:(NSUInteger)count {
+    let objects = retained_objects_from_ptr(env, objects_ptr, count);
+    env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
     this
 }
 
@@ -725,8 +748,31 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
+    // [扫描修 2026-09-15] 倒序删:正序删时前一次删除会让后面的下标整体前移,删错对象甚至越界 panic。
+    for i in to_remove.into_iter().rev() {
         () = msg![env; this removeObjectAtIndex:i];
+    }
+}
+
+- (())removeObjectsInArray:(id)other { // NSArray*
+    // [扫描修 2026-09-15] 缺这个方法 → TMA_SSKeychain(MOLE_REAL_KEYCHAIN=1 时真跑)等调用处 unrecognized selector。
+    // [复核修 2026-09-15] 默认模式下也有真实调用点:-[NetworkManager parseFriendInfoData:pos:len:islocal:]
+    // @0xe4b3e(从 [GameData sharedInstance].latestVisitedUsersInfoList 删掉循环里筛出的来访记录)、
+    // -[CCRibbon addPointAt:width:]@0x2ddb2e(segments_ 删 deletedSegments_)。
+    // 语义同 Apple:对 other 里每个对象按 isEqual: 删除所有相等项。先取出并 retain,
+    // 防止 other 与 this 是同一个数组(或持有唯一引用)时边删边释放。
+    let count: NSUInteger = msg![env; other count];
+    let mut objects = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let obj: id = msg![env; other objectAtIndex:i];
+        retain(env, obj);
+        objects.push(obj);
+    }
+    for &obj in &objects {
+        () = msg![env; this removeObject:obj];
+    }
+    for obj in objects {
+        release(env, obj);
     }
 }
 
@@ -802,6 +848,63 @@ pub fn from_vec(env: &mut Environment, objects: Vec<id>) -> id {
 pub fn mutable_from_vec(env: &mut Environment, objects: Vec<id>) -> id {
     let array: id = msg_class![env; NSMutableArray alloc];
     env.objc.borrow_mut::<ArrayHostObject>(array).array = objects;
+    array
+}
+
+/// [深扫修 2026-09-11] 收集以 nil 结尾的可变参数对象列表,逐个 retain(返回的 `Vec` 持有这些引用)。
+/// 供 `initWithObjects:` / `+arrayWithObjects:` 共用。
+/// 按 Apple 语义:首个参数就是 nil 时列表为空(原实现会把 nil 当成第 1 个元素)。
+fn retained_objects_from_varargs(env: &mut Environment, first_obj: id, args: DotDotDot) -> Vec<id> {
+    let mut objects = Vec::new();
+    if first_obj.is_null() {
+        return objects;
+    }
+    retain(env, first_obj);
+    objects.push(first_obj);
+    let mut varargs = args.start();
+    loop {
+        let next_arg: id = varargs.next(env);
+        if next_arg.is_null() {
+            break;
+        }
+        retain(env, next_arg);
+        objects.push(next_arg);
+    }
+    objects
+}
+
+/// [深扫修 2026-09-11] 从 guest 的 `id` 数组读取 `count` 个对象,逐个 retain。
+/// 供两个具体类的 `initWithObjects:count:` 共用。
+fn retained_objects_from_ptr(
+    env: &mut Environment,
+    objects_ptr: ConstPtr<id>,
+    count: NSUInteger,
+) -> Vec<id> {
+    let mut objects = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let obj: id = env.mem.read(objects_ptr + i);
+        retain(env, obj);
+        objects.push(obj);
+    }
+    objects
+}
+
+/// [深扫修 2026-09-11] 等价于 `[[this alloc] initWithObjects:objects count:n]`,返回 +1 引用。
+/// 用于类方法工厂:让接收者类(NSArray / NSMutableArray / guest 子类)决定构造出的具体类型,
+/// 而不是像 [from_vec] 那样写死 NSArray。`initWithObjects:count:` 需要 guest 指针,
+/// 所以临时在 guest 堆上放一份对象指针数组,调用完立即释放(init 内部会自行 retain 元素)。
+fn new_array_of_receiver_class(env: &mut Environment, this: Class, objects: &[id]) -> id {
+    let count: NSUInteger = objects.len().try_into().unwrap();
+    // 至少分配 1 个槽,避免 alloc(0)。
+    let slots: GuestUSize = count.max(1) * guest_size_of::<id>();
+    let buf: MutPtr<id> = env.mem.alloc(slots).cast();
+    for (i, &object) in objects.iter().enumerate() {
+        let i: GuestUSize = i.try_into().unwrap();
+        env.mem.write(buf + i, object);
+    }
+    let array: id = msg![env; this alloc];
+    let array: id = msg![env; array initWithObjects:(buf.cast_const()) count:count];
+    env.mem.free(buf.cast());
     array
 }
 

@@ -111,6 +111,7 @@ fn CFStringCreateMutable(
     max_length: CFIndex,
 ) -> CFMutableStringRef {
     // RELAXED for MoleWorld (touchHLE assumed a fixed capacity): assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
+    let _ = allocator; // [补完 2026-09-15] 上行断言已按 RELAXED 注释掉,allocator 不再使用;显式丢弃以消除 unused_variables 警告,行为不变
     let _ = max_length; // RELAXED for MoleWorld: ignore the capacity hint, use an unbounded mutable string
     msg_class![env; NSMutableString new]
 }

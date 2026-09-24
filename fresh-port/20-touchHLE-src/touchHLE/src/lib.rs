@@ -45,10 +45,16 @@ mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
+mod mole_activity;
 mod mole_cheats;
+mod mole_dev;
 mod mole_diag;
+mod mole_items;
 pub mod mole_perf;
 pub mod fxhash;
+// [iOS⇄main 合并 2026-09-24] 唯一调用方是下面 cfg(target_os = "ios") 的 ios_entry;模块里直接声明了
+// csops / mach_vm_remap / MAP_JIT 等 Apple 专属符号,门控掉以免 Windows/Linux/安卓构建链接到不存在的符号。
+#[cfg(target_os = "ios")]
 pub mod mole_jitprobe;
 pub mod mole_watchdog;
 mod mole_menu;
@@ -99,7 +105,8 @@ pub extern "C" fn SDL_main(
     // [MoleWorld 点击即玩] touchHLE 默认传空参数 → 弹出 app 选择器。这里改为:把内置在
     // APK assets 里的 MoleWorld.ipa 复制到外部存储的 touchHLE_apps/(touchHLE 的
     // BundleData 只能从真实文件路径加载,读不了 APK asset),再用该路径直接启动 → 跳过
-    // 选择器 = 双击图标即玩。仅首次复制;若复制失败则退回选择器(至少不崩)。
+    // 选择器 = 双击图标即玩。首次启动、以及换装新版 APK 后各复制一次(见 ensure_bundled_moleworld);
+    // 更新失败时继续用旧拷贝,连旧拷贝都没有才退回选择器(至少不崩)。
     let args: Vec<String> = match ensure_bundled_moleworld() {
         Some(ipa_path) => vec![
             String::from("touchHLE"), // argv[0],main() 会跳过
@@ -118,18 +125,41 @@ pub extern "C" fn SDL_main(
 
 /// [MoleWorld 点击即玩] 确保内置游戏已落到外部存储,返回其 .ipa 路径(失败返回 None)。
 /// 游戏以单个 MoleWorld.ipa 内置于 APK assets(见 CI 的"内置 MoleWorld 到 assets"步骤),
-/// 首次启动时复制到 touchHLE_apps/MoleWorld.ipa,之后复用。
+/// 复制到 touchHLE_apps/MoleWorld.ipa;同一构建内复用,换装新版 APK 后重新复制一次。
+/// [2026-09-16] X2-01 以前只要 target 存在就直接复用,而外部存储目录在 APK 覆盖升级后保留:v0.0.4 装机时复制的
+///   无限贝壳破解版 IPA、以及之后新增的宽版底图等资源,老用户永远拿不到。现在旁边写一个戳文件,内容是本次构建的
+///   版本串(用户版本 + CI 注入的提交短 hash + git describe)。戳与本构建一致才复用;缺戳(旧版本复制的)或不一致
+///   (换了 APK)就重新复制。启动时只读几十字节的戳,不用每次都把几百 MB 的 asset 读一遍来比大小。
+///   已知限制:本地同一提交反复出包时戳不变,不会重复复制(需要时删掉戳文件或清应用数据)。
 #[cfg(target_os = "android")]
 fn ensure_bundled_moleworld() -> Option<String> {
-    use std::io::Read;
+    use std::io::{Read, Write};
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
     let target = apps_dir.join("MoleWorld.ipa");
-    if target.is_file() {
+    // 戳文件和下面的临时文件扩展名都不是 .ipa/.app,应用选择器(app_picker.rs enumerate_apps)会跳过它们。
+    let stamp = apps_dir.join("MoleWorld.ipa.stamp");
+    let build_id = format!("{} | {}", crate::mole_sysinfo::version(), VERSION);
+    let have_old = target.is_file();
+    if have_old
+        && std::fs::read_to_string(&stamp)
+            .map(|s| s.trim() == build_id.as_str())
+            .unwrap_or(false)
+    {
         return Some(target.to_string_lossy().into_owned());
     }
+    // 更新失败时:有旧拷贝就照旧用旧的(与改动前的行为一致;旧破解包的贝壳写死由
+    // mole_cheats::restore_cracked_vipgold 兜底),没有旧拷贝才返回 None 退回选择器。
+    let fallback = || {
+        if have_old {
+            echo!("[MoleWorld] 更新内置游戏失败,继续使用已有的 {:?}", target);
+            Some(target.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&apps_dir) {
         echo!("[MoleWorld] 创建目录 {:?} 失败: {:?}", apps_dir, e);
-        return None;
+        return fallback();
     }
     // 从 APK assets 读取内置的 MoleWorld.ipa(经 SDL2 的 Android assets 封装)。
     let mut data = Vec::new();
@@ -137,20 +167,41 @@ fn ensure_bundled_moleworld() -> Option<String> {
         Ok(mut rf) => {
             if let Err(e) = rf.get().read_to_end(&mut data) {
                 echo!("[MoleWorld] 读取内置 MoleWorld.ipa 失败: {:?}", e);
-                return None;
+                return fallback();
             }
         }
         Err(e) => {
             echo!("[MoleWorld] 打开内置 MoleWorld.ipa(APK asset)失败: {}", e);
-            return None;
+            return fallback();
         }
     }
-    if let Err(e) = std::fs::write(&target, &data) {
-        echo!("[MoleWorld] 写入 {:?} 失败: {:?}", target, e);
-        return None;
+    // 先写同目录的临时文件并落盘,再 rename 原子替换:中途被杀或空间不足,都不会留下半截的 MoleWorld.ipa。
+    let tmp = apps_dir.join("MoleWorld.ipa.tmp");
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(&data)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        echo!("[MoleWorld] 写入 {:?} 失败: {:?}", tmp, e);
+        let _ = std::fs::remove_file(&tmp);
+        return fallback();
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        echo!("[MoleWorld] 替换 {:?} 失败: {:?}", target, e);
+        let _ = std::fs::remove_file(&tmp);
+        return fallback();
+    }
+    // 戳最后写:替换成功后才记下本构建。戳写失败只会让下次启动再复制一遍,不会误用旧包。
+    if let Err(e) = std::fs::write(&stamp, &build_id) {
+        echo!(
+            "[MoleWorld] 写入戳文件 {:?} 失败: {:?}(下次启动会再复制一次)",
+            stamp,
+            e
+        );
     }
     echo!(
-        "[MoleWorld] 已复制内置游戏到 {:?}({} 字节)",
+        "[MoleWorld] 已{}内置游戏到 {:?}({} 字节)",
+        if have_old { "更新" } else { "复制" },
         target,
         data.len()
     );
@@ -182,6 +233,16 @@ pub fn ios_entry() {
             echo!("Panic: {}", payload);
         }
     }));
+
+    // [扫描修 2026-09-15] iOS 黑屏脚手架拆除(present.rs 里的 4 个真修复保留不动)。
+    // 这里曾有两类临时改动,都已删除,勿复活:
+    //  ① 分辨率实验三件套(用 set_var 强开的铺屏环境变量 / MOLE_HIDPI / --scale-hack=2):把 guest 逻辑屏改成
+    //     与物理屏不匹配的尺寸,dump 出现精确对半黑白,早已注释停用。[2026-09-16] B-06 铺屏的环境变量入口已从
+    //     window.rs 删除;现在只由下面的 --fill-screen 按真机屏比算逻辑屏,尺寸与屏幕一致,不是当年的错配。
+    //  ② 强开 MOLE_DIAG:每帧 glReadPixels 截帧,在真机 TBDR GPU 上会 resolve+discard 掉随后
+    //     presentRenderbuffer 要呈现的 renderbuffer → 屏幕黑(见 mole_diag.rs diag_enabled 的注释),
+    //     是真机黑屏元凶之一。桌面截帧仍由外部环境变量 MOLE_DIAG=1 开启,不受影响。
+    // 同时删去冗余的 --scale-hack=1:options.rs 默认值就是 1,默认选项文件也没给本游戏设 scale-hack。
 
     // [MoleWorld iOS · JIT 探针] 让设备自己回答「能不能拿到可执行内存」,别再引用旧结论(见 mole_jitprobe)。
     crate::mole_jitprobe::probe();
@@ -254,9 +315,11 @@ unsafe extern "system" fn native_exception_filter(
         .append(true)
         .open(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
     {
+        // [2026-09-16] B-08 文案里的定位标记要与日志里实际输出的一致:早期的 [marker] 已被
+        // mole_sysinfo::milestone 输出的 [足迹] 取代,并补上 environment.rs 加载主程序前后的 [boot]。
         let _ = writeln!(
             f,
-            "FATAL native exception 0x{:08X} ({}) at 0x{:016X} — 崩溃点见上方最后一条 [marker]/[splash]/[appframe] 日志",
+            "FATAL native exception 0x{:08X} ({}) at 0x{:016X} — 崩溃点见上方最后一条 [足迹]/[boot]/[splash]/[appframe] 日志",
             code, kind, addr
         );
         let _ = f.flush();
@@ -538,10 +601,14 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         assert!(parse_result == Ok(true));
     }
 
+    // [2026-09-16] A1-03 选项文件和命令行都应用完了才初始化运行时 log_dbg! 模块表:--log-modules 可能写在
+    // touchHLE_options.txt 里(安卓 / iOS 只有这个入口),更早初始化会漏掉它。
+    crate::log::init_dbg_modules(&options.log_modules);
+
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())
     }));
-    let env = match res {
+    let mut env = match res {
         Ok(ret) => match ret {
             Ok(env) => env,
             Err(e) => {
@@ -565,6 +632,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             std::panic::resume_unwind(e)
         }
     };
+    // [2026-09-16] X2-01 旧破解版游戏包的贝壳写死还原,必须早于第一次 -[UserInfoData initWithCoder:]。
+    // Environment::new 只装载、链接二进制并准备主线程协程,guest 代码(静态初始化器 → _start → UIApplicationMain → 读档)
+    // 要等下面 run() 恢复协程才开始执行,所以这里是确定早于读档的最早时机。字节不是破解版时函数什么都不做。
+    crate::mole_cheats::restore_cracked_vipgold(&mut env);
     env.run();
     Ok(())
 }

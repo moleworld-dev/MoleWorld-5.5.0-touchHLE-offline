@@ -455,25 +455,11 @@ impl Environment {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 env.with_yielder(yielder, move |env| {
                     echo!("CPU emulation begins now.");
-                    // [MoleWorld iOS] 一次性查进程代码签名标志:确认调试器是否真把 CS_DEBUGGED
-                    // (0x10000000)置上。这是 iOS 真机能否跑 JIT 的最终判据——没 CS_DEBUGGED 且
-                    // 没 JIT 权限时,执行 JIT 页必 EXC_BAD_ACCESS。csops(CS_OPS_STATUS=0)。
-                    #[cfg(target_os = "ios")]
-                    unsafe {
-                        extern "C" {
-                            fn csops(pid: i32, ops: u32, useraddr: *mut std::ffi::c_void, usersize: usize) -> i32;
-                            fn getpid() -> i32;
-                        }
-                        let mut flags: u32 = 0;
-                        let r = csops(getpid(), 0, &mut flags as *mut u32 as *mut std::ffi::c_void, 4);
-                        echo!(
-                            "[iOS JIT] csops r={} flags=0x{:08x} CS_DEBUGGED={} CS_GET_TASK_ALLOW={} CS_VALID={}",
-                            r, flags,
-                            (flags & 0x10000000) != 0,
-                            (flags & 0x00000004) != 0,
-                            (flags & 0x00000001) != 0,
-                        );
-                    }
+                    // [扫描修 2026-09-15] 这里曾有 iOS 专属 csops 代码签名标志探针(查 CS_DEBUGGED 判断真机
+                    // 能否跑 JIT);iOS 线已定走纯 Rust 解释器,探针只剩一行无用日志,已删除,勿复活。
+                    // [iOS⇄main 合并 2026-09-24] iOS 分支之后把同样的 csops 读数(连同 mmap/mprotect、vm_remap、
+                    // MAP_JIT 三条可执行内存路径)收进了 mole_jitprobe::probe(),由 lib.rs 的 ios_entry 启动时打一次
+                    // [JITPROBE] 日志,iOS 上取证不丢,这里不再重复。
                     // Some apps use the stack inside the static initializer.
                     // While properly behaving apps should be fine, some app
                     // will try to poke the top of the stack, so we'll give
@@ -1235,6 +1221,11 @@ impl Environment {
     /// Only `main.rs` should call this.
     pub fn run(mut self) {
         // [MoleWorld iOS · 冻结转储器] 宿主线程层看门狗(见 mole_watchdog.rs)。
+        // [iOS⇄main 合并 2026-09-24] 加 cfg(target_os = "ios") 门控:① std::os::unix 在 Windows 上不存在,
+        // 不门控桌面 Windows 直接编不过;② mole_watchdog 用 _dyld_get_image_vmaddr_slide(仅 Apple)/backtrace
+        // (旧安卓 bionic 没有),Linux/安卓链接不过;③ 它会装 SIGUSR1 处理函数并起常驻线程,属 iOS 取证行为,
+        // 桌面默认行为不应被它改变。note_host_progress() 只是一次原子存,各平台照常调用、无副作用。
+        #[cfg(target_os = "ios")]
         {
             use std::os::unix::io::AsRawFd;
             crate::mole_watchdog::start(crate::log::get_log_file().as_raw_fd());
@@ -1337,7 +1328,15 @@ impl Environment {
                     // guest 的 -[UIApplication did_enter_background] 要等到帧间 NSRunLoop 迭代才跑,期间
                     // 任何 present/GL 触 GPU = 0x8badf00d 被杀。这里在 tick 批次边界一看到后台/终止事件就
                     // host 侧立即 gate GL,不等 guest。幂等:guest 稍后处理同一事件无副作用。
-                    if window.background_or_terminate_pending() && !window.is_backgrounded() {
+                    // [iOS⇄main 合并 2026-09-24] 只在 iOS 上生效:解除闸门的 will_enter_foreground /
+                    // did_become_active(frameworks/uikit/ui_application.rs)都是 cfg(target_os = "ios"),
+                    // 安卓收到 AppWillTerminate 若在这里关了 GL 闸门就再没人打开;安卓挂起走 main 的
+                    // suspend_until_foreground 那一套。(用 cfg! 而不是 #[cfg]:这里是块的尾表达式,
+                    // #[cfg] 不能挂在尾表达式上;cfg! 为假时整个判断编译期消除。)
+                    if cfg!(target_os = "ios")
+                        && window.background_or_terminate_pending()
+                        && !window.is_backgrounded()
+                    {
                         window.set_backgrounded(true);
                     }
                 }
@@ -1826,7 +1825,10 @@ impl Environment {
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex);
                             return thread_id;
                         } else if let Some(deadline) = deadline {
-                            let time = SystemTime::now()
+                            // [扫描修 2026-09-15] deadline 是 guest 传给 pthread_cond_timedwait 的绝对时刻
+                            // (CLOCK_REALTIME 语义,由 guest 的 gettimeofday/time 算出,已含时间旅行偏移),
+                            // 必须用同一虚拟墙钟比较,否则偏移 N 小时后超时等待要多等 N 小时。偏移为 0 时不变。
+                            let time = crate::libc::time::guest_wall_clock_now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap();
                             if deadline <= time {

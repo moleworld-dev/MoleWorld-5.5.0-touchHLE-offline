@@ -60,6 +60,10 @@ impl GuestRet for SEL {
 }
 
 impl SEL {
+    /// [扫描修 2026-09-15] 空选择子(NULL SEL),用于给 guest 方法传"无回调选择子"之类的参数。
+    pub const fn null() -> Self {
+        SEL(ConstPtr::null())
+    }
     pub fn as_str(self, mem: &Mem) -> &str {
         // selectors are probably always UTF-8 but this hasn't been verified
         mem.cstr_at_utf8(self.0).unwrap()
@@ -67,8 +71,7 @@ impl SEL {
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
-    /// Interned selector pointer as an integer (one canonical value per name) —
-    /// usable as a cheap identity key without resolving the string.
+    /// [同步 iOS 2026-09-16] 已驻留选择子的指针值(同名选择子只有一个),可当廉价的身份键用,不必解析字符串。
     pub fn to_bits(self) -> u32 {
         self.0.to_bits()
     }
@@ -122,13 +125,11 @@ impl ObjC {
                 // [P0 返回主村空村] 保护"地图数据字典"不被原地清空(见 messages.rs 的 removeAllObjects 钩子)。
                 "removeAllObjects",
                 "showNetWorkError",
-                "initWithCoder:",
+                // [合并注 2026-09-24] main 的 F1-05(2026-09-16)删掉了钩子块里 -[UserInfoData initWithCoder:] 贝壳还原臂
+                // 与 LogoLayer 四个标题页按钮(onMenuKefu/ChangeAccount/ChangePlayer/VersionInfo)删档臂,这里同步去掉
+                // 对应的 5 个选择子,保持「本表 = 钩子块实际比较的选择子全集」(initWithCoder: 很常见,留着会白进钩子块)。
                 "checkUpdates:",
                 "shownewFunctionIntroductionLayer",
-                "onMenuKefuSelected",
-                "onMenuChangeAccountSelected",
-                "onMenuChangePlayerSelected",
-                "onMenuVersionInfoSelected",
                 "onBuyVIPGold:",
                 "onButtonYesSelected:",
                 "caribbeanData",

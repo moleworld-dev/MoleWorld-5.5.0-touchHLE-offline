@@ -44,7 +44,7 @@ pub struct Options {
     /// 768x1366 皆可,内部归一成 portrait=(短,长)。None=不覆盖。见 window::apply_cli_resolution。
     pub logical_size: Option<(u32, u32)>,
     /// [MoleWorld 智能分辨率] `--fill-screen`:按目标屏宽高比自动算 guest 逻辑屏(FixedHeight Hor+),
-    /// 物理满屏不黑边、不拉伸。等价 env MOLE_FILL=1。默认 false=零回归。
+    /// 物理满屏不黑边、不拉伸。默认 false=零回归。
     pub fill_screen: bool,
     /// [MoleWorld 智能分辨率] `--max-aspect=F`:自动适配时 guest landscape 宽高比上限(默认 2.4)。
     /// 夹在 [4:3, 4.0]。None=用默认。仅超宽屏会被钳(留极小 pillarbox 防变形)。
@@ -77,6 +77,10 @@ pub struct Options {
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    /// [2026-09-16] A1-03 `--log-modules=a,b`:运行时打开这些模块(按前缀匹配)的 log_dbg!。
+    /// 能写进 touchHLE_options.txt,安卓 / iOS 设不了环境变量 TOUCHHLE_LOG_MODULES 时靠它。默认空 = 行为不变。
+    /// 由 lib.rs 在全部选项应用完之后交给 log::init_dbg_modules。
+    pub log_modules: Vec<String>,
 }
 
 impl Default for Options {
@@ -115,6 +119,7 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             zero_stack_after_guest_to_host_call: None,
+            log_modules: Vec::new(),
         }
     }
 }
@@ -311,6 +316,15 @@ impl Options {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
             })?);
+        } else if let Some(value) = arg.strip_prefix("--log-modules=") {
+            // [2026-09-16] A1-03 逗号分隔的模块路径前缀。后出现的整体覆盖先出现的(同 --preferred-languages=):
+            // main() 在应用选项文件之后会把命令行重放一遍,追加式写法会让同一批模块重复叠加。
+            self.log_modules = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
         } else {
             return Ok(false);
         };

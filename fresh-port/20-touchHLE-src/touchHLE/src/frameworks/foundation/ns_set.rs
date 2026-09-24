@@ -61,6 +61,22 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
+// [深扫修 2026-09-12] 游戏二进制引用了 setWithArray:/setWithSet:/initWithArray:/initWithSet:/
+// minusSet:,引擎原先一个都没有,消息落空返回 nil,调用方拿到 nil 集合后 containsObject:
+// 恒为 NO,属于静默错误。实现只依赖 objectEnumerator,数组和集合都适用;类方法经
+// `this alloc` 分派,NSMutableSet 调用时得到可变集合。
++ (id)setWithArray:(id)array {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithArray:array];
+    autorelease(env, new)
+}
+
++ (id)setWithSet:(id)set {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithSet:set];
+    autorelease(env, new)
+}
+
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
     retain(env, this)
@@ -131,8 +147,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // NSCopying implementation
+// [深扫修 2026-09-12] 原来是 todo!(),对可变集合发 copy 会直接 panic 整个模拟器。
+// 按 Apple 语义返回独立的不可变 NSSet(调用方持有 +1),内容为当前全部元素。
 - (id)copyWithZone:(NSZonePtr)_zone {
-    todo!(); // TODO: this should produce an immutable copy
+    let null: id = msg_class![env; NSNull null];
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    let mut dict = <DictionaryHostObject as Default>::default();
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        dict.insert(env, object, null, /* copy_key: */ false);
+    }
+    let new: id = msg_class![env; NSSet alloc];
+    env.objc.borrow_mut::<SetHostObject>(new).dict = dict;
+    new
 }
 
 @end
@@ -164,6 +192,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+- (id)initWithArray:(id)array {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_collection(env, array);
+    this
+}
+
+- (id)initWithSet:(id)set {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_collection(env, set);
+    this
+}
+
 - (())dealloc {
     std::mem::take(&mut env.objc.borrow_mut::<SetHostObject>(this).dict).release(env);
     env.objc.dealloc_object(this, &mut env.mem)
@@ -185,8 +223,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)allObjects {
-    let objects = env.objc.borrow_mut::<SetHostObject>(this).dict.iter_keys().collect();
-    ns_array::from_vec(env, objects)
+    // [审查修 2026-09-13] 根因:原实现把宿主快照直接 from_vec 返回,数组是 +1 且从不
+    // autorelease,元素也没 retain。宿主调用方(本文件的 objectEnumerator /
+    // countByEnumeratingWithState: / copyWithZone: / minusSet:,以及 UIKit 触摸分发)和游戏
+    // 都按 Apple 语义把返回值当 autoreleased 用、从不 release,于是每调一次泄漏一个数组;
+    // 而若在调用方补 release,数组 dealloc 会对没 retain 过的元素多 release 一次。
+    // 修法:按 Apple 语义,元素逐个 retain 交给数组持有(与 _touchHLE_NSArray dealloc 的逐个
+    // release 配平),数组 autorelease 后返回。顺带让遍历期间集合被改也不会留下悬垂指针。
+    // 取舍:没有活动池时 autorelease 仍会泄漏(与原来相同),且此时元素也随数组留存;
+    // 宿主的触摸分发、NSTimer/CADisplayLink 回调都包了池,主循环路径不受影响。
+    let objects: Vec<id> = env.objc.borrow::<SetHostObject>(this).dict.iter_keys().collect();
+    for &object in &objects {
+        retain(env, object);
+    }
+    let array: id = ns_array::from_vec(env, objects);
+    autorelease(env, array)
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -240,6 +291,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+- (id)initWithArray:(id)array {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_collection(env, array);
+    this
+}
+
+- (id)initWithSet:(id)set {
+    env.objc.borrow_mut::<SetHostObject>(this).dict = set_from_collection(env, set);
+    this
+}
+
 - (id)initWithCapacity:(NSUInteger)_capacity {
     // TODO: capacity
     msg![env; this init]
@@ -265,8 +326,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)allObjects {
-    let objects = env.objc.borrow_mut::<SetHostObject>(this).dict.iter_keys().collect();
-    ns_array::from_vec(env, objects)
+    // [审查修 2026-09-13] 同 _touchHLE_NSSet 的 allObjects:元素逐个 retain 交给数组持有,
+    // 数组 autorelease 返回(原来 +1 不释放 = 每调一次泄漏一个数组)。根因与取舍见该处注释。
+    let objects: Vec<id> = env.objc.borrow::<SetHostObject>(this).dict.iter_keys().collect();
+    for &object in &objects {
+        retain(env, object);
+    }
+    let array: id = ns_array::from_vec(env, objects);
+    autorelease(env, array)
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -328,9 +395,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (())minusSet:(id)other { // NSSet *
+    if other == nil {
+        return;
+    }
+    // 先取快照再删,other == this 时也不会边遍历边改。
+    // [审查修 2026-09-13] allObjects 现在返回 autoreleased 数组且元素已 retain,删除期间元素不会被
+    // 提前释放;这里不要 release 它。
+    let objects: id = msg![env; other allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    for i in 0..count {
+        let object: id = msg![env; objects objectAtIndex:i];
+        () = msg![env; this removeObject:object];
+    }
+}
+
 @end
 
 };
+
+/// Helper shared by `initWithArray:` / `initWithSet:` of `_touchHLE_NSSet` and
+/// `_touchHLE_NSMutableSet`: any collection answering `objectEnumerator`.
+fn set_from_collection(env: &mut Environment, collection: id) -> DictionaryHostObject {
+    let null: id = msg_class![env; NSNull null];
+    let mut dict = <DictionaryHostObject as Default>::default();
+    if collection == nil {
+        return dict;
+    }
+    let enumerator: id = msg![env; collection objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            break;
+        }
+        dict.insert(env, next, null, /* copy_key: */ false);
+    }
+    dict
+}
 
 /// Helper method shared between `initWithObjects:` of `_touchHLE_NSSet` and
 /// `_touchHLE_NSMutableSet`

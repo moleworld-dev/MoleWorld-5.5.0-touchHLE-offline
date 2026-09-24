@@ -35,6 +35,25 @@ pub enum WrapMode {
     Char,
 }
 
+/// [MoleWorld 2026-09-16] Unicode「默认可忽略」字符(Default_Ignorable_Code_Point):变体选择符(emoji 后的
+/// U+FE0F 等)、零宽字符、双向控制符、BOM 等。它们本来不占宽度也不显示,但 rusttype 逐字符取字形时拿到的是
+/// .notdef,会画成一个方框(修改器菜单「⚠️」后面那个☒就是 U+FE0F)。量宽与绘制前统一滤掉。
+pub fn is_default_ignorable(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFA0 | 0xFFF0..=0xFFF8 | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
+        | 0xE0000..=0xE0FFF)
+}
+
+fn strip_ignorable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(is_default_ignorable) {
+        std::borrow::Cow::Owned(text.chars().filter(|&c| !is_default_ignorable(c)).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Helper for [Font::draw], used for the `draw_glyph` callback.
 pub struct RasterGlyph<'a> {
     origin: (f32, f32),
@@ -71,7 +90,15 @@ impl Font {
     }
 
     pub fn glyph_id_for_char(&self, c: u16) -> GlyphId {
-        self.font.glyph(char::from_u32(c as u32).unwrap()).id()
+        // [MoleWorld 2026-09-16] UTF-16 代理项半边(0xD800–0xDFFF)不是合法 char,原来 unwrap 会 panic。
+        self.font
+            .glyph(char::from_u32(c as u32).unwrap_or(char::REPLACEMENT_CHARACTER))
+            .id()
+    }
+
+    /// [MoleWorld 2026-09-16] 字体里有没有这个字符的字形(id 0 = .notdef,画出来是方框)。
+    pub fn has_glyph(&self, c: char) -> bool {
+        self.font.glyph(c).id().0 != 0
     }
 
     fn from_resource_file(filename: &str) -> Font {
@@ -215,10 +242,11 @@ impl Font {
     fn calculate_line_width(&self, font_size: f32, line: &str) -> f32 {
         let mut line_x_min: f32 = 0.0;
         let mut line_x_max: f32 = 0.0;
+        let line = strip_ignorable(line);
 
         for glyph in self
             .font
-            .layout(line, self.scale(font_size), Default::default())
+            .layout(&line, self.scale(font_size), Default::default())
         {
             let position = glyph.position();
             let h_metrics = glyph.unpositioned().h_metrics();
@@ -413,13 +441,14 @@ impl Font {
         let mut glyph_bitmap: Vec<f32> = Vec::new();
 
         for (line_width, line_text) in lines {
+            let line_text = strip_ignorable(line_text);
             let line_x_offset = match alignment {
                 TextAlignment::Left => 0.0,
                 TextAlignment::Center => -line_width / 2.0,
                 TextAlignment::Right => -line_width,
             };
             for glyph in self.font.layout(
-                line_text,
+                &line_text,
                 self.scale(font_size),
                 Point {
                     x: origin.0 + line_x_offset,

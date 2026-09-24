@@ -67,6 +67,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     if env.window.as_ref().map_or(false, |w| w.is_backgrounded()) {
         return None;
     }
+    // [深扫修 2026-09-11] #23(a):合成前先布局 setNeedsLayout 打过脏标记的视图
+    // (MBProgressHUD 的底框宽高/指示器居中都在 layoutSubviews 里算),必须在
+    // display_layers(drawRect:)之前。放在函数最前面:① 早于下面对 windows 的
+    // 克隆,避免 guest 的 layoutSubviews 改动窗口列表后用到过期列表;② 早于全屏
+    // EAGL 快路径判断,因为布局可能增删子视图从而改变能否走快路径。
+    // 本调用由 NSRunLoop 发起,不在游戏 drawScene 帧栈内;无脏视图时只是一次计数判断。
+    crate::frameworks::uikit::ui_view::layout_dirty_views_before_composition(env);
+
     let mut animation_state = animation::State::default();
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     if !windows.iter().any(|&window| !msg![env; window isHidden]) {
@@ -150,6 +158,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定;
     // 以及 viewRenderbuffer,swap 前绑回 GL_RENDERBUFFER。
     let window_default_fbo = env.window().default_framebuffer();
+    // [补完 2026-09-15] window_default_rbo 只在下方 #[cfg(target_os = "ios")] 的 BindRenderbufferOES 用到,
+    // 桌面/安卓构建报 unused_variables。只在非 iOS 放宽该 lint,取值与调用照旧(不把这行门控掉,
+    // 免得 default_renderbuffer() 在其它调用点也门控后变成 dead_code),各平台行为不变。
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
     let window_default_rbo = env.window().default_renderbuffer();
 
     // TODO: draw status bar if it's not hidden
@@ -748,6 +760,9 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
     // [MoleWorld iOS · 诊断] 标记"合成器整屏重传"这条 TexImage2D 来源。用于区分 [NPOT-FIX] 里
     // 有多少来自 host 合成器(应 ≈60Hz 的零头)vs guest 自己 build 发起(主体)。合成器受 60Hz 门控,
     // 一帧内不可能上千次,所以若 [NPOT-FIX] 一帧上千而 [COMP-UP] 很少,证明主体是 guest。
+    // [同步 2026-09-24] 只在 iOS 打:这是 iOS 真机排查用的探针,桌面慢合成路径(输入框/弹框)上会刷屏,
+    // main 没有这行日志,门控后桌面输出与 main 一致。
+    #[cfg(target_os = "ios")]
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COMP_UP_N: AtomicU64 = AtomicU64::new(0);

@@ -21,11 +21,12 @@ use crate::frameworks::{core_animation, media_player, uikit};
 use crate::libc::semaphore::{host_create_semaphore, sem_post, sem_t};
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_send, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+    id, msg, msg_class, msg_send, nil, objc_classes, release, retain, Class, ClassExports,
+    HostObject, SEL,
 };
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// `NSString*`
 pub type NSRunLoopMode = id;
@@ -42,11 +43,26 @@ pub const CONSTANTS: ConstantExports = &[
         "_NSDefaultRunLoopMode",
         HostConstant::NSString(NSDefaultRunLoopMode),
     ),
+    // [2026-09-16] C-01:Foundation 的全局 `double NSFoundationVersionNumber`(不属于 NSRunLoop,只是借
+    // Foundation 已注册的常量表导出)。根因:此前没导出,dyld 把游戏的非懒指针槽 0x9c8050 留成 0,
+    // -[GameManager iosVerGreaterThan7]@0x1bd18 `vldr d16,[r0]` 读地址 0 → MemoryError panic;好友搜索结果的
+    // 「拜访」「加好友」、留言列表的「留言」「拜访好友」「拜访」「删除」(SeekViewController/MessageViewController
+    // 共 6 个按钮回调)一点就崩。取值 678.24 = NSFoundationVersionNumber_iPhoneOS_2_0,与 UIDevice
+    // systemVersion 报的 "2.0" 一致;≤890.1 时 iosVerGreaterThan7 返回 NO,按钮回调走「按钮→contentView→cell」
+    // 分支,且 addBtnTouched: 自带两层/三层 superview 后备分支,取值大小都能找到 cell。
+    // 另一个读者是 InMobi 的 -[IMCommonMgr configTimestampUpdate:],只影响其版本分支。
+    (
+        "_NSFoundationVersionNumber",
+        HostConstant::Custom(|env| env.mem.alloc_and_write(678.24f64).cast().cast_const()),
+    ),
 ];
 
 #[derive(Default)]
 pub struct State {
     run_loops: HashMap<ThreadId, id>,
+    /// [扫描修 2026-09-15] 主线程 run loop 已处理到的时间旅行跳变代数
+    /// (对照 crate::libc::time::time_jump_generation,初值 0 = 从未跳变)。
+    seen_time_jump_generation: u64,
 }
 
 struct NSRunLoopHostObject {
@@ -354,6 +370,12 @@ pub fn run_run_loop(
             limit_sleep_time(&mut sleep_until, next_due);
         }
 
+        // [扫描修 2026-09-15] 时间旅行跳变后,赶在定时器阶段(CADisplayLink → CCDirector mainLoop)之前
+        // 补发 applicationSignificantTimeChange:,让 cocos2d 下一帧 dt 归零,见 deliver_significant_time_change。
+        if is_main_run_loop {
+            deliver_significant_time_change(env);
+        }
+
         assert!(timers_tmp.is_empty());
         timers_tmp.extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).timers);
         // Retain the timers in case a timer cancels another timer
@@ -363,6 +385,10 @@ pub fn run_run_loop(
         }
 
         for timer in timers_tmp.drain(..) {
+            // [扫描修 2026-09-15] 偏移若在本轮前一个定时器回调里被改,也要赶在下一个定时器(可能正是 mainLoop)前补发。
+            if is_main_run_loop {
+                deliver_significant_time_change(env);
+            }
             let next_due = ns_timer::handle_timer(env, timer);
             limit_sleep_time(&mut sleep_until, next_due);
             release(env, timer);
@@ -495,16 +521,66 @@ pub fn run_run_loop(
             // (Apple's epoch is less convenient in Rust. And "pure"
             // Rust approach with Duration/Instant is just too troublesome
             // and not worthy to convert back and forth)
-            if SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-                >= limit
-            {
+            // [扫描修 2026-09-15] limit 来自 guest NSDate(runUntilDate: → timeIntervalSince1970),而 NSDate 的
+            // "现在"已含时间旅行偏移;这里若仍用宿主 SystemTime::now() 比较,偏移 N 小时后 runUntilDate:
+            // 会多跑 N 小时(等于卡死)。改用同一虚拟墙钟。偏移只往前跳,跳变时最多让本次 runUntilDate:
+            // 提前返回,不会卡住;偏移为 0 时与原实现一致。
+            if crate::libc::time::guest_now_unix_secs_f64() >= limit {
                 break;
             }
         }
     }
+}
+
+/// [扫描修 2026-09-15] 时间旅行偏移跳变后,像真机"系统时间被改"那样通知 app:给 app delegate 发
+/// `applicationSignificantTimeChange:`(若实现),并发 `UIApplicationSignificantTimeChangeNotification`。
+/// 每次跳变只发一次;只在主线程 run loop 调用(与定时器回调同一栈层,可以安全 msg_send)。
+///
+/// 根因:本游戏 cocos2d 帧 dt 用 gettimeofday 计算(-[CCDirector calculateDeltaTime]@0x2c7d74,
+/// dt = MAX(0, now − lastUpdate_),无上限),墙钟跳 N 小时 → 下一帧 dt = N×3600 秒。
+/// -[iMoleVillageAppDelegate applicationSignificantTimeChange:]@0x11a80 就是
+/// [[CCDirector sharedDirector] setNextDeltaTimeZero:YES],补发它即可让下一帧 dt 归零(原版自带的处理)。
+///
+/// 取舍:NSTimer / performSelector:afterDelay: / CADisplayLink 的截止时间都是 `Instant`(单调时钟),
+/// 与墙钟偏移无关,跳变不会让已排队的计时器全部立即触发或永不触发,不需要改它们。
+/// 偏移从未改过(代数为 0)时直接返回,零行为变化;UIApplication 尚未创建(应用选择器阶段)时只记账不发送。
+fn deliver_significant_time_change(env: &mut Environment) {
+    let generation = crate::libc::time::time_jump_generation();
+    if generation == env.framework_state.foundation.ns_run_loop.seen_time_jump_generation {
+        return;
+    }
+    // 先记账再发送:回调里若重入 run loop,不会重复补发。
+    env.framework_state
+        .foundation
+        .ns_run_loop
+        .seen_time_jump_generation = generation;
+
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    if ui_application == nil {
+        return;
+    }
+    log!(
+        "[time travel] clock offset is now {}s (jump #{}), sending applicationSignificantTimeChange:",
+        crate::libc::time::time_offset_secs(),
+        generation
+    );
+
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if delegate != nil
+        && env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "applicationSignificantTimeChange:")
+    {
+        () = msg![env; delegate applicationSignificantTimeChange:ui_application];
+    }
+
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let notif_name =
+        ns_string::get_static_str(env, "UIApplicationSignificantTimeChangeNotification");
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+
+    let _: () = msg![env; pool drain];
 }
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods

@@ -184,29 +184,54 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
     // should be used instead.
     for c in text.chars() {
         let c = c as u32;
+        // [扫描修 2026-09-15] F8-7:CJK 判定区间补全。原来统一汉字止于 0x9FA0,
+        // 0x9FA1-0x9FFF、兼容汉字 0xF900-0xFAFF 等会落到 Liberation(无字形)而显示空白。
         if (0x3000..=0x30FF).contains(&c) || // JA punctuation, kana
            (0xFF00..=0xFFEF).contains(&c) || // full-width/half-width chars
-           (0x4e00..=0x9FA0).contains(&c) || // various kanji
-           (0x3400..=0x4DBF).contains(&c) { // more kanji
-            match kind {
-                // CJK has no italic equivalent
-                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
-                    if state.sans_regular_ja.is_none() {
-                        state.sans_regular_ja = Some(Font::sans_regular_ja());
-                    }
-                    return state.sans_regular_ja.as_ref().unwrap();
-                },
-                FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
-                    if state.sans_bold_ja.is_none() {
-                        state.sans_bold_ja = Some(Font::sans_bold_ja());
-                    }
-                    return state.sans_bold_ja.as_ref().unwrap();
-                },
-            }
+           (0x4E00..=0x9FFF).contains(&c) || // CJK 统一汉字(补全到 0x9FFF)
+           (0x3400..=0x4DBF).contains(&c) || // more kanji
+           (0xF900..=0xFAFF).contains(&c) || // CJK 兼容汉字
+           (0x2E80..=0x2FDF).contains(&c) || // CJK 部首补充 / 康熙部首
+           (0x3100..=0x312F).contains(&c) || // 注音符号
+           (0x31C0..=0x31EF).contains(&c) || // CJK 笔画
+           (0xFE30..=0xFE4F).contains(&c) { // CJK 兼容形式(竖排标点)
+            return cjk_fallback_font(state, kind);
         }
     }
 
+    // [MoleWorld 2026-09-16] 非 CJK 符号也要回退:Liberation 没有 ★ ⚠ ▶ ◀ ① ② ✓ ⇒ ∈ 等字形(画成方框),
+    // 思源黑体 SC 有。整串里只要出现 Liberation 缺字形、又不是空白或默认可忽略的字符,就整串改用思源黑体
+    // (与上面 CJK 回退同一粒度;思源黑体的拉丁字母完整,只是字宽略有差别)。
+    let primary_missing = {
+        let primary = state.get_font_by_kind(kind);
+        text.chars().any(|c| {
+            !c.is_whitespace() && !crate::font::is_default_ignorable(c) && !primary.has_glyph(c)
+        })
+    };
+    if primary_missing {
+        return cjk_fallback_font(state, kind);
+    }
+
     state.get_font_by_kind(kind)
+}
+
+#[rustfmt::skip]
+fn cjk_fallback_font(state: &mut State, kind: FontKind) -> &Font {
+    match kind {
+        // CJK has no italic equivalent
+        FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
+            if state.sans_regular_ja.is_none() {
+                state.sans_regular_ja = Some(Font::sans_regular_ja());
+            }
+            state.sans_regular_ja.as_ref().unwrap()
+        },
+        FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
+            if state.sans_bold_ja.is_none() {
+                state.sans_bold_ja = Some(Font::sans_bold_ja());
+            }
+            state.sans_bold_ja.as_ref().unwrap()
+        },
+    }
 }
 
 /// Called by the `sizeWithFont:` method family on `NSString`.
@@ -419,8 +444,14 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         "Arial-BoldItalicMT" => Some(FontKind::SansBoldItalic),
         "Arial-ItalicMT" => Some(FontKind::SansItalic),
         // Font Family: STHeiti TC
-        "STHeitiTC-Light" => None,
-        "STHeitiTC-Medium" => None,
+        // [扫描修 2026-09-15] F8-7:iOS 4-6 的中文系统字体是 STHeiti Light(常规)与
+        // Medium(粗体)。Medium 映射到 SansBold:含中文时 get_font 会落到
+        // NotoSansSC-Bold,最接近原版 Medium 的字重(Regular 明显偏细);Light → Regular。
+        // 游戏唯一使用者 -[ReceiveGiftLayer showLayer] 的 3 个标签,原先每次建层刷 5 行
+        // "No replacement found" 告警,现在消除。代价:同标签里的拉丁字符变 Liberation
+        // Sans Bold,与 Heiti 拉丁字形略有差异,可接受。
+        "STHeitiTC-Light" => Some(FontKind::SansRegular),
+        "STHeitiTC-Medium" => Some(FontKind::SansBold),
         // Font Family: Hiragino Kaku Gothic ProN
         "HiraKakuProN-W6" => None,
         "HiraKakuProN-W3" => None,
@@ -434,21 +465,27 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         // Font Family: Arial Unicode MS
         "ArialUnicodeMS" => None,
         // Font Family: STHeiti SC
-        "STHeitiSC-Medium" => None,
-        "STHeitiSC-Light" => None,
+        // [扫描修 2026-09-15] F8-7:同上(简体同族)。
+        "STHeitiSC-Medium" => Some(FontKind::SansBold),
+        "STHeitiSC-Light" => Some(FontKind::SansRegular),
         // Font Family: American Typewriter
         "AmericanTypewriter" => Some(FontKind::MonoRegular),
         "AmericanTypewriter-Bold" => Some(FontKind::MonoBold),
         // Font Family: Helvetica
-        "Helvetica-Oblique" => None,
-        "Helvetica-BoldOblique" => None,
-        "Helvetica" => None,
-        "Helvetica-Bold" => None,
+        // [扫描修 2026-09-15] F8-7 顺带:游戏 cfstring 里引用了 Helvetica / Helvetica-Bold /
+        // "Helvetica Neue"。Liberation Sans 本就是 Helvetica 的度量兼容替身,原先回落
+        // SansRegular 字形相同但 -Bold 丢了字重,且会打告警;这里按字重/斜体显式映射。
+        "Helvetica-Oblique" => Some(FontKind::SansItalic),
+        "Helvetica-BoldOblique" => Some(FontKind::SansBoldItalic),
+        "Helvetica" => Some(FontKind::SansRegular),
+        "Helvetica-Bold" => Some(FontKind::SansBold),
         // Font Family: Marker Felt
         "MarkerFelt-Thin" => None,
         // Font Family: Helvetica Neue
-        "HelveticaNeue" => None,
-        "HelveticaNeue-Bold" => None,
+        "HelveticaNeue" => Some(FontKind::SansRegular),
+        "HelveticaNeue-Bold" => Some(FontKind::SansBold),
+        // [扫描修 2026-09-15] 游戏请求的是族名(带空格),同 "Times New Roman" 的处理。
+        "Helvetica Neue" => Some(FontKind::SansRegular),
         // Font Family: DB LCD Temp
         "DBLCDTempBlack" => None,
         // Font Family: Verdana

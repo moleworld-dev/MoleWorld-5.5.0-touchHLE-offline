@@ -43,16 +43,14 @@ View options:
         get a small pillarbox to avoid horizontal distortion.
 
         Ignored if --logical-size is given (that takes precedence). Combine
-        with --fullscreen for a true borderless fill. Equivalent to the
-        MOLE_FILL=1 environment variable.
+        with --fullscreen for a true borderless fill.
 
     --logical-size=WxH
         [MoleWorld] Explicitly set the app's logical screen size in points,
         e.g. --logical-size=1366x768. You may pass either orientation
         (1366x768 or 768x1366); it is normalized internally. This overrides
-        --fill-screen and the MOLE_GUEST_PORTRAIT environment variable, and
-        makes the viewport scale the output while preserving this aspect ratio
-        (no stretching).
+        --fill-screen, and makes the viewport scale the output while
+        preserving this aspect ratio (no stretching).
 
     --max-aspect=F
         [MoleWorld] Upper bound on the app's landscape aspect ratio used by
@@ -256,6 +254,21 @@ Debugging options:
         data directory. Defaults to {user directory}/DUMP.txt. Note that this
         file will get truncated (deleted) if it already exists!
 
+    --log-modules=...
+        [MoleWorld] Turn on verbose debug logging (log_dbg!) for the given
+        modules at runtime, without rebuilding. The value is a comma-separated
+        list of module path prefixes with no spaces, for example
+        --log-modules=touchHLE::mole_cheats,touchHLE::libc::libkern::task
+        A prefix such as touchHLE::mole_ enables every module whose path
+        starts with it. The TOUCHHLE_LOG_MODULES environment variable uses the
+        same format and is merged with this option. Unlike the environment
+        variable, this option can be put in touchHLE_options.txt, so it also
+        works on Android and iOS.
+
+        Warning: never enable touchHLE::objc::messages, or a prefix that covers
+        it (touchHLE::objc, touchHLE::, ...). It logs one line per Objective-C
+        message, which floods the log and makes the app crawl.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.
@@ -324,3 +337,190 @@ Other options:
         stack and branch based on the stack's content. There is normally
         no reason to enable this option. The number of bytes must be
         chosen carefully on a per-app basis.
+
+摩尔庄园专用环境变量(MoleWorld environment variables):
+    下面的变量要在启动 touchHLE 之前设置才生效:macOS / Linux 终端里用
+    export 名字=值(或写进 .command 启动器),Windows 用 set 名字=值。
+    安卓和 iOS 版设不了环境变量,按下文的默认值运行(iOS 默认值不同的已
+    单独注明)。取值说明以源码实际解析为准。
+
+  玩法与显示:
+    MOLE_TZ
+        游戏用的本地时区,决定作物成熟、昼夜、每日签到和节日活动的跨日时刻。
+        默认(不设或留空)是 Asia/Shanghai 北京时间 UTC+8,与原版服务器一致。
+        host / local / system(不区分大小写):跟随本机时区。
+        也可以写固定偏移,如 +8、+08:00、-0530、UTC-5;时区名只认内置的少数
+        几个(如 Asia/Tokyo、Asia/Seoul、Asia/Singapore、Europe/London,一律
+        按固定偏移、不算夏令时)。无法识别的值回退北京时间并写日志。
+
+    MOLE_FESTIVAL
+        节日开关,商店节日商品和节日活动共用同一张节日日历。只在离线时生效,
+        在线以私服下发为准。节日活动只有两项:圣诞窗口(12/10~次年 1/06)的
+        废品站高价回收,新年窗口(春节前后各 15 天;2020~2040 年查表,表外
+        年份按 1/20~2/28)的春节烟花。
+        默认(不设 / 留空 / date / auto)按本地日期。
+        all / on / 1:商店节日商品全部上架,节日活动仍按日期。
+        off / none / 0:商店节日商品和节日活动全部关闭。
+        写节日名则只开这一个节日,不看日期,其它节日的商品和活动都不开:
+        halloween 万圣、harvest 丰收、christmas 或 xmas 圣诞(含高价回收)、
+        winter 冬季、newyear 或 spring 新年(含春节烟花)、worldcup 世界杯、
+        childrens 儿童节、qixi 七夕、anniversary 周年庆、easter 复活节。
+        英文不区分大小写;中文名只认上面列出的写法(如写「新年」,写「春节」
+        认不出)。认不出的值按日期处理,离线打开商店或修改器「节日商店」项
+        时在日志里提示一次。修改器菜单里的「节日商店」切换只改商店,不影响
+        节日活动。
+
+    MOLE_DISCOUNT
+        离线限时折扣:每次进村时按本地日期挑几件主村商店的纯贝壳商品打
+        7~8 折(选品规则为移植者自拟;离线时原版回前台那处发包条件基本不
+        满足,实际只在进村时刷新)。默认开;off / 0 / false /
+        no / none 关闭。
+
+    MOLE_VIP_THRESHOLDS
+        离线 VIP 升级门槛:逗号分隔的累计充值元数,依次对应 VIP1 到 VIP4,
+        必须是严格递增的正整数(也接受全角逗号),多于 4 个的部分忽略。
+        默认 6,100,500,2000(移植者自拟,原版门槛只在淘米服务器上)。
+        格式无效时用默认值并写日志。
+
+    MOLE_WHEEL_PINCH
+        桌面鼠标滚轮模拟双指捏合缩放。默认开;设为 0 关闭。
+
+    MOLE_WHEEL_PINCH_INVERT
+        设为非 0 的值(如 1)反转滚轮缩放方向。默认向上滚是放大,已经跟随
+        系统的「自然滚动」设置。
+
+    MOLE_VSYNC
+        画面交换的垂直同步:1 = VSync;2 = 自适应(LateSwapTearing);其它值
+        = 立即交换。不设则不改动。用于消除 macOS 上的窗口闪烁。
+
+    MOLE_UI43
+        宽屏(--fill-screen 或 --logical-size 比 4:3 宽)时,商店、结算、
+        选关、弹框等复杂界面按原版 1024x768 排版并居中,世界场景照常加宽。
+        非 0 开启,0 关闭。未设置时桌面关(「启动摩尔庄园-宽屏.command」
+        会设成 1),iOS 在宽屏时自动开。
+
+    MOLE_FIX_MAPEXTEND
+        扩地位(存档里的 mapExtend)的兜底修复,绝不白送任何扩地。开启后做
+        两件事:
+        ① 区键安全网:只在村庄取景、可行走区、出生区这三处查表时,并且
+        mapExtend 低 5 位不是原版建过表的合法组合(1、3、5、7、13、15、29、
+        31)时,才临时补成包含它的最小合法组合,用来消除坏档(例如在线下发
+        的 6)造成的拖图闪屏。合法存档上等于不存在;存档、建桥和梯子、扩地
+        摆放、商店锁、成就和任务一律读真值,也不会写回存档。补出来的区只影
+        响取景和行走,没修桥或梯子照样摆不了东西,这是原版规则,不是故障。
+        ② 按存档证据对账:每次进村加载完地图物件后,接管原版的扩地
+        自检(-[ObjectManager checkMapExtendError]),先照原版给已完工的左
+        右桥补位,再只凭自家存档里的证据改 mapExtend(串门看别人家不动):
+          · 一次性收回旧版本白送的低位:只针对低 5 位正好是 0x1F、且启动时
+            存档最后写盘在 2026-09-05(北京时间)当天或之后的存档,更早写盘
+            的老档一律不碰。桥、梯子、雪桥区只有「地图上没有桥梯本体(在建
+            的也算有)、对应区域也没摆东西」才收回;雪桥、梯子、右桥按前置
+            链,后面的区保留则前面的也保留;拿不到地图物件数据时本次不收回。
+            收回雪桥时照原版补回拦路石头。有收回时立刻存档。首次进自家村对
+            账后(不论收没收回)在存档同目录写一次性标记
+            mole_mapextend_v007_reconciled,之后不再做收回判定。
+          · 补回被抹掉的「扩展下方地图」(bit 0x100,每次进自家村都查,只加
+            不减):领主成就已解锁,或下方扩展带里摆着桥梯以外的物件。买过
+            下扩、但下方没摆东西也没解锁领主成就的存档无从取证,补不回来。
+        对账结果写在日志「[MOLECHEAT] mapExtend 对账」一行。
+        非 0 开启,0 关闭。未设置时 iOS 开,桌面和安卓关。「启动摩尔庄园」
+        「-宽屏」「-在线服务器」「-账号菜单测试」四个 .command 启动器默认
+        设成 1;「-iPhone版」「-锁定比例」两个启动器没设,按桌面默认关。
+
+    MOLE_MAX_ASPECT
+        同 --max-aspect=,命令行参数优先。
+
+  在线私服(只在带 --allow-network-access 联网时起作用):
+    MOLE_SERVER
+        私服登录地址,主机:端口。默认 login.moleworld.net:7821。
+
+    MOLE_MIMI
+        自动登录用的米米号(纯数字)。不设或不是数字就不自动登录。
+
+    MOLE_PASSWORD
+        登录密码,默认空。
+
+    MOLE_ACCOUNT_MENU
+        设了就开(任何值都算,包括 0):不自动登录,放原版走 passport 流程,
+        点「切换账号」弹出原版账号管理菜单。
+
+    MOLE_PASSPORT
+        账号菜单模式下 passport 请求的转发目标,主机[:端口](不写端口为
+        80)。默认用 MOLE_SERVER 的主机加 80 端口。
+
+    MOLE_CDN
+        私服静态资源地址,主机[:端口](不写端口为 80);设为 off 或空字符串
+        则不向私服取。默认用 MOLE_SERVER 的主机加 80 端口。
+
+    MOLE_HUD
+        在线调试悬浮窗,非 0 开启,默认关。
+
+  调试用:
+    TOUCHHLE_LOG_MODULES
+        运行时打开 log_dbg! 调试日志的模块路径前缀,逗号分隔,与
+        --log-modules= 合并生效(用法见上文 Debugging options)。
+        例:TOUCHHLE_LOG_MODULES=touchHLE::mole_cheats
+        ★不要打开 touchHLE::objc::messages(或 touchHLE::objc、touchHLE::
+        这类覆盖它的前缀):每条消息打一行,日志暴涨、帧率骤降。
+
+    MOLE_LOG_SYNC
+        设了就开(任何值都算,包括 0):日志每写一行就 sync_data() 落盘一
+        次,用来抓断电、内核崩溃这类硬崩现场。默认关:日志写进系统页缓存
+        即可,进程崩溃也不会丢;每行都落盘会让切场景、进村时主线程卡顿。
+
+    MOLE_ALERT_AUTODISMISS
+        非 0 时系统弹框(UIAlertView)约 1 帧后自动按第一个按钮关闭(旧
+        行为);默认等玩家点。--headless 下总是自动关。带窗口跑的自动化
+        测试脚本要设成 1,否则弹框会一直挡住后续点击。
+
+    MOLE_OPENURL_EXIT
+        打开外部链接后是否退出:1 退出(上游老行为),0 不退出;不设时按
+        Info.plist 的最低系统版本判断,本游戏(4.3)不退出。
+
+    MOLE_BG_CALLBACKS
+        切后台挂起时默认向游戏发 applicationDidEnterBackground: 与
+        applicationWillEnterForeground:;设为 0 只发失活 / 激活(与桌面
+        最小化一致)。
+
+    MOLE_ASSERT
+        未捕获的 NSException 与 NSAssert 失败怎么处理。abort:一律终止;
+        log:只记日志继续跑(存档加密写盘途中也不终止,可能写坏存档);
+        不设:只有未捕获异常发生在存档加密写盘途中才终止。
+
+    MOLE_TRACE
+        选择子跟踪规则,逗号分隔:类名、类名.选择子、*选择子片段。设好后
+        还要在修改器「开发工具」页打开跟踪才会输出。
+
+    MOLE_DIAG
+        设了就开(任何值都算):每 30 帧把画面转储到 /tmp/mole_frame.ppm,
+        把静默空操作的选择子记到 /tmp/mole_diag.log,并从 /tmp/mole_input
+        读取注入的点击命令。只给桌面无头验证用;Windows 没有 /tmp,不要开。
+        ★不要在 iOS 上强开:截帧用的 glReadPixels 会让真机屏幕变黑,曾是
+        真机黑屏的元凶之一。
+
+    MOLE_UI43_DEBUG
+        宽屏 UI43 逐节点日志,非 0 开,0 关。未设置时桌面关、iOS 开。
+
+    MOLE_HIDPI
+        只在安卓和 iOS 的全屏建窗路径读取(桌面窗口不读):非 0 按设备原生
+        像素呈现(allow_highdpi),0 关闭。未设置时安卓关、iOS 开(真机没有
+        环境变量,关了会按点分辨率渲染再被系统放大而发糊)。
+
+    MOLE_REAL_KEYCHAIN
+        设为 1 时不再伪造 TMA_SSKeychain,让淘米账号 SDK 真用钥匙串(试验
+        开关,默认关)。★钥匙串内容(含账号密码)以明文 XML 写到沙盒的
+        Library/Keychain/keychain.plist(宿主上在 touchHLE_sandbox/<应用>/
+        Library/Keychain/ 下),不要随日志或存档一起发给别人。
+
+  构建时读取(编译期生效,运行时设置无效):
+    MOLE_BUILD_HASH
+        CI 注入的构建 commit,显示在「关于」页和崩溃诊断块里。
+
+    MOLE_INTERP_TRACE
+        构建 iOS 解释器时打开 DERAIL 现场追踪(debug 构建默认开)。与 cargo
+        feature interp_debug 等价,两种开法任一即可;只想用 release 速度抓
+        卡死现场时改用 interp_hb(只开轻量心跳,不写 trace 环、不查 DERAIL)。
+
+  已删除:
+    MOLE_FILL、MOLE_GUEST_PORTRAIT
+        2026-09-16 起不再读取,请改用 --fill-screen 与 --logical-size=WxH。

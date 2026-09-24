@@ -46,6 +46,7 @@ cpu_interpreter = []
 # 解释器逐指令调试埋点(trace 环 / heartbeat / DERAIL 检测)。dev(debug_assertions)默认开;
 # release 默认【关】以消除每条指令的固定开销(显著提速)。抓脱轨/挂起时:
 #   --features static,cpu_interpreter,interp_debug
+# 等价开法:编译期环境变量 MOLE_INTERP_TRACE=1(见 src/cpu/interpreter/mod.rs 的 INTERP_TRACE)。
 interp_debug = []
 # 只开轻量心跳(打印 pc/lr/sp,不写 trace 环、不做 DERAIL),~1.05x 而非 interp_debug 的
 # ~40x。专门用来 release 速度下抓"卡死"现场(连续心跳 pc 聚成循环体):
@@ -89,6 +90,11 @@ digest = "0.10.7"
 md-5 = "0.10.6"
 sha1 = "0.10.6"
 encoding_rs = "0.8.35"
+# [MoleWorld P1] FxHashMap for the hot ObjC dispatch tables (selectors/objects/classes,
+# per-class methods/ivars). Keys are u32 (SEL/id); std HashMap's SipHash is DoS-resistant
+# overkill for internal tables with no external attack surface. FxHash (multiply-shift) is
+# faster on the per-message dispatch hot path (~5-10% overall, matching the wasm port). Tiny, dep-free.
+rustc-hash = "2"
 # We currently use a fork of rust-sdl2 because we need a fix for Android builds
 # that's not upstream yet.
 # The HIDAPI feature is enabled because rust-sdl2 hides the SDL2 sensor features

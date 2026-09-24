@@ -133,9 +133,17 @@ fn CGImageCreate(
     let alpha_info = bitmap_info & kCGBitmapAlphaInfoMask;
     assert_eq!(alpha_info | byte_order, bitmap_info); // TODO
     match byte_order {
-        kCGImageByteOrderDefault | kCGImageByteOrder32Big => {
-            assert_eq!(alpha_info, kCGImageAlphaPremultipliedLast); // TODO
-        }
+        kCGImageByteOrderDefault | kCGImageByteOrder32Big => match alpha_info {
+            kCGImageAlphaPremultipliedLast => (),
+            // [扫描修 2026-09-15] RGBX(无 alpha / 跳过末字节):游戏相机截图用 glReadPixels 的数据以这种格式建图,
+            // 原来这里 assert 直接 panic。按不透明处理,把第 4 字节补成 0xFF(该字节内容未定义)。
+            kCGImageAlphaNone | kCGImageAlphaNoneSkipLast => {
+                for chunk in pixels.chunks_exact_mut(4) {
+                    chunk[3] = 0xFF;
+                }
+            }
+            _ => unimplemented!("CGImageCreate: alpha_info {alpha_info} (byte order {byte_order})"),
+        },
         kCGImageByteOrder32Little => {
             // TODO: fix CGImageGetAlphaInfo()
             assert_eq!(alpha_info, kCGImageAlphaNoneSkipFirst); // TODO

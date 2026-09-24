@@ -314,29 +314,116 @@ fn UIImagePNGRepresentation(env: &mut Environment, image: id) -> id {
     msg_class![env; NSData dataWithBytesNoCopy:buf length:len]
 }
 
+/// [扫描修 2026-09-15] F12-4:本地时间戳 `YYYYMMDD_HHMMSS`,用作照片文件名。
+/// 用宿主真实时间(不叠加开发工具的时间旅行偏移,文件名对玩家才有意义),时区与游戏内
+/// 一致走 `local_utc_offset_at`(默认北京时间,MOLE_TZ=host 跟随宿主)。
+fn photo_timestamp_string() -> String {
+    let now = crate::libc::time::host_now_unix_secs();
+    let local = now + crate::libc::time::local_utc_offset_at(now) as i64;
+    let tm = crate::libc::time::timestamp_to_calendar_date_i64(local);
+    // tm 是 packed 结构体,格式化宏会取字段引用,先拷到局部变量。
+    let (year, mon, mday, hour, min, sec) =
+        (tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year + 1900,
+        mon + 1,
+        mday,
+        hour,
+        min,
+        sec
+    )
+}
+
+/// [扫描修 2026-09-15] F12-4:把 UIImage 编成 PNG,原子写到
+/// `user_data_base_path()/screenshots/摩尔庄园_YYYYMMDD_HHMMSS.png`。成功返回宿主完整路径。
+///
+/// - 不写 guest 沙盒 Documents(免得被存档扫描误伤);macOS .app 下 user_data_base_path
+///   是可写的 pref_path,不会写进只读的应用包。
+/// - 相册照片没有透明通道(iOS 相册存为 JPEG),这里强制 alpha=255;像素本身是预乘的,
+///   等价于"合成在黑底上",与屏幕上看到的一致(glReadPixels 读回的 alpha 通道不可信)。
+/// - 写临时文件再 rename,进程中途被杀也不会留下残缺 PNG;同一秒多张时追加 _2、_3。
+fn save_image_to_host_album(env: &mut Environment, image: id) -> Result<std::path::PathBuf, String> {
+    if image == nil {
+        return Err("image 为 nil".to_string());
+    }
+    let cg_image: CGImageRef = msg![env; image CGImage];
+    if cg_image == nil {
+        return Err("UIImage 没有 CGImage".to_string());
+    }
+    let (width, height, mut pixels) = {
+        let img = cg_image::borrow_image(&env.objc, cg_image);
+        let (w, h) = img.dimensions();
+        (w, h, img.pixels().to_vec())
+    };
+    if width == 0 || height == 0 {
+        return Err(format!("图像尺寸为 {}×{}", width, height));
+    }
+    if pixels.len() < (width as usize) * (height as usize) * 4 {
+        return Err("像素缓冲区过小".to_string());
+    }
+    for px in pixels.chunks_exact_mut(4) {
+        px[3] = 0xFF;
+    }
+    let png = encode_png_rgba(&pixels, width, height);
+
+    let dir = crate::paths::user_data_base_path().join("screenshots");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录 {} 失败:{}", dir.display(), e))?;
+    let stamp = photo_timestamp_string();
+    let mut path = dir.join(format!("摩尔庄园_{}.png", stamp));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("摩尔庄园_{}_{}.png", stamp, n));
+        n += 1;
+    }
+    let tmp = dir.join(format!(".摩尔庄园_{}_{}.png.tmp", stamp, n));
+    std::fs::write(&tmp, &png).map_err(|e| format!("写临时文件 {} 失败:{}", tmp.display(), e))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("重命名到 {} 失败:{}", path.display(), e));
+    }
+    Ok(path)
+}
+
 /// `void UIImageWriteToSavedPhotosAlbum(UIImage *image, id completionTarget,
 ///   SEL completionSelector, void *contextInfo)`
 ///
-/// Saving to the photo library is meaningless offline / in the emulator. We
-/// make it a successful no-op (and fire the optional completion callback with a
-/// nil error) so the screenshot flow doesn't hang or crash.
+/// [扫描修 2026-09-15] F12-4 / F9-8(保存照片那一半):原先是"离线无相册,当作成功的空操作",
+/// 玩家点相机/分享/魔法密码截图后听到快门、看到提示,硬盘上却什么都没有。现在真正落盘
+/// (见 save_image_to_host_album),echo 打印完整路径。
+/// 完成回调按原签名 image:didFinishSavingWithError:contextInfo: 三参调用(原先用
+/// performSelector:withObject:withObject: 漏传 contextInfo,第三参是寄存器残值);
+/// 写盘失败时传非 nil 的 NSError(ALAssetsLibraryErrorDomain / -3301 写入失败),
+/// 让原版走失败分支。
 fn UIImageWriteToSavedPhotosAlbum(
     env: &mut Environment,
-    _image: id,
+    image: id,
     completion_target: id,
     completion_selector: crate::objc::SEL,
     context_info: crate::mem::MutVoidPtr,
 ) {
-    log!("UIImageWriteToSavedPhotosAlbum: photo library unavailable offline, treating as success (no-op)");
+    let error: id = match save_image_to_host_album(env, image) {
+        Ok(path) => {
+            echo!("UIImageWriteToSavedPhotosAlbum: 照片已保存到 {}", path.display());
+            nil
+        }
+        Err(reason) => {
+            log!("UIImageWriteToSavedPhotosAlbum: 保存照片失败:{}", reason);
+            let domain: id = ns_string::get_static_str(env, "ALAssetsLibraryErrorDomain");
+            msg_class![env; NSError errorWithDomain:domain
+                                               code:(-3301 as NSInteger)
+                                           userInfo:nil]
+        }
+    };
     if completion_target != nil && !completion_selector.is_null() {
-        // image:didFinishSavingWithError:contextInfo: — pass nil error = success.
-        if msg![env; completion_target respondsToSelector:completion_selector] {
-            () = msg![env; completion_target performSelector:completion_selector
-                                                  withObject:_image
-                                                  withObject:nil];
+        let responds: bool = msg![env; completion_target respondsToSelector:completion_selector];
+        if responds {
+            () = crate::objc::msg_send(
+                env,
+                (completion_target, completion_selector, image, error, context_info),
+            );
         }
     }
-    let _ = context_info;
 }
 
 pub const FUNCTIONS: crate::dyld::FunctionExports = &[

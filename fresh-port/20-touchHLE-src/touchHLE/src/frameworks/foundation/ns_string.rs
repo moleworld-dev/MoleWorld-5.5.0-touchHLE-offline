@@ -10,7 +10,9 @@
 
 mod path_algorithms;
 
-use super::ns_keyed_archiver::set_value_to_encode_for_current_key;
+use super::ns_keyed_archiver::{
+    get_value_to_encode_for_current_key, set_value_to_encode_for_current_key,
+};
 use super::{ns_array, ns_keyed_unarchiver};
 use super::{
     unichar, NSComparisonResult, NSInteger, NSNotFound, NSOrderedAscending, NSOrderedDescending,
@@ -27,14 +29,12 @@ use crate::mach_o::MachO;
 use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
-    HostObject, NSZonePtr, ObjC,
+    HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::{fs, Environment};
-use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
-use std::iter::Peekable;
 use std::string::FromUtf16Error;
 
 pub type NSStringEncoding = NSUInteger;
@@ -48,21 +48,52 @@ pub const NSMacOSRomanStringEncoding: NSUInteger = 30;
 pub const NSUTF16StringEncoding: NSUInteger = NSUnicodeStringEncoding;
 pub const NSUTF16BigEndianStringEncoding: NSUInteger = 0x90000100;
 pub const NSUTF16LittleEndianStringEncoding: NSUInteger = 0x94000100;
+// [扫描修 2026-09-15] F8-4:补齐其余常见 NSStringEncoding。中文编码的值 =
+// CFStringConvertEncodingToNSStringEncoding(kCFStringEncoding…) = 0x80000000 | CF 编码值。
+pub const NSNEXTSTEPStringEncoding: NSUInteger = 2;
+pub const NSJapaneseEUCStringEncoding: NSUInteger = 3;
+pub const NSNonLossyASCIIStringEncoding: NSUInteger = 7;
+pub const NSISOLatin2StringEncoding: NSUInteger = 9;
+pub const NSWindowsCP1251StringEncoding: NSUInteger = 11;
+pub const NSWindowsCP1253StringEncoding: NSUInteger = 13;
+pub const NSWindowsCP1254StringEncoding: NSUInteger = 14;
+pub const NSWindowsCP1250StringEncoding: NSUInteger = 15;
+pub const NSISO2022JPStringEncoding: NSUInteger = 21;
+pub const NSUTF32StringEncoding: NSUInteger = 0x8c000100;
+pub const NSUTF32BigEndianStringEncoding: NSUInteger = 0x98000100;
+pub const NSUTF32LittleEndianStringEncoding: NSUInteger = 0x9c000100;
+/// kCFStringEncodingGB_2312_80 = 0x0630
+pub const NSGB2312StringEncoding: NSUInteger = 0x80000630;
+/// kCFStringEncodingGBK_95 = 0x0631
+pub const NSGBKStringEncoding: NSUInteger = 0x80000631;
+/// kCFStringEncodingGB_18030_2000 = 0x0632
+pub const NSGB18030StringEncoding: NSUInteger = 0x80000632;
+/// kCFStringEncodingDOSChineseSimplif(CP936)= 0x0421
+pub const NSDOSChineseSimplifStringEncoding: NSUInteger = 0x80000421;
+/// kCFStringEncodingEUC_CN = 0x0930
+pub const NSEUCCNStringEncoding: NSUInteger = 0x80000930;
+/// kCFStringEncodingEUC_KR = 0x0940
+pub const NSEUCKRStringEncoding: NSUInteger = 0x80000940;
+/// kCFStringEncodingBig5 = 0x0A03
+pub const NSBig5StringEncoding: NSUInteger = 0x80000A03;
 
 pub type NSStringCompareOptions = NSUInteger;
 pub const NSCaseInsensitiveSearch: NSUInteger = 1;
 pub const NSLiteralSearch: NSUInteger = 2;
 pub const NSBackwardsSearch: NSUInteger = 4;
 pub const NSNumericSearch: NSUInteger = 64;
+// [扫描修 2026-09-15] F8-4:补齐其余比较选项位(原来只认上面四个精确值,组合位直接 panic)。
+pub const NSAnchoredSearch: NSUInteger = 8;
+pub const NSDiacriticInsensitiveSearch: NSUInteger = 128;
+pub const NSWidthInsensitiveSearch: NSUInteger = 256;
+pub const NSForcedOrderingSearch: NSUInteger = 512;
+// [复核修 2026-09-15] 该位有意不放进 KNOWN_COMPARE_OPTIONS(未实现 → 走"未知位"日志按字面处理),
+// 目前只有单元测试引用它,非测试构建报 dead_code 警告;保留常量作文档,只抑制警告。
+#[allow(dead_code)]
+pub const NSRegularExpressionSearch: NSUInteger = 1024;
 
-/// Encodings that C strings (null-terminated byte strings) can use.
-const C_STRING_FRIENDLY_ENCODINGS: &[NSStringEncoding] = &[
-    NSASCIIStringEncoding,
-    NSUTF8StringEncoding,
-    NSWindowsCP1252StringEncoding,
-    NSMacOSRomanStringEncoding,
-    NSISOLatin1StringEncoding,
-];
+// [扫描修 2026-09-15] 原来的 C_STRING_FRIENDLY_ENCODINGS 白名单已删除:C 字符串相关方法改为按
+// nul_terminator_size()/encode_str() 判断(见文件下方的编码辅助函数),不再用白名单 assert。
 
 pub const NSMaximumStringLength: NSUInteger = (i32::MAX - 1) as _;
 
@@ -97,99 +128,156 @@ enum StringHostObject {
 }
 impl HostObject for StringHostObject {}
 impl StringHostObject {
-    fn decode(bytes: Cow<[u8]>, encoding: NSStringEncoding) -> StringHostObject {
+    /// [扫描修 2026-09-15] F8-4:改为返回 Option。None 表示本实现不认识的编码,调用方按真机语义返回 nil。
+    /// 原来遇到没列出的编码直接 panic;ASCII/Latin-1 遇到 ≥0x80 的字节、CP1252/Shift-JIS 遇到非法字节、
+    /// UTF-16 奇数长度也都 assert panic。真机 iOS 在这些情况下都不会让进程崩溃。现在:
+    /// - 已知编码一律宽容解码(非法字节换成替换字符,或按 Latin-1 映射),同类情况只打一次日志;
+    /// - 编码 0:touchHLE 没实现 CFStringConvertEncodingToNSStringEncoding(dyld 链到返回 0 的空桩),
+    ///   ASIHTTPRequest 等 SDK 按响应头 charset 换算出来的编码因此变成 0,这里按 UTF-8 宽容解码补上;
+    /// - 其它不认识的编码返回 None(打一次日志)。
+    fn decode(bytes: Cow<[u8]>, encoding: NSStringEncoding) -> Option<StringHostObject> {
         if bytes.is_empty() {
-            return StringHostObject::Utf8(Cow::Borrowed(""));
+            return Some(StringHostObject::Utf8(Cow::Borrowed("")));
         }
 
-        // TODO: error handling
-
-        match encoding {
-            NSASCIIStringEncoding => {
-                assert!(bytes.iter().all(|byte| byte.is_ascii()));
-                // Safety: guaranteed by above assertion
-                let string = unsafe { String::from_utf8_unchecked(bytes.into_owned()) };
-                StringHostObject::Utf8(Cow::Owned(string))
+        let host_object = match encoding {
+            NSASCIIStringEncoding | NSNonLossyASCIIStringEncoding | NSNEXTSTEPStringEncoding => {
+                if bytes.iter().all(|byte| byte.is_ascii()) {
+                    // Safety: 上面已确认全是 ASCII 字节,必然是合法 UTF-8
+                    let string = unsafe { String::from_utf8_unchecked(bytes.into_owned()) };
+                    StringHostObject::Utf8(Cow::Owned(string))
+                } else {
+                    warn_once(format!("decode-ascii-high:{encoding:#x}"), || {
+                        format!(
+                            "Warning: 用 ASCII 类编码 {encoding:#x} 解码时遇到 ≥0x80 的字节(原来这里 assert panic),按 ISO Latin-1 逐字节映射"
+                        )
+                    });
+                    StringHostObject::Utf8(Cow::Owned(latin1_to_string(&bytes)))
+                }
             }
-            NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => {
-                // TODO: support non ASCII symbols
-                assert!(bytes.iter().all(|byte| byte.is_ascii()));
-                // Safety: guaranteed by above assertion
-                let string = unsafe { String::from_utf8_unchecked(bytes.into_owned()) };
-                StringHostObject::Utf8(Cow::Owned(string))
-            }
+            // ISO Latin-1 的每个字节就是 U+0000..U+00FF,原来 assert 全 ASCII 是 TODO 占位
+            NSISOLatin1StringEncoding => StringHostObject::Utf8(Cow::Owned(latin1_to_string(&bytes))),
             NSUTF8StringEncoding => {
-                // 真实 iOS 的 NSUTF8 解码对非法/截断字节是宽容的(不会崩)。touchHLE 原来
-                // 直接 unwrap():当多字节字符(如中文名)被某处定长缓冲/存档截断在 UTF-8
-                // 字符中间时(尾部出现半个汉字,如 0xE5),就 panic(实测离线改中文名后崩)。
-                // 改为宽容解码:取合法前缀,绝不崩 —— 与 iOS 行为一致或更宽松。
-                let string = match String::from_utf8(bytes.into_owned()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let valid = e.utf8_error().valid_up_to();
-                        let mut bytes = e.into_bytes();
-                        log!(
-                            "Warning: [MoleWorld] NSUTF8 解码遇到非法/截断字节(共 {} 字节,\
-                             合法到 {});取合法前缀避免崩溃(多半是某处定长缓冲把中文等多字节\
-                             字符截断在字符中间)。",
-                            bytes.len(),
-                            valid
-                        );
-                        bytes.truncate(valid);
-                        // SAFETY: bytes[..valid_up_to] 按 Utf8Error 定义是合法 UTF-8。
-                        unsafe { String::from_utf8_unchecked(bytes) }
-                    }
-                };
-                StringHostObject::Utf8(Cow::Owned(string))
+                StringHostObject::Utf8(Cow::Owned(decode_utf8_lenient(bytes.into_owned())))
             }
-            NSWindowsCP1252StringEncoding => {
-                let (cow, encoding_used, had_errors) = WINDOWS_1252.decode(&bytes);
-                assert_eq!(encoding_used, WINDOWS_1252);
-                assert!(!had_errors);
-                StringHostObject::Utf8(Cow::Owned(cow.into_owned()))
-            }
-            NSShiftJISStringEncoding => {
-                let (cow, encoding_used, had_errors) = SHIFT_JIS.decode(&bytes);
-                assert_eq!(encoding_used, SHIFT_JIS);
-                assert!(!had_errors);
-                log_dbg!("ShiftJIS decoded {:?}", cow);
-                StringHostObject::Utf8(Cow::Owned(cow.to_string()))
+            0 => {
+                warn_once("decode-encoding-0".to_string(), || {
+                    "Warning: 字符串编码为 0(多半来自未实现的 CFStringConvertEncodingToNSStringEncoding 空桩),按 UTF-8 宽容解码".to_string()
+                });
+                StringHostObject::Utf8(Cow::Owned(decode_utf8_lenient(bytes.into_owned())))
             }
             NSUTF16StringEncoding
             | NSUTF16BigEndianStringEncoding
             | NSUTF16LittleEndianStringEncoding => {
-                assert!(bytes.len().is_multiple_of(2));
-
+                let mut data: &[u8] = &bytes;
+                if !data.len().is_multiple_of(2) {
+                    warn_once(format!("decode-utf16-odd:{encoding:#x}"), || {
+                        format!(
+                            "Warning: UTF-16 字节数为奇数({} 字节,原来这里 assert panic),丢弃最后一个字节",
+                            data.len()
+                        )
+                    });
+                    data = &data[..data.len() - 1];
+                }
+                let bom = data.get(0..2).map(|b| [b[0], b[1]]);
                 let is_big_endian = match encoding {
                     NSUTF16BigEndianStringEncoding => true,
                     NSUTF16LittleEndianStringEncoding => false,
-                    NSUTF16StringEncoding => match &bytes[0..2] {
-                        [0xFE, 0xFF] => true,
-                        [0xFF, 0xFE] => false,
-                        // Assuming NSUTF16LittleEndianStringEncoding if no BOM
-                        // is present
-                        // TODO: it seems that foundation can prefix string
-                        // with BOM bytes?
+                    // 通用 NSUTF16StringEncoding:有 BOM 时按 BOM 定字节序并剥掉 BOM(真机行为);
+                    // 没有 BOM 时按宿主字节序(ARM 小端)处理,与原实现一致。
+                    _ => match bom {
+                        Some([0xFE, 0xFF]) => {
+                            data = &data[2..];
+                            true
+                        }
+                        Some([0xFF, 0xFE]) => {
+                            data = &data[2..];
+                            false
+                        }
                         _ => false,
                     },
-                    _ => unreachable!(),
                 };
-                // TODO: Should the BOM be stripped? Always/sometimes/never?
-
-                StringHostObject::Utf16(if is_big_endian {
-                    bytes
-                        .chunks(2)
-                        .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
-                        .collect()
-                } else {
-                    bytes
-                        .chunks(2)
-                        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
-                        .collect()
-                })
+                StringHostObject::Utf16(
+                    data.chunks_exact(2)
+                        .map(|chunk| {
+                            if is_big_endian {
+                                u16::from_be_bytes([chunk[0], chunk[1]])
+                            } else {
+                                u16::from_le_bytes([chunk[0], chunk[1]])
+                            }
+                        })
+                        .collect(),
+                )
             }
-            _ => panic!("Unimplemented encoding: {encoding:#x}"),
-        }
+            NSUTF32StringEncoding
+            | NSUTF32BigEndianStringEncoding
+            | NSUTF32LittleEndianStringEncoding => {
+                let mut data: &[u8] = &bytes;
+                if !data.len().is_multiple_of(4) {
+                    warn_once(format!("decode-utf32-len:{encoding:#x}"), || {
+                        format!(
+                            "Warning: UTF-32 字节数 {} 不是 4 的倍数,丢弃末尾不完整的码元",
+                            data.len()
+                        )
+                    });
+                    data = &data[..data.len() - data.len() % 4];
+                }
+                let bom = data.get(0..4).map(|b| [b[0], b[1], b[2], b[3]]);
+                let is_big_endian = match encoding {
+                    NSUTF32BigEndianStringEncoding => true,
+                    NSUTF32LittleEndianStringEncoding => false,
+                    _ => match bom {
+                        Some([0x00, 0x00, 0xFE, 0xFF]) => {
+                            data = &data[4..];
+                            true
+                        }
+                        Some([0xFF, 0xFE, 0x00, 0x00]) => {
+                            data = &data[4..];
+                            false
+                        }
+                        _ => false,
+                    },
+                };
+                let string: String = data
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let raw = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                        let value = if is_big_endian {
+                            u32::from_be_bytes(raw)
+                        } else {
+                            u32::from_le_bytes(raw)
+                        };
+                        char::from_u32(value).unwrap_or(char::REPLACEMENT_CHARACTER)
+                    })
+                    .collect();
+                StringHostObject::Utf8(Cow::Owned(string))
+            }
+            _ => match legacy_encoding_for(encoding) {
+                Some(legacy) => {
+                    // 用 without_bom_handling:不让 encoding_rs 按 BOM 偷偷改成 UTF-8/16
+                    // (原来 CP1252/Shift-JIS 分支用 assert_eq! 防这个,现在直接不嗅探)
+                    let (decoded, had_errors) = legacy.decode_without_bom_handling(&bytes);
+                    if had_errors {
+                        warn_once(format!("decode-invalid:{encoding:#x}"), || {
+                            format!(
+                                "Warning: 按 {} 解码时遇到非法字节(原来这里 assert panic),已替换为 U+FFFD",
+                                legacy.name()
+                            )
+                        });
+                    }
+                    StringHostObject::Utf8(Cow::Owned(decoded.into_owned()))
+                }
+                None => {
+                    warn_once(format!("decode-unknown:{encoding:#x}"), || {
+                        format!(
+                            "Warning: 遇到未实现的字符串编码 {encoding:#x}(原来这里 panic),按真机「无法转换」语义返回 nil"
+                        )
+                    });
+                    return None;
+                }
+            },
+        };
+        Some(host_object)
     }
     fn to_utf8(&self) -> Result<Cow<'static, str>, FromUtf16Error> {
         match self {
@@ -262,14 +350,8 @@ impl CodeUnitIterator<'_> {
                 Some(prefix_c) => {
                     let self_c = self_match.next();
                     if case_insensitive {
-                        self_c?;
-                        let (Some(a_c), Some(b_c)) = (
-                            char::from_u32(self_c.unwrap() as u32),
-                            char::from_u32(prefix_c as u32),
-                        ) else {
-                            panic!("Invalid chars in the strings!");
-                        };
-                        if !a_c.to_lowercase().eq(b_c.to_lowercase()) {
+                        // [扫描修 2026-09-15] 原来遇到代理项(非 BMP 字符的半边)panic,改为精确比较该码元
+                        if !units_equal(self_c?, prefix_c, true) {
                             return None;
                         }
                     } else if self_c != Some(prefix_c) {
@@ -309,6 +391,457 @@ pub fn from_rust_ordering(ordering: std::cmp::Ordering) -> NSComparisonResult {
         std::cmp::Ordering::Equal => NSOrderedSame,
         std::cmp::Ordering::Greater => NSOrderedDescending,
     }
+}
+
+// ============================================================================
+// [扫描修 2026-09-15] F8-4:比较选项按位解析 + 字符串编码转换的公共辅助函数
+// ============================================================================
+// 原来 rangeOfString:options: / compare:options: / 替换 三处都按 options 的精确值 match,
+// 组合位(如 CaseInsensitive|Backwards = 5、CaseInsensitive|Numeric = 0x41)或没列出的位
+// (NSAnchoredSearch = 8、连 replace 的 NSLiteralSearch = 2)一律 unimplemented! 整机 panic;
+// 编码侧 decode/cStringUsingEncoding:/getCString… 也是遇到没列出的值就 panic。
+// 目前游戏自己的调用点都在已支持的集合里(compare:options: 用 0x40,编码全是 4),
+// 这里主要防 SDK 路径和在线新数据包踩到。纯函数部分(不碰 env)在文件末尾有单元测试。
+
+/// 同一类告警整局只打一次(按 key 去重),避免某条路径每帧刷屏。
+fn warn_once(key: String, message: impl FnOnce() -> String) {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let first_time = SEEN.lock().map(|mut seen| seen.insert(key)).unwrap_or(false);
+    if first_time {
+        log!("{}(同类告警只显示一次)", message());
+    }
+}
+
+/// 解析后的 NSStringCompareOptions。
+/// - NSLiteralSearch:本实现本来就按 UTF-16 码元逐个比较,等价于字面比较,无需单独处理;
+/// - NSDiacriticInsensitiveSearch / NSWidthInsensitiveSearch:忽略(按区分变音/全半角处理);
+/// - NSRegularExpressionSearch 及其它未知位:忽略并打一次日志,按字面处理。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CompareOptions {
+    case_insensitive: bool,
+    backwards: bool,
+    anchored: bool,
+    numeric: bool,
+    forced_ordering: bool,
+}
+
+const KNOWN_COMPARE_OPTIONS: NSUInteger = NSCaseInsensitiveSearch
+    | NSLiteralSearch
+    | NSBackwardsSearch
+    | NSAnchoredSearch
+    | NSNumericSearch
+    | NSDiacriticInsensitiveSearch
+    | NSWidthInsensitiveSearch
+    | NSForcedOrderingSearch;
+
+/// 返回 (解析结果, 未支持的位)。
+fn parse_compare_options(options: NSStringCompareOptions) -> (CompareOptions, NSUInteger) {
+    (
+        CompareOptions {
+            case_insensitive: (options & NSCaseInsensitiveSearch) != 0,
+            backwards: (options & NSBackwardsSearch) != 0,
+            anchored: (options & NSAnchoredSearch) != 0,
+            numeric: (options & NSNumericSearch) != 0,
+            forced_ordering: (options & NSForcedOrderingSearch) != 0,
+        },
+        options & !KNOWN_COMPARE_OPTIONS,
+    )
+}
+
+fn compare_options_logged(options: NSStringCompareOptions, api: &str) -> CompareOptions {
+    let (parsed, unsupported) = parse_compare_options(options);
+    if unsupported != 0 {
+        warn_once(format!("compare-options:{api}:{unsupported:#x}"), || {
+            format!(
+                "Warning: [NSString {api}] options={options:#x} 含未实现的位 {unsupported:#x}(如 NSRegularExpressionSearch=0x400),已忽略这些位按字面处理(原来这里 unimplemented! panic)"
+            )
+        });
+    }
+    parsed
+}
+
+/// 两个 UTF-16 码元是否相等。大小写不敏感时按 char 的小写形式比较;
+/// 代理项(非 BMP 字符的半边)不是合法 char,无法单独折叠大小写,只做精确比较(原来这里 panic)。
+fn units_equal(a: u16, b: u16, case_insensitive: bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if !case_insensitive {
+        return false;
+    }
+    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
+        (Some(x), Some(y)) => x.to_lowercase().eq(y.to_lowercase()),
+        _ => false,
+    }
+}
+
+fn cmp_units(a: u16, b: u16, case_insensitive: bool) -> std::cmp::Ordering {
+    if !case_insensitive || a == b {
+        return a.cmp(&b);
+    }
+    match (char::from_u32(a as u32), char::from_u32(b as u32)) {
+        (Some(x), Some(y)) => x.to_lowercase().cmp(y.to_lowercase()),
+        _ => a.cmp(&b),
+    }
+}
+
+/// 在 hay 里找 needle,返回匹配起点。NSAnchoredSearch 只看开头(带 NSBackwardsSearch 时只看结尾)。
+fn find_code_units(hay: &[u16], needle: &[u16], opts: CompareOptions) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    let matches_at = |start: usize| {
+        hay[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(&x, &y)| units_equal(x, y, opts.case_insensitive))
+    };
+    if opts.anchored {
+        let start = if opts.backwards { last } else { 0 };
+        return matches_at(start).then_some(start);
+    }
+    if opts.backwards {
+        (0..=last).rev().find(|&start| matches_at(start))
+    } else {
+        (0..=last).find(|&start| matches_at(start))
+    }
+}
+
+/// compare:options: 的核心。NSNumericSearch:两边同时遇到 ASCII 数字串时按数值比较
+/// (先去前导零再比位数和字典序,长数字串不会溢出;原实现用 u32 累加,超过 10 位会溢出)。
+/// NSForcedOrderingSearch:大小写不敏感/数值比较结果相等时,再用字面比较强制分出先后。
+fn compare_code_units(a: &[u16], b: &[u16], opts: CompareOptions) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn is_digit(unit: u16) -> bool {
+        (b'0' as u16..=b'9' as u16).contains(&unit)
+    }
+    fn digit_run(units: &[u16], start: usize) -> (&[u16], usize) {
+        let end = units[start..]
+            .iter()
+            .position(|&unit| !is_digit(unit))
+            .map_or(units.len(), |offset| start + offset);
+        let run = &units[start..end];
+        let first_significant = run
+            .iter()
+            .position(|&unit| unit != b'0' as u16)
+            .unwrap_or(run.len());
+        (&run[first_significant..], end)
+    }
+
+    let (mut i, mut j) = (0usize, 0usize);
+    let primary = loop {
+        match (a.get(i).copied(), b.get(j).copied()) {
+            (None, None) => break Ordering::Equal,
+            (None, Some(_)) => break Ordering::Less,
+            (Some(_), None) => break Ordering::Greater,
+            (Some(unit_a), Some(unit_b)) => {
+                if opts.numeric && is_digit(unit_a) && is_digit(unit_b) {
+                    let (digits_a, next_i) = digit_run(a, i);
+                    let (digits_b, next_j) = digit_run(b, j);
+                    let order = digits_a
+                        .len()
+                        .cmp(&digits_b.len())
+                        .then_with(|| digits_a.cmp(digits_b));
+                    if order != Ordering::Equal {
+                        break order;
+                    }
+                    i = next_i;
+                    j = next_j;
+                    continue;
+                }
+                let order = cmp_units(unit_a, unit_b, opts.case_insensitive);
+                if order != Ordering::Equal {
+                    break order;
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    };
+    if primary == Ordering::Equal && opts.forced_ordering && (opts.case_insensitive || opts.numeric)
+    {
+        return a.cmp(b);
+    }
+    primary
+}
+
+/// 替换 src 中所有(不重叠的)target,返回 (结果, 替换次数)。
+/// NSAnchoredSearch 只替换开头(带 NSBackwardsSearch 时只替换结尾)那一处;
+/// NSBackwardsSearch 决定重叠匹配时从哪头开始取(如 "aaa" 里替换 "aa")。
+fn replace_code_units(
+    src: &[u16],
+    target: &[u16],
+    replacement: &[u16],
+    opts: CompareOptions,
+) -> (Utf16String, usize) {
+    if target.is_empty() || target.len() > src.len() {
+        return (src.to_vec(), 0);
+    }
+    let matches_at = |start: usize| {
+        src[start..start + target.len()]
+            .iter()
+            .zip(target)
+            .all(|(&x, &y)| units_equal(x, y, opts.case_insensitive))
+    };
+    let mut starts: Vec<usize> = Vec::new();
+    if opts.anchored {
+        let start = if opts.backwards {
+            src.len() - target.len()
+        } else {
+            0
+        };
+        if matches_at(start) {
+            starts.push(start);
+        }
+    } else if opts.backwards {
+        let mut end = src.len();
+        while end >= target.len() {
+            let start = end - target.len();
+            if matches_at(start) {
+                starts.push(start);
+                end = start;
+            } else {
+                end -= 1;
+            }
+        }
+        starts.reverse();
+    } else {
+        let mut start = 0;
+        while start + target.len() <= src.len() {
+            if matches_at(start) {
+                starts.push(start);
+                start += target.len();
+            } else {
+                start += 1;
+            }
+        }
+    }
+    let mut result = Vec::with_capacity(src.len());
+    let mut copied_up_to = 0;
+    for &start in &starts {
+        result.extend_from_slice(&src[copied_up_to..start]);
+        result.extend_from_slice(replacement);
+        copied_up_to = start + target.len();
+    }
+    result.extend_from_slice(&src[copied_up_to..]);
+    (result, starts.len())
+}
+
+/// 取任意 NSString 的 UTF-16 码元。宿主字符串直接读宿主对象;guest 自定义子类走 length/characterAtIndex:。
+fn collect_code_units(env: &mut Environment, string: id) -> Utf16String {
+    if string == nil {
+        return Vec::new();
+    }
+    let is_host_string = env
+        .objc
+        .get_host_object(string)
+        .is_some_and(|host| host.as_any().is::<StringHostObject>());
+    if is_host_string {
+        let mut units = Vec::new();
+        for_each_code_unit(env, string, |_, unit| units.push(unit));
+        units
+    } else {
+        let len: NSUInteger = msg![env; string length];
+        (0..len)
+            .map(|index| {
+                let unit: u16 = msg![env; string characterAtIndex:index];
+                unit
+            })
+            .collect()
+    }
+}
+
+/// rangeOfString:options: 与 rangeOfString:options:range: 的公共实现。
+fn range_of_string_common(
+    env: &mut Environment,
+    this: id,
+    search_string: id,
+    options: NSStringCompareOptions,
+    range: NSRange,
+) -> NSRange {
+    let not_found = NSRange {
+        location: NSNotFound as NSUInteger,
+        length: 0,
+    };
+    if search_string == nil {
+        return not_found;
+    }
+    let hay = collect_code_units(env, this);
+    let needle = collect_code_units(env, search_string);
+    // NSRange 是 packed 结构体,先拷到局部变量再用
+    let (location, length) = (range.location as usize, range.length as usize);
+    let start = location.min(hay.len());
+    let end = location.saturating_add(length).min(hay.len());
+    if location.saturating_add(length) > hay.len() {
+        log!(
+            "Warning: [(NSString*){:?} rangeOfString:options:range:{{{}, {}}}] 越界(字符串长度 {},真机抛 NSRangeException),裁剪后搜索",
+            this,
+            location,
+            length,
+            hay.len()
+        );
+    }
+    let opts = compare_options_logged(options, "rangeOfString:options:");
+    match find_code_units(&hay[start..end], &needle, opts) {
+        Some(offset) => NSRange {
+            location: (start + offset) as NSUInteger,
+            length: needle.len() as NSUInteger,
+        },
+        None => not_found,
+    }
+}
+
+/// UTF-8 宽容解码:取合法前缀,绝不崩溃(原 NSUTF8 分支的逻辑原样搬过来,编码 0 也复用)。
+fn decode_utf8_lenient(bytes: Vec<u8>) -> String {
+    // 真实 iOS 的 NSUTF8 解码对非法/截断字节是宽容的(不会崩)。touchHLE 原来
+    // 直接 unwrap():当多字节字符(如中文名)被某处定长缓冲/存档截断在 UTF-8
+    // 字符中间时(尾部出现半个汉字,如 0xE5),就 panic(实测离线改中文名后崩)。
+    // 改为宽容解码:取合法前缀,绝不崩 —— 与 iOS 行为一致或更宽松。
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            log!(
+                "Warning: [MoleWorld] NSUTF8 解码遇到非法/截断字节(共 {} 字节,\
+                 合法到 {});取合法前缀避免崩溃(多半是某处定长缓冲把中文等多字节\
+                 字符截断在字符中间)。",
+                bytes.len(),
+                valid
+            );
+            bytes.truncate(valid);
+            // SAFETY: bytes[..valid_up_to] 按 Utf8Error 定义是合法 UTF-8。
+            unsafe { String::from_utf8_unchecked(bytes) }
+        }
+    }
+}
+
+/// ISO Latin-1:每个字节就是 U+0000..U+00FF。
+fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| byte as char).collect()
+}
+
+/// 交给 encoding_rs 处理的传统编码(UTF-8/16/32、ASCII、Latin-1 另行手工处理)。
+fn legacy_encoding_for(encoding: NSStringEncoding) -> Option<&'static encoding_rs::Encoding> {
+    Some(match encoding {
+        NSMacOSRomanStringEncoding => encoding_rs::MACINTOSH,
+        NSWindowsCP1252StringEncoding => encoding_rs::WINDOWS_1252,
+        NSWindowsCP1251StringEncoding => encoding_rs::WINDOWS_1251,
+        NSWindowsCP1250StringEncoding => encoding_rs::WINDOWS_1250,
+        NSWindowsCP1253StringEncoding => encoding_rs::WINDOWS_1253,
+        NSWindowsCP1254StringEncoding => encoding_rs::WINDOWS_1254,
+        NSISOLatin2StringEncoding => encoding_rs::ISO_8859_2,
+        NSShiftJISStringEncoding => encoding_rs::SHIFT_JIS,
+        NSJapaneseEUCStringEncoding => encoding_rs::EUC_JP,
+        NSISO2022JPStringEncoding => encoding_rs::ISO_2022_JP,
+        NSGB18030StringEncoding => encoding_rs::GB18030,
+        NSGBKStringEncoding
+        | NSGB2312StringEncoding
+        | NSEUCCNStringEncoding
+        | NSDOSChineseSimplifStringEncoding => encoding_rs::GBK,
+        NSBig5StringEncoding => encoding_rs::BIG5,
+        NSEUCKRStringEncoding => encoding_rs::EUC_KR,
+        _ => return None,
+    })
+}
+
+/// 结尾 NUL 占几个字节:UTF-16 两个、UTF-32 四个,其余一个。
+fn nul_terminator_size(encoding: NSStringEncoding) -> GuestUSize {
+    match encoding {
+        NSUTF16StringEncoding | NSUTF16BigEndianStringEncoding | NSUTF16LittleEndianStringEncoding => 2,
+        NSUTF32StringEncoding | NSUTF32BigEndianStringEncoding | NSUTF32LittleEndianStringEncoding => 4,
+        _ => 1,
+    }
+}
+
+/// 把字符串按 NSStringEncoding 编码成字节(不含结尾 NUL、不带 BOM;通用 UTF-16/32 按宿主小端)。
+/// 返回 None:编码未实现,或 `lossy == false` 时遇到该编码表示不了的字符(真机此时返回 NULL/nil)。
+/// `lossy == true` 时表示不了的字符写成 '?'。
+fn encode_str(string: &str, encoding: NSStringEncoding, lossy: bool) -> Option<Vec<u8>> {
+    match encoding {
+        // 0 的来历见 decode()
+        NSUTF8StringEncoding | 0 => Some(string.as_bytes().to_vec()),
+        NSASCIIStringEncoding | NSNonLossyASCIIStringEncoding | NSNEXTSTEPStringEncoding => {
+            if string.is_ascii() {
+                return Some(string.as_bytes().to_vec());
+            }
+            if !lossy {
+                return None;
+            }
+            Some(
+                string
+                    .chars()
+                    .map(|c| if c.is_ascii() { c as u32 as u8 } else { b'?' })
+                    .collect(),
+            )
+        }
+        NSISOLatin1StringEncoding => {
+            let mut out = Vec::with_capacity(string.len());
+            for c in string.chars() {
+                if (c as u32) <= 0xFF {
+                    out.push(c as u32 as u8);
+                } else if lossy {
+                    out.push(b'?');
+                } else {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        NSUTF16StringEncoding | NSUTF16LittleEndianStringEncoding => {
+            Some(string.encode_utf16().flat_map(u16::to_le_bytes).collect())
+        }
+        NSUTF16BigEndianStringEncoding => {
+            Some(string.encode_utf16().flat_map(u16::to_be_bytes).collect())
+        }
+        NSUTF32StringEncoding | NSUTF32LittleEndianStringEncoding => {
+            Some(string.chars().flat_map(|c| (c as u32).to_le_bytes()).collect())
+        }
+        NSUTF32BigEndianStringEncoding => {
+            Some(string.chars().flat_map(|c| (c as u32).to_be_bytes()).collect())
+        }
+        _ => {
+            let legacy = legacy_encoding_for(encoding)?;
+            let (bytes, _, had_unmappable) = legacy.encode(string);
+            if !had_unmappable {
+                return Some(bytes.into_owned());
+            }
+            if !lossy {
+                return None;
+            }
+            let mut out = Vec::with_capacity(string.len());
+            let mut buf = [0u8; 4];
+            for c in string.chars() {
+                let (piece, _, unmappable) = legacy.encode(c.encode_utf8(&mut buf));
+                if unmappable {
+                    out.push(b'?');
+                } else {
+                    out.extend_from_slice(&piece);
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// dataUsingEncoding: / writeToFile:…encoding: 用:通用 NSUTF16StringEncoding/NSUTF32StringEncoding
+/// 按真机习惯在前面加 BOM(小端),其余同 encode_str。
+fn encode_for_data(string: &str, encoding: NSStringEncoding, lossy: bool) -> Option<Vec<u8>> {
+    let bytes = encode_str(string, encoding, lossy)?;
+    let bom: &[u8] = match encoding {
+        NSUTF16StringEncoding => &[0xFF, 0xFE],
+        NSUTF32StringEncoding => &[0xFF, 0xFE, 0x00, 0x00],
+        _ => &[],
+    };
+    if bom.is_empty() {
+        return Some(bytes);
+    }
+    let mut out = Vec::with_capacity(bom.len() + bytes.len());
+    out.extend_from_slice(bom);
+    out.extend_from_slice(&bytes);
+    Some(out)
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -430,6 +963,60 @@ pub const CLASSES: ClassExports = objc_classes! {
     NSUTF8StringEncoding
 }
 
+// NSCoding implementation
+// [深扫修 2026-09-12] 从 _touchHLE_NSString 上移到抽象 NSString。根因:_touchHLE_NSMutableString
+// 的继承链是 NSMutableString→NSString,拿不到兄弟分支 _touchHLE_NSString 上的方法——
+// 归档可变串时 encodeWithCoder: 不响应,$objects 里只留一个空字典;解 Apple 档里的
+// {$class: NSMutableString, NS.string} 时 initWithCoder: 不响应,读成 nil。
+// 可变接收者解出后换成可变副本,保持类型语义。
+- (id)initWithCoder:(id)coder {
+    let class: Class = msg![env; coder class];
+    let keyed_unarch_class: Class = msg_class![env; NSKeyedUnarchiver class];
+    let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let new_str = if env.objc.class_is_subclass_of(class, keyed_unarch_class) {
+        ns_keyed_unarchiver::decode_current_string(env, coder)
+    } else if env.objc.class_is_subclass_of(class, nib_archive_class) {
+        _nib_archive_decoder::decode_current_string(env, coder)
+    } else {
+        unimplemented!();
+    };
+    let this_class: Class = msg![env; this class];
+    let mutable_class = env.objc.get_known_class("NSMutableString", &mut env.mem);
+    let is_mutable = env.objc.class_is_subclass_of(this_class, mutable_class);
+    release(env, this);
+    if is_mutable && new_str != nil {
+        let mutable_str: id = msg![env; new_str mutableCopy];
+        release(env, new_str);
+        mutable_str
+    } else {
+        new_str
+    }
+}
+- (())encodeWithCoder:(id)coder {
+    let string = to_rust_string(env, this);
+    // [MoleWorld] 原来这里 assert! 全 ASCII(TODO 占位),导致归档含中文的字符串
+    // (如离线改的中文庄园名,经 saveUserInfoData → NSKeyedArchiver → encodeWithCoder:)
+    // 直接 panic(实测离线改中文名稳定复现)。二进制 plist 写入器(plist::to_writer_binary,
+    // 见 ns_keyed_archiver.rs)原生支持 UTF-8,plist::Value::String 可容纳任意 UTF-8 字符串
+    // → 去掉这个过严断言即可正确归档非 ASCII 字符串,与真实 iOS 行为一致。
+    // [审查修 2026-09-13] 区分可变与不可变,让归档往返后类型不变。根因:原来一律把 $objects
+    // 当前条目整条换成裸串,可变串解档后变成不可变 _touchHLE_NSString,上面 initWithCoder:
+    // 的 mutableCopy 分支永远走不到。
+    // - 不可变串:保持原写法(裸串,encode_object 对它不写 $class),旧存档形态不变。
+    // - 可变串:encode_object 已在当前条目字典写好 $class(= NSMutableString),这里只补
+    //   "NS.string",得到 Apple 的 {$class: NSMutableString, NS.string};解档走
+    //   NSMutableString alloc → initWithCoder: → decode_current_string 读 NS.string → mutableCopy。
+    // 可变判断必须与 ns_keyed_archiver.rs encode_object 的 $class 判断保持一致(见该处注释)。
+    let this_class: Class = msg![env; this class];
+    let mutable_class = env.objc.get_known_class("NSMutableString", &mut env.mem);
+    if env.objc.class_is_subclass_of(this_class, mutable_class) {
+        let scope = get_value_to_encode_for_current_key(env, coder);
+        scope.insert("NS.string".into(), plist::Value::String(string.to_string()));
+    } else {
+        set_value_to_encode_for_current_key(env, coder, plist::Value::String(string.to_string()));
+    }
+}
+
 - (id)initWithUTF8String:(ConstPtr<u8>)utf8_string {
     msg![env; this initWithCString:utf8_string encoding:NSUTF8StringEncoding]
 }
@@ -446,7 +1033,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithCString:(ConstPtr<u8>)c_string
              encoding:(NSStringEncoding)encoding {
-    assert!(C_STRING_FRIENDLY_ENCODINGS.contains(&encoding), "encoding {encoding}");
+    // [扫描修 2026-09-15] F8-4:原来 assert 编码必须在 5 种白名单里,GB18030/Big5/Shift-JIS 等直接 panic。
+    // 现在凡是以 8 位为单元、单个 NUL 结尾的编码都照常解码;UTF-16/32 不能当 C 字符串读(真机文档同样
+    // 要求 8 位编码),打一次日志后返回 nil。
+    if nul_terminator_size(encoding) != 1 {
+        warn_once(format!("cstring-wide:{encoding:#x}"), || {
+            format!("Warning: initWithCString:encoding: 收到非 8 位单元的编码 {encoding:#x},无法按 C 字符串读取,返回 nil")
+        });
+        release(env, this);
+        return nil;
+    }
     let len: NSUInteger = env.mem.cstr_at(c_string).len().try_into().unwrap();
     msg![env; this initWithBytes:c_string length:len encoding:encoding]
 }
@@ -490,14 +1086,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSUInteger)lengthOfBytesUsingEncoding:(NSStringEncoding)encoding {
-    if C_STRING_FRIENDLY_ENCODINGS.contains(&encoding) {
-        let string = to_rust_string(env, this);
-        // [MoleWorld] 原来 assert! 全 ASCII(TODO);对 UTF-8 编码,字节长度就是 string.len()
-        // (UTF-8 字节数),含中文也正确 → 去掉过严断言,中文名按 UTF-8 计长(常用于分配
-        // getCString: 缓冲)不再 panic。
-        string.len().try_into().unwrap()
-    } else {
-        unimplemented!("lengthOfBytesUsingEncoding: {}", encoding)
+    // [MoleWorld] 原来 assert! 全 ASCII(TODO);对 UTF-8 编码,字节长度就是 string.len()
+    // (UTF-8 字节数),含中文也正确 → 去掉过严断言,中文名按 UTF-8 计长(常用于分配
+    // getCString: 缓冲)不再 panic。
+    // [扫描修 2026-09-15] F8-4:原来 5 种白名单之外的编码 unimplemented! panic。现在按真实编码算字节数
+    // (不含 NUL、不含 BOM);无法表示时按真机语义返回 0。游戏 5 处调用
+    // (AvatarLayer/InviteFriendsLayer/RegisterView calculateTextNumber:、NetworkManager 漂流瓶/乌鸦祭司)
+    // 全是 movs r2,#4 = UTF-8,结果与原来逐字节一致。
+    let string = to_rust_string(env, this);
+    match encode_str(&string, encoding, false) {
+        Some(bytes) => bytes.len().try_into().unwrap(),
+        None => 0,
     }
 }
 
@@ -511,45 +1110,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         "[(NSString *){} rangeOfString:{} options:{}]",
         to_rust_string(env, this), to_rust_string(env, search_string), options
     );
+    // [扫描修 2026-09-15] F8-4:原来按 options 精确值 match(0/2、1、4),组合位与 NSAnchoredSearch
+    // 直接 unimplemented! panic。现在按位解析,见 range_of_string_common / find_code_units。
     let len: NSUInteger = msg![env; this length];
-    let len_search: NSUInteger = msg![env; search_string length];
-    if len_search == 0 {
-        return NSRange { location: NSNotFound as NSUInteger, length: 0 };
-    }
-    // TODO: other search options
-    // TODO: OR'ing of options
-    match options {
-        // 0 is for default options, which is NSLiteralSearch
-        NSLiteralSearch | 0 => {
-            for i in 0..len {
-                if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        NSCaseInsensitiveSearch => {
-            let compare = |a, b| {
-                let (Some(a_c), Some(b_c)) = (char::from_u32(a as u32), char::from_u32(b as u32)) else {
-                    panic!("Invalid chars in the strings!");
-                };
-                a_c.to_lowercase().eq(b_c.to_lowercase())
-            };
-            for i in 0..len {
-                if is_match_at_position(env, this, search_string, i, len, len_search, compare) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        NSBackwardsSearch => {
-            for i in (0..len).rev() {
-                if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        _ => unimplemented!("options {}", options)
-    }
-    NSRange { location: NSNotFound as NSUInteger, length: 0 }
+    range_of_string_common(env, this, search_string, options, NSRange { location: 0, length: len })
+}
+
+// [扫描修 2026-09-15] F8-4:原来缺这个方法(SDK 的 iRate/TaomeeRate/TaomeeVersion/FlurryUtil 会调用)。
+- (NSRange)rangeOfString:(id)search_string // NSString *
+                 options:(NSStringCompareOptions)options
+                   range:(NSRange)range {
+    range_of_string_common(env, this, search_string, options, range)
 }
 
 - (id)description {
@@ -599,8 +1170,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO: use current locale
     // TODO: support `compatibility equivalence` in the Unicode standard
     // More info: https://www.objc.io/issues/9-strings/unicode/
-    assert!(to_rust_string(env, this).is_ascii());
-    assert!(to_rust_string(env, other).is_ascii());
+    // [扫描修 2026-09-15] F8-4:原来两个 assert 要求全 ASCII,中文串一比较就整机 panic。
+    // 本地化排序规则仍未实现,退化为字面比较(ASCII 输入的结果与原来一致)。
     msg![env; this compare:other]
 }
 
@@ -621,81 +1192,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSComparisonResult)compare:(id)other options:(NSStringCompareOptions)mask { // NSString*
-    fn ascii_number(iter: &mut Peekable<CodeUnitIterator>, leftmost_digit: char) -> u32 {
-        let mut num = leftmost_digit.to_digit(10).unwrap();
-        while let Some(a_digit_char) = iter.next_if(
-            |&x| char::from_u32(x as u32).is_some_and(|y| y.is_ascii_digit())
-        ) {
-            num = num * 10 + char::from_u32(a_digit_char as u32).unwrap().to_digit(10).unwrap();
-        }
-        num
+    // [扫描修 2026-09-15] F8-4:原来按 mask 精确值 match(0/2、1、64),组合位(如 0x41、0x44)
+    // unimplemented! panic;遇到代理项 "Invalid chars" panic;other 为 nil 时 assert panic;
+    // 数值比较用 u32 累加会溢出。现在按位解析,核心在 compare_code_units。
+    // 游戏自己的调用 -[WrapperManager showWeather]@0x19ae76 用 NSNumericSearch(0x40),结果与原来一致。
+    if other == nil {
+        log!(
+            "Warning: [(NSString*){:?} compare:nil options:{:#x}] 参数为 nil(真机未定义),返回 NSOrderedDescending",
+            this,
+            mask
+        );
+        return NSOrderedDescending;
     }
-
-    assert_ne!(other, nil);
-
-    // TODO: support foreign subclasses (perhaps via a helper function that
-    // copies the string first)
-    let mut a_iter = env.objc.borrow::<StringHostObject>(this).iter_code_units().peekable();
-    let mut b_iter = env.objc.borrow::<StringHostObject>(other).iter_code_units().peekable();
-
-    // By default, no mask is a literal search
-    let mask = if mask == 0 {
-        NSLiteralSearch
-    } else {
-        mask
-    };
-
-    // TODO: OR'ing of compare options
-    match mask {
-        NSCaseInsensitiveSearch => {
-            loop {
-                let a_next = a_iter.next();
-                let b_next = b_iter.next();
-                let (Some(a_unit), Some(b_unit)) = (a_next, b_next) else {
-                    return from_rust_ordering(a_next.cmp(&b_next));
-                };
-                let (Some(a_c), Some(b_c)) = (char::from_u32(a_unit as u32), char::from_u32(b_unit as u32)) else {
-                    panic!("Invalid chars in the strings!");
-                };
-
-                let insensitive_order = a_c.to_lowercase().cmp(b_c.to_lowercase());
-                if insensitive_order != std::cmp::Ordering::Equal {
-                    return from_rust_ordering(insensitive_order);
-                }
-            }
-        },
-        NSLiteralSearch => {
-            from_rust_ordering(a_iter.cmp(b_iter))
-        },
-        NSNumericSearch => {
-            loop {
-                let a_next = a_iter.next();
-                let b_next = b_iter.next();
-                let (Some(a_unit), Some(b_unit)) = (a_next, b_next) else {
-                    return from_rust_ordering(a_next.cmp(&b_next));
-                };
-                let (Some(a_c), Some(b_c)) = (char::from_u32(a_unit as u32), char::from_u32(b_unit as u32)) else {
-                    panic!("Invalid chars in the strings!");
-                };
-
-                if a_c.is_ascii_digit() && b_c.is_ascii_digit() {
-                    let a_int = ascii_number(&mut a_iter, a_c);
-                    let b_int = ascii_number(&mut b_iter, b_c);
-
-                    let numeric_order = a_int.cmp(&b_int);
-                    if numeric_order != std::cmp::Ordering::Equal {
-                        return from_rust_ordering(numeric_order);
-                    }
-                } else {
-                    let char_order = a_c.cmp(&b_c);
-                    if char_order != std::cmp::Ordering::Equal {
-                        return from_rust_ordering(char_order);
-                    }
-                }
-            }
-        },
-        mask => unimplemented!("Other mask: {mask}"),
-    }
+    let opts = compare_options_logged(mask, "compare:options:");
+    let a = collect_code_units(env, this);
+    let b = collect_code_units(env, other);
+    from_rust_ordering(compare_code_units(&a, &b, opts))
 }
 
 // NSCopying implementation
@@ -814,32 +1326,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (ConstPtr<u8>)cStringUsingEncoding:(NSStringEncoding)encoding {
+    // [扫描修 2026-09-15] F8-4:原来 ASCII/MacRoman/Latin-1 遇到非 ASCII 字符 assert panic,
+    // 其它编码 unimplemented! panic。现在按真实编码转换;无法无损表示或编码未实现时按真机语义返回 NULL。
+    // UTF-8(UTF8String 走这里)的输出与原来逐字节一致。
     // TODO: avoid copying
     let string = to_rust_string(env, this);
-    // TODO: other encodings
-    let bytes: Vec<u8> = match encoding {
-        NSASCIIStringEncoding | NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => {
-            // TODO: properly support Mac OS Roman and ISO Latin 1 encodings.
-            // The first 128 characters are identical to the ASCII
-            assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
-            string.as_bytes().to_vec()
-        },
-        NSUTF8StringEncoding => {
-            string.as_bytes().to_vec()
-        },
-        NSUTF16LittleEndianStringEncoding => string.encode_utf16().flat_map(u16::to_le_bytes).collect(),
-        _ => unimplemented!("{}", encoding),
+    let Some(bytes) = encode_str(&string, encoding, false) else {
+        warn_once(format!("cstring-encode:{encoding:#x}"), || {
+            format!("Warning: cStringUsingEncoding:{encoding:#x} 无法表示该字符串或编码未实现,返回 NULL(真机语义;原来这里 panic)")
+        });
+        return Ptr::null();
     };
-    let null_size: GuestUSize = match encoding {
-        NSUTF8StringEncoding | NSASCIIStringEncoding | NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => 1,
-        NSUTF16LittleEndianStringEncoding => 2,
-        _ => unimplemented!()
-    };
+    let null_size = nul_terminator_size(encoding);
     let bytes_size = bytes.len() as GuestUSize;
     let total_size: GuestUSize = bytes_size + null_size;
     let c_string: MutPtr<u8> = env.mem.alloc(total_size).cast();
-    _ = env.mem.bytes_at_mut(c_string, bytes_size).write(&bytes).unwrap();
-    assert_eq!(env.mem.read(c_string + total_size - 1), b'\0');
+    let dest = env.mem.bytes_at_mut(c_string, total_size);
+    dest[..bytes.len()].copy_from_slice(&bytes);
+    dest[bytes.len()..].fill(0);
     // NSData will handle releasing the string (it is autoreleased)
     let _: id = msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void())
                                                     length:total_size];
@@ -1026,15 +1530,34 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)stringByAddingPercentEscapesUsingEncoding:(NSStringEncoding)encoding {
-    assert!(encoding == NSASCIIStringEncoding || encoding == NSUTF8StringEncoding); // TODO: other encodings
-    // TODO: implement escaping as per RFC 2396
-    let str = to_rust_string(env, this);
-    // FIXME: figure out why '[' and ']' are escaped on iOS simulator
-    assert!(str.as_bytes().iter().all(|byte| {
-        (byte.is_ascii_alphanumeric() || b"-_.~".contains(byte)) // unreserved
-        || b"!*'();:@&=+$,/?%#".contains(byte) // reserved
-    }));
-    let new: id = msg![env; this copy];
+    // [扫描修 2026-09-15] F8-4:原来 assert 编码只能是 ASCII/UTF-8、字符只能是 URL 合法字符,
+    // URL 里带空格、中文或 [ ] 就整机 panic(iMoleVillageAppDelegate、TSMutableString、Request 等都会调)。
+    // 现在把字符串按指定编码转成字节,不在原放行集合里的字节写成 %XX(大写十六进制)。
+    // 放行集合与原 assert 完全相同:unreserved(字母数字 -_.~)与 reserved(!*'();:@&=+$,/?%#),
+    // 所以原来不崩的输入结果不变(仍返回副本);真机同样会转义空格、[ ]、非 ASCII 等。
+    // 无法按该编码表示时返回 nil(真机语义)。
+    const KEEP: &[u8] = b"-_.~!*'();:@&=+$,/?%#";
+    let keep = |byte: u8| byte.is_ascii_alphanumeric() || KEEP.contains(&byte);
+    let string = to_rust_string(env, this);
+    let Some(bytes) = encode_str(&string, encoding, false) else {
+        warn_once(format!("percent-escape:{encoding:#x}"), || {
+            format!("Warning: stringByAddingPercentEscapesUsingEncoding:{encoding:#x} 无法按该编码表示字符串,返回 nil")
+        });
+        return nil;
+    };
+    if bytes.iter().all(|&byte| keep(byte)) {
+        let new: id = msg![env; this copy];
+        return autorelease(env, new);
+    }
+    let mut escaped = String::with_capacity(bytes.len() * 3);
+    for &byte in &bytes {
+        if keep(byte) {
+            escaped.push(byte as char);
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    let new = from_rust_string(env, escaped);
     autorelease(env, new)
 }
 
@@ -1206,22 +1729,28 @@ pub const CLASSES: ClassExports = objc_classes! {
          atomically:(bool)use_aux_file
            encoding:(NSStringEncoding)encoding
               error:(MutPtr<id>)error { // NSError**
-    assert!(encoding == NSUTF8StringEncoding || encoding == NSASCIIStringEncoding);
-
+    // [扫描修 2026-09-15] F8-4:原来 assert 编码只能是 UTF-8/ASCII,写失败且传了 error 时 todo!() panic。
+    // 现在按真实编码写(通用 UTF-16/32 带 BOM);编码失败或写盘失败返回 NO,error 写 nil(尚未构造 NSError)。
+    // UTF-8/ASCII 的输出与原来逐字节一致。
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
     let string = to_rust_string(env, this);
-    let c_string = env.mem.alloc_and_write_cstr(string.as_bytes());
+    let Some(bytes) = encode_for_data(&string, encoding, false) else {
+        warn_once(format!("write-encode:{encoding:#x}"), || {
+            format!("Warning: writeToFile:atomically:encoding:{encoding:#x} 无法按该编码表示字符串,返回 NO")
+        });
+        return false;
+    };
+    let c_string = env.mem.alloc_and_write_cstr(&bytes);
     // This should not include a NULL terminator!
-    let length: NSUInteger = string.len().try_into().unwrap();
+    let length: NSUInteger = bytes.len().try_into().unwrap();
     // NSData will handle releasing the string (it is autoreleased)
     let data: id = msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void())
                                                     length:length];
 
     // TODO: write extended attributes about text encoding
-    let success: bool = msg![env; data writeToFile:path atomically:use_aux_file];
-    if !success && !error.is_null() {
-        todo!(); // TODO: create an NSError if requested
-    }
-    success
+    msg![env; data writeToFile:path atomically:use_aux_file]
 }
 
 - (f32)floatValue {
@@ -1342,6 +1871,55 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setString:res];
 }
 
+// [扫描修 2026-09-15] F8-4:原来 NSMutableString 完全没有这个方法(消息发过来只打"不响应"然后空操作)。
+// 游戏 -[HttpManager asynchronousHttpServerlist]@0x1954d6 用它删掉服务器列表正文里的 "\r"
+// (options=2 NSLiteralSearch)。私服钩子返回的正文里本来就没有 \r,结果不变;
+// 真服务器用 CRLF 换行时现在也能正确清洗。其余调用者在 SDK 里(immobUtils、AppCommunicate、ASINetworkQueue 等)。
+// 返回替换次数。
+- (NSUInteger)replaceOccurrencesOfString:(id)target // NSString*
+                              withString:(id)replacement // NSString*
+                                 options:(NSStringCompareOptions)options
+                                   range:(NSRange)range {
+    if target == nil || replacement == nil {
+        log!(
+            "Warning: [(NSMutableString*){:?} replaceOccurrencesOfString:{:?} withString:{:?}] 参数为 nil(真机抛 NSInvalidArgumentException),不做替换",
+            this,
+            target,
+            replacement
+        );
+        return 0;
+    }
+    let whole = collect_code_units(env, this);
+    let target_units = collect_code_units(env, target);
+    let replacement_units = collect_code_units(env, replacement);
+    // NSRange 是 packed 结构体,先拷到局部变量再用
+    let (location, length) = (range.location as usize, range.length as usize);
+    let start = location.min(whole.len());
+    let end = location.saturating_add(length).min(whole.len());
+    if location.saturating_add(length) > whole.len() {
+        log!(
+            "Warning: [(NSMutableString*){:?} replaceOccurrencesOfString:… range:{{{}, {}}}] 越界(长度 {},真机抛 NSRangeException),裁剪后替换",
+            this,
+            location,
+            length,
+            whole.len()
+        );
+    }
+    let opts = compare_options_logged(options, "replaceOccurrencesOfString:withString:options:range:");
+    let (middle, count) = replace_code_units(&whole[start..end], &target_units, &replacement_units, opts);
+    if count == 0 {
+        return 0;
+    }
+    let mut result = Vec::with_capacity(start + middle.len() + (whole.len() - end));
+    result.extend_from_slice(&whole[..start]);
+    result.extend_from_slice(&middle);
+    result.extend_from_slice(&whole[end..]);
+    let new_string = from_u16_vec(env, result);
+    () = msg![env; this setString:new_string];
+    release(env, new_string);
+    count.try_into().unwrap()
+}
+
 @end
 
 // Our private subclass that is the single implementation of NSString for the
@@ -1355,30 +1933,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: more init methods
 
-// NSCoding implementation
-- (id)initWithCoder:(id)coder {
-    let class: Class = msg![env; coder class];
-    let keyed_unarch_class: Class = msg_class![env; NSKeyedUnarchiver class];
-    let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
-    let new_str = if env.objc.class_is_subclass_of(class, keyed_unarch_class) {
-        ns_keyed_unarchiver::decode_current_string(env, coder)
-    } else if env.objc.class_is_subclass_of(class, nib_archive_class) {
-        _nib_archive_decoder::decode_current_string(env, coder)
-    } else {
-        unimplemented!();
-    };
-    release(env, this);
-    new_str
-}
-- (())encodeWithCoder:(id)coder {
-    let string = to_rust_string(env, this);
-    // [MoleWorld] 原来这里 assert! 全 ASCII(TODO 占位),导致归档含中文的字符串
-    // (如离线改的中文庄园名,经 saveUserInfoData → NSKeyedArchiver → encodeWithCoder:)
-    // 直接 panic(实测离线改中文名稳定复现)。二进制 plist 写入器(plist::to_writer_binary,
-    // 见 ns_keyed_archiver.rs)原生支持 UTF-8,plist::Value::String 可容纳任意 UTF-8 字符串
-    // → 去掉这个过严断言即可正确归档非 ASCII 字符串,与真实 iOS 行为一致。
-    set_value_to_encode_for_current_key(env, coder, plist::Value::String(string.to_string()));
-}
+// NSCoding(initWithCoder:/encodeWithCoder:)已上移到抽象 NSString,见该类。
 
 - (id)initWithFormat:(id)format, // NSString*
                      ...args {
@@ -1393,9 +1948,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithBytes:(ConstPtr<u8>)bytes
              length:(NSUInteger)len
            encoding:(NSStringEncoding)encoding {
-    // TODO: error handling
+    // [扫描修 2026-09-15] F8-4:长度 0 时不碰内存(bytes 可以是 NULL,原来 bytes_at 在空页 panic);
+    // 编码无法解码时按真机语义释放自身、返回 nil(原来 panic)。
+    if len == 0 {
+        *env.objc.borrow_mut(this) = StringHostObject::Utf8(Cow::Borrowed(""));
+        return this;
+    }
     let slice = env.mem.bytes_at(bytes, len);
-    let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
+    let Some(host_object) = StringHostObject::decode(Cow::Borrowed(slice), encoding) else {
+        release(env, this);
+        return nil;
+    };
 
     *env.objc.borrow_mut(this) = host_object;
 
@@ -1403,11 +1966,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithCharacters:(ConstPtr<unichar>)characters length:(NSUInteger)len {
-    assert!(!characters.is_null());
+    // [扫描修 2026-09-15] F8-4:unichar 缓冲是 guest 内存里的小端 UTF-16 码元,按小端原样解码。
+    // 原来传 NSUTF16StringEncoding:现在该编码会识别并剥掉 BOM,首个字符恰好是 U+FEFF/U+FFFE 时会被误吞或误换字节序。
+    // 长度 0 时允许 characters 为 NULL(真机返回空串,原来 assert panic)。
+    assert!(!characters.is_null() || len == 0);
     let num_bytes = len * 2;
     msg![env; this initWithBytes:(characters.cast::<u8>())
                           length:num_bytes
-                        encoding:NSUTF16StringEncoding]
+                        encoding:NSUTF16LittleEndianStringEncoding]
 }
 
 - (id)initWithString:(id)string { // NSString *
@@ -1437,7 +2003,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         msg_class![env; NSString defaultCStringEncoding]
     };
 
-    let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
+    let Some(host_object) = StringHostObject::decode(Cow::Owned(bytes), encoding) else {
+        release(env, this);
+        return nil;
+    };
     *env.objc.borrow_mut(this) = host_object;
     this
 }
@@ -1448,12 +2017,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO: avoid copy?
     let path = to_rust_string(env, path);
     let Ok(bytes) = env.fs.read(GuestPath::new(&path)) else {
-        assert!(error.is_null()); // TODO: error handling
+        // [扫描修 2026-09-15] 原来 assert!(error.is_null()):调用方传了 error 指针且文件不存在就 panic。
+        // 现在 error 写 nil(尚未构造 NSError),释放自身返回 nil。
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
+        release(env, this);
         return nil;
     };
 
-    // TODO: error handling for encoding
-    let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
+    // [扫描修 2026-09-15] F8-4:编码无法解码时返回 nil(原来 panic)
+    let Some(host_object) = StringHostObject::decode(Cow::Owned(bytes), encoding) else {
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
+        release(env, this);
+        return nil;
+    };
 
     *env.objc.borrow_mut(this) = host_object;
 
@@ -1601,9 +2181,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithBytes:(ConstPtr<u8>)bytes
              length:(NSUInteger)len
            encoding:(NSStringEncoding)encoding {
-    // TODO: error handling
+    // [扫描修 2026-09-15] F8-4:同 _touchHLE_NSString(长度 0 不碰内存;无法解码返回 nil 而不是 panic)
+    if len == 0 {
+        *env.objc.borrow_mut(this) = StringHostObject::Utf8(Cow::Borrowed(""));
+        return this;
+    }
     let slice = env.mem.bytes_at(bytes, len);
-    let host_object = StringHostObject::decode(Cow::Borrowed(slice), encoding);
+    let Some(host_object) = StringHostObject::decode(Cow::Borrowed(slice), encoding) else {
+        release(env, this);
+        return nil;
+    };
 
     *env.objc.borrow_mut(this) = host_object;
 
@@ -1658,6 +2245,160 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+// ============================================================================
+// [扫描修 2026-09-15] F8-5:NSException / NSAssertionHandler
+// ============================================================================
+// 逻辑、判断依据与 MOLE_ASSERT 策略全部写在 ns_exception.rs,这里只是薄包装。
+// 挂在本文件的类表里,是因为 Foundation 的类表注册在 foundation.rs(不属于本修复包);放进已注册的
+// ns_string::CLASSES 就能直接生效。切勿再在 foundation.rs 注册同名类,否则类重复。
+// guest 子类 InvalidKeyException / TMA_InvalidKeyException(: NSException)自动继承这些方法。
+@implementation NSException: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = super::ns_exception::new_exception_host_object();
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
++ (id)exceptionWithName:(id)name // NSString*
+                 reason:(id)reason // NSString*
+               userInfo:(id)user_info { // NSDictionary*
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithName:name reason:reason userInfo:user_info];
+    autorelease(env, new)
+}
+
++ (())raise:(id)name // NSString*
+     format:(id)format, // NSString*
+     ...args {
+    let reason = if format == nil {
+        String::new()
+    } else {
+        with_format(env, format, args.start())
+    };
+    super::ns_exception::raise_with_reason(env, this, name, reason, "+raise:format:");
+}
+
+- (id)initWithName:(id)name // NSString*
+            reason:(id)reason // NSString*
+          userInfo:(id)user_info { // NSDictionary*
+    let name: id = msg![env; name copy];
+    let reason: id = msg![env; reason copy];
+    let user_info: id = msg![env; user_info copy];
+    let host_object = env.objc.borrow_mut::<super::ns_exception::NSExceptionHostObject>(this);
+    host_object.name = name;
+    host_object.reason = reason;
+    host_object.user_info = user_info;
+    this
+}
+
+- (())dealloc {
+    let host_object = env.objc.borrow::<super::ns_exception::NSExceptionHostObject>(this);
+    let (name, reason, user_info) = (host_object.name, host_object.reason, host_object.user_info);
+    release(env, name);
+    release(env, reason);
+    release(env, user_info);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
+- (id)name {
+    env.objc.borrow::<super::ns_exception::NSExceptionHostObject>(this).name
+}
+
+- (id)reason {
+    env.objc.borrow::<super::ns_exception::NSExceptionHostObject>(this).reason
+}
+
+- (id)userInfo {
+    env.objc.borrow::<super::ns_exception::NSExceptionHostObject>(this).user_info
+}
+
+// 真机 -[NSException description] 返回 reason
+- (id)description {
+    env.objc.borrow::<super::ns_exception::NSExceptionHostObject>(this).reason
+}
+
+- (id)callStackReturnAddresses {
+    let array = ns_array::from_vec(env, Vec::new());
+    autorelease(env, array)
+}
+
+- (id)callStackSymbols {
+    let array = ns_array::from_vec(env, Vec::new());
+    autorelease(env, array)
+}
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    retain(env, this)
+}
+
+- (())raise {
+    super::ns_exception::raise_common(env, this, "-raise");
+}
+
+@end
+
+@implementation NSAssertionHandler: NSObject
+
+// 真机是每线程一个实例(存在 threadDictionary 里)。游戏(实际上都是 SDK)只会对它立刻发
+// handleFailureIn…,不依赖对象同一性,所以每次给一个新的 autoreleased 实例,省去全局单例。
++ (id)currentHandler {
+    let new: id = msg![env; this new];
+    autorelease(env, new)
+}
+
+- (())handleFailureInMethod:(SEL)selector
+                     object:(id)object
+                       file:(id)file_name // NSString*
+                 lineNumber:(NSInteger)line
+                description:(id)format, // NSString*
+                ...args {
+    let description = if format == nil {
+        String::new()
+    } else {
+        with_format(env, format, args.start())
+    };
+    let class_name = if object == nil {
+        "nil".to_string()
+    } else {
+        let class: Class = msg![env; object class];
+        env.objc.try_get_class_name(class).unwrap_or("?").to_string()
+    };
+    let selector_name = if selector.is_null() {
+        "?".to_string()
+    } else {
+        selector.as_str(&env.mem).to_string()
+    };
+    super::ns_exception::assertion_failure(
+        env,
+        format!("[{class_name} {selector_name}]"),
+        file_name,
+        line,
+        description,
+    );
+}
+
+- (())handleFailureInFunction:(id)function_name // NSString*
+                         file:(id)file_name // NSString*
+                   lineNumber:(NSInteger)line
+                  description:(id)format, // NSString*
+                  ...args {
+    let description = if format == nil {
+        String::new()
+    } else {
+        with_format(env, format, args.start())
+    };
+    let function_name = to_rust_string(env, function_name).into_owned();
+    super::ns_exception::assertion_failure(
+        env,
+        format!("{function_name}()"),
+        file_name,
+        line,
+        description,
+    );
+}
+
+@end
+
 };
 
 /// This helper is used in `initWithFormat:` on our private subclasses
@@ -1676,26 +2417,36 @@ fn data_using_encoding_lossy_inner(
     encoding: NSStringEncoding,
     lossy: bool,
 ) -> id {
-    if lossy {
-        log!(
-            "Warning: ignoring allowLossyConversion for '{}'",
-            to_rust_string(env, this)
-        );
-    }
-    assert!(
-        encoding == NSUTF8StringEncoding
-            || encoding == NSASCIIStringEncoding
-            || encoding == NSISOLatin1StringEncoding
-    );
-
+    // [扫描修 2026-09-15] F8-4:原来 assert 编码只能是 UTF-8/ASCII/Latin-1,ASCII/Latin-1 还 assert 全 ASCII,
+    // 否则 panic;allowLossyConversion 被忽略且每次都打日志。现在:
+    // - UTF-8,以及 ASCII/Latin-1(含能表示的非 ASCII 字符):保持原有「长度包含结尾 NUL」的行为。
+    //   这是原实现的既有特性,+[CryptUtils encryptString:withString:]@0x124876、
+    //   -[iMoleVillageAppDelegate hashedISU]@0xfb06 会把这个长度算进密文或摘要。刻意不改,
+    //   以免与已经生成的数据不一致(真机不含 NUL,是否统一需单独评估);
+    // - 其它编码(UTF-16/32、GB18030、Big5、Shift-JIS 等):按真机语义返回不含 NUL 的数据,通用 UTF-16/32 带 BOM;
+    // - lossy 为真时,表示不了的字符写成 '?';不允许有损且表示不了,或编码未实现:返回 nil。
     let string = to_rust_string(env, this);
-    if encoding == NSASCIIStringEncoding || encoding == NSISOLatin1StringEncoding {
-        assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
+    let Some(bytes) = encode_for_data(&string, encoding, lossy) else {
+        warn_once(format!("data-encode:{encoding:#x}:{lossy}"), || {
+            format!("Warning: dataUsingEncoding:{encoding:#x} allowLossyConversion:{lossy} 无法按该编码表示字符串或编码未实现,返回 nil")
+        });
+        return nil;
+    };
+    let keeps_nul_in_length = encoding == NSUTF8StringEncoding
+        || encoding == NSASCIIStringEncoding
+        || encoding == NSISOLatin1StringEncoding;
+    if keeps_nul_in_length {
+        let c_string = env.mem.alloc_and_write_cstr(&bytes);
+        let length: NSUInteger = (bytes.len() + 1).try_into().unwrap();
+        msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length]
+    } else {
+        let length: NSUInteger = bytes.len().try_into().unwrap();
+        let buffer = env.mem.alloc(length.max(1));
+        if length > 0 {
+            env.mem.bytes_at_mut(buffer.cast(), length).copy_from_slice(&bytes);
+        }
+        msg_class![env; NSData dataWithBytesNoCopy:buffer length:length]
     }
-    let c_string = env.mem.alloc_and_write_cstr(string.as_bytes());
-    let length: NSUInteger = (string.len() + 1).try_into().unwrap();
-
-    msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length]
 }
 
 /// For use by [crate::dyld]: Handle static strings listed in the app binary.
@@ -1807,10 +2558,16 @@ pub fn to_rust_string(env: &mut Environment, string: id) -> Cow<'static, str> {
         return Cow::Borrowed("");
     }
     // TODO: handle foreign subclasses of NSString
-    env.objc
-        .borrow_mut::<StringHostObject>(string)
-        .to_utf8()
-        .unwrap()
+    let host_object = env.objc.borrow_mut::<StringHostObject>(string);
+    match host_object.to_utf8() {
+        Ok(utf8) => utf8,
+        // [扫描修 2026-09-15] F8-4:含未配对代理项的 UTF-16(比如把 emoji 从中间截断)原来 unwrap panic,
+        // 现在把坏码元换成 U+FFFD。
+        Err(_) => match &*host_object {
+            StringHostObject::Utf16(units) => Cow::Owned(String::from_utf16_lossy(units)),
+            StringHostObject::Utf8(utf8) => utf8.clone(),
+        },
+    }
 }
 
 /// Shortcut for host code, calls a callback once for each UTF-16 code-unit in a
@@ -1831,28 +2588,7 @@ where
         });
 }
 
-/// Helper function for `rangeOfString:options:` method
-/// Note: this implementation is linear
-fn is_match_at_position<F: Fn(u16, u16) -> bool>(
-    env: &mut Environment,
-    the_string: id,
-    search_string: id,
-    start: NSUInteger,
-    len: NSUInteger,
-    len_search: NSUInteger,
-    compare_fn: F,
-) -> bool {
-    (0..len_search).all(|j| {
-        let curr: NSUInteger = start + j;
-        if curr < len {
-            let a_c: u16 = msg![env; the_string characterAtIndex:curr];
-            let b_c: u16 = msg![env; search_string characterAtIndex:j];
-            compare_fn(a_c, b_c)
-        } else {
-            false
-        }
-    })
-}
+// [扫描修 2026-09-15] 原 is_match_at_position(逐字符发消息的 O(n·m) 搜索)已由 find_code_units 取代并删除
 
 /// Helper function for shared `doubleValue` and `floatValue` implementations.
 fn float_value_common<F: std::str::FromStr + Default>(env: &mut Environment, string: id) -> F {
@@ -2019,6 +2755,115 @@ mod ns_string_tests {
         assert!(line_range_helper(&str5, range(6, 1), true, true) == (5, 7, 6));
         assert!(line_range_helper(&str5, range(4, 1), true, true) == (0, 5, 4));
     }
+
+    // [扫描修 2026-09-15] F8-4 单元测试:比较选项按位解析、编码转换(纯函数,不需要 Environment)
+    fn u16s(s: &str) -> Utf16String {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn compare_options_bits() {
+        let (opts, unknown) = parse_compare_options(NSCaseInsensitiveSearch | NSBackwardsSearch);
+        assert!(opts.case_insensitive && opts.backwards && !opts.anchored && !opts.numeric);
+        assert_eq!(unknown, 0);
+        let (opts, unknown) = parse_compare_options(NSLiteralSearch);
+        assert_eq!(opts, CompareOptions::default());
+        assert_eq!(unknown, 0);
+        let (_, unknown) = parse_compare_options(NSRegularExpressionSearch | NSCaseInsensitiveSearch);
+        assert_eq!(unknown, NSRegularExpressionSearch);
+    }
+
+    #[test]
+    fn range_search_options() {
+        let hay = u16s("abcABCabc");
+        let opts = |o| parse_compare_options(o).0;
+        assert_eq!(find_code_units(&hay, &u16s("ABC"), opts(0)), Some(3));
+        assert_eq!(find_code_units(&hay, &u16s("ABC"), opts(NSCaseInsensitiveSearch)), Some(0));
+        // options 5 = CaseInsensitive | Backwards
+        assert_eq!(find_code_units(&hay, &u16s("ABC"), opts(5)), Some(6));
+        // options 8 = Anchored:只看开头
+        assert_eq!(find_code_units(&hay, &u16s("abc"), opts(NSAnchoredSearch)), Some(0));
+        assert_eq!(find_code_units(&hay, &u16s("ABC"), opts(NSAnchoredSearch)), None);
+        // Anchored | Backwards:只看结尾
+        assert_eq!(find_code_units(&hay, &u16s("abc"), opts(NSAnchoredSearch | NSBackwardsSearch)), Some(6));
+        assert_eq!(find_code_units(&hay, &u16s("zzz"), opts(0)), None);
+        assert_eq!(find_code_units(&hay, &[], opts(0)), None);
+        // 代理项不再 panic
+        let emoji = u16s("x😀y");
+        assert_eq!(find_code_units(&emoji, &u16s("😀"), opts(NSCaseInsensitiveSearch)), Some(1));
+    }
+
+    #[test]
+    fn compare_with_combined_options() {
+        use std::cmp::Ordering;
+        let opts = |o| parse_compare_options(o).0;
+        assert_eq!(compare_code_units(&u16s("a2"), &u16s("a10"), opts(NSNumericSearch)), Ordering::Less);
+        assert_eq!(compare_code_units(&u16s("a2"), &u16s("a10"), opts(0)), Ordering::Greater);
+        // 0x41 = CaseInsensitive | Numeric
+        assert_eq!(compare_code_units(&u16s("File2"), &u16s("file10"), opts(0x41)), Ordering::Less);
+        // 0x44 = Backwards | Numeric(Backwards 对比较无影响)
+        assert_eq!(compare_code_units(&u16s("v9"), &u16s("v10"), opts(0x44)), Ordering::Less);
+        assert_eq!(compare_code_units(&u16s("ABC"), &u16s("abc"), opts(NSCaseInsensitiveSearch)), Ordering::Equal);
+        assert_eq!(
+            compare_code_units(&u16s("ABC"), &u16s("abc"), opts(NSCaseInsensitiveSearch | NSForcedOrderingSearch)),
+            Ordering::Less
+        );
+        // 超长数字串不溢出
+        assert_eq!(
+            compare_code_units(&u16s("99999999999999999999"), &u16s("100000000000000000000"), opts(NSNumericSearch)),
+            Ordering::Less
+        );
+        assert_eq!(compare_code_units(&u16s("a01"), &u16s("a1"), opts(NSNumericSearch)), Ordering::Equal);
+    }
+
+    #[test]
+    fn replace_with_options() {
+        let opts = |o| parse_compare_options(o).0;
+        let run = |src: &str, target: &str, repl: &str, o| {
+            let (out, count) = replace_code_units(&u16s(src), &u16s(target), &u16s(repl), opts(o));
+            (String::from_utf16(&out).unwrap(), count)
+        };
+        // options 2 = NSLiteralSearch(原来这里 panic)
+        assert_eq!(run("a\r\nb\r\n", "\r", "", NSLiteralSearch), ("a\nb\n".to_string(), 2));
+        assert_eq!(run("aXbxc", "x", "-", NSCaseInsensitiveSearch), ("a-b-c".to_string(), 2));
+        assert_eq!(run("aaa", "aa", "b", 0), ("ba".to_string(), 1));
+        assert_eq!(run("aaa", "aa", "b", NSBackwardsSearch), ("ab".to_string(), 1));
+        assert_eq!(run("abab", "ab", "X", NSAnchoredSearch), ("Xab".to_string(), 1));
+        assert_eq!(run("abab", "ab", "X", NSAnchoredSearch | NSBackwardsSearch), ("abX".to_string(), 1));
+        assert_eq!(run("abc", "", "X", 0), ("abc".to_string(), 0));
+    }
+
+    #[test]
+    fn encode_and_decode_encodings() {
+        let decode_utf8 = |bytes: &[u8], encoding| -> Option<String> {
+            StringHostObject::decode(Cow::Borrowed(bytes), encoding).map(|host| host.to_utf8().unwrap().into_owned())
+        };
+        // Latin-1 往返
+        assert_eq!(encode_str("café", NSISOLatin1StringEncoding, false), Some(vec![b'c', b'a', b'f', 0xE9]));
+        assert_eq!(decode_utf8(&[b'c', b'a', b'f', 0xE9], NSISOLatin1StringEncoding).as_deref(), Some("café"));
+        // ASCII:非 ASCII 字符无损模式返回 None(真机 NULL),有损模式换成 '?'
+        assert_eq!(encode_str("中a", NSASCIIStringEncoding, false), None);
+        assert_eq!(encode_str("中a", NSASCIIStringEncoding, true), Some(b"?a".to_vec()));
+        // UTF-16:LE/BE 与带 BOM
+        assert_eq!(encode_str("A中", NSUTF16LittleEndianStringEncoding, false), Some(vec![0x41, 0x00, 0x2D, 0x4E]));
+        assert_eq!(encode_str("A中", NSUTF16BigEndianStringEncoding, false), Some(vec![0x00, 0x41, 0x4E, 0x2D]));
+        assert_eq!(encode_for_data("A", NSUTF16StringEncoding, false), Some(vec![0xFF, 0xFE, 0x41, 0x00]));
+        assert_eq!(decode_utf8(&[0xFE, 0xFF, 0x00, 0x41, 0x4E, 0x2D], NSUTF16StringEncoding).as_deref(), Some("A中"));
+        assert_eq!(decode_utf8(&[0x41, 0x00, 0x2D, 0x4E], NSUTF16LittleEndianStringEncoding).as_deref(), Some("A中"));
+        // GB18030 往返
+        let gb = encode_str("摩尔庄园", NSGB18030StringEncoding, false).unwrap();
+        assert_eq!(gb, vec![0xC4, 0xA6, 0xB6, 0xFB, 0xD7, 0xAF, 0xD4, 0xB0]);
+        assert_eq!(decode_utf8(&gb, NSGB18030StringEncoding).as_deref(), Some("摩尔庄园"));
+        // UTF-32
+        assert_eq!(decode_utf8(&[0x41, 0, 0, 0], NSUTF32LittleEndianStringEncoding).as_deref(), Some("A"));
+        // 未知编码:编码侧返回 None(解码侧同样返回 None,但会写日志文件,不在单测里触发)
+        assert_eq!(encode_str("abc", 0x7FFF_0001, false), None);
+        assert!(legacy_encoding_for(0x7FFF_0001).is_none());
+        // 结尾 NUL 宽度
+        assert_eq!(nul_terminator_size(NSUTF8StringEncoding), 1);
+        assert_eq!(nul_terminator_size(NSUTF16LittleEndianStringEncoding), 2);
+        assert_eq!(nul_terminator_size(NSUTF32StringEncoding), 4);
+    }
 }
 
 /// Helper function to get bytes of a string in the specified NSStringEncoding.
@@ -2039,40 +2884,27 @@ pub fn get_bytes_buffer_inner(
     encoding: NSStringEncoding,
     include_null_terminator: bool,
 ) -> bool {
-    // TODO: other encodings
-    assert!(
-        encoding == NSUTF8StringEncoding
-            || encoding == NSASCIIStringEncoding
-            || encoding == NSMacOSRomanStringEncoding
-            || encoding == NSISOLatin1StringEncoding
-    );
-
+    // [扫描修 2026-09-15] F8-4:原来 assert 编码只能是 UTF-8/ASCII/MacRoman/Latin-1,
+    // 后三种还 assert 全 ASCII,否则 panic。现在按真实编码转换(结尾 NUL 按编码单元宽度补),
+    // 无法表示或编码未实现时按真机语义返回 NO。UTF-8 的输出与原来逐字节一致。
+    // 另外只触碰实际要写的那段缓冲,不再按 buffer_size 整段取切片(getCString: 会传接近 2GB 的上限)。
     let src = to_rust_string(env, str);
-    if encoding == NSASCIIStringEncoding
-        || encoding == NSMacOSRomanStringEncoding
-        || encoding == NSISOLatin1StringEncoding
-    {
-        // TODO: properly support Mac OS Roman and ISO Latin 1 encoding.
-        // The first 128 characters are identical to the ASCII
-        assert!(src.as_bytes().iter().all(|byte| byte.is_ascii()));
-    }
-    let dest = env.mem.bytes_at_mut(buffer, buffer_size);
-    let src_len = if include_null_terminator {
-        src.len() + 1
-    } else {
-        src.len()
+    let Some(mut bytes) = encode_str(&src, encoding, false) else {
+        warn_once(format!("get-bytes-encode:{encoding:#x}"), || {
+            format!("Warning: getCString:maxLength:encoding:{encoding:#x} 无法表示该字符串或编码未实现,返回 NO(原来这里 panic)")
+        });
+        return false;
     };
-    if dest.len() < src_len {
+    if include_null_terminator {
+        bytes.extend(std::iter::repeat_n(0u8, nul_terminator_size(encoding) as usize));
+    }
+    if (buffer_size as usize) < bytes.len() {
         return false;
     }
-
-    let iter: Box<dyn Iterator<Item = &u8>> = if include_null_terminator {
-        Box::new(src.as_bytes().iter().chain(b"\0".iter()))
-    } else {
-        Box::new(src.as_bytes().iter())
-    };
-    for (i, &byte) in iter.enumerate() {
-        dest[i] = byte;
+    if !bytes.is_empty() {
+        env.mem
+            .bytes_at_mut(buffer, bytes.len() as GuestUSize)
+            .copy_from_slice(&bytes);
     }
 
     true
@@ -2088,47 +2920,24 @@ fn string_by_replacing_occurrences_inner(
     replacement: id, // NSString *
     options: NSStringCompareOptions,
 ) -> id {
-    // TODO: support foreign subclasses (perhaps via a helper function that
-    // copies the string first)
-    let mut main_iter = env
-        .objc
-        .borrow::<StringHostObject>(source)
-        .iter_code_units();
-    let target_iter = env
-        .objc
-        .borrow::<StringHostObject>(target)
-        .iter_code_units();
-    let replacement_iter = env
-        .objc
-        .borrow::<StringHostObject>(replacement)
-        .iter_code_units();
+    // [扫描修 2026-09-15] F8-4:原来 options 只认 0 和 NSCaseInsensitiveSearch,连最常见的
+    // NSLiteralSearch(2)都 unimplemented! panic(+[TSMutableString urlEncode:stringEncoding:] 就传 2)。
+    // 现在按位解析,替换逻辑见 replace_code_units;guest 自定义字符串子类也能处理。
+    let source_units = collect_code_units(env, source);
+    let target_units = collect_code_units(env, target);
 
     // Zero-length target case
-    if target_iter.clone().next().is_none() {
+    if target_units.is_empty() {
         let res = msg![env; source copy];
         return autorelease(env, res);
     }
 
-    let case_insensitive = match options {
-        0 => false, // No options mean literal match
-        NSCaseInsensitiveSearch => true,
-        _ => unimplemented!(),
-    };
-
-    let mut result: Utf16String = Vec::new();
-    loop {
-        if let Some(new_main_iter) = main_iter.strip_prefix(&target_iter, case_insensitive) {
-            // matched target, replace it
-            result.extend(replacement_iter.clone());
-            main_iter = new_main_iter;
-        } else {
-            // no match, copy as normal
-            match main_iter.next() {
-                Some(cur) => result.push(cur),
-                None => break,
-            }
-        }
-    }
+    let replacement_units = collect_code_units(env, replacement);
+    let opts = compare_options_logged(
+        options,
+        "stringByReplacingOccurrencesOfString:withString:options:range:",
+    );
+    let (result, _) = replace_code_units(&source_units, &target_units, &replacement_units, opts);
 
     // TODO: For a foreign subclass of NSString, do we have to return that
     // subclass? The signature implies this isn't the case and it's probably not

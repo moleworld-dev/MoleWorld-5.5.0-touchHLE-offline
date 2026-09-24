@@ -28,6 +28,15 @@ fresh-port/30-oldver/v5.4.0/
 # 不带尾斜杠 → 同时匹配目录(touchHLE/.git)和指针文件(vendor 子模块的 .git)
 **/.git__MOVED__
 
-# IDA 数据库 / 本地打包产物
+# ── 逆向/脱壳产物与大文件(绝不入库)────────────────────────
+# IDA 数据库(单个 300MB+)、破解包备份、图集重打包前的原始备份
 *.i64
+*.i64.tmp
+*.cracked.bak
+*.orig
+# 脱壳/打包产物目录(含未加密二进制与 IPA,不可公开)
+android-packages/
+ios-packages/
+**/脱壳-decrypted/
+# iOS 本地打包产物(TestFlight 用 IPA)
 *-testflight.ipa

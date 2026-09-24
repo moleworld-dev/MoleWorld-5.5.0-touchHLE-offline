@@ -32,6 +32,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// [MoleWorld iOS · 同步 2026-09-24] 是否把"宽高互换 + 90° 旋转"的横屏 CAEAGLLayer 也认作全屏层
+/// (iOS 分支 f53da75 / 91eb00f)。真机上横屏 cocos2d 的层是【交换过的屏幕尺寸 + 旋转变换】,
+/// 不放行就永远掉进慢合成路径(黑屏 / 每帧整屏回读)。只在 iOS 开;桌面/安卓保持 main 的判定,
+/// 行为零改动(铁律:iOS 渲染改动不污染桌面)。
+const ACCEPT_ROTATED_FULLSCREEN_LAYER: bool = cfg!(target_os = "ios");
+
+/// [MoleWorld iOS · 同步 2026-09-24] 下降找全屏层时是否跳过"未聚焦的小浮层"(iOS 分支 91eb00f,
+/// 好友村卡死根治,见 [overlay_is_ignorable])。取舍是被跳过的小浮层这一帧不显示——无 JIT 的 iOS
+/// 必须这么换帧率;桌面有 JIT、慢合成路径跑得动,保持 main 行为(小浮层照常合成显示)。
+const SKIP_UNFOCUSED_SMALL_OVERLAYS: bool = cfg!(target_os = "ios");
+
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 ///
@@ -46,7 +57,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 /// and present it directly from the app's context. This function is used to
 /// determine when that will happen.
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
+    // [MoleWorld] 编辑文本时强制走 composition 路径(返回 nil = 无 fullscreen 快路径),
+    // 否则 UITextField/UILabel 的逐字符更新永远不上屏(快路径只 present 游戏 GL renderbuffer,
+    // recomposite 又在 fullscreen-EAGL 处早退跳过 UIKit overlay)。返回 nil 后 presentRenderbuffer:
+    // 走 slow path 存 presented_pixels 底图,故合成时游戏画面+输入框文字一起显示,不黑屏。
+    if env.options.force_composition || crate::window::mole_text_input_active() {
         return nil;
     }
 
@@ -79,6 +94,10 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // This is stricter than it should be. In theory we should accumulate
         // the transforms and handle different anchor points etc, but real apps
         // probably only use this common case.
+        // [同步 iOS 2026-09-16] 尺寸/位置比较带容差(移植自 iOS 分支 1f4f66b):--fill-screen 算出的逻辑屏
+        // (如 1188×768 / 1669×768)经 guest 的 frame→bounds 浮点换算后会带尾差(768.00006),精确相等会把
+        // 真正的全屏层判成"不是全屏" → 每帧掉进慢合成路径(整屏像素来回拷,铺屏模式下 iOS 上还是黑屏)。
+        // 4:3 的 1024/768 全是整数所以从没暴露。
         // [MoleWorld iOS] Accept a *rotated* fullscreen layer. A landscape cocos2d
         // game gives its CAEAGLLayer the swapped screen size (e.g. 1024x768 for a
         // 768x1024 portrait UIScreen) plus a 90° affine_transform. It is still the
@@ -87,14 +106,15 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // swapped size and don't require an identity transform here. Without this we
         // drop to the slow composition path, which never displays the frame = black
         // screen (the renderbuffer is confirmed non-black, full game content).
+        // [同步 2026-09-24] 这条"认旋转全屏层"(宽高互换、位置按互换中心、不要求恒等变换)只在 iOS 生效
+        // (见 ACCEPT_ROTATED_FULLSCREEN_LAYER);桌面/安卓仍按 main 的判定(容差比较 + 要求恒等变换)。
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
         let bsz = layer_host_obj.bounds.size;
         let ssz = screen_bounds.size;
-        // [MoleWorld iOS 宽屏] 尺寸/位置比较必须带容差:--fill-screen 算出的逻辑屏 1669×768 经 guest 的
-        // frame→bounds 浮点换算后是 1669×768.00006(4:3 的 1024/768 全是整数所以从没暴露),精确相等会把
-        // 真正的全屏层判成"不是全屏" → 100% 帧掉进慢合成路径(每帧整屏 5MB 重传,且铺屏模式下画出来是黑的)。
-        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
         let size_ok = (near(bsz.width, ssz.width) && near(bsz.height, ssz.height))
-            || (near(bsz.width, ssz.height) && near(bsz.height, ssz.width));
+            || (ACCEPT_ROTATED_FULLSCREEN_LAYER
+                && near(bsz.width, ssz.height)
+                && near(bsz.height, ssz.width));
         // [MoleWorld iOS · 性能] 位置检查也要接受"旋转后的全屏层":上面已按"宽高互换"放行了横屏
         // 1024×768 的层,但它的 position 是自己坐标系的中心 (512,384),而不是竖屏 UIScreen 的中心
         // (384,512)。真机实测村里 12.5% 的帧([PRESENT] SLOW 45×64)就是在这里被判 nil 掉进慢路径
@@ -104,12 +124,20 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         let center = CGPoint { x: ssz.width / 2.0, y: ssz.height / 2.0 };
         let center_swapped = CGPoint { x: ssz.height / 2.0, y: ssz.width / 2.0 };
         let pos_ok = (near(pos.x, center.x) && near(pos.y, center.y))
-            || (near(pos.x, center_swapped.x) && near(pos.y, center_swapped.y));
+            || (ACCEPT_ROTATED_FULLSCREEN_LAYER
+                && near(pos.x, center_swapped.x)
+                && near(pos.y, center_swapped.y));
         let origin = layer_host_obj.bounds.origin;
+        // 桌面/安卓保留上游的恒等变换要求(main 行为不变);iOS 放行 90° 旋转的横屏层。
+        // TODO: support affine transforms that result in a full-screen
+        //       layer (typical example is 90° rotation).
+        let transform_ok =
+            ACCEPT_ROTATED_FULLSCREEN_LAYER || layer_host_obj.affine_transform.is_identity();
         if !size_ok
             || !(near(origin.x, 0.0) && near(origin.y, 0.0))
             || layer_host_obj.anchor_point != (CGPoint { x: 0.5, y: 0.5 })
             || !pos_ok
+            || !transform_ok
             || layer_host_obj.hidden
             || layer_host_obj.opacity != 1.0
         {
@@ -117,6 +145,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             // 慢合成路径(无 JIT 解释器上慢到 ~2-5fps = 假死)。这里打印【到底是哪个 layer、因为什么条件】
             // 把快路径判没了,一次定位真正盖住全屏的那个 UIKit 层(HUD?广告 WebView?尺寸/透明度不符?)。
             // 节流打印,避免刷屏。
+            // [同步 2026-09-24] 只在 iOS 打(真机排查探针);桌面 main 没有这行日志,不刷屏。
+            #[cfg(target_os = "ios")]
             {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static NIL_N: AtomicU64 = AtomicU64::new(0);
@@ -155,10 +185,13 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         // 响应者),从而仍能识别底下的全屏 CAEAGLLayer、留在快路径。
         // 取舍:被跳过的小浮层这一帧不参与合成(不显示)。但【正在输入的输入框不会被跳过】——
         // 用户点进改名框时它是第一响应者/editing=true,照常走合成显示,打字所见即所得不受影响。
+        // [同步 2026-09-24] 只在 iOS 跳过(SKIP_UNFOCUSED_SMALL_OVERLAYS);非 iOS 恒不跳过 = 取最后一个
+        // 子层,与 main 的 `sublayers.last()` 完全等价。
         let subs: Vec<id> = layer_host_obj.sublayers.clone();
         let mut next_layer: Option<id> = None;
         for &cand in subs.iter().rev() {
-            if overlay_is_ignorable(env, cand, screen_bounds.size) {
+            if SKIP_UNFOCUSED_SMALL_OVERLAYS && overlay_is_ignorable(env, cand, screen_bounds.size)
+            {
                 continue;
             }
             next_layer = Some(cand);
@@ -173,24 +206,28 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
 
     // [MoleWorld iOS · 诊断] 同上:另两条判 nil 的出口也打印,区分"顶层不透明度不符"与"顶层压根不是 CAEAGLLayer
     // (=被某个 UIKit 覆盖层顶掉)"。后者正是好友村跌慢路径最可能的形态。
+    // [同步 2026-09-24] 判定本身(不透明 + 是 CAEAGLLayer)全平台照旧;只有日志门控到 iOS。
     {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TAIL_N: AtomicU64 = AtomicU64::new(0);
         let opaque = env.objc.borrow::<CALayerHostObject>(layer).opaque;
         let ca_eagl_layer_class: Class = msg_class![env; CAEAGLLayer class];
         let is_eagl: bool = msg![env; layer isKindOfClass:ca_eagl_layer_class];
         if !opaque || !is_eagl {
-            let n = TAIL_N.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n % 256 == 0 {
-                let cls = env
-                    .objc
-                    .try_get_class_name(layer)
-                    .unwrap_or("?")
-                    .to_string();
-                echo!(
-                    "[FSLAYER-NIL] n={} (尾判) 顶层layer类={} opaque={} isCAEAGLLayer={}",
-                    n, cls, opaque, is_eagl
-                );
+            #[cfg(target_os = "ios")]
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static TAIL_N: AtomicU64 = AtomicU64::new(0);
+                let n = TAIL_N.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n % 256 == 0 {
+                    let cls = env
+                        .objc
+                        .try_get_class_name(layer)
+                        .unwrap_or("?")
+                        .to_string();
+                    echo!(
+                        "[FSLAYER-NIL] n={} (尾判) 顶层layer类={} opaque={} isCAEAGLLayer={}",
+                        n, cls, opaque, is_eagl
+                    );
+                }
             }
             return nil;
         }

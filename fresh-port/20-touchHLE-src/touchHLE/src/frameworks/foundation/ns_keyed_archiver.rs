@@ -365,8 +365,18 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
                 .replace(new_uid);
             let class: id = msg![env; object class];
             // TODO: it seems that NSString class itself is _not_ encoded??
+            // [审查修 2026-09-13] 只对不可变串跳过 $class(它会被 -[NSString encodeWithCoder:]
+            // 整条替换成裸 plist 字符串,与 Apple 一致)。根因:原来对所有 NSString 子类都跳过,
+            // 可变串也被存成裸串,解档后变成不可变 _touchHLE_NSString,再发 appendString:/setString:
+            // 就落空。现在可变串照常写 $class(按类链跳过 _touchHLE 前缀后 = NSMutableString),
+            // 由 encodeWithCoder: 往本条字典补 NS.string,形态同 Apple 的 {$class: NSMutableString, NS.string}。
+            // 注意:这里的可变判断必须与 ns_string.rs 里 -[NSString encodeWithCoder:] 的判断一致,
+            // 否则会产出"有 NS.string 没 $class"的字典,解档时 dict["$class"] 直接 panic。
             let str_class = env.objc.get_known_class("NSString", &mut env.mem);
-            if !env.objc.class_is_subclass_of(class, str_class) {
+            let mutable_str_class = env.objc.get_known_class("NSMutableString", &mut env.mem);
+            let is_immutable_string = env.objc.class_is_subclass_of(class, str_class)
+                && !env.objc.class_is_subclass_of(class, mutable_str_class);
+            if !is_immutable_string {
                 encode_object_for_key(env, archiver, class, "$class".into());
             }
             () = msg![env; object encodeWithCoder:archiver];

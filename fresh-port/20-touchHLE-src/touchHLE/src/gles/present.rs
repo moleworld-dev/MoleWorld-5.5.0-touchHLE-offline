@@ -158,6 +158,9 @@ pub unsafe fn present_frame(
     }
 
     gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+    // [扫描修 2026-09-15] 这里曾有 iOS 专属「三角定位诊断角块」(左上品红实心 + 右上采样纹理中心),
+    // 是黑屏排查的临时脚手架,每帧叠画在真机屏幕上,已删除,勿复活。上方的纹理单元锁 TEXTURE0、
+    // texcoord 绕中心旋转,以及紧接着的 LoadIdentity 都是黑屏真修复,必须保留。
     // clean this up so we don't need to worry about it in e.g. Core Animation
     gles.LoadIdentity();
 

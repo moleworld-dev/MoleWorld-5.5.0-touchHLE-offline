@@ -278,7 +278,24 @@ pub fn read(
                 // need to set EOF
                 file.reached_eof = true;
             }
-            if bytes_read < buffer_slice.len() {
+            // [扫描修 2026-09-15] F8-8/F10-4:普通文件读到 0 字节 = 已到 EOF,是 libc 正常语义。
+            // -[ASprite initASpriteFile:]@0x20bb7c 用 `while(!feof(f)) fread(buf, size, 1, f)`:第一次
+            // fread 就读满整个文件,touchHLE 与真 libc 一样只在读到 0 字节时置 EOF,所以每个精灵文件都会
+            // 再读一次拿到 0 字节——一轮 74 行 "read only 0x0 bytes" 全是这种,数据完整无截断。
+            // 取舍:宿主文件/包内文件/资源文件读到 0 字节降为 log_dbg!;真正的短读(0 < 读到 < 请求,
+            // 例如包内压缩条目读一半)以及非普通文件读到 0 字节仍然 log! 告警,方便抓真问题。
+            let is_regular_file = matches!(
+                file.file,
+                GuestFile::File(_) | GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_)
+            );
+            if bytes_read == 0 && size != 0 && is_regular_file {
+                log_dbg!(
+                    "read({:?}, {:?}, {:#x}) => 0 (EOF)",
+                    fd,
+                    buffer,
+                    size,
+                );
+            } else if bytes_read < buffer_slice.len() {
                 log!(
                     "Warning: read({:?}, {:?}, {:#x}) read only {:#x} bytes",
                     fd,

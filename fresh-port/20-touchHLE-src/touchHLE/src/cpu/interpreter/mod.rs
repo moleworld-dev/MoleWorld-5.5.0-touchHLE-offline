@@ -28,6 +28,28 @@ const CPSR_THUMB: u32 = 0x0000_0020;
 const CPSR_USER_MODE: u32 = 0x0000_0010;
 const PC: usize = 15;
 
+/// [扫描修 2026-09-15] 解释器逐指令诊断记账开关(编译期常量)。
+///
+/// 根因:原来的 [P1 debug] 记账(指令计数、HEARTBEAT、上一条 pc/insn、64 项环形 trace、
+/// 跳进零字的 DERAIL 判定)无条件跑在解释器最热的循环里,每条指令都要付这笔开销。
+/// 取舍:
+///  - iOS 发行包是 release 构建,只用 debug_assertions 门控的话,设备排查时也拿不到
+///    DERAIL 现场;所以另设编译期环境变量开关,排查时这样重编即可开启:
+///    `MOLE_INTERP_TRACE=1 cargo build --release --target aarch64-apple-ios ...`
+///  - debug 构建(debug_assertions)默认开启,与改动前的行为一致。
+///  - `option_env!` 在编译期读取,rustc 会把这个环境变量记进依赖信息,改了它会触发重编。
+///  - 关闭时 `if INTERP_TRACE { … }` 整块在编译期被消除;INTERP-UNIMPL 的 Error 返回、
+///    PC 落进高地址栈区的兜底停机都不受这个开关影响。
+///  - [iOS⇄main 合并 2026-09-24] iOS 分支(8b75bed)独立做过同一件事,用的是 cargo feature
+///    `interp_debug`(`--features static,cpu_interpreter,interp_debug`);两种开法都保留,任一开启即生效。
+const INTERP_TRACE: bool = cfg!(any(feature = "interp_debug", debug_assertions))
+    || option_env!("MOLE_INTERP_TRACE").is_some();
+
+/// [iOS⇄main 合并 2026-09-24] 轻量心跳 / 卡死探针开关(iOS 分支的 `interp_hb` feature):
+/// 只 +1 计数 +1 分支(~1.05x),不写 trace 环、不做 DERAIL 检测。记账全开(INTERP_TRACE)时一并开启,
+/// 与 iOS 侧原来 `#[cfg(any(interp_debug, interp_hb, debug_assertions))]` 的范围一致。
+const INTERP_HB: bool = INTERP_TRACE || cfg!(feature = "interp_hb");
+
 /// CPU context for guest thread switches. Layout is the interpreter's own (only
 /// the interpreter reads it); when the dynarmic backend is also compiled (P1
 /// differential harness) this must be made bit-compatible with that backend's
@@ -523,6 +545,13 @@ impl InterpreterCpu {
 
     /// [P1 debug] dump the recent-instruction ring buffer (oldest → newest).
     pub fn dump_trace(&self) {
+        // [扫描修 2026-09-15] 记账关闭(release 默认)时环形缓冲一直是空的,打印空列表会误导人。
+        // 改成提示怎么开启。调用方(INTERP-UNIMPL、[OBJC-BADRECV]、[STACK-CHK-FAIL] 这些崩溃
+        // 现场)照常调用,不受影响。
+        if !INTERP_TRACE {
+            echo!("[TRACE] 解释器指令 trace 未启用(release 构建需带编译期环境变量 MOLE_INTERP_TRACE=1 或 --features interp_debug 重编)");
+            return;
+        }
         echo!("[TRACE] last {} executed insns (old → new):", self.trace.len());
         for i in 0..self.trace.len() {
             let (p, ins) = self.trace[(self.trace_pos + i) % self.trace.len()];
@@ -694,8 +723,9 @@ impl InterpreterCpu {
         // 心跳的 pc 会聚在一个小范围=循环体,配 lr 可定位到具体函数。只 +1 计数 +1 分支,
         // ~1.05x(对比 interp_debug 的 ~40x,因为不写 trace 环、不做 DERAIL 检测)。
         // 用 `--features interp_hb` 单开抓卡死,不拖慢正常 release。
-        #[cfg(any(feature = "interp_debug", feature = "interp_hb", debug_assertions))]
-        {
+        // [iOS⇄main 合并 2026-09-24] 原 #[cfg(any(interp_debug, interp_hb, debug_assertions))] 改为编译期
+        // 常量 INTERP_HB(见文件顶部),以便 main 的 MOLE_INTERP_TRACE 环境变量开关也能打开;关闭时整块编译期消除。
+        if INTERP_HB {
             self.dbg_n = self.dbg_n.wrapping_add(1);
             // [hang debug] 影子调用栈 = 穿透 objc 跳板还原 guest 真实调用链。
             // 思路:每条指令跨步比对——若【上一条】把 LR 设成了"自己之后"(ppc+2/+4)且现在 pc 跳走了,
@@ -858,8 +888,9 @@ impl InterpreterCpu {
 
         // [P1 debug] log first few instructions, and any jump into the stack
         // region (control-flow bug) together with the PREVIOUS instruction.
-        #[cfg(any(feature = "interp_debug", debug_assertions))]
-        {
+        // [扫描修 2026-09-15] 整块逐指令记账改由 INTERP_TRACE 门控(说明见文件顶部常量),关闭时
+        // 编译期消除。块内逻辑一字未改;下面 else 分支保留 PC 落进高地址栈区的兜底停机。
+        if INTERP_TRACE {
             let lpc = self.dbg_last_pc;
             let linsn = self.dbg_last_insn;
             self.dbg_last_pc = pc;
@@ -893,6 +924,17 @@ impl InterpreterCpu {
                 self.regs[PC] = pc;
                 return CpuState::Error(CpuError::UndefinedInstruction);
             }
+        } else if pc >= 0xe000_0000 {
+            // [扫描修 2026-09-15] 不开记账时,仍保留这条几乎零成本的高地址兜底:PC 落进栈区
+            // (>= 0xe000_0000,这里没有代码映射)必然是返回地址或函数指针被破坏,立即停机报错,
+            // 与改动前一致,避免把栈数据当指令接着执行、把现场越跑越乱。零字 DERAIL 判定依赖
+            // 上一条指令记账,只在 INTERP_TRACE 开启时生效(真实 CPU 会把零字当 andeq/movs 执行)。
+            echo!(
+                "[DERAIL] pc={:#010x} insn={:#x} sp={:#x} lr={:#x} r7={:#x}(未开 INTERP_TRACE,无上一条指令现场)",
+                pc, insn, self.regs[13], self.regs[14], self.regs[7]
+            );
+            self.regs[PC] = pc;
+            return CpuState::Error(CpuError::UndefinedInstruction);
         }
 
         // ---- P1 Group 4: Thumb IT-block ----

@@ -37,6 +37,10 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// [深扫修 2026-09-11] 原子写([Fs::write_atomic])在宿主同目录使用的隐藏临时文件后缀。
+/// 完整文件名形如 `.<目标文件名>.touchhle-tmp`。
+const ATOMIC_WRITE_TMP_SUFFIX: &str = ".touchhle-tmp";
+
 /// The actual location of a file outside the virtual filesystem, e.g. a host
 /// file path.
 #[derive(Debug)]
@@ -97,6 +101,26 @@ impl FsNode {
             } else {
                 kind
             };
+
+            // [深扫修 2026-09-11] 清理原子写残留的隐藏临时文件(见 [Fs::write_atomic])。
+            // 根因:进程若恰好死在"写临时文件"与"rename 覆盖"之间,宿主目录会留下
+            // `.<名>.touchhle-tmp`;不清理的话下次启动它会作为普通文件出现在 guest 的
+            // Documents 视图里(游戏枚举目录时能看到)。目标文件本身此时仍是完整旧版,
+            // 所以直接删掉残留即可,不影响任何存档。只对可写的沙盒目录做,bundle 不碰。
+            if writeable && kind.is_file() && name.ends_with(ATOMIC_WRITE_TMP_SUFFIX) {
+                match std::fs::remove_file(&host_path) {
+                    Ok(()) => {
+                        log!(
+                            "[fs] 启动时清理原子写残留临时文件 {:?}(上次写盘被打断,目标文件仍是完整旧版)",
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!("[fs] 无法清理原子写残留临时文件 {:?}: {}", host_path, e);
+                    }
+                }
+                continue;
+            }
 
             if kind.is_file() {
                 children.insert(
@@ -584,13 +608,17 @@ impl Fs {
             // Special case: Some apps may create save files at
             // Library/Preferences at the start, thus presence of that
             // directory is expected
-            let path = paths::user_data_base_path()
-                .join(paths::SANDBOX_DIR)
-                .join(bundle_id)
-                .join("Library")
-                .join("Preferences");
-            if let Err(e) = std::fs::create_dir_all(&path) {
-                panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
+            // [MoleWorld 2026-09-16] 真机应用容器里 Library/Caches 同样开箱就有:游戏内置的 TalkingData 等 SDK
+            // 直接往 Library/Caches/.talkingdata_ga_* 原子写文件、不先建目录,少了它每次都报 DoesNotExist。
+            for sub in ["Preferences", "Caches"] {
+                let path = paths::user_data_base_path()
+                    .join(paths::SANDBOX_DIR)
+                    .join(bundle_id)
+                    .join("Library")
+                    .join(sub);
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
+                }
             }
         }
 
@@ -945,6 +973,155 @@ impl Fs {
             .map_err(FsError::IoError)
     }
 
+    /// [深扫修 2026-09-11] 原子写:`writeToFile:atomically:YES` /
+    /// `writeToFile:options:NSDataWritingAtomic` 的真实语义。
+    ///
+    /// 根因:原来所有写盘都走 [Self::write] = `O_TRUNC` 打开后 `write_all`,
+    /// "先截断再写"。进程恰好死在截断与写入之间(关终端 SIGHUP、强退、断电、
+    /// 磁盘满)会留下 0 字节/残缺文件。摩尔庄园读到残缺的 userinfo.dat 会在
+    /// checkUserinfoMd5: 崩溃或走反作弊删档分支(连 map.dat 一起删),map.dat
+    /// 残缺会 resetUserGameData 整档清空;偏好 plist 残缺会让 isEncrypt 读成 NO
+    /// 而每次启动 exit(0)。真机 iOS 靠 NSDataWritingAtomic 天然防住,这是移植层退化。
+    ///
+    /// 做法:解析出目标的宿主真实路径 → 在宿主同目录写隐藏临时文件
+    /// `.<名>.touchhle-tmp` → `std::fs::rename` 覆盖目标。同卷 rename 在
+    /// macOS/Linux/Android/iOS 上是原子的,Windows 上是 MoveFileExW
+    /// (REPLACE_EXISTING),读者只会看到完整旧版或完整新版。
+    /// - 目标 guest 节点不存在时补建(与 [Self::open_with_options] 创建新文件一致)。
+    /// - 刻意不复用 [Self::rename]:那样临时文件会短暂出现在 guest 目录视图里,临时文件
+    ///   只应存在于宿主侧。([复核修 2026-09-16] 原先另一条理由"rename 内部有 `assert!`/
+    ///   `unimplemented!`"已随 FS-01 失效,rename 现在所有失败都返回 Err。)
+    /// - 刻意不调 `sync_all`:Apple 平台上它是 F_FULLFSYNC,每次几十毫秒且跑在模拟
+    ///   线程上,岛上节拍落盘一次写 6 个文件会明显卡顿;防进程被杀 rename 已足够。
+    ///   残余风险:断电/内核崩溃时未落盘的新数据可能丢失(但一般仍是完整旧版)。
+    /// - rename 失败(例如 Windows 上目标正被打开)时回落到旧的非原子写,保证不比
+    ///   修复前更差。启动时残留临时文件由 [FsNode::from_host_dir] 清理。
+    pub fn write_atomic<P: AsRef<GuestPath>>(
+        &mut self,
+        path: P,
+        data: &[u8],
+    ) -> Result<(), FsError> {
+        let path = path.as_ref();
+
+        let (parent_node, file_name) = self
+            .lookup_parent_node(path)
+            .ok_or(FsError::DoesNotExist)?;
+        let FsNode::Directory {
+            children,
+            writeable: dir_host_path,
+        } = parent_node
+        else {
+            return Err(FsError::NonexistentParentDir);
+        };
+
+        // 解析目标的宿主路径;记下是否需要补建 guest 节点。
+        let (target_host_path, need_new_node): (PathBuf, bool) = match children.get(&file_name) {
+            Some(FsNode::File {
+                location,
+                writeable,
+            }) => {
+                if !*writeable {
+                    log!("Warning: attempt to write to read-only file {:?}", path);
+                    return Err(FsError::AccessDenied);
+                }
+                match location {
+                    FileLocation::Path(host_path) => (host_path.clone(), false),
+                    FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => {
+                        log!("Warning: attempt to write to read-only file {:?}", path);
+                        return Err(FsError::AccessDenied);
+                    }
+                }
+            }
+            Some(FsNode::Directory { .. }) => return Err(FsError::IsDirectory),
+            None => {
+                let Some(dir_host_path) = dir_host_path else {
+                    log!(
+                        "Warning: attempt to create file at path {:?}, but directory is read-only",
+                        path
+                    );
+                    return Err(FsError::AccessDenied);
+                };
+                if file_name.chars().any(std::path::is_separator) {
+                    log!(
+                        "Warning: attempt to create file at path {:?}, but filename contains a path separator",
+                        path
+                    );
+                    return Err(FsError::AccessDenied);
+                }
+                (dir_host_path.join(&file_name), true)
+            }
+        };
+
+        let tmp_host_path =
+            target_host_path.with_file_name(format!(".{}{}", file_name, ATOMIC_WRITE_TMP_SUFFIX));
+
+        // 1) 写临时文件(create+truncate 的是临时文件,目标完全不动)。
+        let tmp_result = (|| -> std::io::Result<()> {
+            let mut tmp = File::create(&tmp_host_path)?;
+            tmp.write_all(data)?;
+            tmp.flush()?;
+            Ok(())
+        })();
+
+        let final_result = match tmp_result {
+            Ok(()) => {
+                // 2) 同目录 rename 覆盖目标 = 原子替换。
+                match fs::rename(&tmp_host_path, &target_host_path) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // [2026-09-16 黄金岛审查修] rename 失败**不再**回落成「File::create 截断目标再写」。
+                        // 原因:rename 失败时目标还是完好的旧版本,而截断重写一旦中途再失败(磁盘满、被
+                        // 杀进程),好档就变成 0 字节或半截 —— 这正是 write_atomic 要防的事,回落把它亲手
+                        // 做了一遍。同目录 rename 在正常情况下不会失败(跨设备不可能),真失败了说明环境
+                        // 已经异常,此时「保住旧档 + 报错」永远优于「赌一把重写」。
+                        // 调用方(save_island_*、GameData 存档等)看到 Err 会记日志并跳过本次落盘,
+                        // 下一个节拍会再试,不丢数据。
+                        log!(
+                            "[fs] 原子写 rename {:?} -> {:?} 失败({}),目标保持原样未改动(不回落截断重写)",
+                            tmp_host_path,
+                            target_host_path,
+                            e
+                        );
+                        let _ = fs::remove_file(&tmp_host_path);
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                // 临时文件都写不出来(磁盘满等):目标保持完整旧版,返回失败。
+                log!(
+                    "[fs] 原子写临时文件 {:?} 失败({}),目标 {:?} 保持原样未改动",
+                    tmp_host_path,
+                    e,
+                    target_host_path
+                );
+                let _ = fs::remove_file(&tmp_host_path);
+                Err(e)
+            }
+        };
+
+        if let Err(e) = final_result {
+            return Err(FsError::IoError(e));
+        }
+
+        // 3) 目标原本不存在:补建 guest 节点,之后 open/exists 才能看到它。
+        if need_new_node {
+            log_dbg!(
+                "Created file at path {:?} (host path: {:?}) via atomic write",
+                path,
+                target_host_path
+            );
+            children.insert(
+                file_name,
+                FsNode::File {
+                    location: FileLocation::Path(target_host_path),
+                    writeable: true,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Like [File::open] but for the guest filesystem.
     #[allow(dead_code)]
     pub fn open<P: AsRef<GuestPath>>(&self, path: P) -> Result<GuestFile, ()> {
@@ -967,54 +1144,155 @@ impl Fs {
         }
     }
 
+    /// [扫描修 2026-09-16] FS-01:所有失败都返回 `Err`,不再 panic,失败时 guest 目录树不留痕迹。
+    ///
+    /// 原实现有三处崩溃点:源文件只读 `assert!`、源是目录 `unimplemented!`、目标已存在但只读
+    /// `assert!`;目标不存在时还会先经 [Self::open_with_options] 建一个空文件占位,宿主建文件失败
+    /// 走 handle_open_err 直接 panic,宿主 rename 失败则把这个 0 字节占位文件留在目标路径上。
+    /// 原版 -[ASIHTTPRequest handleStreamComplete]@0x2ac86e 等 9 处经 NSFileManager
+    /// moveItemAtPath:toPath:error: 走到这里,它们判断失败看的是 NSError 而不是返回值,残留的空文件
+    /// 会被下载缓存当成已下载的内容读回去。
+    ///
+    /// 现在照 [Self::write_atomic] 的做法:目标不在 guest 树里时直接算出宿主路径,宿主 rename 成功后
+    /// 才摘源节点、补目标节点;任何一步失败都原样返回错误,guest 树不动。成功路径的最终状态和原实现
+    /// 一致(源节点摘掉,目标节点指向目标宿主路径,writeable)。
     pub fn rename<P: AsRef<GuestPath> + Copy>(&mut self, from: P, to: P) -> Result<(), FsError> {
-        let from_node = self
-            .lookup_node(from.as_ref())
-            .ok_or(FsError::DoesNotExist)?;
-        let from_host_path = match from_node {
-            FsNode::File {
-                location: from_location,
-                writeable: from_writeable,
-            } => {
-                let FileLocation::Path(from_host_path) = from_location else {
+        // [复核修 2026-09-16] FS-01 返修:源节点改用不带宽屏重定向的 lookup_node_inner 解析。
+        // lookup_node 在宽屏模式下会把 `X.png` 透明换成同目录的 `X_wide.png`,而下面摘源节点用的
+        // lookup_parent_node 没有这层重定向:宿主上搬走的是 X_wide.png,guest 树里摘掉的却是 X.png,
+        // 两个节点都失效,之后再打开会在 handle_open_err 里 panic。移动属于写操作,必须操作精确路径;
+        // 4:3 默认下两者本来就等价,行为不变。放在单独块里,让对 self 的不可变借用在块尾明确结束。
+        let from_host_path = {
+            let from_components = resolve_path(from.as_ref(), Some(&self.working_directory));
+            let from_node = self
+                .lookup_node_inner(&from_components)
+                .ok_or(FsError::DoesNotExist)?;
+            match from_node {
+                FsNode::File {
+                    location: from_location,
+                    writeable: from_writeable,
+                } => {
+                    let FileLocation::Path(from_host_path) = from_location else {
+                        return Err(FsError::IsDirectory);
+                    };
+                    if !*from_writeable {
+                        log!(
+                            "[fs] 移动 {:?} 失败:源文件只读(应用包内文件)",
+                            from.as_ref()
+                        );
+                        return Err(FsError::AccessDenied);
+                    }
+                    // TODO: avoid copy?
+                    from_host_path.clone()
+                }
+                FsNode::Directory { .. } => {
+                    // 游戏里 9 处 moveItemAtPath: 调用都只移动下载临时文件,没有移动目录的需求;
+                    // 真要支持需要连同子树里每个节点的宿主路径一起改,先按失败返回。
+                    log!(
+                        "[fs] 移动 {:?} 失败:暂不支持移动目录,返回错误",
+                        from.as_ref()
+                    );
                     return Err(FsError::IsDirectory);
-                };
-                assert!(from_writeable); // TODO: return errno
-                                         // TODO: avoid copy?
-                from_host_path.clone()
+                }
             }
-            _ => unimplemented!(),
         };
 
-        if self.lookup_node(to.as_ref()).is_none() {
-            // In case target guest node do not exist, we need to create one
-            let mut options = GuestOpenOptions::new();
-            options.write().create().truncate();
-            self.open_with_options(to, options)?;
-        }
-
-        let to_node = self.lookup_node(to.as_ref()).unwrap();
-        let FsNode::File {
-            location: to_location,
-            writeable: to_writeable,
-        } = to_node
-        else {
-            return Err(FsError::IsDirectory);
-        };
-        let FileLocation::Path(to_host_path) = to_location else {
-            return Err(FsError::AccessDenied);
-        };
-        assert!(to_writeable); // TODO: return errno
-        let res = fs::rename(from_host_path, to_host_path);
-        if res.is_ok() {
-            // Remove reference to the old from node
-            let (parent_from, component) = self.lookup_parent_node(from.as_ref()).unwrap();
-            let FsNode::Directory { children, .. } = parent_from else {
-                panic!()
+        // 目标的宿主路径;need_new_node = guest 树里还没有目标节点,宿主 rename 成功后要补建。
+        // 不再先建空文件占位(见函数说明)。
+        let (to_host_path, need_new_node): (PathBuf, bool) = {
+            let (parent_node, file_name) = self
+                .lookup_parent_node(to.as_ref())
+                .ok_or(FsError::DoesNotExist)?;
+            let FsNode::Directory {
+                children,
+                writeable: dir_host_path,
+            } = parent_node
+            else {
+                return Err(FsError::NonexistentParentDir);
             };
-            children.remove(&component).unwrap();
+            match children.get(&file_name) {
+                Some(FsNode::File {
+                    location,
+                    writeable,
+                }) => {
+                    if !*writeable {
+                        log!(
+                            "[fs] 移动到 {:?} 失败:目标文件只读(应用包内文件)",
+                            to.as_ref()
+                        );
+                        return Err(FsError::AccessDenied);
+                    }
+                    match location {
+                        FileLocation::Path(host_path) => (host_path.clone(), false),
+                        FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => {
+                            log!(
+                                "[fs] 移动到 {:?} 失败:目标文件只读(应用包内文件)",
+                                to.as_ref()
+                            );
+                            return Err(FsError::AccessDenied);
+                        }
+                    }
+                }
+                Some(FsNode::Directory { .. }) => return Err(FsError::IsDirectory),
+                None => {
+                    let Some(dir_host_path) = dir_host_path else {
+                        log!(
+                            "[fs] 移动到 {:?} 失败:目标所在目录只读",
+                            to.as_ref()
+                        );
+                        return Err(FsError::AccessDenied);
+                    };
+                    if file_name.chars().any(std::path::is_separator) {
+                        log!(
+                            "[fs] 移动到 {:?} 失败:文件名里含路径分隔符",
+                            to.as_ref()
+                        );
+                        return Err(FsError::AccessDenied);
+                    }
+                    (dir_host_path.join(&file_name), true)
+                }
+            }
+        };
+
+        // rename(2) 语义:源和目标是同一个文件时什么都不做、直接成功。原实现在这种情况下宿主 rename
+        // 成功后会把源节点(也就是目标节点)从 guest 树里摘掉,文件在 guest 视图里凭空消失。
+        if from_host_path == to_host_path {
+            return Ok(());
         }
-        res.map_err(FsError::IoError)
+
+        if let Err(e) = fs::rename(&from_host_path, &to_host_path) {
+            log!(
+                "[fs] 移动 {:?} -> {:?} 失败:宿主 {:?} -> {:?} 报错 {},guest 目录树未改动",
+                from.as_ref(),
+                to.as_ref(),
+                from_host_path,
+                to_host_path,
+                e
+            );
+            return Err(FsError::IoError(e));
+        }
+
+        // 宿主已移动成功:摘掉源节点。源节点刚查到过,它的父目录一定在;这里仍用 if let 兜底不 panic。
+        if let Some((FsNode::Directory { children, .. }, component)) =
+            self.lookup_parent_node(from.as_ref())
+        {
+            children.remove(&component);
+        }
+        // 目标原本不在 guest 树里:补建节点,之后 open/exists 才能看到它(与 write_atomic 一致)。
+        if need_new_node {
+            if let Some((FsNode::Directory { children, .. }, file_name)) =
+                self.lookup_parent_node(to.as_ref())
+            {
+                children.insert(
+                    file_name,
+                    FsNode::File {
+                        location: FileLocation::Path(to_host_path),
+                        writeable: true,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Like [File::options] but for the guest filesystem.
@@ -1188,12 +1466,37 @@ impl Fs {
                     FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => panic!(),
                 };
 
-                handle_open_err(std::fs::remove_file(host_path), host_path);
-                log_dbg!(
-                    "Deleted file at path {:?} (host path: {:?})",
-                    path,
-                    host_path
-                );
+                // [扫描修 2026-09-16] F2-02:宿主删除失败不再经 handle_open_err 直接 panic。
+                // guest 目录树只在启动时建一次,运行中宿主文件被外部删掉(玩家手删存档)后 guest 节点还在;
+                // 原版 -[GameData resetUserGameData]、-[WrapperManager deleteFile:] 都是先 fileExistsAtPath:
+                // 判 YES 再删,宿主于是回 NotFound。调用方要的"文件不在了"已经成立,只是 guest 视图过期,
+                // 所以按成功处理并同步摘掉节点。其余失败(无权限、被占用)返回 IoError 且保留节点,
+                // 由 unlink/remove 回 -1、NSFileManager 回 NO,和真机删不掉文件时一致。
+                match std::fs::remove_file(host_path) {
+                    Ok(()) => {
+                        log_dbg!(
+                            "Deleted file at path {:?} (host path: {:?})",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        log!(
+                            "[fs] 删除 {:?} 时宿主文件 {:?} 已不存在(运行中被外部删除),同步移除 guest 节点",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!(
+                            "[fs] 删除 {:?} 失败:宿主文件 {:?} 报错 {},保留 guest 节点",
+                            path,
+                            host_path,
+                            e
+                        );
+                        return Err(FsError::IoError(e));
+                    }
+                }
             }
             FsNode::Directory {
                 children,
@@ -1209,12 +1512,33 @@ impl Fs {
                     return Err(FsError::AccessDenied);
                 };
 
-                handle_open_err(std::fs::remove_dir(host_path), host_path);
-                log_dbg!(
-                    "Deleted directory at path {:?} (host path: {:?})",
-                    path,
-                    host_path
-                );
+                // [扫描修 2026-09-16] F2-02:同上。宿主目录已不存在 → 同步摘掉 guest 节点;其余失败
+                // (无权限,或宿主目录里有启动后才出现、guest 看不到的文件)返回 IoError 且保留节点。
+                match std::fs::remove_dir(host_path) {
+                    Ok(()) => {
+                        log_dbg!(
+                            "Deleted directory at path {:?} (host path: {:?})",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        log!(
+                            "[fs] 删除目录 {:?} 时宿主目录 {:?} 已不存在(运行中被外部删除),同步移除 guest 节点",
+                            path,
+                            host_path
+                        );
+                    }
+                    Err(e) => {
+                        log!(
+                            "[fs] 删除目录 {:?} 失败:宿主目录 {:?} 报错 {},保留 guest 节点",
+                            path,
+                            host_path,
+                            e
+                        );
+                        return Err(FsError::IoError(e));
+                    }
+                }
             }
         }
 
@@ -1276,7 +1600,83 @@ impl Fs {
 
         let host_path = dir_host_path.join(&new_dir_name);
 
-        handle_open_err(std::fs::create_dir(&host_path), &host_path);
+        // [扫描修 2026-09-16] FS-03:宿主建目录失败不再经 handle_open_err 直接 panic,与 71601f6(F2-02)
+        // 删除失败的处理对称。原版 -[SDImageCache init]@0x51b7be、+[TMLocalFile createSubPath:subPath:]@0x5628fc
+        // 等 42 处经 NSFileManager createDirectoryAtPath:… 走到这里,宿主失败(目录无权限、磁盘满、运行中父目录
+        // 被外部删掉)时应当回 NO,而不是整个模拟器崩溃。错误尽量归到调用方已经会处理的变体上
+        // (libc mkdir 只认 AlreadyExist/NonexistentParentDir/ReadonlyParentDir,其余走 unimplemented!):
+        // - AlreadyExists:guest 目录树只在启动时建一次,宿主上的同名项是运行中被外部建出来的(例如 iOS 上
+        //   文件 App 往 Documents 里建文件夹)。按"guest 视图过期"处理:把宿主现状补进 guest 树,再返回
+        //   guest 树本来就会给出的 AlreadyExist(create_dir_all 视为已存在继续往下建,mkdir 回 EEXIST)。
+        //   补目录用启动建树同一个 [FsNode::from_host_dir],下次启动本来也会这样把它扫进来。
+        // - NotFound:宿主父目录运行中被外部删掉 → NonexistentParentDir(mkdir 回 ENOENT)。
+        // - PermissionDenied:宿主父目录不可写 → ReadonlyParentDir(mkdir 回 EACCES)。
+        // - 其余(磁盘满等)→ IoError。
+        // 除 AlreadyExists 补的是宿主上真实存在的项外,失败时都不插入 guest 节点。
+        match std::fs::create_dir(&host_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match std::fs::metadata(&host_path) {
+                    Ok(meta) if meta.is_dir() => {
+                        log!(
+                            "[fs] 创建目录 {:?} 时宿主目录 {:?} 已存在(运行中被外部创建),同步补进 guest 目录树",
+                            path,
+                            host_path
+                        );
+                        children.insert(new_dir_name, FsNode::from_host_dir(&host_path, true));
+                    }
+                    Ok(meta) if meta.is_file() => {
+                        log!(
+                            "[fs] 创建目录 {:?} 失败:宿主上已有同名文件 {:?}(运行中被外部创建),同步补进 guest 目录树",
+                            path,
+                            host_path
+                        );
+                        children.insert(
+                            new_dir_name,
+                            FsNode::File {
+                                location: FileLocation::Path(host_path),
+                                writeable: true,
+                            },
+                        );
+                    }
+                    _ => {
+                        log!(
+                            "[fs] 创建目录 {:?} 失败:宿主 {:?} 已存在但不是普通文件或目录,guest 目录树未改动",
+                            path,
+                            host_path
+                        );
+                    }
+                }
+                return Err(FsError::AlreadyExist);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log!(
+                    "[fs] 创建目录 {:?} 失败:宿主父目录已不存在(运行中被外部删除),宿主路径 {:?} 报错 {}",
+                    path,
+                    host_path,
+                    e
+                );
+                return Err(FsError::NonexistentParentDir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                log!(
+                    "[fs] 创建目录 {:?} 失败:宿主路径 {:?} 无权限({})",
+                    path,
+                    host_path,
+                    e
+                );
+                return Err(FsError::ReadonlyParentDir);
+            }
+            Err(e) => {
+                log!(
+                    "[fs] 创建目录 {:?} 失败:宿主路径 {:?} 报错 {}",
+                    path,
+                    host_path,
+                    e
+                );
+                return Err(FsError::IoError(e));
+            }
+        }
         log_dbg!(
             "Created directory at path {:?} (host path: {:?})",
             path,

@@ -24,8 +24,10 @@ use crate::Environment;
 
 pub mod ui_navigation_controller;
 
+// [扫描修 2026-09-15] F8-1:改为 pub(crate),让 ui_view/ui_table_view.rs 里的
+// UITableViewController 能把它嵌作 superclass(字段仍私有,只用 Default)。
 #[derive(Default)]
-struct UIViewControllerHostObject {
+pub(crate) struct UIViewControllerHostObject {
     /// The root view.
     /// `UIView*`
     view: id,
@@ -163,6 +165,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         view
     }
 }
+// [扫描修 2026-09-15] F8-1:iOS 3.0+ 的 isViewLoaded,不触发 loadView。
+- (bool)isViewLoaded {
+    env.objc.borrow::<UIViewControllerHostObject>(this).view != nil
+}
 
 // Usually overridden by the application
 - (())viewDidLoad {
@@ -277,6 +283,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// [扫描修 2026-09-15] F8-1:取已加载的根视图,未加载时返回 nil(不触发 loadView)。
+/// 供 UITableViewController dealloc 清理表格的 dataSource/delegate 弱引用。
+pub(crate) fn view_if_loaded(env: &Environment, view_controller: id) -> id {
+    env.objc
+        .borrow::<UIViewControllerHostObject>(view_controller)
+        .view
+}
 
 /// A helper function to resolve suitable NIB name for a `view_controller`
 /// in the `bundle`. Returns nil if fails.

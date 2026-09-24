@@ -57,6 +57,8 @@ impl HostObject for DictionaryHostObject {}
 /// 关键:它【不发任何 ObjC 消息】——因此可以安全地在 `mole_cheats::intercept` 的【放行路径】
 /// (return false)里调用。用 `msg![env; obj count]` 会执行 guest 代码、冲掉待派发调用的参数
 /// 寄存器(踩过:主村整屏纯绿),而这个函数只做一次 host 侧 downcast 读取。
+// 目前唯一调用方是 mole_cheats 里只在 iOS 编译的「返回主村空村」修复块,桌面构建会报未使用。
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 pub fn host_dict_count(env: &Environment, obj: id) -> Option<NSUInteger> {
     env.objc
         .get_host_object(obj)?
@@ -494,7 +496,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dictionaryWithObject:(id)object forKey:(id)key {
     assert_ne!(key, nil); // TODO: raise proper exception
 
-    let new_dict = dict_from_keys_and_objects(env, &[(key, object)]);
+    // [深扫修 2026-09-11] 根因:原实现直接调 dict_from_keys_and_objects,里面写死
+    // `NSDictionary alloc`,完全不看接收者;NSMutableDictionary 又没覆盖本方法,于是
+    // `[NSMutableDictionary dictionaryWithObject:forKey:]` 拿到的是不可变字典,之后的
+    // setObject:forKey: 全被 messages.rs 当成"不响应选择子"静默吞掉。
+    // 修法:与同类的 +dictionaryWithObjects:forKeys: 一致,走 `[[this alloc] initWithObjects:forKeys:]`,
+    // 让接收者类决定可变性(_touchHLE_NSDictionary / _touchHLE_NSMutableDictionary 都实现了该 init)。
+    // 临时数组用 from_vec 构造(要求元素已 retain),init 内部会自行 retain/copy,用完即 release。
+    retain(env, object);
+    let objects = ns_array::from_vec(env, vec![object]);
+    retain(env, key);
+    let keys = ns_array::from_vec(env, vec![key]);
+    let new_dict: id = msg![env; this alloc];
+    let new_dict: id = msg![env; new_dict initWithObjects:objects forKeys:keys];
+    release(env, objects);
+    release(env, keys);
     autorelease(env, new_dict)
 }
 

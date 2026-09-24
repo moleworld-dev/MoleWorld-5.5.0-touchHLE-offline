@@ -51,7 +51,11 @@ fn task_info(
     task_info_out: task_info_t,
     task_info_out_cnt: MutPtr<mach_msg_type_number_t>,
 ) -> kern_return_t {
-    log!(
+    // [扫描修 2026-09-15] F6-2:原版 -[CCDirector showFPS] 每 0.1 秒经 +[LogMemory LogMemUsage]
+    // (底层 C 函数 0x3dd898)调一次 task_info。FPS 悬浮层打开后这行 TODO 会每秒刷 10 行把真正的告警冲掉。
+    // 实现本身可用(写死 iPod 实测数值),只把这行降为 log_dbg!;要看就在 log::ENABLED_MODULES
+    // 加 "touchHLE::libc::libkern::task"。
+    log_dbg!(
         "TODO: task_info({:?}, {:?}, {:?}, {:?})",
         target_task,
         flavor,

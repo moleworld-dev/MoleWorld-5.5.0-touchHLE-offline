@@ -26,12 +26,145 @@ use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-/// [MoleWorld] 递归卫:`-[UserInfoData initWithCoder:]` 的离线贝壳还原拦截内部要再调用
-/// 一次真正的 `initWithCoder:`(让原方法把存档各字段解出来),那一次必须落到正常派发、
-/// 不能再被本拦截截走,否则无限递归。进入拦截前置 true,放行原方法后置回 false。
-static MOLE_IN_UID_INITCODER: AtomicBool = AtomicBool::new(false);
+/// [扫描修 2026-09-15] F10-5:兼容性兜底告警(does not respond / faked class / unimplemented class)
+/// 按 (类别, 类, 选择子) 去重:同一组合只在第一次返回 true(调用方 log!),之后返回 false(调用方走
+/// log_dbg!)。原来每次调用都 log!,同一个缺失方法反复刷屏,把真正有价值的告警冲掉。
+/// 只在这些冷路径上调用,不影响 objc_msgSend 热路径;键存 64 位哈希、不分配字符串,集合大小 =
+/// 缺失方法个数(几十个)。哈希碰撞的代价只是某条告警降为 log_dbg!,没有功能影响。
+fn first_compat_warning(kind: &str, class: &str, sel: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+        std::sync::Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (kind, class, sel).hash(&mut hasher);
+    let key = hasher.finish();
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get_or_insert_with(Default::default).insert(key)
+}
+
+/// [复核修 2026-09-15] R3-1:选择子跟踪([TRACE])限流。
+/// 根因:F7-12 的跟踪对每条命中消息同步 log! 一行(stderr + 写日志文件),mole_dev::trace_filter_matches
+/// 的注释写明「限流由调用方负责」,调用方就是 objc_msgSend_inner,但这里原来没做。被跟踪类每帧都会收到
+/// visit/transform/draw/update: 等消息,实测 touchHLE_log.txt 28392 行里 28252 行是 [TRACE],既冲掉真正的
+/// 告警,又在 objc_msgSend 热路径和 drawScene 帧栈上同步写文件拖慢帧率。
+/// 做法:按宿主单调时钟的整秒分窗,每窗最多打印 TRACE_LINES_PER_SEC 行,超出的只计数;进入新窗口后的第一条
+/// 命中消息先补一行上一窗口的丢弃数。只用原子变量,无锁、无分配(除首次初始化时钟基准外)。
+/// 只在「跟踪开启且规则命中」时才调用:跟踪关闭时 objc_msgSend 路径与原来一样,只有 trace_on() 那一次原子读。
+/// [复核修 2026-09-15] R3-1 返修①(稀有消息不再被整批丢掉):原先整秒额度全局共用,每帧重复的
+/// visit/transform/draw/sortAllChildren/tag 先把它用完——实测 touchHLE_log.txt 里相邻两条
+/// ActionCenterLayer visit 之间有 1905 处正好隔 11 行,即稳态每帧 11 行,60FPS 约 660 行/秒,约 0.3 秒就用完
+/// 200 条;点开活动中心时那批偶发消息(日志 792-846 行:NetworkManager isReachable/isConnected、setShowForecast:、
+/// displayUILayer、ActivityForecastLayer 初始化链)落在同一秒剩下的时间里就一行不打,而这正是排查「签到页
+/// isReachable/isConnected 漏放行 LR」要找的信息。现在「本秒内第一次出现的 (类, 选择子, 调用方 LR)」不占全局
+/// 额度、直接打印(另设 TRACE_FIRST_SEEN_PER_SEC 上限,防宽泛的 *片段 规则失控),重复出现的才占 200 条额度。
+/// 键里带 LR 而不只是 (类, 选择子):同一批里同一个选择子常从不同调用点发出(isOpen lr=0x1b877 / lr=0x59b81、
+/// init lr=0x2d2629 / lr=0x3ece79),各打一行正好是定位调用点要的;每帧消息的调用点是固定的几个,不会多出多少行。
+/// 不做去重,打印出来的每一行仍带 recv/lr。「本秒见过」集合是 TRACE_SEEN_WORDS 个 u64 组成的原子位图,开新窗口
+/// 时整体清零:不分配、不加锁、不读字符串内容。哈希碰撞只会让某个新组合被当成重复、改走全局额度(额度没用完
+/// 照样打印),不会反过来让重复消息绕过额度——每个位每秒最多放行一次,没有两组合互相覆盖导致反复放行的问题。
+/// [复核修 2026-09-15] R3-1 返修②(缺口立刻可见):原先丢弃数只在「下一秒第一条命中」时补报;超限那一秒里
+/// 跟踪被关掉(mole_dev::toggle_trace 不清算)或游戏 panic,日志就停在第 200 行,读日志的人会误以为那就是最后
+/// 一次调用。现在每个窗口第一次丢弃时立刻打一行「已达上限」提示,每窗最多多一行。
+/// guest 线程都在同一个宿主线程上轮转执行,这几个原子量之间没有真正的并发;即使将来有,最坏也只是计数略有
+/// 偏差,不影响正确性。
+const TRACE_LINES_PER_SEC: u32 = 200;
+/// [复核修 2026-09-15] R3-1 返修①:每秒「首次出现的 (类, 选择子, 调用方 LR)」绕过全局额度打印的上限。
+/// 正常的类名/类名.选择子 规则每秒不同组合只有几十个(整份 28252 行跟踪日志从头到尾一共才 238 个),
+/// 这个上限只拦宽泛的 *片段 规则;超出后新组合改走全局额度。
+const TRACE_FIRST_SEEN_PER_SEC: u32 = 500;
+/// [复核修 2026-09-15] R3-1 返修①:「本秒见过的组合」位图位数取对数(2^13 = 8192 位 = 128 个 u64,共 1KB)。
+/// 本秒已有 k 个不同组合时,一个新组合被误判为重复的概率约 k/8192。
+const TRACE_SEEN_BITS_LOG2: u32 = 13;
+const TRACE_SEEN_WORDS: usize = 1 << (TRACE_SEEN_BITS_LOG2 - 6);
+static TRACE_SEEN: [AtomicU64; TRACE_SEEN_WORDS] = [const { AtomicU64::new(0) }; TRACE_SEEN_WORDS];
+/// 当前窗口的秒号(进程内单调时钟,从 1 起算;0 = 还没开过窗口)。
+static TRACE_WINDOW_SEC: AtomicU64 = AtomicU64::new(0);
+/// 当前窗口占全局额度打印的 [TRACE] 行数(不含「首次出现」旁路打印的行)。
+static TRACE_WINDOW_PRINTED: AtomicU32 = AtomicU32::new(0);
+/// [复核修 2026-09-15] R3-1 返修①:当前窗口走「首次出现」旁路打印的行数。
+static TRACE_WINDOW_FIRST_SEEN: AtomicU32 = AtomicU32::new(0);
+/// 当前窗口因超限被丢弃的命中条数。
+static TRACE_WINDOW_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// [复核修 2026-09-15] R3-1 返修①:把 (类, 选择子, 调用方 LR) 压成 64 位键,只做整数运算。
+/// 类与 LR 都是 32 位 guest 地址;SEL 的内部字段在 objc::selectors 里是私有的,这里取不到,改用 as_str 借来的
+/// 宿主指针——选择子已唯一化,guest 内存是一整块固定映射,同一个选择子的字符串地址不变。不读字符串内容。
+/// 乘奇数常数在 2^64 下是双射,第二轮乘法让高位依赖全部输入位(trace_rate_admit 取高位当位图下标)。
+fn trace_pair_key(class: Class, sel_str: &str, lr: u32) -> u64 {
+    let class_lr = (class.to_bits() as u64) | ((lr as u64) << 32);
+    (class_lr.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (sel_str.as_ptr() as usize as u64))
+        .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// [复核修 2026-09-15] R3-1 返修②:限流判定结果。原先用 Option 只能区分「打印/不打印」,
+/// 没法告诉调用方「本窗口刚开始丢弃」,缺口要等下一秒才看得见。
+enum TraceAdmit {
+    /// 打印本条。dropped > 0 表示刚结束的那个窗口丢弃了 dropped 条、该窗口开始于 age_secs 秒前,调用方先补一行汇报。
+    Print { dropped: u32, age_secs: u64 },
+    /// 本窗口第一次超限:本条计入丢弃,调用方立刻打一行「已达上限」提示(每个窗口最多一次)。
+    FirstDrop,
+    /// 超限:只计数,不打印。
+    Drop,
+}
+
+/// [复核修 2026-09-15] R3-1:限流判定。`key` 由 trace_pair_key 算出,只用来判断本秒是否第一次出现。
+/// 开新窗口时各计数清零,新窗口的第一条要么走「首次出现」旁路(位图刚清空,必然命中),要么走全局额度
+/// (已打印数为 0,必然有额度),两条路都返回 Print,所以上一窗口的丢弃汇报总是和一条允许打印的消息一起返回,不会丢。
+fn trace_rate_admit(key: u64) -> TraceAdmit {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // 秒号 +1,保证与初始值 0 不同:第一次命中一定会开出新窗口。
+    let now_sec = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1;
+    let window_sec = TRACE_WINDOW_SEC.load(Ordering::Relaxed);
+    let mut prev_dropped = 0u32;
+    let mut prev_age_secs = 0u64;
+    if window_sec != now_sec {
+        TRACE_WINDOW_SEC.store(now_sec, Ordering::Relaxed);
+        TRACE_WINDOW_PRINTED.store(0, Ordering::Relaxed);
+        TRACE_WINDOW_FIRST_SEEN.store(0, Ordering::Relaxed);
+        // 每秒最多一次,128 次原子写。
+        for word in TRACE_SEEN.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+        prev_dropped = TRACE_WINDOW_DROPPED.swap(0, Ordering::Relaxed);
+        prev_age_secs = now_sec.saturating_sub(window_sec);
+    }
+    // 返修①:本秒第一次出现的组合不占全局额度。旁路额度用完后不再置位,新组合直接走下面的全局额度。
+    let first_seen = TRACE_WINDOW_FIRST_SEEN.load(Ordering::Relaxed);
+    if first_seen < TRACE_FIRST_SEEN_PER_SEC {
+        let bit = (key >> (64 - TRACE_SEEN_BITS_LOG2)) as usize;
+        let mask = 1u64 << (bit & 63);
+        let before = TRACE_SEEN[bit >> 6].fetch_or(mask, Ordering::Relaxed);
+        if before & mask == 0 {
+            TRACE_WINDOW_FIRST_SEEN.store(first_seen + 1, Ordering::Relaxed);
+            return TraceAdmit::Print {
+                dropped: prev_dropped,
+                age_secs: prev_age_secs,
+            };
+        }
+    }
+    let printed = TRACE_WINDOW_PRINTED.load(Ordering::Relaxed);
+    if printed < TRACE_LINES_PER_SEC {
+        TRACE_WINDOW_PRINTED.store(printed + 1, Ordering::Relaxed);
+        TraceAdmit::Print {
+            dropped: prev_dropped,
+            age_secs: prev_age_secs,
+        }
+    } else {
+        let dropped = TRACE_WINDOW_DROPPED.load(Ordering::Relaxed);
+        TRACE_WINDOW_DROPPED.store(dropped.saturating_add(1), Ordering::Relaxed);
+        // 返修②:丢弃数由 0 变 1 = 本窗口第一次超限,让调用方立刻留痕。
+        if dropped == 0 {
+            TraceAdmit::FirstDrop
+        } else {
+            TraceAdmit::Drop
+        }
+    }
+}
 
 pub(super) struct ThreadInitializer {
     mutex: MutPtr<pthread_mutex_t>,
@@ -210,6 +343,24 @@ fn resolve_class_for_selector(objc: &ObjC, orig_class: Class, selector: SEL, is_
     }
 }
 
+// [合并复核 2026-09-24] 这组计数原先插在 objc_msgSend_inner 的文档注释与 #[allow(non_snake_case)]
+// 之后、函数之前,导致文档和 allow 都挂到了 MSG_N 上、函数本身反而没有 allow(会出非蛇形命名告警)。
+// 挪到文档注释之前,内容不变。
+/// [hang debug] 全局 msgSend 计数 + 最后出帧时的计数(见环形缓冲 dump)。
+// 这组出帧失速计数只在 interp_hb / debug 构建里被读写(见下方 MSGRING 块与 eagl.rs 的 [PRESENT]),release 下是死代码。
+#[cfg_attr(not(any(feature = "interp_hb", debug_assertions)), allow(dead_code))]
+pub static MSG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg_attr(not(any(feature = "interp_hb", debug_assertions)), allow(dead_code))]
+pub static LAST_PRESENT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// present 时调用:记下当前 msgSend 计数,用于检测"出帧失速"死循环。
+#[cfg_attr(not(any(feature = "interp_hb", debug_assertions)), allow(dead_code))]
+pub fn note_present() {
+    LAST_PRESENT_N.store(
+        MSG_N.load(std::sync::atomic::Ordering::Relaxed),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -223,17 +374,6 @@ fn resolve_class_for_selector(objc: &ObjC, orig_class: Class, selector: SEL, is_
 /// by the method implementation. We are relying on CallFromGuest not
 /// overwriting it.
 #[allow(non_snake_case)]
-/// [hang debug] 全局 msgSend 计数 + 最后出帧时的计数(见环形缓冲 dump)。
-pub static MSG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static LAST_PRESENT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// present 时调用:记下当前 msgSend 计数,用于检测"出帧失速"死循环。
-pub fn note_present() {
-    LAST_PRESENT_N.store(
-        MSG_N.load(std::sync::atomic::Ordering::Relaxed),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
 fn objc_msgSend_inner(
     env: &mut Environment,
     receiver: id,
@@ -361,24 +501,71 @@ fn objc_msgSend_inner(
     // anti-cheat off). Gated by a cheap any_enabled() check so the hot path pays
     // nothing when all cheats are off. intercept() may fully handle the call
     // (return) or tweak an argument register and let the real method run.
-    if crate::mole_cheats::any_enabled() {
-        // [MoleWorld iOS · 性能] ★原本每条 objc 消息都做【两次堆分配 String】(类名 + 选择子)。
-        // any_enabled() 在本移植里恒为真(破解开关默认开),所以这是【每条消息】的固定成本,
-        // 在 60 万消息/秒量级下相当可观。改为:先用【已注册 SEL 指针的集合】做 O(1) 整数快判定,
-        // 只有可能命中 intercept 的选择子才付字符串化的代价。行为等价(intercept 的每条分支都是
-        // `sel == "..."` 形式,选择子不在集合里就不可能命中任何分支)。
-        // [MoleWorld 宽屏适配·热路径] 虚拟世界换算(已右移根层的 position/setPosition:、已右移 UIKit
-        // 子视图的 frame/setFrame:、白名单代码的触摸/世界坐标换算、dealloc 除名):SEL 指针快判定、零分配,
-        // 没有任何登记对象时只付一次原子读。★`message_type_info.is_some()` = 本条消息由**宿主** msg_send
-        // 发出(宿主 msg_send 设置它、guest 派发恒为 None):宿主发起时 LR 是陈旧的 main 返回地址,不能拿来
-        // 判定"谁在问",且宿主必须看到真实坐标。
-        if crate::mole_cheats::intercept_fast(env, selector, message_type_info.is_some()) {
-            return;
+    // [合并注 2026-09-24] iOS 分支(158df05/91eb00f)这里原用 mole_cheats::is_intercept_sel(已注册 SEL 指针集合)
+    // 做 intercept 预检;main 用 intercept_wants(借用 &str、零分配的类名/选择子粗筛,CLASSES/SELS 不变量由 main 维护,
+    // 且含 F10-2 的「受模式门控的 sel」)。合并后统一走 main 的 intercept_wants:main 09-11~16 新增的大量 intercept 臂只登记
+    // 在 intercept_wants 里,继续用 iOS 的 SEL 清单会让这些钩子在 iOS 上静默失效。iOS 侧独有的 intercept 臂须同步进
+    // intercept_wants 的白名单(见 mole_cheats.rs)。顺序保持:intercept_fast(UI43 v2 SEL 快路径)→ 跟踪 → 粗筛 → intercept。
+    // [扫描修 2026-09-15] F7-12:选择子跟踪(开发工具)。类名/选择子字符串在这里统一取一次,供跟踪与
+    // 作弊钩子粗筛共用。跟踪判断放在 any_enabled 总闸之前、intercept_wants 之外:既不依赖作弊总闸,
+    // 也不会把被跟踪的类误送进 intercept、破坏它的白名单不变量。trace_on() 只读原子变量,关闭时这里
+    // 只多一次分支判断;get_class_name / as_str 都是借用,整条路径不产生任何字符串分配。
+    let trace_on = crate::mole_dev::trace_on();
+    let cheats_on = crate::mole_cheats::any_enabled();
+    // [同步 iOS 2026-09-16] 宽屏 UI43 v2 虚拟世界换算(移植自 iOS 分支 8bc7046):已右移根层的 position/setPosition:、
+    // 已右移 UIKit 子视图的 frame/setFrame:、白名单代码的触摸/世界坐标换算、dealloc 除名。SEL 指针快判定、零分配,
+    // 没有任何登记对象时(未开 UI43 时恒如此)只付两次原子读。★`message_type_info.is_some()` = 本条消息由**宿主**
+    // msg_send 发出(宿主 msg_send 设置它、guest 派发恒为 None):宿主发起时 LR 是陈旧的 main 返回地址,不能拿来判定
+    // "谁在问",且宿主必须看到真实坐标。放在跟踪之前不会让跟踪漏看:换算臂转发真方法走的是宿主 msg_send,
+    // 同一个选择子会再经过这里一次并被跟踪打印。
+    if cheats_on && crate::mole_cheats::intercept_fast(env, selector, message_type_info.is_some()) {
+        return;
+    }
+    if trace_on || cheats_on {
+        // [MoleWorld P0-B] 先用借来的 &str(零分配)过粗筛:游戏每帧约 16000 条消息,99% 不命中任何
+        // hook,直接 bail——不付出下面两次 to_string 堆分配,也不进 intercept 的长比较链(每条消息省
+        // 2 次 malloc/free,显著降分配器压力/抖动)。只有命中白名单的少数消息才 to_string + 进 intercept。
+        let class_name = env.objc.get_class_name(orig_class);
+        let sel_str = selector.as_str(&env.mem);
+        if trace_on && crate::mole_dev::trace_filter_matches(class_name, sel_str) {
+            // [复核修 2026-09-15] R3-1:命中后先过每秒限流(见 trace_rate_admit),超限的只计数不打印;
+            // 进入新的一秒时先补一行上一窗口的丢弃数,再打印本条。
+            // [复核修 2026-09-15] R3-1 返修:本秒首次出现的 (类, 选择子, 调用方 LR) 不占额度照常打印;
+            // 每个窗口第一次丢弃时立刻打一行提示,跟踪被关掉或崩溃时也看得出后面有截断。
+            let lr = env.cpu.regs()[crate::cpu::Cpu::LR];
+            match trace_rate_admit(trace_pair_key(orig_class, sel_str, lr)) {
+                TraceAdmit::Print { dropped, age_secs } => {
+                    if dropped > 0 {
+                        log!(
+                            "[TRACE] 限流:{} 秒前开始的那 1 秒内另有 {} 条命中未打印(重复命中上限 {} 条/秒)",
+                            age_secs,
+                            dropped,
+                            TRACE_LINES_PER_SEC
+                        );
+                    }
+                    // 格式:[TRACE] 类 选择子 接收者地址 调用方LR(LR = 调用点 + 4,Thumb 代码带最低位 1)。
+                    log!(
+                        "[TRACE] {} {} recv={:?} lr={:#x}",
+                        class_name,
+                        sel_str,
+                        receiver,
+                        lr
+                    );
+                }
+                TraceAdmit::FirstDrop => {
+                    log!(
+                        "[TRACE] 限流:本秒重复命中已达上限 {} 条,之后的重复命中只计数(下一秒开头汇总);本秒首次出现的 类+选择子+调用点 仍照常打印(每秒最多 {} 条)",
+                        TRACE_LINES_PER_SEC,
+                        TRACE_FIRST_SEEN_PER_SEC
+                    );
+                }
+                TraceAdmit::Drop => {}
+            }
         }
-        if crate::mole_cheats::is_intercept_sel(&mut env.objc, &mut env.mem, selector) {
-            let class_name = env.objc.get_class_name(orig_class).to_string();
-            let sel_str = selector.as_str(&env.mem).to_string();
-            if crate::mole_cheats::intercept(env, &class_name, &sel_str) {
+        if cheats_on && crate::mole_cheats::intercept_wants(class_name, sel_str) {
+            let class_owned = class_name.to_string();
+            let sel_owned = sel_str.to_string();
+            if crate::mole_cheats::intercept(env, &class_owned, &sel_owned) {
                 return;
             }
         }
@@ -410,12 +597,18 @@ fn objc_msgSend_inner(
             .objc
             .register_host_selector("render".to_string(), &mut env.mem);
         if selector == render_sel {
-            let ap_cls = env.objc.get_known_class("AnimPlayer", &mut env.mem);
-            if orig_class == ap_cls && crate::mole_cheats::anim_render_should_skip(env, receiver) {
-                env.cpu.regs_mut()[0] = 0;
-                return;
+            // [合并注 2026-09-24] 头像重建跳过只在无 JIT 构建(iOS / 解释器后端)生效:它带「≈15fps 节流 + 每帧
+            // 重建预算」,真卡时头像动画会降帧/延后刷新;JIT 桌面本就无感,不能让桌面默认行为被它改变。
+            // 桌面上 "render" 只是命中 is_mole_hook 选择子门、这里什么都不做,下面的钩子块也没有 render 臂 → 照常派发。
+            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+            {
+                let ap_cls = env.objc.get_known_class("AnimPlayer", &mut env.mem);
+                if orig_class == ap_cls && crate::mole_cheats::anim_render_should_skip(env, receiver) {
+                    env.cpu.regs_mut()[0] = 0;
+                    return;
+                }
             }
-        } else if {
+        } else {
             // [MoleWorld iOS · P0 从好友村返回后主村只剩背景] 保护那份【地图数据字典】不被原地清空。
             // 实测(纯读 host 字典 count):首次进村 -[GameManager loadMapFromData:] 拿到的字典 0x30017440
             // count=7;从好友村返回时【同一个指针】count 变成 0 → -[GameManager
@@ -423,35 +616,49 @@ fn objc_msgSend_inner(
             // 一个 loadMapObjects: 都不执行 → 地面/建筑/人物/村庄UI 全不加载,只剩背景装饰。
             // 这里按【receiver 指针精确比对】吞掉对那一个字典的 removeAllObjects(只影响它,不动别的容器),
             // 使返回时数据仍在 → 早退不再命中 → 走正常加载路径。仅离线生效。
-            let mapdata_ptr = crate::mole_cheats::MAPDATA_PTR
-                .load(std::sync::atomic::Ordering::Relaxed);
-            mapdata_ptr != 0
-                && receiver.to_bits() == mapdata_ptr
-                && !env.options.network_access
-                && selector
-                    == env
-                        .objc
-                        .register_host_selector("removeAllObjects".to_string(), &mut env.mem)
-        } {
-            use std::sync::atomic::{AtomicU32, Ordering as O2};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let n = N.fetch_add(1, O2::Relaxed);
-            if n < 4 {
-                log!(
-                    "[MOLECHEAT] 保护地图数据字典 {:?}:吞掉第 {} 次 removeAllObjects(防返回主村空村)",
-                    receiver, n
-                );
+            // [合并复核 2026-09-24] 门控到 iOS / 解释器构建(与上面的头像重建跳过同一口径):这是 iOS 分支 91eb00f
+            // 的修复,main 从没有过;main 的 F9-4 已在离线时拦下好友入口(弹「该功能需要联网」、不卸载主村),
+            // 桌面走不到这条「进好友村再返回」的路径。吞掉 removeAllObjects 后 loadMapData 若读档成功会与旧内容
+            // 叠加,桌面上没经过验证,按「iOS 改动不得改变桌面默认行为」不对桌面生效;iOS 上照旧作为兜底保留。
+            // (mole_cheats 侧也只在 iOS 记录 MAPDATA_PTR,所以桌面开 cpu_interpreter 时这里指针恒为 0、实际也不命中。)
+            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+            {
+                let mapdata_ptr = crate::mole_cheats::MAPDATA_PTR
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if mapdata_ptr != 0
+                    && receiver.to_bits() == mapdata_ptr
+                    && !env.options.network_access
+                    && selector
+                        == env
+                            .objc
+                            .register_host_selector("removeAllObjects".to_string(), &mut env.mem)
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering as O2};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let n = N.fetch_add(1, O2::Relaxed);
+                    if n < 4 {
+                        log!(
+                            "[MOLECHEAT] 保护地图数据字典 {:?}:吞掉第 {} 次 removeAllObjects(防返回主村空村)",
+                            receiver, n
+                        );
+                    }
+                    env.cpu.regs_mut()[0] = 0;
+                    return;
+                }
             }
-            env.cpu.regs_mut()[0] = 0;
-            return;
-        } else {
             // 每帧 drawScene 入口复位头像重建预算(早于本帧 updateTick→render 遍历)。不拦截,照常派发。
             let draw_scene_sel = env
                 .objc
                 .register_host_selector("drawScene".to_string(), &mut env.mem);
             if selector == draw_scene_sel {
                 // [性能观测] 每帧一次;内部 5 秒节流打一行 [PERF] 汇总。
-                crate::mole_perf::tick(env.objc.object_count());
+                // [合并复核 2026-09-24] 同样只在 iOS / 解释器构建上打:mole_perf 是 iOS 分支 158df05 的真机观测底座,
+                // 桌面上每 5 秒往 stderr 和 touchHLE_log.txt 多写一行 [PERF] 是新增的日志噪音(main 09-16 刚清理过日志)。
+                // 计数器本身(MSGSEND/DRAWS 等原子加)不影响行为,不门控。
+                #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+                {
+                    crate::mole_perf::tick(env.objc.object_count());
+                }
                 crate::mole_cheats::anim_render_reset_frame_budget();
                 // [诊断] 每帧 drawScene 推进看门狗帧计数(证明 guest 还在出帧)。无条件,不依赖 island。
                 crate::mole_cheats::watchdog_frame();
@@ -494,7 +701,6 @@ fn objc_msgSend_inner(
             // 最后吞掉"无网络"弹窗。
             if name == "AvatarLayer" && selector.as_str(&env.mem) == "showNetWorkError" {
                 let recv = receiver;
-                drop(message_type_info);
                 // 1) 本地生效 + 刷新屏幕昵称(saveName 只读 self.textField,离线安全)。
                 if env.objc.object_has_method_named(&env.mem, recv, "saveName") {
                     let save_name = env
@@ -552,75 +758,12 @@ fn objc_msgSend_inner(
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
             }
-            // -[UserInfoData initWithCoder:]: 离线"忠于原版"地还原贝壳(vipGold)。
-            //
-            // 这个破解包(无限贝壳版)在读本地存档(NSKeyedUnarchiver → initWithCoder:)时,
-            // 把贝壳写死成 2097151(0x1FFFFF):VA 0xb9ce0
-            //   `[self setNewVipGold:[CryptUtils encryptInt:2097151]]`
-            // 同一函数里 curLevel/xp/gold/totalWorkers 等其它字段统统老老实实
-            // `decodeIntForKey:` 读存档真实值,唯独 vipGold 被塞死常量 → 每次进游戏都把贝壳
-            // 覆写成 2097151(全二进制仅此一处 0x1FFFFF;2.4.3 零此常量、且根本没有
-            // setNewVipGold: → 实锤是破解作者新加的私货,作者原话"重进游戏贝壳数自动变 2097151")。
-            //
-            // 我们要的是"离线、但贝壳像原版一样从存档自然持久化、能花能存",而不是每次被强制重置。
-            // 做法:拦截 initWithCoder:,先放行原方法整段跑完(所有字段照常解出,包括那个被塞死的
-            // 2097151),拿到返回的 self 后,用作者删掉的那行原始逻辑——
-            //   `[self setNewVipGold:[CryptUtils encryptInt:[coder decodeIntForKey:@"vipGold"]]]`
-            // ——把贝壳改回存档里的真实值。archive key 实测为 "vipGold"(AES 解密玩家 userinfo.dat
-            // 的 NSKeyedArchiver 键名:username/userId/curLevel/xp/gold/vipGold/totalWorkers/…)。
-            // setNewVipGold: 存的是密文(getter 用 CryptUtils decryptInt: 解),所以要先 encryptInt:
-            // 再写,与原版完全一致。
-            //
-            // 只拦"读本地存档"这一条路径(initWithCoder:);联网同步 decodeRemoteData:/排行榜/
-            // copyWithZone:/调试菜单里也会用到 setNewVipGold:,那些一律放行不动。占卜扣费走
-            // [WrapperManager addVipGold:]、T 菜单加贝壳同样走 addVipGold:,都读 vipGold 真实值,
-            // 不受影响。MOLE_IN_UID_INITCODER 是递归卫(定义见文件顶部)。
-            if name == "UserInfoData"
-                && !MOLE_IN_UID_INITCODER.load(Ordering::Relaxed)
-                && selector.as_str(&env.mem) == "initWithCoder:"
-            {
-                let recv = receiver;
-                // initWithCoder: 的 NSCoder 实参在 r2(r0=self, r1=_cmd, r2=arg1);
-                // 必须在任何 msg_send 之前读出(后续调用会覆写寄存器)。
-                let coder: id = MutPtr::from_bits(env.cpu.regs()[2]);
-                drop(message_type_info);
-                // 1) 放行原 initWithCoder:(递归卫=true → 落正常派发跑原方法)。
-                MOLE_IN_UID_INITCODER.store(true, Ordering::Relaxed);
-                let result: id = crate::objc::msg_send(env, (recv, selector, coder));
-                MOLE_IN_UID_INITCODER.store(false, Ordering::Relaxed);
-                // 2) 把 vipGold 从"塞死的 2097151"还原成存档真实值(= 作者删掉的那行)。
-                if result != nil && coder != nil {
-                    let key = crate::frameworks::foundation::ns_string::from_rust_string(
-                        env,
-                        "vipGold".to_string(),
-                    );
-                    let decode_sel = env
-                        .objc
-                        .register_host_selector("decodeIntForKey:".to_string(), &mut env.mem);
-                    let real_vip: i32 = crate::objc::msg_send(env, (coder, decode_sel, key));
-                    let crypt_cls = env.objc.get_known_class("CryptUtils", &mut env.mem);
-                    if crypt_cls != nil {
-                        let enc_sel = env
-                            .objc
-                            .register_host_selector("encryptInt:".to_string(), &mut env.mem);
-                        let enc_vip: i32 =
-                            crate::objc::msg_send(env, (crypt_cls, enc_sel, real_vip));
-                        let set_sel = env
-                            .objc
-                            .register_host_selector("setNewVipGold:".to_string(), &mut env.mem);
-                        let _: () = crate::objc::msg_send(env, (result, set_sel, enc_vip));
-                        log!(
-                            "[贝壳] 读档:跳过破解版强制 2097151,vipGold 还原为存档真实值 {}(保持加密持久化)",
-                            real_vip
-                        );
-                    } else {
-                        log!("[贝壳] 警告:未找到 CryptUtils 类,vipGold 未还原(仍为破解版默认)");
-                    }
-                }
-                // 3) 返回原 initWithCoder: 的 self(上面的 msg_send 已覆写 r0,这里写回)。
-                env.cpu.regs_mut()[0] = result.to_bits();
-                return;
-            }
+            // [2026-09-16] F1-05 删掉 -[UserInfoData initWithCoder:] 的「贝壳读档还原」钩子(连同递归卫 MOLE_IN_UID_INITCODER)。
+            // 它是给无限贝壳破解包写的:破解包在 VA 0xb9ce0 把 vipGold 塞死成 2097151。现在基底是香草,
+            // -[UserInfoData initWithCoder:]@0xb99f4 在 0xb9ce0-0xb9d02 本来就是 decodeIntForKey:@"vipGold" → encryptInt: →
+            // setNewVipGold:,原版自己按存档真实值还原贝壳;CRACK_PATCHES 也不含 0xb9ce0。钩子只会让每次读档重复解码一遍、
+            // 打出已不成立的「跳过破解版」日志,还泄漏一个 from_rust_string 的 +1 字符串。
+            // 将来若换回破解包,需要恢复这个钩子(可先读 0xb9ce0 处字节确认是破解版常量装载再生效)。
             // -[IMCommonMgr checkUpdates:]: kicks off +[CryptUtils doCipher:...]
             // on network data that's empty offline, computing a negative (huge
             // unsigned) buffer size that corrupts memory. Pure analytics/update
@@ -696,28 +839,45 @@ fn objc_msgSend_inner(
             {
                 if let Some(sel) = env.objc.lookup_selector("replaceByLoadingScene") {
                     let recv = receiver;
-                    drop(message_type_info);
+                    // [深扫修 2026-09-12] 补回原版在这里做的版本记录写入(0x1905b0-0x190616):
+                    // 本地版本号大于 newVersionRecord 时先 setNewVersionRecord: + saveSettings,
+                    // 然后才决定弹不弹介绍层。只吞介绍层不补写的话 newVersionRecord 永远是 0,
+                    // -[GameSettings loadSettings]@0x185890 每次启动都把 isNightEffectOff 强制置 1,
+                    // 玩家在选项里打开的夜晚效果重启即丢。
+                    if let (Some(sh_mgr), Some(get_ver), Some(sh_inst), Some(nvr), Some(set_nvr), Some(save)) = (
+                        env.objc.lookup_selector("sharedManager"),
+                        env.objc.lookup_selector("getLocalVersion"),
+                        env.objc.lookup_selector("sharedInstance"),
+                        env.objc.lookup_selector("newVersionRecord"),
+                        env.objc.lookup_selector("setNewVersionRecord:"),
+                        env.objc.lookup_selector("saveSettings"),
+                    ) {
+                        let wm_cls = env.objc.get_known_class("WrapperManager", &mut env.mem);
+                        let gs_cls = env.objc.get_known_class("GameSettings", &mut env.mem);
+                        let wm: id = crate::objc::msg_send(env, (wm_cls, sh_mgr));
+                        let gs: id = crate::objc::msg_send(env, (gs_cls, sh_inst));
+                        if wm != nil && gs != nil {
+                            let local: u32 = crate::objc::msg_send(env, (wm, get_ver));
+                            let record: u32 = crate::objc::msg_send(env, (gs, nvr));
+                            if record < local {
+                                let _: () = crate::objc::msg_send(env, (gs, set_nvr, local));
+                                let _: () = crate::objc::msg_send(env, (gs, save));
+                                log!(
+                                    "[深扫修] 跳过新功能介绍层,补写 newVersionRecord {:#x} → {:#x}(夜晚效果开关从此按玩家设置读取)",
+                                    record,
+                                    local
+                                );
+                            }
+                        }
+                    }
                     () = crate::objc::msg_send(env, (recv, sel));
                     return;
                 }
             }
-            // The start-screen's secondary buttons (客服 / 换账号 / 换玩家 / 版本)
-            // are all server-dependent and do nothing useful offline. Repurpose
-            // whichever the user taps into a one-tap player-save reset, guarded by
-            // a native confirmation dialog. (设置/帮助 keep their normal behaviour.)
-            if name == "LogoLayer"
-                && matches!(
-                    selector.as_str(&env.mem),
-                    "onMenuKefuSelected"
-                        | "onMenuChangeAccountSelected"
-                        | "onMenuChangePlayerSelected"
-                        | "onMenuVersionInfoSelected"
-                )
-            {
-                crate::save_reset::confirm_and_reset_saves(env);
-                env.cpu.regs_mut()[0..2].fill(0);
-                return;
-            }
+            // [2026-09-16] F1-05 删掉 LogoLayer 客服/换账号/换玩家/版本四个选择子的「标题页删档」臂:5.5.0 的 LogoLayer
+            // 只有 scene/init/replaceByLoadingScene/shownewFunctionIntroductionLayer/callLoading/onEnter/update:/
+            // PlayAnimation/dealloc,那四个选择子在 methods.txt 与 selref 里零命中,这一臂永远不会触发。
+            // 删档入口在作弊菜单「删本地存档并退出」(共享实现 save_reset::delete_local_saves)。
             // -[NewStyleStoreMainLayer onBuyVIPGold:]: the 贝壳 (shell) packs are
             // real-money StoreKit IAP gated by network reachability — both dead in
             // this offline port, so a shell-pack tap normally just shows a
@@ -725,15 +885,30 @@ fn objc_msgSend_inner(
             // it a free local purchase: credit shells via
             // -[GameData addVipGoldForBuy:UIUpdate:] (adds to vip_gold + refreshes
             // the HUD) and skip the dead IAP path entirely.
+            // [2026-09-16] E-01 只接管 100_0.dat 里真有的充值档位(shell_pack 查得到的 itemid 1..7)。itemid 8 是广告墙「免费贝壳」格:
+            // onItemsMenuSelected: 在 0x3b23ce 固定传 8,资源页 onButtonBuyItemSelected: 在 _selectedObjectId−1≤7 时也可能传 8。
+            // 以前它落到兜底白送 20 贝壳:岛上(isReachable 被通配成 1)和联机时每点一次送一次,还经 on_shells_purchased 误触发
+            // gamedataFlag|=0x30、解锁 16283/14974 这些「充值成功」副作用;主村离线却弹「没有连接网络」,同一个按钮两种表现。
+            // 现在查不到档位就不进这一臂:条件里只读 r2,不发任何 msg_send,寄存器原样,落到下面的放行分支和真 onBuyVIPGold:。
+            // 原版 0x3b29c4 `cmp r2,#8` → [[WrapperManager sharedManager] checkAdWallAvailable]@0x262274,canShowADForExchange 只由服务器
+            // 1064/1182 回包写入,离线和私服下恒为 NO → 直接收尾,即原版离线的空操作。广告墙类在 classes.rs 里整类伪造,不复活。
             if name == "NewStyleStoreMainLayer"
                 && selector.as_str(&env.mem) == "onBuyVIPGold:"
+                && crate::mole_items::shell_pack(env.cpu.regs()[2]).is_some()
             {
-                // onBuyVIPGold:(int 档位索引):regs[2] = 包索引(0..=6;原版 cmp r2,8)。
-                // 按原版各档真实贝壳数发放(20/105/225/370/650/1500/3500),不再死值 1000。
+                // onBuyVIPGold:(int):按原版各档真实贝壳数发放,不再死值 1000。
                 // 必须在任何 msg_send 前读 regs[2],否则被覆盖。
-                let pack_idx = env.cpu.regs()[2] as usize;
-                const SHELL_PACKS: [i32; 7] = [20, 105, 225, 370, 650, 1500, 3500];
-                let shells = SHELL_PACKS.get(pack_idx).copied().unwrap_or(20);
+                // [补完 2026-09-15] 参数纠正:regs[2] 不是 0 起的包下标,而是 ShopItemData.itemid(1..7,取自 100_0.dat)。
+                // 原版 -[NewStyleStoreMainLayer onBuyVIPGold:]@0x3b29b0 用它调 -[GameData getShopItemData:]@0x7bf3c,
+                // 按 itemid 相等查档位;itemid 8 是广告墙「免费贝壳」格(0x3b29c4 cmp r2,#8 → 广告墙,不是充值)。
+                // 三个调用方传的都是 itemid:-[NewStyleStoreItemsView onButtonBuyItemSelected:]@0x3bd9c0(_selectedObjectId−1 ≤ 7 才发,
+                // 0 永远到不了这里)、-[DiscountInfoLayer onButtonShop:]@0x1ec46a(goodsId ≤ 7)、onItemsMenuSelected:@0x3b23ce(固定 8)。
+                // 旧代码按下标取 [20,105,…,3500]:每档都多发一档,itemid 7(3500 贝壳档)越界落到兜底只发 20。
+                // 档位表(贝壳数 + 标价)移到 mole_items::SHELL_PACKS,与 VIP 累计共用一份。
+                // [2026-09-16] E-01 查不到档位的参数已被上面的条件挡在外面,这里 pack 恒为 Some;map_or 的 20 只是避免写 unwrap。
+                let item_id = env.cpu.regs()[2];
+                let pack = crate::mole_items::shell_pack(item_id);
+                let shells = pack.map_or(20, |p| p.shells);
                 let gd_class = env.objc.get_known_class("GameData", &mut env.mem);
                 let shared_sel = env
                     .objc
@@ -742,19 +917,38 @@ fn objc_msgSend_inner(
                     "addVipGoldForBuy:UIUpdate:".to_string(),
                     &mut env.mem,
                 );
-                drop(message_type_info);
                 let gd: id = crate::objc::msg_send(env, (gd_class, shared_sel));
                 if gd != nil {
                     let amount: i32 = shells;
                     let do_update: bool = true;
                     let _: () = crate::objc::msg_send(env, (gd, add_sel, amount, do_update));
+                    // [2026-09-16] E-01 去掉「不是充值档位,按旧兜底发放」那半句:这种参数已不会进来。有档位时输出与改动前逐字相同。
                     log!(
-                        "[SHELLHOOK] granted {} shells (pack idx {}, offline IAP bypass)",
-                        amount, pack_idx
+                        "[SHELLHOOK] granted {} shells (pack idx {} = ShopItemData.itemid, offline IAP bypass)",
+                        amount,
+                        item_id
                     );
+                    // [扫描修 2026-09-15] F2-1:这个钩子吞掉了原版 IAP 流程,原版「充值成功」的副作用
+                    // (-[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]@0x7f3bc:gamedataFlag |= 0x20/0x10、
+                    // unlockItem:16283 都教授等)离线永远不会发生。只在贝壳确实发放成功(gd != nil)后交给
+                    // mole_items 补齐。它内部会发宿主 msg_send、可能改写 r0-r3,所以放在最终写回返回寄存器
+                    // 之前调用;onBuyVIPGold: 返回 void,下面统一把 r0/r1 清零,寄存器最终状态与原来一致。
+                    // [补完 2026-09-15] 同时把本次购买的 itemid / 实发贝壳数 / 档位(含标价)交给 mole_items,
+                    // 替原版服务器做「累计充值 → VIP 等级」(原版 1083 上报 + 1084 回包 parseVipInfo 写三值)。
+                    crate::mole_items::on_shells_purchased(env, item_id, amount, pack);
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
+            }
+            // [2026-09-16] E-01 上面没接管的 onBuyVIPGold:(查不到充值档位,即广告墙「免费贝壳」itemid 8):不吞、不发贝壳,
+            // 只记一行日志,然后照常派发真方法(原版离线空操作)。只读寄存器,不发消息。
+            if name == "NewStyleStoreMainLayer"
+                && selector.as_str(&env.mem) == "onBuyVIPGold:"
+            {
+                log!(
+                    "[SHELLHOOK] onBuyVIPGold:{} 不是 100_0.dat 充值档位(广告墙「免费贝壳」),离线/私服下不可用,放行原版:checkAdWallAvailable 为 NO 时什么都不做",
+                    env.cpu.regs()[2]
+                );
             }
             // -[MagicNumberView onButtonYesSelected:]: the "magic number" gate
             // (a secret-content password prompt). With the bypass on, skip the
@@ -775,7 +969,6 @@ fn objc_msgSend_inner(
                 let close_sel = env
                     .objc
                     .register_host_selector("doClose".to_string(), &mut env.mem);
-                drop(message_type_info);
                 let del: id = crate::objc::msg_send(env, (recv, del_sel));
                 if del != nil {
                     let _: () = crate::objc::msg_send(env, (del, finish_sel));
@@ -793,7 +986,6 @@ fn objc_msgSend_inner(
             // the no-network popup. Gated on a cheap flag so it's free when off.
             if crate::mole_cheats::fix_golden_island_on() {
                 if name == "GameData" && selector.as_str(&env.mem) == "caribbeanData" {
-                    drop(message_type_info);
                     let data = crate::mole_cheats::build_caribbean_data(env);
                     env.cpu.regs_mut()[0] = data.to_bits();
                     return;
@@ -810,7 +1002,6 @@ fn objc_msgSend_inner(
                     && selector.as_str(&env.mem) == "showLayerWithTarget:selector:"
                 {
                     let recv = receiver;
-                    drop(message_type_info);
                     if env
                         .objc
                         .object_has_method_named(&env.mem, recv, "closeCaribbeanMainLayer")
@@ -829,7 +1020,6 @@ fn objc_msgSend_inner(
                     && selector.as_str(&env.mem) == "getCaribbeanStateInfo:"
                 {
                     let recv = receiver;
-                    drop(message_type_info);
                     // Build the local state and store it in GameData so the
                     // activity's getter / direct-ivar reads both see valid data.
                     let data = crate::mole_cheats::build_caribbean_data(env);
@@ -932,41 +1122,28 @@ fn objc_msgSend_inner(
             // niceties) that would otherwise each crash boot, and keep going
             // toward the first frame. Essential gaps still surface as visibly
             // wrong behavior to investigate.
-            // [MoleWorld iOS · 性能] ★这条原本【完全不去重】,而每条 log! 都要 format + NSLog +
-            // write + fsync(见 log.rs)。只要有任何一个选择子每帧落空(实测 statusBarFrame 就是),
-            // 就是每帧一次 fsync —— 这是全进程唯一【没有上界】的每次调用开销。
-            // 改为按 (类名, 选择子) 去重:首次打全文,之后只累加计数、每 4096 次打一行汇总。
-            {
-                use std::collections::HashSet;
-                use std::sync::Mutex;
-                static SEEN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
-                static SUPPRESSED: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let sel_s = selector.as_str(&env.mem).to_string();
-                let first = {
-                    let mut g = match SEEN.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    g.get_or_insert_with(HashSet::new)
-                        .insert((name.to_string(), sel_s.clone()))
-                };
-                if first {
-                    log!(
-                        "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil). [此后同类只计数]",
-                        receiver, name, sel_s,
-                    );
-                } else {
-                    let n = SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 4096 == 0 {
-                        log!("(已静默 {} 次重复的 \"不响应选择子\" 警告)", n);
-                    }
-                }
+            // [扫描修 2026-09-15] F10-5:selector.as_str 只求值一次(原来 3 次,每次都要在客体内存里
+            // 逐字节找字符串结尾);同一 (类, 选择子) 只在第一次 log!,之后降为 log_dbg!。
+            let sel_str = selector.as_str(&env.mem);
+            if first_compat_warning("does-not-respond", &name, sel_str) {
+                log!(
+                    "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil). [repeats of this class+selector go to log_dbg]",
+                    receiver,
+                    name,
+                    sel_str,
+                );
+            } else {
+                log_dbg!(
+                    "Warning: {:?} (class \"{}\") does not respond to selector \"{}\"; treating as no-op (nil).",
+                    receiver,
+                    name,
+                    sel_str,
+                );
             }
             // [MoleWorld DIAG] Persist a de-duplicated list of every class+selector
             // that silently no-ops, so a normal play session leaves behind the full
             // set of missing methods to read from /tmp/mole_diag.log.
-            crate::mole_diag::log_unique(&name, selector.as_str(&env.mem));
+            crate::mole_diag::log_unique(&name, sel_str);
             let _ = super2;
             // MoleWorld offline port: a guest class whose superclass chain
             // doesn't reach a real -initWithCoder: (some TMMapData* saved-map
@@ -974,7 +1151,7 @@ fn objc_msgSend_inner(
             // exactly as -[NSObject initWithCoder:] does. Returning nil instead
             // made every decoded saved-map object (buildings, farmland,
             // decorations) come back nil and vanish from a reloaded village.
-            if selector.as_str(&env.mem) == "initWithCoder:" {
+            if sel_str == "initWithCoder:" {
                 env.cpu.regs_mut()[0] = receiver.to_bits();
                 env.cpu.regs_mut()[1] = 0;
                 return;
@@ -1049,13 +1226,25 @@ Type mismatch when sending message {} to {:?}!
             // JSONKit's runtime-created JKArray/JKDictionary). Behave as if the
             // message went to nil so the game keeps booting toward the first
             // frame instead of crashing the emulator.
-            log!(
-                "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil).",
-                name,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                selector.as_str(&env.mem),
-            );
+            // [扫描修 2026-09-15] F10-5:同 does-not-respond,按 (类, 选择子) 去重,首次 log!、之后 log_dbg!。
+            let sel_str = selector.as_str(&env.mem);
+            if first_compat_warning("unimplemented-class", name, sel_str) {
+                log!(
+                    "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil). [repeats of this class+selector go to log_dbg]",
+                    name,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_str,
+                );
+            } else {
+                log_dbg!(
+                    "Class \"{}\" ({:?}) is unimplemented; {} method \"{}\" treated as no-op (nil).",
+                    name,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_str,
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else if let Some(&super::FakeClass {
@@ -1079,15 +1268,32 @@ Type mismatch when sending message {} to {:?}!
                 "GADRequest",
                 "GADInterstitial",
                 "AtomAdNetworkAdapter",
+                // [扫描修 2026-09-15] F10-5:淘米统计 SDK 自带的 SSKeychain,classes.rs 有意把它 fake 掉
+                // (没有真钥匙串,离线也不要统计)。一轮启动 19 行 passwordForService:account: /
+                // setPassword:forService:account: 全是它。账号菜单模式的 allAccounts 空数组桩在
+                // mole_cheats::intercept 里、先于这里执行,不受影响。将来若给它做真钥匙串桩,记得移出名单。
+                "TMA_SSKeychain",
             ];
             if !SILENT_FAKE_CLASSES.contains(&name.as_str()) {
-                log!(
-                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                    name,
-                    class,
-                    if is_metaclass { "class" } else { "instance" },
-                    selector.as_str(&env.mem),
-                );
+                // [扫描修 2026-09-15] F10-5:其余 fake class 按 (类, 选择子) 去重,首次 log!、之后 log_dbg!。
+                let sel_str = selector.as_str(&env.mem);
+                if first_compat_warning("faked-class", name, sel_str) {
+                    log!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil. [repeats of this class+selector go to log_dbg]",
+                        name,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_str,
+                    );
+                } else {
+                    log_dbg!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
+                        name,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_str,
+                    );
+                }
             }
             env.cpu.regs_mut()[0..2].fill(0);
             return;

@@ -39,6 +39,11 @@ fn main() {
     build.define("DYNARMIC_TESTS", "OFF");
     build.define("DYNARMIC_USE_BUNDLED_EXTERNALS", "ON");
     build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+    // [复核修 2026-09-15] 捆绑的 fmt 10.1 在新版 Apple clang(Xcode 27 beta / clang 21)下,
+    // os.cc / format-inl.h 里的 FMT_STRING 报「call to consteval function ... is not a constant
+    // expression」,dynarmic 整体编不过。fmt 的 core.h 用 #ifndef FMT_CONSTEVAL 包着自动探测,
+    // 预先定义成空即可关闭编译期格式串校验(运行期行为不变,旧编译器上也无副作用)。
+    build.cxxflag("-DFMT_CONSTEVAL=");
 
     // This is Windows- and Android-specific because on macOS or Linux, you can
     // easily get Boost with a package manager.

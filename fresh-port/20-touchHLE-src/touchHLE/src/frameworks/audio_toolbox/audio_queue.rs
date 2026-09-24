@@ -766,6 +766,21 @@ fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mu
     }
 }
 
+// [扫描修 2026-09-16] AQ-01:队列是否还在表里、且仍持有这个 OpenAL source。
+// guest 回调里 AudioQueueDispose 后宿主对象会被移出表、source 被删;若同一地址
+// 又新建并 prime 了队列、OpenAL 恰好复用了同一个名字,就当同一队列继续处理,
+// 那个名字是有效的,不会触发断言。
+fn audio_queue_still_owns_source(
+    env: &mut Environment,
+    in_aq: AudioQueueRef,
+    al_source: ALuint,
+) -> bool {
+    State::get(&mut env.framework_state)
+        .audio_queues
+        .get(&in_aq)
+        .is_some_and(|host_object| host_object.al_source == Some(al_source))
+}
+
 /// For use by `NSRunLoop`: check the status of an audio queue, recycle buffers,
 /// call callbacks, push new buffers etc.
 pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
@@ -775,7 +790,11 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
 
-    let host_object = state.audio_queues.get_mut(&in_aq).unwrap();
+    // [扫描修 2026-09-16] AQ-01:run loop 先拍快照再逐个处理,前一个队列的回调
+    // 可能已 Dispose 本队列(见 ns_run_loop.rs 的 TODO),宿主对象不在了就跳过。
+    let Some(host_object) = state.audio_queues.get_mut(&in_aq) else {
+        return;
+    };
     let Some(al_source) = host_object.al_source else {
         return;
     };
@@ -814,6 +833,14 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         );
 
         let () = callback_proc.call_from_host(env, (callback_user_data, in_aq, buffer_ref));
+
+        // [扫描修 2026-09-16] AQ-01:回调是 guest 代码,可能已 AudioQueueDispose 本队列。
+        // 那时宿主对象已移出表、上面取到的 al_source 已被删、剩下待回调的缓冲也已释放,
+        // 再往下走会在 unwrap 处 panic,或拿失效的 source 名字触发 OpenAL 断言,直接收手。
+        if !audio_queue_still_owns_source(env, in_aq, al_source) {
+            log_dbg!("Audio queue {:?} disposed by its callback.", in_aq);
+            return;
+        }
     }
 
     // Push new buffers etc.
@@ -860,10 +887,13 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         }
     }
 
+    // [扫描修 2026-09-16] AQ-01:finish_stopping_audio_queue 最后会通知 IsRunning
+    // 监听(guest 代码),监听里同样可能 Dispose 本队列,那时不能再 unwrap。
     let state = State::get(&mut env.framework_state);
 
-    let host_object = state.audio_queues.get_mut(&in_aq).unwrap();
-    host_object.is_running_handler = false;
+    if let Some(host_object) = state.audio_queues.get_mut(&in_aq) {
+        host_object.is_running_handler = false;
+    }
 }
 
 fn AudioQueuePrime(
@@ -1095,7 +1125,9 @@ pub fn AudioQueueDispose(
         env.mem.free(buffer_ptr.cast());
     }
 
-    if let Some(al_source) = host_object.al_source {
+    // [扫描修 2026-09-16] AQ-01:用 take() 取出 source,宿主对象里同时置 None,
+    // 下面删掉这个 OpenAL 名字后不会再有人拿它去用。
+    if let Some(al_source) = host_object.al_source.take() {
         unsafe {
             context.SourceStop(al_source);
             assert!(context.GetError() == 0);
@@ -1110,6 +1142,20 @@ pub fn AudioQueueDispose(
                 host_object.al_unused_buffers.len().try_into().unwrap(),
                 host_object.al_unused_buffers.as_ptr(),
             );
+            assert!(context.GetError() == 0);
+        }
+
+        // [扫描修 2026-09-16] AQ-01:原来只删缓冲、从不删 source。prime_audio_queue
+        // 给每个队列 GenSources 一个,AVAudioPlayer stop/dealloc 都走这里,
+        // CDLongAudioSource 每换一首曲子就漏一个;openal-soft 默认上限 256
+        // (alc.cpp SourcesMax),用尽后 GenSources 报 AL_OUT_OF_MEMORY,
+        // prime_audio_queue 的断言直接 panic。放在删缓冲之后:上面已停止并出队
+        // 全部已处理缓冲;只 Prime 没 Start(AL_INITIAL)的 source 队列里剩下的
+        // 缓冲出不了队,删 source 时 openal-soft 会自己释放引用、不报错,但宿主
+        // 不知道这些缓冲名字,名字仍会漏(修前同样漏);AVAudioPlayer 先 Start
+        // 才建 source 并立刻 SourcePlay,走不到。
+        unsafe {
+            context.DeleteSources(1, &al_source);
             assert!(context.GetError() == 0);
         }
     }

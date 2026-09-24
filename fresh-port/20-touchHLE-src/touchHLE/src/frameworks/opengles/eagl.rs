@@ -323,6 +323,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // 与"只在快路径自增"的 [FRAME] 对比。[PRESENT] 仍涨而 [FRAME] 停 ⇒ guest 没冻死、只是跌出了
     // 全屏 CAEAGLLayer 快路径(顶层被 HUD/遮罩盖住);两者都停 ⇒ guest 真卡在一次 drawScene(CPU 死循环)。
     // 慢路径顺带打出 fullscreen/ drawable 图层归属,坐实是否被覆盖层挤出快路径。
+    // [同步 2026-09-24] 只在 iOS 打:iOS 真机排查探针;桌面每 64 帧一行会刷屏,main 没有这行日志。
+    #[cfg(target_os = "ios")]
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static PRES_ALL_N: AtomicU64 = AtomicU64::new(0);
@@ -588,6 +590,8 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     // [FRAME] 仍在增长 = 每帧还在出帧(渲染慢/内存压力,非单帧 CPU 死循环);停滞 = guest 卡在一次
     // drawScene 从不返回 present(CPU 死循环)。用于决定性区分"CPU 死循环 vs OOM"。开销:每帧一次
     // 原子自增 + 每 256 帧一行日志,可忽略。
+    // [同步 2026-09-24] 门控到 iOS(iOS 的 release 照样打,上面"release 也开"的语义不变);桌面 main 没有这行日志。
+    #[cfg(target_os = "ios")]
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static FRAME_N: AtomicU64 = AtomicU64::new(0);
@@ -705,6 +709,15 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         gles11::TEXTURE_MIN_FILTER,
         gles11::LINEAR as _,
     );
+    // [MoleWorld iOS 黑屏根治] 这条是【游戏真机主呈现路径】(EAGL fast path):把屏幕大小
+    // 的游戏 renderbuffer CopyTexImage2D 成一张纹理再画到屏幕。该纹理是 NPOT(960×640/
+    // 1024×768/自适配尺寸),原版只设了 MIN_FILTER、wrap 停在默认 GL_REPEAT。桌面 GL2.1
+    // (gles1_on_gl2)容忍 NPOT+REPEAT 故 Mac 一直正常;但【原生 iOS GLES1.1】对 NPOT 纹理
+    // 仅在 CLAMP_TO_EDGE+非 mipmap 过滤时才【完整】,否则纹理 texture-incomplete:即便
+    // GL_TEXTURE_2D 已 Enable、TEXTURE_BINDING_2D 非 0,采样也按『纹理被禁用』处理且【不报
+    // glError】→ REPLACE 环境下整块四边形纯黑。这正是真机『纹理有内容(读回非0)却 present 全黑、
+    // 纯色四边形却正常、glErr=0』的根因。composition.rs / window.rs(splash)早已为各自的 NPOT
+    // 纹理补了 CLAMP_TO_EDGE,唯独这条游戏主路径漏补。仅 iOS 加,Mac 保持 REPEAT 不回归。
     // [MoleWorld iOS] The present texture is the NPOT drawable/screen size. On iOS
     // native OpenGL ES 1.1, an NPOT texture with the default GL_REPEAT wrap is an
     // INCOMPLETE texture, so the texture unit samples "as if texturing were disabled"

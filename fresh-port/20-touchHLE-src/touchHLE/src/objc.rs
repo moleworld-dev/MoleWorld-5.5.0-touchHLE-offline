@@ -21,7 +21,9 @@
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
-use std::collections::HashMap;
+// [MoleWorld P1] FxHashMap (faster hash for the u32-keyed ObjC dispatch tables on the
+// per-message hot path; std HashMap's SipHash is DoS-resistant overkill for internal tables).
+use rustc_hash::FxHashMap;
 
 mod classes;
 mod messages;
@@ -32,6 +34,9 @@ mod selectors;
 mod synchronization;
 
 pub use classes::{objc_classes, Class, ClassExports, ClassTemplate};
+// note_present 的唯一调用方(eagl.rs 的 [PRESENT] 出帧计数)只在 interp_hb / debug 构建编译,
+// release 下这个再导出没人用;保留导出(让 MSG_N 这组出帧失速计数不被当成死代码),只压掉未使用告警。
+#[allow(unused_imports)]
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, msg_super,
     note_present, objc_super, release, retain,
@@ -66,28 +71,29 @@ pub type NSZonePtr = crate::mem::MutVoidPtr;
 /// Main type holding Objective-C runtime state.
 pub struct ObjC {
     /// Known selectors (interned method name strings).
-    selectors: HashMap<String, SEL>,
+    selectors: FxHashMap<String, SEL>,
 
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: crate::fxhash::FxHashMap<id, HostObjectEntry>,
+    objects: FxHashMap<id, HostObjectEntry>,
     /// [MoleWorld iOS · 性能] 方法解析缓存:(起始类, 选择子, 是否 objc_msgSendSuper2) → 实现所在的类
     /// (nil = 整条链都没有)。派发时先查它,命中即省掉沿超类链逐级查表。`method_cache_epoch` 与
     /// [crate::objc::methods::METHOD_TABLE_EPOCH] 不一致时整表作废(方法表有变动,只发生在加载期)。
-    pub(super) method_cache: crate::fxhash::FxHashMap<(u32, u32, bool), Class>,
+    /// (合并注:与 main 统一用 rustc_hash 的 FxHashMap,算法与 iOS 自带 crate::fxhash 同款。)
+    pub(super) method_cache: FxHashMap<(u32, u32, bool), Class>,
     pub(super) method_cache_epoch: u32,
 
     /// Known classes.
     ///
     /// Look at the `isa` to get the metaclass for a class.
-    classes: HashMap<String, Class>,
+    classes: FxHashMap<String, Class>,
 
     /// Mutexes used in @synchronized blocks (objc_sync_enter/exit).
-    sync_mutexes: HashMap<id, MutexId>,
+    sync_mutexes: FxHashMap<id, MutexId>,
 
     /// Mutexes for running the +initialize function.
-    initializer_threads: HashMap<id, ThreadInitializer>,
+    initializer_threads: FxHashMap<id, ThreadInitializer>,
 
     /// Temporary storage for optional type information when sending a message.
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
@@ -104,18 +110,20 @@ pub struct ObjC {
 
 impl ObjC {
     /// [性能观测] 当前活着的 objc 对象数(host 侧对象表大小)。
+    /// (合并复核:唯一调用点 mole_perf::tick 只在 iOS / 解释器构建上调,桌面上不用它,免未使用告警。)
+    #[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
     pub fn new() -> ObjC {
         ObjC {
-            selectors: HashMap::new(),
-            objects: crate::fxhash::FxHashMap::default(),
-            method_cache: crate::fxhash::FxHashMap::default(),
+            selectors: FxHashMap::default(),
+            objects: FxHashMap::default(),
+            method_cache: FxHashMap::default(),
             method_cache_epoch: 0,
-            classes: HashMap::new(),
-            sync_mutexes: HashMap::new(),
-            initializer_threads: HashMap::new(),
+            classes: FxHashMap::default(),
+            sync_mutexes: FxHashMap::default(),
+            initializer_threads: FxHashMap::default(),
             message_type_info: None,
             mole_hook_sels: None,
         }

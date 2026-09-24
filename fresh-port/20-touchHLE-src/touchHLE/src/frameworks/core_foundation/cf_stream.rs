@@ -467,15 +467,28 @@ fn fire(env: &mut Environment, cb_bits: GuestUSize, stream: id, event: u32, info
     if cb_bits == 0 || stream == nil {
         return;
     }
-    // [MOLE-READ-DIAG] log everything except the per-frame CanAcceptBytes spam, so we can see
-    // OpenCompleted(1)/HasBytesAvailable(2)/Error(8)/End(16) actually reaching the AsyncSocket.
-    if event != EV_CANACCEPT {
-        log!(
-            "[CFStream] fire event={} stream={:?} cb={:#x}",
-            event,
-            stream,
-            cb_bits
-        );
+    // [2026-09-16] B-02 按事件分级打日志。HasBytesAvailable 是电平触发:drive_streams 的 Peek::Bytes
+    // 分支没有闩锁,AsyncSocket 暂时没有读请求时,socket 里剩下的字节会让它每轮 run loop 都触发一次,
+    // 联网时会刷屏,所以降为 log_dbg!(格式不变,打开本模块调试日志即可看到)。CanAcceptBytes 每帧都有,
+    // 不打。OpenCompleted/ErrorOccurred/EndEncountered 是连接状态转换,排查断连要看,保留 log!。
+    match event {
+        EV_CANACCEPT => {}
+        EV_HASBYTES => {
+            log_dbg!(
+                "[CFStream] fire event={} stream={:?} cb={:#x}",
+                event,
+                stream,
+                cb_bits
+            );
+        }
+        _ => {
+            log!(
+                "[CFStream] fire event={} stream={:?} cb={:#x}",
+                event,
+                stream,
+                cb_bits
+            );
+        }
     }
     let f = GuestFunction::from_addr_with_thumb_bit(cb_bits);
     let _: () = f.call_from_host(env, (stream, event, info));

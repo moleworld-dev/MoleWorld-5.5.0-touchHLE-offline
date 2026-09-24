@@ -88,7 +88,7 @@ fn serverlist_override(env: &mut Environment, request: id) -> Option<Vec<u8>> {
 }
 
 /// Build an autoreleased NSData copying `bytes` into guest memory.
-fn nsdata_from_bytes(env: &mut Environment, bytes: &[u8]) -> id {
+pub(crate) fn nsdata_from_bytes(env: &mut Environment, bytes: &[u8]) -> id {
     let len = bytes.len() as GuestUSize;
     let buf = env.mem.alloc(len);
     env.mem.bytes_at_mut(buf.cast(), len).copy_from_slice(bytes);

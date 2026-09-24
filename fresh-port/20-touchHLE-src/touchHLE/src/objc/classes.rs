@@ -15,9 +15,11 @@ use super::{
     IMP, SEL,
 };
 use crate::mach_o::MachO;
-use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, Ptr, SafeRead};
+use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
+// [MoleWorld P1] FxHashMap for the per-class methods/ivars tables (hit on every msgSend).
+use rustc_hash::FxHashMap;
 
 /// Generic pointer to an Objective-C class or metaclass.
 ///
@@ -36,11 +38,11 @@ pub(super) struct ClassHostObject {
     pub(super) name: String,
     pub(super) is_metaclass: bool,
     pub(super) superclass: Class,
-    pub(super) methods: crate::fxhash::FxHashMap<SEL, IMP>,
-    pub(super) guest_method_signatures: HashMap<SEL, ConstPtr<u8>>,
+    pub(super) methods: FxHashMap<SEL, IMP>,
+    pub(super) guest_method_signatures: FxHashMap<SEL, ConstPtr<u8>>,
     /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
     /// (Alignment is used during ivar reconciliation.)
-    pub(super) ivars: HashMap<String, (ConstPtr<GuestUSize>, u32)>,
+    pub(super) ivars: FxHashMap<String, (ConstPtr<GuestUSize>, u32)>,
     /// Offset into the allocated memory for the object where the ivars of
     /// instances of this class or metaclass (respectively: normal objects or
     /// classes) should live. This is always >= the value in the superclass.
@@ -362,7 +364,7 @@ impl ClassHostObject {
             name: template.name.to_string(),
             is_metaclass,
             superclass,
-            methods: crate::fxhash::FxHashMap::from_iter(
+            methods: FxHashMap::from_iter(
                 (if is_metaclass {
                     template.class_methods
                 } else {
@@ -376,11 +378,11 @@ impl ClassHostObject {
                     (objc.selectors[name], IMP::Host(host_imp))
                 }),
             ),
-            guest_method_signatures: HashMap::default(),
+            guest_method_signatures: FxHashMap::default(),
             // maybe this should be 0 for NSObject? does it matter?
             instance_start: size,
             instance_size: size,
-            ivars: HashMap::default(),
+            ivars: FxHashMap::default(),
             is_initialized: InitializationStatus::NotInitialized,
         }
     }
@@ -404,11 +406,11 @@ impl ClassHostObject {
             name,
             is_metaclass,
             superclass,
-            methods: crate::fxhash::FxHashMap::default(),
-            guest_method_signatures: HashMap::new(),
+            methods: FxHashMap::default(),
+            guest_method_signatures: FxHashMap::default(),
             instance_start,
             instance_size,
-            ivars: HashMap::new(),
+            ivars: FxHashMap::default(),
             is_initialized: InitializationStatus::NotInitialized,
         };
 
@@ -480,7 +482,10 @@ fn substitute_classes(
         // its keychain queries no-ops — it also dodges the unbound Security.framework
         // kSec* constants (null-deref in -[TMA_SSKeychain _queryForService:account:])
         // and a known 124k-iteration spin in +[TMA_SSKeychain allAccounts].
-        || name == "TMA_SSKeychain"
+        // [扫描修 2026-09-15] MOLE_REAL_KEYCHAIN=1 时不 fake,改走 security.rs 的钥匙串持久化真跑 SSKeychain
+        // (试验开关,默认关 = 行为不变)。
+        || (name == "TMA_SSKeychain"
+            && std::env::var("MOLE_REAL_KEYCHAIN").as_deref() != Ok("1"))
         // TaomeeAnalytics: TaoMee's analytics SDK (startSession/logEvent/event/
         // uploadAllArchivedData/setLogServerUrl…). Pure analytics, all network.
         // Its -startSession: fires an ASIHTTPRequest to a now-dead server, which
@@ -508,7 +513,25 @@ fn substitute_classes(
         || name == "NewRelicAgent"    // P1 APM: harvest timer + URLProtocol/method swizzle
         || name == "IMAdTracker"      // P1 InMobi conversion tracking: reachability + NSOperationQueue retries
         || name == "MiidiManager"     // P1 Miidi offer-wall setup + plist probing
-        || name == "TaomeeAdWall")    // P1 Taomee offer-wall + bare network analytics
+        || name == "TaomeeAdWall"     // P1 Taomee offer-wall + bare network analytics
+        // (合并注:上面 7 个精确类名来自 iOS 分支 3e9a80a 启动提速;下面按前缀 fake 的广告 SDK 来自 main
+        //  的「登录进村跨游戏广告」修复。两组互不重叠,都保留。)
+        // AppDriver (Metaps, 服务器 d.appsdt.com):跨游戏广告 SDK,类名全 "ADC" 前缀
+        // (ADCSplash* 开屏插屏 / ADCPowerWall* 全屏广告墙 / ADCBannerView / ADCRecommendView /
+        //  ADCProtocolEngine …)。**这才是登录进村弹"赛尔号:王者归来 立即参战"整屏广告的真凶**
+        // ——它没被 fake,会真跑:建 UIWebView + 联网 d.appsdt.com 拉广告并整屏展示。游戏自身无 ADC 前缀类,
+        // 整族都属该 SDK,按前缀 fake 安全。同 fake PunchBox 插屏(PBInterstitial*,PunchBoxAd 仅命中单类)
+        // 与 AppDriver 广告墙(AdWalls*)。fake 后整条广告流程变 no-op,不弹任何跨游戏广告。
+        || name.starts_with("ADC")
+        || name.starts_with("PBInterstitial")
+        || name.starts_with("AdWalls")
+        || name == "AppDriverRequest"
+        // ★[赛尔号/卡丁车 跨游戏推荐弹窗真凶] PunchBox MoreGame:登录进村弹"请尝试我们的其他游戏"
+        // (PBMoreGameView/Manager/Net…),内容随服务器/缓存轮换(用户看到赛尔号,离线看到摩尔卡丁车)。
+        // 和已 fake 的 PunchBoxAd 是同 SDK 不同模块,之前漏了。连同 Taomee 的 MoreGame 包装控制器一起 fake。
+        || name.starts_with("PBMoreGame")
+        || name.starts_with("TaomeeMore")
+        || name.starts_with("PunchBoxMoreGame"))
     {
         return None;
     }
@@ -523,7 +546,10 @@ fn substitute_classes(
         assert!(name == metaclass_name);
     }
 
-    log!(
+    // [扫描修 2026-09-15] F10-5:能走到这里的全是上面白名单里的广告/统计/社交 SDK 类(ADC*/Flurry*/
+    // AdWalls*/PB*/Tapjoy*/TDGA*…),一轮启动 127 行逐类 Note 纯属噪音。逐类降为 log_dbg!,
+    // register_bin_classes 结束时汇总打一行计数。
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -676,11 +702,14 @@ impl ObjC {
 
         assert!(list.size % 4 == 0);
         let base: ConstPtr<Class> = Ptr::from_bits(list.addr);
+        // [扫描修 2026-09-15] F10-5:统计被替换成 fake class 的 SDK 类个数,循环后汇总一行。
+        let mut fake_class_count: usize = 0;
         for i in 0..(list.size / 4) {
             let class = mem.read(base + i);
             let metaclass = Self::read_isa(class, mem);
 
             let name = if let Some(fakes) = substitute_classes(mem, class, metaclass) {
+                fake_class_count += 1;
                 let (class_host_object, metaclass_host_object) = fakes;
 
                 assert!(class_host_object.name == metaclass_host_object.name);
@@ -706,6 +735,12 @@ impl ObjC {
             };
 
             self.classes.insert(name.to_string(), class);
+        }
+        if fake_class_count > 0 {
+            log!(
+                "Note: substituted fake classes for {} ad/analytics/social SDK classes to improve compatibility (per-class list: enable log_dbg for touchHLE::objc::classes)",
+                fake_class_count
+            );
         }
 
         let mut queue = VecDeque::<Class>::new();
@@ -789,7 +824,22 @@ impl ObjC {
                             continue;
                         }
 
-                        *offset = Ptr::from_bits((*offset).to_bits() + diff);
+                        // [MoleWorld 修复] 把修正后的 ivar 偏移【写回 guest 的 _OBJC_IVAR 变量】,
+                        // 而非只平移 Rust map 里的指针。原代码 `*offset = ptr + diff` 改的是 map 指针,
+                        // 既没修游戏【编译码】读的 guest _OBJC_IVAR 值(LDR [_OBJC_IVAR];STR [self,off]),
+                        // 也让 object_lookup_ivar 读到错误邻居。非脆弱(non-fragile)ivar 的编译期偏移
+                        // 假设了父类某个 size,真机由 dyld 在加载时按真实父类 size 修正并写回 _OBJC_IVAR;
+                        // touchHLE 漏了这步 → 子类首个 ivar 与父类末尾 ivar 重叠。
+                        // ★实证(黄金岛商店空白):NewSceneObjectData.build_value 编译期@136 撞
+                        //   ObjectData.shop_sub_type@136(u8)→ setBuild_value:(0) 覆盖 shop_sub_type
+                        //   → parseObjectData 的 `shop_sub_type<=6` 入桶门失败 → storeBuildingsArray 全空
+                        //   → 建设庄园/食材店物品网格空、买不了。写回修正偏移后 build_value→140(4对齐),
+                        //   不再重叠。map 指针保持指向 _OBJC_IVAR 变量(其值已被修正),host/guest 一致。
+                        let addr = (*offset).to_bits();
+                        let rp: ConstPtr<GuestUSize> = Ptr::from_bits(addr);
+                        let cur: GuestUSize = mem.read(rp);
+                        let wp: MutPtr<GuestUSize> = Ptr::from_bits(addr);
+                        mem.write(wp, cur + diff);
                     }
                 }
 

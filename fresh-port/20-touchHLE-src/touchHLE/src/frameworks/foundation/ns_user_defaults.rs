@@ -94,6 +94,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let dict: id = msg_class![env; NSDictionary dictionaryWithContentsOfFile:plist_file_path];
 
     let dict: id = if dict == nil {
+        // [深扫修 2026-09-11] 文件存在却解析不出字典 = 偏好 plist 已损坏(旧版非原子写被打断等)。
+        // 行为不变(仍退回空字典),但必须大声记日志:摩尔庄园此时 isEncrypt/EV130 读成 NO,
+        // loadUserInfoData 会弹 HACK_USERINFO_DATA_ERROR(被自动关闭)后 exit(0),玩家只看到秒退。
+        if env.fs.exists(&plist_file_path_buf) {
+            log!(
+                "[!] NSUserDefaults: 偏好文件 {:?} 存在但无法解析为字典(已损坏?)— 以空偏好启动,原有设置全部视为缺失",
+                plist_file_path_buf
+            );
+        }
         msg_class![env; NSMutableDictionary new]
     } else {
         msg![env; dict mutableCopy]
@@ -296,6 +305,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     let plist_file_path_buf = plist_file_path_dir.join(plist_file_name);
     let plist_file_path = ns_string::from_rust_string(env, plist_file_path_buf.as_str().to_string());
     let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
+    // [深扫修 2026-09-11] atomically:true 现在是真原子写:NSDictionary writeToFile:atomically:
+    // → NSData writeToFile:atomically: → Fs::write_atomic(同目录临时文件 + rename)。
+    // 原来是先截断再写,写到一半被杀会留下残缺 plist,下次启动 isEncrypt 读成 NO → 游戏秒退。
     msg![env; dict writeToFile:plist_file_path atomically:true]
 }
 

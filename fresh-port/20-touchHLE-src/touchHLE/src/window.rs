@@ -42,17 +42,17 @@ impl std::fmt::Display for DeviceFamily {
 }
 impl DeviceFamily {
     pub fn portrait_size(&self) -> (u32, u32) {
-        // [MoleWorld 智能分辨率·测试分支] MOLE_GUEST_PORTRAIT=WxH 覆盖 guest 逻辑屏(点,portrait 维度)。
+        // [MoleWorld 智能分辨率] 第一层:--logical-size=WxH 显式覆盖 guest 逻辑屏(点,portrait 维度)。
         // 用途="物理满屏不黑边"折中:喂一个更宽的 winSize → 游戏世界场景(村庄/岛,checkBounding 读
         // winSize)自然扩视野铺满 + winSize 相对 UI(底部菜单/弹窗)自动重锚;顶部 HUD 等写死坐标保持
         // 老位(后续 targeted 重锚 + present 模糊填缝补)。★portrait 维度:landscape 时 size_for_orientation
         // 交换宽高,故"加宽 landscape"=加大这里的 height(如 768x1366 → landscape 1366x768=16:9)。
         // ui_screen bounds(guest winSize)与 window size 都走本函数 → 窗口自动匹配 guest 宽高比=无 letterbox。
-        // 仅 env 显式设置时生效;默认(不设)逐字节不变,零回归。
+        // 仅显式传参时生效;默认(不传)逐字节不变,零回归。
         if let Some(sz) = guest_portrait_override() {
             return sz;
         }
-        // [MoleWorld 智能分辨率] 第二层:MOLE_FILL=1 时由 Window::new 按目标屏宽高比自动算的 guest 逻辑屏。
+        // [MoleWorld 智能分辨率] 第二层:--fill-screen 时由 Window::new 按目标屏宽高比自动算的 guest 逻辑屏。
         if let Some(&sz) = AUTO_PORTRAIT.get() {
             return sz;
         }
@@ -63,14 +63,14 @@ impl DeviceFamily {
     }
 }
 
-/// [MoleWorld 智能分辨率] 自动适配(--fill-screen / MOLE_FILL)时,Window::new 按目标屏宽高比
+/// [MoleWorld 智能分辨率] 自动适配(--fill-screen)时,Window::new 按目标屏宽高比
 /// 算好的 guest portrait 逻辑屏。
 static AUTO_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
 
 /// [MoleWorld 智能分辨率] CLI `--logical-size=WxH` 显式指定的 guest portrait 逻辑屏(点,已归一
-/// 成 portrait=(短,长))。优先级高于 env `MOLE_GUEST_PORTRAIT`。由 [apply_cli_resolution] 写入。
+/// 成 portrait=(短,长))。优先级高于 --fill-screen 自动算的尺寸。由 [apply_cli_resolution] 写入。
 static CLI_PORTRAIT: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-/// [MoleWorld 智能分辨率] CLI `--fill-screen` 开关(等价 MOLE_FILL=1,一等公民)。
+/// [MoleWorld 智能分辨率] CLI `--fill-screen` 开关(自动铺屏适配的唯一入口)。
 static CLI_FILL_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// [MoleWorld 智能分辨率] CLI `--max-aspect=F` 覆盖(自动适配时 guest landscape 宽高比上限)。
 static CLI_MAX_ASPECT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -108,36 +108,17 @@ pub fn apply_cli_resolution(
     }
 }
 
-/// [MoleWorld 智能分辨率] 显式 guest portrait 逻辑屏覆盖:CLI `--logical-size` 优先,其次
-/// env `MOLE_GUEST_PORTRAIT=WxH`(portrait 点尺寸,仅解析一次)。
+/// [MoleWorld 智能分辨率] 显式 guest portrait 逻辑屏覆盖:只认 CLI `--logical-size`。
+/// [2026-09-16] B-06 删掉了分辨率实验期留下的环境变量入口:它早被 --logical-size 收编(CLI 优先),
+/// 启动器、安卓、iOS 入口都不用它,留着只是一个能绕过启动器参数改 guest 逻辑屏的隐藏旋钮。
 fn guest_portrait_override() -> Option<(u32, u32)> {
-    if let Some(&sz) = CLI_PORTRAIT.get() {
-        return Some(sz);
-    }
-    static OVERRIDE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        let s = std::env::var("MOLE_GUEST_PORTRAIT").ok()?;
-        let (w, h) = s.split_once('x')?;
-        let w: u32 = w.trim().parse().ok()?;
-        let h: u32 = h.trim().parse().ok()?;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        log!(
-            "[MOLE-RES] guest 逻辑屏覆盖 MOLE_GUEST_PORTRAIT={}x{}(landscape={}x{})",
-            w,
-            h,
-            h,
-            w
-        );
-        Some((w, h))
-    })
+    CLI_PORTRAIT.get().copied()
 }
 
-/// [MoleWorld 智能分辨率] 是否请求自动铺屏适配(--fill-screen 或 MOLE_FILL=1)。
+/// [MoleWorld 智能分辨率] 是否请求自动铺屏适配(只认 CLI `--fill-screen`)。
+/// [2026-09-16] B-06 同上,删掉了等价的环境变量入口。
 fn fill_screen_requested() -> bool {
     CLI_FILL_SCREEN.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("MOLE_FILL").map(|v| v != "0").unwrap_or(false)
 }
 
 /// [MoleWorld 智能分辨率] 自动适配时 guest landscape 宽高比上限。默认 2.4(≈21.6:9,覆盖
@@ -170,7 +151,7 @@ fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
     (base_short, landscape_long)
 }
 
-/// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size/env,或自动 fill 已算出)。
+/// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size,或 --fill-screen 已自动算出)。
 /// [Window::viewport] 据此:定制时走【等比缩放】(不变形,且 guest 比例≈屏比例故无黑边);默认
 /// (无定制)保持窗口模式自由拉伸铺满(零回归)。
 fn custom_guest_size_active() -> bool {
@@ -268,8 +249,73 @@ pub enum FingerId {
     ButtonToTouch(crate::options::Button),
     StickToTouch,
     DpadToTouch,
+    /// [扫描修 2026-09-15] 鼠标滚轮/触控板滑动合成的虚拟捏合手指 A(见 poll_for_events 的滚轮处理)。
+    PinchA,
+    /// [扫描修 2026-09-15] 虚拟捏合手指 B,与 A 关于两指中点对称。
+    PinchB,
 }
 pub type Coords = (f32, f32);
+
+/// [扫描修 2026-09-15] 滚轮模拟双指捏合的参数(长度单位均为 guest 点)。
+/// 根因(F12-2):桌面上鼠标只有一根手指,而游戏 -[GameManager processTouch:withType:]@0x1a680
+/// 与 -[NewGameManager processTouch:withType:]@0x245474 要求“本次触点数 ≥2 且类型为移动”才调
+/// zoom:touch2:,所以村庄/黄金岛在桌面上无法缩放。-[VillageLayer zoom:touch2:]@0x35668 按两指
+/// “当前间距/上次间距”算缩放比、以两指中点为锚点,自带 isMaxZoomed/isMinZoomed 与 checkBounding
+/// 边界,故合成两根对称的虚拟手指即可走原版缩放逻辑,不改游戏语义。
+const PINCH_HALF_START: f32 = 60.0; // 初始半间距 → 两指间距 120pt
+const PINCH_HALF_MIN: f32 = 20.0; // 最小半间距 → 两指间距 40pt
+const PINCH_HALF_MAX: f32 = 240.0; // 最大半间距 → 两指间距 480pt(另受画面边界限制)
+const PINCH_EDGE_MARGIN: f32 = 150.0; // 中点离画面边缘至少这么远(画面够大时),给张开留余量
+const PINCH_HALF_PER_NOTCH: f32 = 6.0; // 每格滚轮半间距变 6pt → 间距 ±12pt(约 ±10% 缩放)
+const PINCH_MAX_NOTCHES_PER_EVENT: f32 = 5.0; // 单个滚轮事件最多按 5 格算,防触控板猛甩一下到头
+const PINCH_IDLE_TIMEOUT: Duration = Duration::from_millis(150); // 停止滚动多久后抬起双指
+
+/// [扫描修 2026-09-15] 进行中的滚轮捏合手势:一段手势内两根虚拟手指一直按住,只发移动。
+struct PinchState {
+    /// 两指中点(guest 竖屏坐标系,整数点);一段手势内固定不动。
+    center: Coords,
+    /// 捏合轴:窗口水平方向在 guest 坐标系里的单位向量(分量取 ±1 或 0)。
+    axis: Coords,
+    /// 当前半间距(整数点)。保持整数,保证每次变化时两指坐标都各动 ≥1 点——ui_touch 会跳过
+    /// 位置没变的触点,只动一根会让游戏收到单指移动,误走拖动地图的分支。
+    half: f32,
+    /// 本段手势允许的最大半间距(受画面边界限制)。
+    max_half: f32,
+    /// 不足 1 点的滚动累积(触控板会给小数增量)。
+    pending: f32,
+    /// 最近一次滚轮输入的时刻。
+    last_input: Instant,
+}
+impl PinchState {
+    fn touch_map(&self) -> HashMap<FingerId, Coords> {
+        let (cx, cy) = self.center;
+        let (ax, ay) = self.axis;
+        HashMap::from([
+            (FingerId::PinchA, (cx - ax * self.half, cy - ay * self.half)),
+            (FingerId::PinchB, (cx + ax * self.half, cy + ay * self.half)),
+        ])
+    }
+}
+
+/// [扫描修 2026-09-15] 滚轮捏合总开关:环境变量 MOLE_WHEEL_PINCH=0 关闭(默认开启)。
+fn wheel_pinch_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_WHEEL_PINCH")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+/// [扫描修 2026-09-15] MOLE_WHEEL_PINCH_INVERT=1 反转缩放方向。默认按 SDL 给出的增量:
+/// 向上滚(y>0)= 两指张开 = 放大;SDL 的数值已含系统“自然滚动”设置,这里不再看 direction 字段。
+fn wheel_pinch_inverted() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_WHEEL_PINCH_INVERT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
 
 struct DpadState {
     left: bool,
@@ -292,16 +338,24 @@ pub enum Event {
     Quit,
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
+    /// [补完 2026-09-15] Android 上收到后不再退出:frameworks/uikit.rs 走「失活→挂起→激活」
+    /// (ui_application::suspend_app → [Window::suspend_until_foreground])。
+    /// [同步 2026-09-24] iOS 上也不退出:只暂停(游戏自己存档 + 暂停 CCDirector),真正进后台另见
+    /// [Event::AppDidEnterBackground](iOS 分支 6b93bc1)。
     AppWillResignActive,
     /// [MoleWorld iOS] OS told touchHLE the app entered the TRUE background.
     /// (iOS `applicationDidEnterBackground:`) GL is illegal until foreground.
+    /// [同步 2026-09-24] 下面三个只在 iOS 上由 poll_for_events 产生;非 iOS 构建里从不构造,放宽 dead_code。
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     AppDidEnterBackground,
     /// [MoleWorld iOS] OS told touchHLE the app is about to return to foreground.
     /// (iOS `applicationWillEnterForeground:`) Only fires after a true background.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     AppWillEnterForeground,
     /// [MoleWorld iOS] OS told touchHLE the app became active again.
     /// (iOS `applicationDidBecomeActive:`) Fires for every resume, including
     /// foreground overlays (Control Center) that never entered the background.
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     AppDidBecomeActive,
     /// OS has informed touchHLE it will soon terminate.
     /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
@@ -309,13 +363,62 @@ pub enum Event {
     TouchesDown(HashMap<FingerId, Coords>),
     TouchesMove(HashMap<FingerId, Coords>),
     TouchesUp(HashMap<FingerId, Coords>),
+    /// [复核修 2026-09-15] R1-3:触摸被取消(UIKit 的 touchesCancelled:withEvent: / UITouchPhaseCancelled)。
+    /// 目前只用来结束滚轮虚拟捏合:以抬起结束时,被 cocos2d 目标代理(如 HUD 上的 CCMenu)认领的那根
+    /// 虚拟手指会走 ccTouchEnded → activate,被当成一次点击;取消只走 ccTouchCancelled(不 activate)。
+    /// 不认取消的 cocos2d 代理由 ui_touch 的 handle_touches_cancelled 收尾([复核修 2026-09-15] R1-3 返修)。
+    TouchesCancel(HashMap<FingerId, Coords>),
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
     /// [MoleWorld] User pressed T, requesting the debug/cheat menu be toggled.
     ToggleMoleMenu,
     TextInput(TextInputEvent),
+    /// [扫描修 2026-09-15] F12-3:桌面窗口被最小化/隐藏(SDL Minimized/Hidden)。只在状态变化时
+    /// 发一次;由 frameworks/uikit.rs 转成 applicationWillResignActive: 与对应通知。
+    WindowMinimized,
+    /// [扫描修 2026-09-15] F12-3:桌面窗口从最小化/隐藏还原(SDL Restored/Shown/Maximized)。只在此前
+    /// 发过 WindowMinimized 时发一次;由 frameworks/uikit.rs 转成 applicationDidBecomeActive: 与对应通知。
+    WindowRestored,
 }
+
+/// [补完 2026-09-15] 切后台挂起的结束条件,见 [Window::suspend_until_foreground]。
+#[derive(Debug, Clone, Copy)]
+pub enum SuspendEnd {
+    /// 等 SDL 报告应用已回到前台(`SDL_APP_DIDENTERFOREGROUND`,Android `onResume()`)。
+    Foreground,
+    /// 计时到点就结束(/tmp/mole_input 注入 `suspend <秒数>`,在桌面上无头验证挂起流程用)。
+    Timer(Duration),
+}
+
+/// [补完 2026-09-15] 挂起的结果,见 [Window::suspend_until_foreground]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    /// 回到前台(或计时到点),继续运行。
+    Resumed,
+    /// 挂起期间收到 `SDL_QUIT` / `SDL_APP_TERMINATING`(关窗或系统要结束应用),调用方走退出流程。
+    Terminate,
+    /// 回前台时 SDL 报 `SDL_RENDER_DEVICE_RESET`:恢复原 EGL 上下文失败、SDL 新建了上下文,游戏上传过的
+    /// 纹理/缓冲全部失效,touchHLE 其它 GL 上下文再 make current 会失败(unwrap panic)。调用方先存档再退出。
+    RenderDeviceLost,
+}
+
+/// [补完 2026-09-15] 挂起期间每轮 poll SDL 事件之后的休眠时长(省电)。
+const SUSPEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// [补完 2026-09-15] 进入挂起循环后,前这么多轮排空事件队列之后不休眠,让 SDL 尽快备份 EGL 上下文。
+/// 依据(rust-sdl2 touchHLE-3 自带的 SDL 2.26):SDL_PollEvent 就是 SDL_WaitEventTimeout(ev, 0),只在队列里
+/// 没有待取的 SDL_POLLSENTINEL(sentinel_pending == 0)时才 pump 并压入哨兵,取到哨兵即返回 0——所以一个
+/// while-let 排空周期只 pump 一次(touchHLE 没关 SDL_HINT_POLL_SENTINEL)。Android 非阻塞泵
+/// (Android_PumpEvents_NonBlocking)在 SDL_APP_DIDENTERBACKGROUND 被取走后的下一次 pump 才置 isPaused,
+/// 再下一次 pump 才 android_egl_context_backup(置 backup_done)。poll_for_events 取到 WILLENTERBACKGROUND
+/// 就停止轮询,DIDENTERBACKGROUND 和哨兵还留在队列里,于是:第 1 轮只取走它们(不 pump)、第 2 轮 pump 置
+/// isPaused、第 3 轮 pump 才备份。Java 侧 onNativeSurfaceDestroyed 只等 backup_done 约 49×10ms
+/// (SDL_android.c nb_attempt = 50),这段预算还要先扣掉跑完当前帧、取消触点、失活/进后台回调(存档)的时间;
+/// 若前两轮各睡 50ms,会平白多占约 100ms,超时后 SDL 会在上下文仍 current 时销毁 surface
+/// ("Try to release egl_surface with context probably still active"),部分机型回前台黑屏或崩溃。
+/// 计时模式(桌面注入)照此处理也无害,只是多两次立即 poll。
+const SUSPEND_FAST_ROUNDS: u32 = 3;
 
 pub enum BatteryState {
     Unknown,
@@ -421,6 +524,12 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    /// [扫描修 2026-09-15] F12-2:滚轮合成的虚拟双指捏合;None = 虚拟手指未按下。
+    pinch: Option<PinchState>,
+    /// [扫描修 2026-09-15] F12-2:左键是否按住(按 SDL 事件顺序跟踪),左键拖动中的滚轮直接忽略。
+    mouse_left_down: bool,
+    /// [扫描修 2026-09-15] F12-3:上一次发出的窗口最小化状态,用来给 WindowMinimized/WindowRestored 去重。
+    window_minimized: bool,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -459,6 +568,9 @@ impl Window {
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
             // Disable blocking of event loop when app is paused.
+            // [补完 2026-09-15] 保持非阻塞:切后台时由 Window::suspend_until_foreground 自己循环 poll 等回前台
+            // (这样能先让游戏跑完失活回调,挂起期间也收得到 SDL_QUIT / SDL_APP_TERMINATING);EGL 上下文的
+            // 备份/恢复仍由 SDL 在 pump 里完成。
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
 
@@ -483,11 +595,11 @@ impl Window {
         apply_cli_resolution(options.logical_size, options.fill_screen, options.max_aspect);
         set_ambient_fill(options.ambient_fill);
 
-        // [MoleWorld 智能分辨率] --fill-screen / MOLE_FILL:按目标屏(主显示器/真机设备屏)宽高比
+        // [MoleWorld 智能分辨率] --fill-screen:按目标屏(主显示器/真机设备屏)宽高比
         // 【自动】算 guest 逻辑屏,实现"物理满屏不黑边、不拉伸"——guest winSize 与屏幕同比例(钳制后)
         // → 世界场景(村庄/岛)扩视野铺满 + winSize 相对 UI 自动重锚,无 letterbox。短边按 device-family
         // 固定(iPad=768/iPhone=320),长边按屏宽高比缩放并夹在 [4:3, max_aspect](见 compute_fill_portrait)。
-        // 仅当未显式指定 guest 逻辑屏(--logical-size / MOLE_GUEST_PORTRAIT)时生效(显式优先)。结果存
+        // 仅当未显式指定 guest 逻辑屏(--logical-size)时生效(显式优先)。结果存
         // AUTO_PORTRAIT,供 portrait_size(ui_screen bounds + 窗口尺寸都走它)读取。默认(不请求)零回归。
         if fill_screen_requested() && guest_portrait_override().is_none() {
             if let Ok(db) = video_ctx.display_bounds(0) {
@@ -519,8 +631,8 @@ impl Window {
             // 路径不受影响(铁律:iOS 渲染改动不污染 Mac)。env 门控,默认不开,真机 opt-in 实测。
             let mut wb = video_ctx.window(title, width, height);
             wb.fullscreen().opengl();
-            // [MoleWorld iOS 对齐] 真机默认开高 DPI(原生像素呈现,画面清晰;见 5e2c481),MOLE_HIDPI=0 可关;
-            // 其它平台保持 env opt-in。iOS 没有环境变量,若沿用 env 门控会退回点分辨率=糊(cherry-pick 回归)。
+            // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:真机默认开高 DPI(原生像素呈现,画面清晰),MOLE_HIDPI=0 可关;
+            // 其它平台(安卓全屏)保持环境变量 opt-in。iOS 没有环境变量,沿用 env 门控会退回点分辨率而变糊。
             let hidpi = std::env::var("MOLE_HIDPI")
                 .map(|v| v != "0")
                 .unwrap_or(cfg!(target_os = "ios"));
@@ -628,6 +740,9 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
+            pinch: None,
+            mouse_left_down: false,
+            window_minimized: false,
             on_main_stack: true,
         };
 
@@ -636,8 +751,10 @@ impl Window {
         // because SDL2 won't let us use more than one graphics API in the same
         // window, and we also need OpenGL ES for the app's own rendering.
         let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
-        let mut window_default_fbo: crate::gles::gles11_raw::types::GLuint = 0;
-        let mut window_default_rbo: crate::gles::gles11_raw::types::GLuint = 0;
+        // [补完 2026-09-15] 消除 "value assigned is never read" 告警:两个变量在下面的块里一定会被赋值,
+        // 原先的初值 0 从来没被读过;改成延迟初始化(只赋值一次,也就不需要 mut),各平台取值不变。
+        let window_default_fbo: crate::gles::gles11_raw::types::GLuint;
+        let window_default_rbo: crate::gles::gles11_raw::types::GLuint;
         {
             let mut gl_ctx = gl_ins.make_current(&mut window);
             let desc = unsafe { gl_ctx.driver_description() };
@@ -660,7 +777,9 @@ impl Window {
         }
         window.default_framebuffer = window_default_fbo;
         window.default_renderbuffer = window_default_rbo;
-        log!("[ios-present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
+        // [2026-09-16] B-08 前缀从 [ios-present] 改成 [present]:这行没有 cfg 门控,全平台都打(桌面/安卓值为 0),
+        // 不是 iOS 专属;仍保留这一行,因为排查 iOS 真机 present 黑屏要看这个非 0 的默认 FBO。
+        log!("[present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
         window.internal_gl_ins = Some(gl_ins);
 
         if window.splash_image.is_some() {
@@ -742,8 +861,164 @@ impl Window {
             let (screen_width, screen_height) = window.window.drawable_size();
             (screen_width as f32 * x, screen_height as f32 * y)
         }
+        /// [扫描修 2026-09-15] F12-2:结束进行中的滚轮捏合。两根虚拟手指放进同一个事件一起结束:
+        /// 游戏 processTouch:withType: 对“触点数 ≥2 且不是移动”的事件直接返回,不会被当成点击
+        /// (若分两次结束,后结束的那根会以单指身份走点击/拖动分支)。
+        /// [复核修 2026-09-15] R1-3:改用 TouchesCancel 结束,不再用 TouchesUp。两指落在 cocos2d 目标代理上时
+        /// (HUD 的 CCMenu 按钮、可点物件),CCTouchDispatcher 让代理认领并吞掉其中一根,游戏只收到单指;
+        /// 以抬起结束会走 -[CCMenu ccTouchEnded:withEvent:]@0x2ceac8 → [selectedItem activate](误点按钮),
+        /// 剩下那根单指走 processTouch:withType:2 → ObjSelector/ActorManager 的 touchEnd(误点建筑/角色)。
+        /// 取消走 -[EAGLView touchesCancelled:withEvent:]@0x2f7750 → CCTouchDispatcher 类型 3:
+        /// -[CCMenu ccTouchCancelled:withEvent:]@0x2ceb10 只 unselected;VillageLayer@0x3558c/InGameLayer@0x2403f8
+        /// 以 processTouch:withType:3 进 GameManager/NewGameManager,各子处理器只对类型 2 做点击。
+        /// [复核修 2026-09-15] R1-3 返修:游戏里有几个目标代理不认取消(没有 ccTouchCancelled:withEvent:),
+        /// 却在 ccTouchBegan: 置门控、只在 ccTouchEnded: 清零(OutputHanlder.state_、TreasureRewardLayer /
+        /// FinalRewardAnimation._touchState),被取消后门控永远停在 1,产出图标 / 奖励层再也点不动;村庄
+        /// ObjSelector 的 isMoved/isSelected 也会残留,下一次点建筑丢一次。这些收尾放在
+        /// frameworks/uikit/ui_touch.rs 的 handle_touches_cancelled(发取消前清门控、发完清 ObjSelector 残留),
+        /// 这里仍然以取消结束,不回退成抬起(抬起会让 CCMenu 误点按钮)。
+        fn end_wheel_pinch(window: &mut Window, reason: &str) {
+            if let Some(p) = window.pinch.take() {
+                log!(
+                    "[滚轮捏合] 结束双指(取消,{}),最终间距 {}pt",
+                    reason,
+                    p.half * 2.0
+                );
+                window
+                    .event_queue
+                    .push_back(Event::TouchesCancel(p.touch_map()));
+            }
+        }
+        /// [扫描修 2026-09-15] F12-2:以光标为中心算一段新捏合手势的初始状态。
+        /// 中点先走 transform_input_coords(与左键点击同一条变换,自动适配窗口拉伸、
+        /// --fill-screen/--logical-size、letterbox 与旋转),两指偏移直接在 guest 点空间里加,
+        /// 与窗口缩放倍率无关。画面太小或坐标异常(如最小化时视口为 0)返回 None,不合成。
+        fn begin_wheel_pinch(window: &Window, cursor: Coords, now: Instant) -> Option<PinchState> {
+            let (gw, gh) = window.size_unrotated_unscaled();
+            let (gw, gh) = (gw as f32, gh as f32);
+            let (_, _, vw, vh) = window.viewport();
+            if gw < 4.0 || gh < 4.0 || vw == 0 || vh == 0 {
+                return None;
+            }
+            let c = transform_input_coords(window, cursor, false);
+            // 窗口水平方向对应 guest 坐标系的哪根轴:取光标右侧一段位移做差(横屏时是 guest 的 y 轴)。
+            let probe = transform_input_coords(
+                window,
+                (cursor.0 + (vw as f32 / 4.0).max(8.0), cursor.1),
+                false,
+            );
+            if !(c.0.is_finite() && c.1.is_finite() && probe.0.is_finite() && probe.1.is_finite()) {
+                return None;
+            }
+            let (dx, dy) = (probe.0 - c.0, probe.1 - c.1);
+            let axis: Coords = if dx.abs() >= dy.abs() {
+                (if dx < 0.0 { -1.0 } else { 1.0 }, 0.0)
+            } else {
+                (0.0, if dy < 0.0 { -1.0 } else { 1.0 })
+            };
+            let along_x = axis.0 != 0.0;
+            // 沿捏合轴:中点离边缘至少 PINCH_EDGE_MARGIN(画面不够大时取一半),给张开留余量;
+            // 另一根轴只保证不出画面。结果取整,保证两指坐标都是整数点。
+            let clamp_along = |v: f32, dim: f32| -> f32 {
+                let margin = PINCH_EDGE_MARGIN.min((dim / 2.0 - 1.0).floor()).max(0.0);
+                v.clamp(margin, (dim - 1.0 - margin).max(margin)).round()
+            };
+            let clamp_cross = |v: f32, dim: f32| -> f32 { v.clamp(1.0, dim - 2.0).round() };
+            let center: Coords = if along_x {
+                (clamp_along(c.0, gw), clamp_cross(c.1, gh))
+            } else {
+                (clamp_cross(c.0, gw), clamp_along(c.1, gh))
+            };
+            let (pos, dim) = if along_x {
+                (center.0, gw)
+            } else {
+                (center.1, gh)
+            };
+            // 两指都不越出画面:最大半间距受中点到两侧边缘的较近距离限制。
+            let max_half = PINCH_HALF_MAX.min(pos.min(dim - 1.0 - pos).floor());
+            if max_half < PINCH_HALF_MIN + 1.0 {
+                return None;
+            }
+            Some(PinchState {
+                center,
+                axis,
+                half: PINCH_HALF_START.min(max_half),
+                max_half,
+                pending: 0.0,
+                last_input: now,
+            })
+        }
+        /// [扫描修 2026-09-15] F12-2:一个滚轮事件(鼠标一格,或触控板的一段小数增量)→ 虚拟双指捏合。
+        /// 状态机:没有进行中的手势时,两根虚拟手指放进同一个 TouchesDown 一起按下(游戏对 ≥2 指的
+        /// 按下事件直接返回,不会误判点击);之后每次滚动只发 TouchesMove(半间距按增量变化);
+        /// 滚轮停下 PINCH_IDLE_TIMEOUT 后由 poll_for_events 末尾统一结束([复核修 2026-09-15] R1-3:
+        /// 以 TouchesCancel 结束,见 end_wheel_pinch)。已按下的虚拟手指绝不再发 Down。
+        fn handle_wheel_pinch(window: &mut Window, notches_int: i32, notches_precise: f32) {
+            // 不合成的情形:开关关闭 / 正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
+            if !wheel_pinch_enabled()
+                || MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                || crate::mole_menu::is_open()
+            {
+                return;
+            }
+            let mouse = window.event_pump.mouse_state();
+            // 左键拖动中收到滚轮:直接忽略(否则鼠标手指 + 两根虚拟手指 = 三指)。
+            if window.mouse_left_down && mouse.left() {
+                return;
+            }
+            let mut delta = if notches_precise != 0.0 && notches_precise.is_finite() {
+                notches_precise
+            } else {
+                notches_int as f32
+            };
+            if wheel_pinch_inverted() {
+                delta = -delta;
+            }
+            let delta = delta.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
+            if delta == 0.0 {
+                return;
+            }
+            let now = Instant::now();
+            if window.pinch.is_none() {
+                let cursor = (mouse.x() as f32, mouse.y() as f32);
+                let Some(p) = begin_wheel_pinch(window, cursor, now) else {
+                    return;
+                };
+                log!(
+                    "[滚轮捏合] 按下双指:中点 {:?} 轴 {:?} 间距 {}pt",
+                    p.center,
+                    p.axis,
+                    p.half * 2.0
+                );
+                window
+                    .event_queue
+                    .push_back(Event::TouchesDown(p.touch_map()));
+                window.pinch = Some(p);
+            }
+            let p = window.pinch.as_mut().unwrap();
+            p.last_input = now;
+            p.pending += delta * PINCH_HALF_PER_NOTCH;
+            let step = p.pending.trunc();
+            if step == 0.0 {
+                return;
+            }
+            p.pending -= step;
+            let new_half = (p.half + step).clamp(PINCH_HALF_MIN, p.max_half);
+            if new_half == p.half {
+                // 已到最大/最小间距:抬起双指,下一次滚动从初始间距重新按下(重握),实现连续缩放。
+                // 游戏按相邻两次间距之比缩放,重握不会让画面跳变。
+                end_wheel_pinch(window, "间距到头,重握");
+                return;
+            }
+            p.half = new_half;
+            let map = p.touch_map();
+            log_dbg!("[滚轮捏合] 移动:间距 {}pt", new_half * 2.0);
+            window.event_queue.push_back(Event::TouchesMove(map));
+        }
 
         let mut controller_updated = false;
+        // [扫描修 2026-09-15] F12-3:只有桌面窗口才把最小化/还原翻译成事件(见循环里的 E::Window 分支)。
+        let desktop_window = !Self::rotatable_fullscreen() && !cfg!(target_os = "ios");
         // event_pump doesn't have a method to peek on events
         // so, we keep track of an unconsumed one from a previous loop iteration
         // FIXME: use peek_event() from even_subsystem
@@ -837,6 +1112,71 @@ impl Window {
                         self.max_height = self.max_height.max(fh);
                         self.viewport_y_offset = self.max_height - fh;
                     }
+                }
+                _ => {}
+            }
+
+            // [扫描修 2026-09-15] F12-2 / F12-3:需要一次推入多个事件、或只改状态的输入先在这里处理。
+            // (下面 `self.event_queue.push_back(match …)` 的匹配臂里不能再往队列里推事件。)
+            match event {
+                E::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    self.mouse_left_down = true;
+                    // 左键按下前先抬起虚拟双指,避免与鼠标手指叠成三指。
+                    end_wheel_pinch(self, "左键按下");
+                }
+                E::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    self.mouse_left_down = false;
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::T),
+                    ..
+                } if !MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) => {
+                    // 菜单打开后 uikit.rs 会吞掉 Move/Up,先抬起虚拟双指,免得游戏里残留按住的触点。
+                    end_wheel_pinch(self, "切换修改器菜单");
+                }
+                E::MouseWheel { y, precise_y, .. } => {
+                    handle_wheel_pinch(self, y, precise_y);
+                    continue;
+                }
+                // F12-3:窗口最小化/隐藏 → WindowMinimized;还原/显示/最大化 → WindowRestored。
+                // 只在状态真正变化时发一次(Hidden+Minimized、Shown+Restored 常成对出现;启动时的
+                // Shown 与普通最大化因此不会误发)。普通失焦(FocusLost)不发:点一下别的窗口就暂停、
+                // 停音乐太打扰。只在桌面发:安卓/iOS 切后台走 AppWillEnterBackground(安卓挂起、iOS 暂停,
+                // 两条路径都自己发失活回调),在这里再发只会重复。
+                // [补完 2026-09-15] 注释更新:安卓切后台已从"直接退出"改为挂起等回前台(suspend_until_foreground)。
+                // [同步 2026-09-24] iOS 也不再退出:失活只暂停,真进后台由 AppDidEnterBackground 先关 GL 闸门。
+                E::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::Minimized | sdl2::event::WindowEvent::Hidden,
+                    ..
+                } => {
+                    if desktop_window && !self.window_minimized {
+                        end_wheel_pinch(self, "窗口最小化");
+                        self.window_minimized = true;
+                        log!("[窗口] 最小化/隐藏,发出 WindowMinimized");
+                        self.event_queue.push_back(Event::WindowMinimized);
+                    }
+                    continue;
+                }
+                E::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::Restored
+                        | sdl2::event::WindowEvent::Shown
+                        | sdl2::event::WindowEvent::Maximized,
+                    ..
+                } => {
+                    if desktop_window && self.window_minimized {
+                        self.window_minimized = false;
+                        log!("[窗口] 还原/显示,发出 WindowRestored");
+                        self.event_queue.push_back(Event::WindowRestored);
+                    }
+                    continue;
                 }
                 _ => {}
             }
@@ -1011,6 +1351,13 @@ impl Window {
                         continue;
                     }
                 }
+                // [同步 2026-09-24] 生命周期事件按平台分两套处理(消费侧 frameworks/uikit.rs 同样按
+                // cfg(target_os = "ios") 分两套):
+                // - iOS:沿用 iOS 分支 6b93bc1 的语义——resign 只暂停不退出;真正进后台由
+                //   AppDidEnterBackground 先关 GL 闸门;不再 assert、不再永久停轮询,回前台时还能继续收事件。
+                // - 非 iOS(安卓/桌面):沿用 main 的语义——安卓失活后停轮询,交给
+                //   [Window::suspend_until_foreground] 挂起等回前台(main 3bc4529),桌面行为与 main 逐字一致。
+                #[cfg(target_os = "ios")]
                 E::AppWillEnterBackground { .. } => {
                     // [MoleWorld iOS] SDL's "AppWillEnterBackground" is actually
                     // iOS `applicationWillResignActive:` — it fires for ANY
@@ -1035,6 +1382,7 @@ impl Window {
                     // foreground/background lifecycle events (needed to resume).
                     break;
                 }
+                #[cfg(target_os = "ios")]
                 E::AppDidEnterBackground { .. } => {
                     // [MoleWorld iOS] iOS `applicationDidEnterBackground:` — the
                     // TRUE background. After this, ANY GL call kills the app
@@ -1044,12 +1392,14 @@ impl Window {
                     self.high_priority_event = Some(Event::AppDidEnterBackground);
                     break;
                 }
+                #[cfg(target_os = "ios")]
                 E::AppWillEnterForeground { .. } => {
                     // [MoleWorld iOS] iOS `applicationWillEnterForeground:` —
                     // leaving the background. Ungate GL + resume.
                     log!("Received app-will-enter-foreground event.");
                     Event::AppWillEnterForeground
                 }
+                #[cfg(target_os = "ios")]
                 E::AppDidEnterForeground { .. } => {
                     // [MoleWorld iOS] SDL's "AppDidEnterForeground"
                     // (SDL_APP_DIDENTERFOREGROUND) is iOS
@@ -1058,11 +1408,37 @@ impl Window {
                     log!("Received app-did-become-active event.");
                     Event::AppDidBecomeActive
                 }
+                #[cfg(target_os = "ios")]
                 E::AppTerminating { .. } => {
                     log!("Received app-will-terminate event.");
                     // terminate 优先级最高:直接覆盖。不再 assert。
                     self.high_priority_event = Some(Event::AppWillTerminate);
                     break;
+                }
+                #[cfg(not(target_os = "ios"))]
+                E::AppWillEnterBackground { .. } => {
+                    log!("Received app-will-resign-active event.");
+                    assert!(self.high_priority_event.is_none());
+                    self.high_priority_event = Some(Event::AppWillResignActive);
+                    // For some reason, if we don't pause event polling, we will
+                    // never finish handling the event.
+                    // [补完 2026-09-15] 上游 TODO(回到前台后重新打开轮询)已实现:Android 上
+                    // frameworks/uikit.rs 先在模拟器线程给游戏发失活/进后台回调,再调
+                    // [Window::suspend_until_foreground] 自己 poll 等回前台,返回前把轮询恢复为 true。
+                    // 这里暂停轮询仍然必要:SDL(BLOCK_ON_PAUSE=0)在 SDL_APP_DIDENTERBACKGROUND 被取走后的
+                    // 下一次 pump 就会备份 EGL 上下文(MakeCurrent NULL);若继续轮询,游戏还没收到失活回调、
+                    // 可能还在画帧,上下文就被摘掉了。停轮询把这一步推迟到挂起循环里、游戏回调跑完之后。
+                    // [同步 2026-09-24] iOS 不走这里,见上面 cfg(target_os = "ios") 的几个臂。
+                    self.enable_event_polling = false;
+                    continue;
+                }
+                #[cfg(not(target_os = "ios"))]
+                E::AppTerminating { .. } => {
+                    log!("Received app-will-terminate event.");
+                    assert!(self.high_priority_event.is_none());
+                    self.high_priority_event = Some(Event::AppWillTerminate);
+                    self.enable_event_polling = false;
+                    continue;
                 }
                 E::FingerUp {
                     timestamp,
@@ -1190,6 +1566,17 @@ impl Window {
             })
         }
 
+        // [扫描修 2026-09-15] F12-2:滚轮停下 PINCH_IDLE_TIMEOUT(约 150ms)后结束两根虚拟手指
+        // ([复核修 2026-09-15] R1-3:以取消结束,见 end_wheel_pinch)。
+        // 必须放在 controller_updated 分支之前——那个分支的 match 里有 `_ => return`。
+        if self
+            .pinch
+            .as_ref()
+            .is_some_and(|p| p.last_input.elapsed() >= PINCH_IDLE_TIMEOUT)
+        {
+            end_wheel_pinch(self, "滚轮停止");
+        }
+
         if controller_updated {
             let (new_x, new_y, pressed, pressed_changed, moved) =
                 self.update_virtual_cursor(options);
@@ -1234,6 +1621,225 @@ impl Window {
             self.high_priority_event,
             Some(Event::AppDidEnterBackground) | Some(Event::AppWillTerminate)
         )
+    }
+
+    /// [补完 2026-09-15] 切后台挂起用:丢掉队列里已经翻译好、还没交给游戏的输入事件(触摸、文字输入、
+    /// 菜单键),并把窗口侧合成输入的"按住"状态复位(滚轮虚拟捏合、鼠标左键、方向键/摇杆/虚拟光标映射的
+    /// 触点、右键虚拟加速度计)。游戏里仍按着的触点由 frameworks/uikit.rs 的 cancel_tracked_touches 以取消
+    /// 结束,两边一起清,回来后第一下按键/触摸重新从"按下"开始:不会出现窗口侧以为还按着、只发移动
+    /// (ui_touch 不认识而丢掉),也不会让右键倾斜一直生效。只改字段、不调 SDL,可以在协程栈上调用。
+    /// 其它事件(Quit、WindowMinimized/Restored、EnterDebugger 等)保留。返回丢掉的事件数。
+    pub fn discard_pending_input(&mut self) -> usize {
+        let before = self.event_queue.len();
+        self.event_queue.retain(|event| {
+            !matches!(
+                event,
+                Event::TouchesDown(_)
+                    | Event::TouchesMove(_)
+                    | Event::TouchesUp(_)
+                    | Event::TouchesCancel(_)
+                    | Event::TextInput(_)
+                    | Event::ToggleMoleMenu
+            )
+        });
+        let dropped = before - self.event_queue.len();
+        // 虚拟捏合的两根手指若已交给游戏,由 cancel_tracked_touches 取消;这里只清窗口侧状态、不补发取消
+        // (补发的话队列里又多一条游戏已经不认识的取消)。
+        self.pinch = None;
+        self.mouse_left_down = false;
+        self.dpad_state.left = false;
+        self.dpad_state.right = false;
+        self.dpad_state.up = false;
+        self.dpad_state.down = false;
+        self.dpad_state.active = false;
+        self.stick_active = false;
+        if let Some(last) = self.virtual_cursor_last.as_mut() {
+            // (x, y, pressed, visible):只清"按下",保留光标位置;仍按着的键下次更新时会重新发按下。
+            last.2 = false;
+        }
+        if let Some(last) = self.virtual_accelerometer_last.as_mut() {
+            // (x, y, right_click_hold):右键若在挂起期间松开,不清就会一直保持倾斜。
+            last.2 = false;
+        }
+        dropped
+    }
+
+    /// [补完 2026-09-15] 切后台时在模拟器线程上挂起,直到回到前台(或计时到点)。
+    ///
+    /// 调用方(frameworks/uikit/ui_application.rs 的 suspend_app)先给游戏发完失活/进后台回调,再通过
+    /// `Environment::on_parent_stack_in_coroutine` 在主栈上调用本方法(Android 的 SDL poll 会走 JNI)。
+    /// 挂起期间不跑 guest、不渲染:自己循环 poll SDL 事件,每轮排空队列后休眠 [SUSPEND_POLL_INTERVAL]
+    /// ([补完 2026-09-15] 前 [SUSPEND_FAST_ROUNDS] 轮不休眠,见该常量)。
+    /// - Android(SDL_ANDROID_BLOCK_ON_PAUSE=0,vendor/SDL 的 Android_PumpEvents_NonBlocking):取走
+    ///   SDL_APP_DIDENTERBACKGROUND 后,下一次 pump 置 isPaused,再下一次 pump 备份 EGL 上下文(MakeCurrent
+    ///   NULL、backup_done=1;Java 侧 onNativeSurfaceDestroyed 最多等约 490ms 就是在等它,之后才销毁
+    ///   EGLSurface)。[补完 2026-09-15] 注意 SDL_PollEvent 每个排空周期(取到 SDL_POLLSENTINEL 为止)只 pump
+    ///   一次,这里的"下一次 pump"就是"下一轮排空",所以备份发生在进入本循环后的第 3 轮。
+    ///   回前台时同一次 pump 里依次发 WILLENTERFOREGROUND / DIDENTERFOREGROUND /
+    ///   WINDOWEVENT_RESTORED 并 MakeCurrent 回原上下文,失败则新建上下文并推 SDL_RENDER_DEVICE_RESET。
+    ///   所以一直 poll 即可:看到 DIDENTERFOREGROUND 时原上下文已恢复,后续继续用它。每轮先排空队列再判断
+    ///   是否结束,既能看到紧随其后的 RENDER_DEVICE_RESET,也能处理"刚回前台又被切走"(继续挂起)。
+    /// - 触摸/鼠标/按键/手柄输入一律丢弃;桌面窗口的最小化/还原照常换成 WindowMinimized/WindowRestored
+    ///   入队(回来后由 uikit.rs 处理);macOS 窗口尺寸变化只更新 viewport_y_offset(--lock-aspect 的
+    ///   窗口比例约束等下一次尺寸事件再做);手柄插拔照常登记。
+    /// - 收到 SDL_QUIT / SDL_APP_TERMINATING 立即返回 [SuspendOutcome::Terminate]。
+    ///
+    /// 返回前再丢一次残留输入(见 [Self::discard_pending_input]),并恢复 enable_event_polling = true。
+    pub fn suspend_until_foreground(&mut self, end: SuspendEnd) -> SuspendOutcome {
+        use sdl2::event::Event as E;
+        use sdl2::event::WindowEvent as WE;
+
+        assert!(self.on_main_stack);
+        let started = Instant::now();
+        let deadline = match end {
+            SuspendEnd::Foreground => None,
+            SuspendEnd::Timer(duration) => Some(started + duration),
+        };
+        let desktop_window = !Self::rotatable_fullscreen() && !cfg!(target_os = "ios");
+        let mut dropped = self.discard_pending_input();
+        let mut foreground = false;
+        let mut device_lost = false;
+        let end_desc = match end {
+            SuspendEnd::Foreground => "等待系统通知回到前台".to_string(),
+            SuspendEnd::Timer(duration) => format!("计时 {:.1}s 后结束", duration.as_secs_f64()),
+        };
+        log!(
+            "[生命周期] 模拟器线程挂起:{}(不跑 guest、不渲染;前 {} 轮排空后不休眠,好让 SDL 尽快备份 EGL 上下文,之后每 {}ms poll 一次 SDL 事件)",
+            end_desc,
+            SUSPEND_FAST_ROUNDS,
+            SUSPEND_POLL_INTERVAL.as_millis()
+        );
+
+        // [补完 2026-09-15] 已完成的排空轮数;前 SUSPEND_FAST_ROUNDS 轮不休眠(依据见该常量)。
+        let mut round: u32 = 0;
+        let outcome = 'suspend: loop {
+            while let Some(event) = self.event_pump.poll_event() {
+                match event {
+                    E::Quit { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_QUIT(关闭窗口 / 系统结束应用)");
+                        break 'suspend SuspendOutcome::Terminate;
+                    }
+                    E::AppTerminating { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_APP_TERMINATING(系统即将结束应用)");
+                        break 'suspend SuspendOutcome::Terminate;
+                    }
+                    E::AppWillEnterBackground { .. } | E::AppDidEnterBackground { .. } => {
+                        if foreground {
+                            log!("[生命周期] 刚回到前台又被切到后台,继续挂起");
+                        }
+                        foreground = false;
+                    }
+                    E::AppWillEnterForeground { .. } => {
+                        log!("[生命周期] SDL:应用即将回到前台");
+                    }
+                    E::AppDidEnterForeground { .. } => {
+                        log!("[生命周期] SDL:应用已回到前台(SDL 已在本次 pump 里恢复 EGL 上下文)");
+                        foreground = true;
+                    }
+                    E::AppLowMemory { .. } => {
+                        log!("[生命周期] 挂起期间收到系统低内存警告(忽略)");
+                    }
+                    E::RenderTargetsReset { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_RENDER_TARGETS_RESET(渲染目标被重置,纹理内容可能已丢失)");
+                    }
+                    E::RenderDeviceReset { .. } => {
+                        log!("[生命周期] 挂起期间收到 SDL_RENDER_DEVICE_RESET:SDL 恢复原 EGL 上下文失败并新建了上下文,游戏上传过的纹理/缓冲全部失效");
+                        device_lost = true;
+                    }
+                    E::Window {
+                        win_event: WE::Minimized | WE::Hidden,
+                        ..
+                    } => {
+                        if desktop_window && !self.window_minimized {
+                            self.window_minimized = true;
+                            log!("[窗口] 挂起期间最小化/隐藏,WindowMinimized 入队,回来后处理");
+                            self.event_queue.push_back(Event::WindowMinimized);
+                        }
+                    }
+                    E::Window {
+                        win_event: WE::Restored | WE::Shown | WE::Maximized,
+                        ..
+                    } => {
+                        if desktop_window && self.window_minimized {
+                            self.window_minimized = false;
+                            log!("[窗口] 挂起期间还原/显示,WindowRestored 入队,回来后处理");
+                            self.event_queue.push_back(Event::WindowRestored);
+                        }
+                    }
+                    E::Window {
+                        win_event: WE::SizeChanged(..) | WE::Resized(..),
+                        ..
+                    } => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let (_, fh) = self.window.size();
+                            self.max_height = self.max_height.max(fh);
+                            self.viewport_y_offset = self.max_height - fh;
+                        }
+                    }
+                    E::ControllerDeviceAdded { which, .. } => {
+                        self.controller_added(which);
+                    }
+                    E::ControllerDeviceRemoved { which, .. } => {
+                        self.controller_removed(which);
+                    }
+                    E::MouseButtonDown { .. }
+                    | E::MouseButtonUp { .. }
+                    | E::MouseMotion { .. }
+                    | E::MouseWheel { .. }
+                    | E::FingerDown { .. }
+                    | E::FingerUp { .. }
+                    | E::FingerMotion { .. }
+                    | E::MultiGesture { .. }
+                    | E::KeyDown { .. }
+                    | E::KeyUp { .. }
+                    | E::TextEditing { .. }
+                    | E::TextInput { .. }
+                    | E::ControllerButtonDown { .. }
+                    | E::ControllerButtonUp { .. }
+                    | E::ControllerAxisMotion { .. } => {
+                        dropped += 1;
+                    }
+                    _ => {}
+                }
+            }
+            round = round.saturating_add(1);
+            let done = match deadline {
+                Some(deadline) => Instant::now() >= deadline,
+                None => foreground,
+            };
+            if done {
+                break if device_lost {
+                    SuspendOutcome::RenderDeviceLost
+                } else {
+                    SuspendOutcome::Resumed
+                };
+            }
+            // [补完 2026-09-15] 前几轮立即再 poll:第 2、3 轮的 pump 才置 isPaused、备份 EGL 上下文,
+            // 不能让 50ms 休眠挤占 Java 侧约 490ms 的等待预算(见 SUSPEND_FAST_ROUNDS)。
+            if round < SUSPEND_FAST_ROUNDS {
+                continue;
+            }
+            let nap = match deadline {
+                Some(deadline) => deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(SUSPEND_POLL_INTERVAL),
+                None => SUSPEND_POLL_INTERVAL,
+            };
+            std::thread::sleep(nap);
+        };
+
+        dropped += self.discard_pending_input();
+        self.enable_event_polling = true;
+        // 让回来后的第一次 poll_for_events 不被 1/120s 的节流跳过。
+        self.last_polled = Instant::now() - Duration::from_secs(1);
+        log!(
+            "[生命周期] 结束挂起:{:?},历时 {:.1}s,丢弃输入事件 {} 个",
+            outcome,
+            started.elapsed().as_secs_f64(),
+            dropped
+        );
+        outcome
     }
 
     fn controller_added(&mut self, joystick_idx: u32) {
@@ -1592,6 +2198,10 @@ impl Window {
                 }
             }
         }
+        // [补完 2026-09-15] 消除非 iOS 平台的 "unused variable: procname" 告警:procname 只在上面的 iOS 分支里用,
+        // 这里显式丢弃,行为不变。
+        #[cfg(not(target_os = "ios"))]
+        let _ = procname;
         addr
     }
 
@@ -1640,6 +2250,9 @@ impl Window {
 
         let image = self.splash_image.as_ref().unwrap();
         let window_fbo = self.default_framebuffer();
+        // [补完 2026-09-15] 只有下面 iOS 分支(swap 前绑回 viewRenderbuffer)用到它;非 iOS 平台不取,
+        // 消除 "unused variable: window_rbo" 告警,行为不变。
+        #[cfg(target_os = "ios")]
         let window_rbo = self.default_renderbuffer();
         // [MoleWorld 智能分辨率] 完整 drawable 尺寸,供 present_frame 的 --ambient-fill。
         let full_size = self.window.drawable_size();
@@ -1873,29 +2486,11 @@ impl Window {
         let (app_width, app_height) =
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
         let (screen_width, screen_height) = self.window.drawable_size();
-        // [MoleWorld VPDIAG] 拖动错位回归排查:打印 app/drawable/窗口尺寸 + viewport_y_offset。
-        // render 用 viewport()+yoff,touch(transform_input_coords)用 viewport() 不加 yoff;
-        // 若 yoff≠0(启动时被 SizeChanged 置非零)→ render 偏移而 touch 不偏移 = 错位根因。
-        // macOS-only:max_height / viewport_y_offset 字段是 #[cfg(target_os="macos")]
-        // (窗口可拖动缩放才有意义);iOS 全屏无窗口拖动,该诊断不适用,gate 掉以修复 iOS 构建。
-        #[cfg(target_os = "macos")]
-        {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) % 180 == 0 {
-                log!(
-                    "[VPDIAG] app=({},{}) drawable=({},{}) winsize={:?} yoff={} max_h={} fullscreen={} scale_hack={}",
-                    app_width, app_height, screen_width, screen_height,
-                    self.window.size(), self.viewport_y_offset, self.max_height,
-                    self.fullscreen, self.scale_hack
-                );
-            }
-        }
 
         // [MoleWorld] 「自由铺满」分支(返回整个 drawable,无 letterbox):
         //   (a) 窗口模式 + 无定制 guest 逻辑屏 = 旧默认「自由调节适配屏幕拉伸」,drawable==app 原生
         //       尺寸时逐字节等同旧行为 → 零回归;
-        //   (b) ★有定制 guest 逻辑屏时(--fill-screen / --logical-size / MOLE_FILL / MOLE_GUEST_PORTRAIT)
+        //   (b) ★有定制 guest 逻辑屏时(--fill-screen / --logical-size)
         //       也走这里【无条件铺满、绝不 letterbox】——因为窗口已被 resize 事件钉死在 guest 比例
         //       (见 poll_for_events 的 E::Window 分支,custom_guest_size_active() 触发锁比例),且 fullscreen
         //       下 --fill-screen 的 guest 比例=屏比例 → 铺满即等比、不变形、【永远无黑边(连拖拽瞬间都不闪)】。

@@ -5,7 +5,7 @@
  */
 //! `NSFileManager` etc.
 
-use super::{ns_array, ns_string, NSUInteger};
+use super::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::foundation::ns_error::{NSCocoaErrorDomain, NSFileReadNoSuchFileError};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -23,6 +23,44 @@ const NSDocumentDirectory: NSSearchPathDirectory = 9;
 
 type NSSearchPathDomainMask = NSUInteger;
 const NSUserDomainMask: NSSearchPathDomainMask = 1;
+
+// [扫描修 2026-09-16] F2-02:removeItemAtPath:error: 删除失败时回填的 NSCocoaErrorDomain 错误码,
+// 取值同 Foundation 的 FoundationErrors.h;只有本文件用到,就近定义。
+const NSFileWriteUnknownError: NSInteger = 512;
+const NSFileWriteNoPermissionError: NSInteger = 513;
+
+/// [扫描修 2026-09-16] FS-01/FS-02:Fs 层错误 → NSCocoaErrorDomain 错误码。
+/// 映射就是 71601f6(F2-02)在 removeItemAtPath:error: 里写的那套,抽出来给 moveItemAtPath:toPath:error:、
+/// createDirectoryAtPath:withIntermediateDirectories:attributes:error:、copyItemAtPath:toPath:error: 共用:
+/// 不存在 → NSFileReadNoSuchFileError(260),无权限 → NSFileWriteNoPermissionError(513),其余 → 512。
+/// 宿主 IoError 按 io::ErrorKind 归到前两类(Fs::rename 的宿主 rename 会带回 NotFound)。
+/// 游戏里这些调用处都不读错误码,只判断 NSError 是否为 nil / 返回值是否为 NO。
+fn cocoa_file_error_code(err: &FsError) -> NSInteger {
+    match err {
+        FsError::DoesNotExist | FsError::NonexistentParentDir => NSFileReadNoSuchFileError,
+        FsError::AccessDenied | FsError::ReadonlyParentDir => NSFileWriteNoPermissionError,
+        FsError::IoError(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            NSFileReadNoSuchFileError
+        }
+        FsError::IoError(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            NSFileWriteNoPermissionError
+        }
+        _ => NSFileWriteUnknownError,
+    }
+}
+
+/// [扫描修 2026-09-16] FS-01/FS-02:调用方传了非空 `NSError**` 时,autorelease 一个
+/// NSCocoaErrorDomain 错误写回;传 NULL 时什么都不做。只在失败时调用(Cocoa 约定成功时不碰 error)。
+fn write_cocoa_file_error(env: &mut Environment, out_error: MutPtr<id>, code: NSInteger) {
+    if out_error.is_null() {
+        return;
+    }
+    let domain = get_static_str(env, NSCocoaErrorDomain);
+    let error: id = msg_class![env; NSError alloc];
+    let error: id = msg![env; error initWithDomain:domain code:code userInfo:nil];
+    autorelease(env, error);
+    env.mem.write(out_error, error);
+}
 
 pub const NSFileModificationDate: &str = "NSFileModificationDate";
 pub const NSFileSize: &str = "NSFileSize";
@@ -195,18 +233,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     match env.fs.remove(GuestPath::new(&path)) {
         Ok(()) => true,
         Err(err) => {
-            if !out_error.is_null() {
-                match err {
-                    FsError::DoesNotExist => {
-                        let domain = get_static_str(env, NSCocoaErrorDomain);
-                        let error = msg_class![env; NSError alloc];
-                        let error = msg![env; error initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
-                        autorelease(env, error);
-                        env.mem.write(out_error, error);
-                    }
-                    _ => unimplemented!()
-                }
+            // [扫描修 2026-09-16] F2-02:原来只给 DoesNotExist 造 NSError,其余错误在 error 指针非空时走
+            // unimplemented! 崩溃。原版 -[GameData resetUserGameData]@0x7dec8、-[GameData loadUserInfoData]@0x75a26、
+            // -[WrapperManager deleteFile:]@0x38f79a 发这个消息时都传了非空 NSError**,所以 Fs::remove 一旦返回
+            // 宿主 IoError/无权限,光修 fs.rs 只是把崩溃点挪到这里。按 Foundation 删除失败时的 errno 归类补全:
+            // 无权限 → NSFileWriteNoPermissionError,其余 → NSFileWriteUnknownError;文件或父目录不存在沿用原有的
+            // NSFileReadNoSuchFileError。上述调用处都不读错误码,关键是回 NO 而不是崩。
+            // [扫描修 2026-09-16] FS-01/FS-02:归类与回填抽成 cocoa_file_error_code / write_cocoa_file_error,
+            // 与 moveItemAtPath:、createDirectoryAtPath:、copyItemAtPath: 共用,本方法行为不变。
+            let code = cocoa_file_error_code(&err);
+            if code != NSFileReadNoSuchFileError {
+                log!(
+                    "[NSFileManager] removeItemAtPath {} 失败({:?}),返回 NO,NSCocoaErrorDomain 错误码 {}",
+                    path,
+                    err,
+                    code
+                );
             }
+            write_cocoa_file_error(env, out_error, code);
             false
         }
     }
@@ -220,10 +264,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     let toPath = ns_string::to_rust_string(env, toPath); // TODO: avoid copy
     match env.fs.rename(GuestPath::new(&path), GuestPath::new(&toPath)) {
         Ok(()) => true,
-        Err(_) => {
-            if !error.is_null() {
-               todo!(); // TODO: create an NSError if requested
-            }
+        Err(err) => {
+            // [扫描修 2026-09-16] FS-01:原来 error 指针非空时是 todo!() 崩溃。原版 -[ASIHTTPRequest
+            // handleStreamComplete]@0x2ac86e(及 TMA_/TM_/TMI_/AppDriverChina 变体共 9 处)传 &moveError,
+            // 调用后在 0x2ac872 读 moveError 判非 nil 才走失败分支(不看返回值),所以失败时必须写回 NSError,
+            // 否则下载会被当成移动成功。Fs::rename 的失败现在都是 Err 且不改 guest 树,这里按统一映射回 NO。
+            let code = cocoa_file_error_code(&err);
+            log!(
+                "[NSFileManager] moveItemAtPath {} toPath {} 失败({:?}),返回 NO,NSCocoaErrorDomain 错误码 {}",
+                path,
+                toPath,
+                err,
+                code
+            );
+            write_cocoa_file_error(env, error, code);
             false
         }
     }
@@ -242,7 +296,13 @@ pub const CLASSES: ClassExports = objc_classes! {
   withIntermediateDirectories:(bool)with_intermediates
                    attributes:(id)attributes // NSDictionary*
                         error:(MutPtr<id>)error { // NSError**
-    assert_eq!(attributes, nil); // TODO
+    // [扫描修 2026-09-16] FS-02:原来 assert_eq!(attributes, nil)。原版 -[PLCrashReporter
+    // populateCrashReportDirectoryAndReturnError:]@0x53866c/0x5386bc 传的是
+    // dictionaryWithObject:forKey: 建的 {NSFilePosixPermissions: 0755},走到就崩。touchHLE 不模拟
+    // POSIX 权限位(libc mkdir 同样忽略 mode),记一次日志后忽略属性,照常建目录。
+    if attributes != nil {
+        log_once!("[NSFileManager] createDirectoryAtPath:withIntermediateDirectories:attributes:error: 忽略 attributes(不模拟 POSIX 权限)");
+    }
 
     let path_str = ns_string::to_rust_string(env, path); // TODO: avoid copy
     let res = if with_intermediates {
@@ -256,12 +316,17 @@ pub const CLASSES: ClassExports = objc_classes! {
             true
         }
         Err(err) => {
-            assert!(error.is_null()); // TODO
+            // [扫描修 2026-09-16] FS-02:原来 error 指针非空时 assert! 崩溃。PLCrashReporter 上面两处把自己的
+            // outError 原样传下来;Fs::create_dir 的宿主失败(FS-03)现在也会返回 Err 走到这里。
+            // 按 removeItemAtPath:error: 同一套映射回 NO 并回填 NSError。
+            let code = cocoa_file_error_code(&err);
             log!(
-                "Warning: createDirectoryAtPath {} failed with {:?}, returning false",
+                "Warning: createDirectoryAtPath {} failed with {:?}, returning false (NSCocoaErrorDomain code {})",
                 path_str,
                 err,
+                code
             );
+            write_cocoa_file_error(env, error, code);
             false
         }
     }
@@ -368,15 +433,37 @@ pub const CLASSES: ClassExports = objc_classes! {
                  error:(MutPtr<id>)error { // NSError**
     let src = ns_string::to_rust_string(env, src);
     let dst = ns_string::to_rust_string(env, dst);
+    // [扫描修 2026-09-16] FS-02 同类:原来两处失败分支在 error 指针非空时 assert! 崩溃。原版
+    // -[ASIDownloadCache storeResponseForRequest:maxAge:]@0x5058ea(及 TMI_/AppDriverChina 变体)传的是
+    // 栈上 &error。失败时回 NO 并按统一映射回填 NSError;读失败只拿得到 (),按源是否存在分 260/512。
     let data = match env.fs.read(GuestPath::new(src.as_ref())) {
         Ok(d) => d,
         Err(_) => {
-            assert!(error.is_null()); // TODO
+            let code = if env.fs.exists(GuestPath::new(&src)) {
+                NSFileWriteUnknownError
+            } else {
+                NSFileReadNoSuchFileError
+            };
+            log!(
+                "[NSFileManager] copyItemAtPath {} toPath {} 读源失败,返回 NO,NSCocoaErrorDomain 错误码 {}",
+                src,
+                dst,
+                code
+            );
+            write_cocoa_file_error(env, error, code);
             return false;
         }
     };
-    if env.fs.write(GuestPath::new(dst.as_ref()), &data).is_err() {
-        assert!(error.is_null()); // TODO
+    if let Err(err) = env.fs.write(GuestPath::new(dst.as_ref()), &data) {
+        let code = cocoa_file_error_code(&err);
+        log!(
+            "[NSFileManager] copyItemAtPath {} toPath {} 写目标失败({:?}),返回 NO,NSCocoaErrorDomain 错误码 {}",
+            src,
+            dst,
+            err,
+            code
+        );
+        write_cocoa_file_error(env, error, code);
         return false;
     }
     true
@@ -404,7 +491,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)attributesOfItemAtPath:(id)path // NSString *
                        error:(MutPtr<id>)error { // NSError **
-    assert!(error.is_null()); // TODO
+    // [扫描修 2026-09-16] FS-02 同类:原来入口处 assert!(error.is_null()),原版 -[ASIHTTPRequest buildPostBody]@0x2a4ad8
+    // 等传栈上 &err 的调用不论文件在不在都会崩。按 Cocoa 约定只在失败(返回 nil)时回填错误:
+    // file_attributes_common 只在路径不存在时返回 nil,对应 260。
 
     // TODO: other attributes
     log_once!("Warning: NSFileManager attributesOfItemAtPath:error: returns only NSFileType, NSFileModificationDate and NSFileSize attributes!");
@@ -414,7 +503,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[(NSFileManager *){:?} attributesOfItemAtPath:{} error:{:?}]", this, path, error);
     let guest_path = GuestPath::new(&path);
 
-    file_attributes_common(env, guest_path)
+    let attrs = file_attributes_common(env, guest_path);
+    if attrs == nil {
+        write_cocoa_file_error(env, error, NSFileReadNoSuchFileError);
+    }
+    attrs
 }
 
 - (id)attributesOfFileSystemForPath:(id)_path
