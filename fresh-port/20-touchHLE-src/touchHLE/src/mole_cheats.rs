@@ -3357,6 +3357,8 @@ fn island_ff_extras(env: &mut Environment, secs: f64) {
 }
 
 fn island_flush(env: &mut Environment, reason: &str) {
+    // [2026-09-24 第四轮 K3 N-D6-1] 整轮落盘与合并各自计时,log_dbg! 打出来供改前改后对比(大岛铺路场景)。
+    let t_flush = Instant::now();
     // 先清脏标记:落盘过程中若又有新变化(理论上 merge/归档本身不会触发),会重新置脏、下个节拍再存。
     ISLAND_FLUSHING.store(true, O);
     ISLAND_DIRTY.store(false, O);
@@ -3379,7 +3381,9 @@ fn island_flush(env: &mut Environment, reason: &str) {
     island_flush_prepare(env);
     let s_ui = save_island_userinfo(env);
     // ★必须在真 startNewSceneFrom→unloadMap 清空 ObjectManager 活表【之前】,此刻活表满载岛对象。
+    let t_merge = Instant::now();
     let merged = merge_new_island_objects_into_mapdata(env);
+    let merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
     let s_map = save_island_map(env);
     let s_ships = save_island_ships(env);
     let s_frag = save_island_fragments(env);
@@ -3400,6 +3404,11 @@ fn island_flush(env: &mut Environment, reason: &str) {
     } else {
         log!("[MOLECHEAT] island: {} → {}", reason, body);
     }
+    log_dbg!(
+        "[MOLECHEAT] island: island_flush 耗时 {:.1} ms(其中合并新放置 {:.1} ms)",
+        t_flush.elapsed().as_secs_f64() * 1000.0,
+        merge_ms
+    );
 }
 
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
@@ -3491,6 +3500,15 @@ fn delete_island_object(env: &mut Environment, snap: id) {
 }
 
 /// [扫描修 2026-09-15] F10-6 返回本次合并的新放置对象个数(由 island_flush 汇总进一行日志);F10-7 动态键串用完即释放。
+/// [2026-09-24 第四轮 K3 N-D6-1] 只改算法、不改语义:以前每次落盘对【每个】活对象都先调
+///   +[NewGameManager saveTMMapDataFromObject:](0x243d8c,普通 Object 要过约 13 次 isKindOfClass: 再 alloc/init/十来个 set/autorelease),
+///   再在同键数组里逐个 objectAtIndex:+objectSequenceId 线性去重;地块全落进 mapData["1"](-[NewScenePorter finishBuild:] 0x26deb6
+///   对 type 4 地表装饰建 Object type:1),铺几百格后每 1.5 秒一次 O(N²) 客户端 getter,关键操作即时落盘后更频繁。
+///   现在:开头遍历一次 mapData.allValues,把已有的 objectSequenceId(TMMapDataBase 0xcc779,L8@0:4)收进 HashSet;活对象先发
+///   -[Object objSequenceId](0x41539,L8@0:4)——快照函数各分支都是原样抄这个值(0x243f06/0x24411e/…/0x2453d0 → setObjectSequenceId:),
+///   所以跟以前"快照 seq 为 0 就跳过/已在表就跳过"逐一等价;只有新对象才造快照、定键、入数组,并把 seq 补回集合。
+///   去重从"按键"变成"全表":seqId 在整张 mapData 里本来就唯一(island_find_by_seqid / writeback 都依赖这一点)。
+///   mapData 的值只处理数组(宿主侧 object_has_method 判 objectAtIndex:,零客户端消息),跳过其它包注入的字典/数字值。
 fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
     let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
     if om_cls == nil {
@@ -3567,20 +3585,47 @@ fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
     let add_s = env
         .objc
         .register_host_selector("addObject:".to_string(), &mut env.mem);
+    // [2026-09-24 第四轮 K3 N-D6-1] 活对象的 seq getter(-[Object objSequenceId],L8@0:4)。
+    let obj_seq_s = island_sel(env, "objSequenceId");
+    // ① 一次性收集 mapData 里已有的全部 seqId(读档对象、种子对象、上一拍已合并/回写的对象)。
+    let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let md_vals: id = msg_send(env, (md, av_s));
+    if md_vals != nil {
+        let nv: crate::mem::GuestUSize = msg_send(env, (md_vals, cnt_s));
+        for vi in 0..nv {
+            let v: id = msg_send(env, (md_vals, oai, vi));
+            // 只处理数组值;字典/数字等其它值(宿主侧判定,不发客户端消息)直接跳过。
+            if v == nil || !env.objc.object_has_method(&env.mem, v, oai) {
+                continue;
+            }
+            let an: crate::mem::GuestUSize = msg_send(env, (v, cnt_s));
+            for j in 0..an {
+                let old: id = msg_send(env, (v, oai, j));
+                if old == nil || !env.objc.object_has_method(&env.mem, old, seq_s) {
+                    continue;
+                }
+                let oseq: u32 = msg_send(env, (old, seq_s));
+                if oseq != 0 {
+                    known.insert(oseq);
+                }
+            }
+        }
+    }
     let mut merged = 0i32;
     for i in 0..n {
         let obj: id = msg_send(env, (all, oai, i));
         if obj == nil {
             continue;
         }
+        // ② 先读活对象 seq(1 次 getter):未分配(0)或已在表里 → 跳过,不再造快照、不再定键。
+        let seqid: u32 = msg_send(env, (obj, obj_seq_s));
+        if seqid == 0 || known.contains(&seqid) {
+            continue; // 未分配 seqId 无法去重/持久化;已在表 = 种子/读档/经营回写/上一拍已存
+        }
         // 活对象 → TMMapData 快照(原版编码器,按 class/type 各写各字段;Firework 返 nil)。
         let snap: id = msg_send(env, (ngm_cls, save_snap, obj));
         if snap == nil {
             continue;
-        }
-        let seqid: i32 = msg_send(env, (snap, seq_s));
-        if seqid == 0 {
-            continue; // 未分配 seqId,无法去重/持久化
         }
         // key:精确6类(island_class_to_key)优先,否则活对象 type 字符串(=mapData key)。
         let key: String = match island_class_to_key(env, snap) {
@@ -3602,24 +3647,15 @@ fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
                 continue;
             }
             let _: () = msg_send(env, (md, sfk, arr, keystr));
+            // [2026-09-24 第四轮 K3 N-D6-1 / I2-4] alloc/init 得到的 +1 已被 mapData retain,这里平衡掉(以前每新建一个键漏一个数组)。
+            //   arr 仍由 mapData 持有,下面 addObject: 照常可用。
+            release(env, arr);
         }
         // [扫描修 2026-09-15] F10-7 键串本轮已用完(objectForKey: 只读;setObject:forKey: 会 copy 键)→ 释放 from_rust_string 的 +1。
         release(env, keystr);
-        // 去重:该 seqId 已在数组(种子/经营回写已存)→ 跳过,绝不重复加。
-        let an: crate::mem::GuestUSize = msg_send(env, (arr, cnt_s));
-        let mut dup = false;
-        for j in 0..an {
-            let old: id = msg_send(env, (arr, oai, j));
-            let oseq: i32 = msg_send(env, (old, seq_s));
-            if oseq == seqid {
-                dup = true;
-                break;
-            }
-        }
-        if dup {
-            continue;
-        }
+        // 去重已在上面 ② 用全表 seq 集合做完(以前这里对同键数组逐个 objectAtIndex:+objectSequenceId 线性扫)。
         let _: () = msg_send(env, (arr, add_s, snap));
+        known.insert(seqid);
         merged += 1;
     }
     if merged > 0 {
