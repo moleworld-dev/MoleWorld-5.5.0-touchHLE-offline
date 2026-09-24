@@ -263,7 +263,9 @@ static INJECT_QUEUE: Mutex<std::collections::VecDeque<Inject>> =
 ///                                        与 Android 切后台走同一条代码路径;日志关键字「[生命周期]」
 /// [2026-09-16] A1-04 文本开发命令,整行交给 mole_dev::run_text_command,日志写 `[DEVCMD] ok|err <文案>`:
 ///   `dev fps` / `dev grid` / `dev center` / `dev speed <倍率>` — FPS 显示 / 地图格线 / 相机回中 / 动画倍速
+///   `dev trace` / `dev unlock` / `dev store` / `dev weather <类型>` — 选择子跟踪 / 解锁交互 / 建筑商店 / 天气
 ///   `quest main|time|vip|island <任务号>`                      — 任务跳转
+///   `story <段号>`                                             — 剧情播放
 ///   `time <分钟>`                                              — 对象计时快进
 ///   `give <物品ID>`                                            — 物品放到当前地图
 ///   `menu <页名>`                                              — 暂不支持,回 err(不带参数的 menu 照旧开关)

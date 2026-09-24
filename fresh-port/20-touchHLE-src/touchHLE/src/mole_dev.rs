@@ -1369,7 +1369,9 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 /// 根因:回归脚本原来只能按菜单格子坐标点开发工具、隐藏物品、任务跳转,要开菜单、翻页、输寄存器好几步;
 /// 菜单加页、宽屏 --fill-screen 多出水平偏移,坐标就失效。这里按名字直接调菜单按钮背后的同一批函数:
 ///   dev fps | dev grid | dev center | dev speed <倍率> → toggle_fps / toggle_map_grid / camera_center / set_time_scale
+///   dev trace | dev unlock | dev store | dev weather <类型> → toggle_trace / unlock_interaction / open_building_store / weather
 ///   quest main|time|vip|island <任务号>                → quest_jump
+///   story <段号>                                       → story_play
 ///   time <分钟>                                        → apply_time_minutes
 ///   give <物品ID>                                      → mole_items::place_item(与召唤页、隐藏物品页同一入口)
 /// 在线模式、场景、数值范围的拒绝都由这些函数自己给出,与菜单点按钮完全一致,这里不另加门。
@@ -1390,7 +1392,15 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
                 let scale: f32 = parse_command_number(x, "倍率")?;
                 set_time_scale(env, scale)
             }
-            _ => Err("用法:dev fps | dev grid | dev center | dev speed <0.25..4>".to_string()),
+            ["trace"] => toggle_trace(),
+            ["unlock"] => unlock_interaction(env),
+            ["store"] => open_building_store(env),
+            ["weather", k] => {
+                let kind: i64 = parse_command_number(k, "天气类型")?;
+                weather(env, kind)
+            }
+            _ => Err("用法:dev fps | dev grid | dev center | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev weather <类型>"
+                .to_string()),
         },
         "quest" => match args.as_slice() {
             [family, n] => {
@@ -1411,6 +1421,13 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             }
             _ => Err("用法:quest main|time|vip|island <任务号>".to_string()),
         },
+        "story" => match args.as_slice() {
+            [n] => {
+                let section: i64 = parse_command_number(n, "剧情段号")?;
+                story_play(env, section)
+            }
+            _ => Err("用法:story <段号>".to_string()),
+        },
         "time" => match args.as_slice() {
             [m] => {
                 let minutes: i64 = parse_command_number(m, "分钟数")?;
@@ -1430,7 +1447,7 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             args.join(" ")
         )),
         _ => Err(format!(
-            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / time / give",
+            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give",
             head
         )),
     }
