@@ -98,8 +98,10 @@ pub enum Action {
     /// 一键进入 NewScene 可建筑黄金岛(scene id 10):arm 进岛(开功能/开窗/注入默认岛
     /// mapData)后直接 `[SceneMannager startNewSceneFrom:1 toScene:10]`。
     EnterIsland,
-    /// 岛上一键回主村:走原版 `-[HolidayVillageLayer returnToMainVillage]`(=点岛上飞机后确认框的
-    /// 回调路径),会触发 gobackMainVillage → 我们的退岛存盘(island_map/userinfo/fragments)。
+    /// 岛上一键回主村:调原版 `-[HolidayVillageLayer gobackMainVillage]`@0x23d15c(与点岛上飞机后确认框的回调
+    /// 同一路径,0x23d458 把它作为 showWithTarget:selector: 的回调选择子)。
+    /// [2026-09-24 第四轮 K14 N-D5-3] 不走 returnToMainVillage(断网专用,会 setConnectFirstInThisOpen:1);
+    /// 退岛存盘在 mole_cheats 的 startNewSceneFrom 10→1 出口,不在 gobackMainVillage 上。
     ExitIsland,
     /// [扫描修 2026-09-15] 开发工具按钮:调用 mole_dev 的约定函数,DevResult 文案写底部 toast。
     Dev(DevTool),
@@ -1892,9 +1894,15 @@ fn open_caribbean(env: &mut Environment) {
     teardown(env);
 }
 
-/// 岛上一键回主村:找当前村庄层(岛上=HolidayVillageLayer),调原版 returnToMainVillage
-/// (setConnectFirstInThisOpen:1 + gobackMainVillage)。gobackMainVillage 被 mole_cheats 拦截做退岛存盘,
-/// 再由原版 startNewSceneFrom:10 toScene:1 回主村。不在岛上(无该方法)则只提示。
+/// 岛上一键回主村:找当前村庄层(岛上=HolidayVillageLayer),调原版 gobackMainVillage(和点飞机确认同路径:
+/// -[HolidayVillageLayer checkSpecailZone:rect:] 在 0x23d456-0x23d468 弹 MessageBox 确认框,回调选择子就是它),
+/// 由原版 startNewSceneFrom:10 toScene:1 回主村。不在岛上(无该方法)则只提示。
+/// [2026-09-24 第四轮 K14 N-D5-3] 以前发的是 returnToMainVillage@0x23d6c4:它在 0x23d6e2-0x23d6f4 先
+/// [[NetworkManager sharedInstance] setConnectFirstInThisOpen:1] 再调 gobackMainVillage,原版只在断网弹框关闭(0x23b6e4)
+/// 与收包错误分支(0x23eaae)走它。在线模式回村后 startGame: 排的 sendGameData2Server: 在 0x21064 读到这个标志,就改发
+/// getLocalUserAndMapInfo(1001)重拉,回包可能弹存档比对框或用云端覆盖本地;离线时 0x20f7c 的 isReachable 门先返回,不受影响。
+/// 现在直接发 gobackMainVillage,不去动 connectFirstInThisOpen 本身(不走断网路径就是忠于原版)。
+/// 退岛存盘在 mole_cheats 的 startNewSceneFrom 10→1 出口(island_flush),不在 gobackMainVillage 上(那里没有钩子臂)。
 fn exit_island(env: &mut Environment) {
     let wm = game_singleton(env, "WrapperManager", "sharedManager");
     let village: id = if wm != nil {
@@ -1903,15 +1911,16 @@ fn exit_island(env: &mut Environment) {
     } else {
         nil
     };
-    if village == nil || !env.objc.object_has_method_named(&env.mem, village, "returnToMainVillage") {
-        log!("[MOLEMENU] currentVillageLayer/returnToMainVillage unavailable (need to be on island)");
+    // gobackMainVillage 与 returnToMainVillage 一样只在 HolidayVillageLayer 上实现,「在岛上」的判定语义不变。
+    if village == nil || !env.objc.object_has_method_named(&env.mem, village, "gobackMainVillage") {
+        log!("[MOLEMENU] currentVillageLayer/gobackMainVillage unavailable (need to be on island)");
         set_toast("回主村失败:你现在不在黄金岛上".to_string());
         return;
     }
     // ★[深扫修 2026-09-11] #19 岛上 gameMode 前置门(写法与 enter_island 的门①一致)。
     //   根因:岛上拿起建筑进入移动/放置态时 NewGameManager.gameMode=2/3(NewSceneMoveLayer onButtonMoveSelected:
     //   0x2b35b2/0x2b3602),9/11 是菜单瞬态。原版的离岛入口(点飞机 gobackMainVillage)只在浏览态(=1)可点,只有本菜单
-    //   绕过 UI 直接 returnToMainVillage。离岛加载 -[LoadingMainVillage updateLoading:] 在 0x2543b6 把岛上 gameMode 拷进
+    //   绕过 UI 直接发离岛方法(K14 N-D5-3 起为 gobackMainVillage,以前是 returnToMainVillage)。离岛加载 -[LoadingMainVillage updateLoading:] 在 0x2543b6 把岛上 gameMode 拷进
     //   主村 GameManager,0x254f48 见 ≠1 就跳过 [GameData loadFromLocal] → 主村不重读档、loadMapObjects/createIdleWorkers
     //   在内存旧值上再扣一轮工人(可扣成负数并被存盘),且主村 VillageLayer processTouch 读到 ≠1 直接不响应点击。
     //   修法:≠1 就拒绝并提示,不自动复位(resetGamemode 只管 9/11,管不了移动层的 2/3;代调 NewSceneMoveLayer detech
@@ -1938,9 +1947,10 @@ fn exit_island(env: &mut Environment) {
         set_toast("回主村失败:场景切换进行中,稍后再试".to_string());
         return;
     }
-    let s = sel(env, "returnToMainVillage");
+    // [2026-09-24 第四轮 K14 N-D5-3] 无参数(v8@0:4);菜单动作在 UIKit 事件处理里执行,不在 drawScene 帧栈,可直接发。
+    let s = sel(env, "gobackMainVillage");
     let _: () = msg_send(env, (village, s));
-    log!("[MOLEMENU] exit island -> [village returnToMainVillage]");
+    log!("[MOLEMENU] exit island -> [village gobackMainVillage](同飞机确认路径)");
     teardown(env);
 }
 
