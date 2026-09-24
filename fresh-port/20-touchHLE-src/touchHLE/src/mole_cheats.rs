@@ -3357,6 +3357,28 @@ fn island_ff_extras(env: &mut Environment, secs: f64) {
 }
 
 fn island_flush(env: &mut Environment, reason: &str) {
+    // [2026-09-24 第四轮 K3 I7-01] 时间旅行落盘闸:开发者「时间旅行」偏移(只增不减、只在本进程)期间,岛上所有计时
+    //   (TMMapDataShip.beginDiscoverTime/beginFixTime、TMMapDataShop.beginTime、TMMapDataRestaurant.beginUpgradeTime、
+    //   各 coolingTime、curQuestResult、NpcData.lastCoolDownTime 等)都是"未来"时刻;写进岛档后重启回到现实时间,
+    //   -[DiscoveryShip checkIsDiscoverFinished] 0x361e56 vcmpe + 0x361e5e blt.w 对未来起点恒判未完成(不像餐厅/公寓会把起点重置成 now),
+    //   cf_fix_residue 只修超前 15.5 年以上的残留 → 出海/NPC 冷却/打工任务长期卡死且不可逆。照 mole_items.rs on_enter_village
+    //   与 mole_activity 侧档的既有做法:旅行期间岛档只留在内存、不落盘。每次进岛 build_default_island_mapdata 都从磁盘读岛档,
+    //   所以离岛再进、或重启后,岛上进度都回到旅行前(离岛那次 startNewSceneFrom 10→1 的落盘同样被本闸跳过)。
+    //   · 放在置 FLUSHING / 清 DIRTY 之前:不清 DIRTY、不更新 ISLAND_LAST_FLUSH(旅行只在重启时结束,留给那之后);
+    //   · 节拍因此每拍都会走到这里(due 恒真),日志只在第一次打(偏移只增不减,一次就够),本分支零消息;
+    //   · 有意连开头那次 [NewSceneData saveUserinfoToLocal](主档)也一起跳过:游戏自己的存档路径(add*InNewScene: 等)照常写主档,
+    //     这里只是不再额外触发,不是漏写。四个 save_island_* 只有本函数一个调用点,不再各加重复闸。
+    let tt_offset = crate::libc::time::time_offset_secs();
+    if tt_offset != 0 {
+        if !ISLAND_TT_SKIP_LOGGED.swap(true, O) {
+            log!(
+                "[MOLECHEAT] island: 时间旅行中不保存岛档(偏移 {} 秒,{}):岛上进度只留在内存,离岛再进或重启后都回到旅行前",
+                tt_offset,
+                reason
+            );
+        }
+        return;
+    }
     // [2026-09-24 第四轮 K3 N-D6-1] 整轮落盘与合并各自计时,log_dbg! 打出来供改前改后对比(大岛铺路场景)。
     let t_flush = Instant::now();
     // 先清脏标记:落盘过程中若又有新变化(理论上 merge/归档本身不会触发),会重新置脏、下个节拍再存。
@@ -3410,6 +3432,9 @@ fn island_flush(env: &mut Environment, reason: &str) {
         merge_ms
     );
 }
+
+/// [2026-09-24 第四轮 K3 I7-01] 「时间旅行中不保存岛档」日志是否已打过(本进程只打一次,见 island_flush 开头)。
+static ISLAND_TT_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
 fn island_mark_dirty() {
