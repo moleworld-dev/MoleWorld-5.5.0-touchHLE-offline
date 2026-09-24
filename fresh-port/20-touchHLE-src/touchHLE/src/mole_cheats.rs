@@ -1494,7 +1494,8 @@ fn load_island_fragments(env: &mut Environment) {
 // 读回在 island_after_layout_ready(早于 CafeShop 两个 init 读 getAllShownNotifyQuestIds 算 hasQuest)。
 
 /// [2026-09-24 第四轮 K10 I5-3] 咖啡馆许愿任务侧档(保护位 ISLAND_FILE_CAFE)。
-/// 根字典:accepted / unreward / finished(即上面三张表原样归档)+ savedAt(落盘时刻 CFAbsoluteTime,仅诊断用)。
+/// 根字典:accepted / unreward / finished(即上面三张表原样归档)+ savedAt(落盘时刻 CFAbsoluteTime,仅诊断用)
+/// + day(当天任务池日期 yyyymmdd)/ offered(当天下发的任务号 NSNumber 数组)。
 const ISLAND_CAFE_FILE: &str = "island_cafe.dat";
 /// cafeQuestHV.dat 共 17 条咖啡任务,ID 1..=17。
 const CAFE_QUEST_MAX_ID: i32 = 17;
@@ -1507,6 +1508,66 @@ const CAFE_REQ_WORK_IDS: [i32; 6] = [2, 8, 11, 13, 16, 17];
 const CAFE_ACCEPTED_MAX: usize = 3;
 /// 本次进岛 island_cafe_restore_and_offer 是否已跑完。没跑过(在线、表未建好)就不落盘,免得拿空表盖掉玩家进度。
 static CAFE_SESSION_READY: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K10 I2-02/I5-02] 每天下发的咖啡任务条数。移植者自拟:原版 1081 的下发规则只在服务器,不可考;
+/// 取 3 条,与已接上限 CAFE_ACCEPTED_MAX 一致(一天的任务正好都能同时接下)。
+const CAFE_DAILY_OFFER: usize = 3;
+/// 当前任务池对应的日期(yyyymmdd,北京时间日界)与当天下发的任务号位图(bit N = 任务 N)。
+/// 随 island_cafe.dat 的 day / offered 键往返,保证同一天无论进出岛几次、重启几次,下发的都是同一份。
+static CAFE_OFFER_DAY: AtomicU32 = AtomicU32::new(0);
+static CAFE_OFFER_MASK: AtomicU32 = AtomicU32::new(0);
+/// 任务号 1..=17 对应的全部合法位。
+const CAFE_OFFER_MASK_ALL: u32 = ((1u32 << (CAFE_QUEST_MAX_ID + 1)) - 1) & !1;
+
+/// 北京时间(UTC+8)日界的 (自 1970-01-01 的天数, yyyymmdd)。与 mole_activity 的 daily_day_key(每日任务选题种子)
+/// 同一口径:unix 秒 + 28800 后按 86400 取整,再用 Howard Hinnant civil_from_days 拆年月日(那两个函数在 mole_activity
+/// 里是私有的,本包只许改本文件,这里按同一算法复刻)。now_cf 为 CFAbsoluteTime(含开发者时间旅行偏移)。
+fn cafe_day_key(now_cf: f64) -> (i64, u32) {
+    let cf = if now_cf.is_finite() { now_cf } else { 0.0 };
+    let unix = cf.floor() as i64 + 978_307_200;
+    let days = (unix + 28_800).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (days, (y.max(0) as u32) * 10_000 + m * 100 + d)
+}
+
+/// [2026-09-24 第四轮 K10 I2-02/I5-02] 当天的咖啡任务选品(移植者自拟,原版 1081 规则不可考)。
+/// 候选 = 1..=17 里不在已接/待领奖/已完成三张表的任务号(升序);按天轮转取连续 CAFE_DAILY_OFFER 条:
+/// 起点 = (天数 × 3) mod 候选数。候选不变时起点每天前进 3,⌈候选数/3⌉ 天内每条都会轮到一次——玩家即便一直不接某几条
+/// (比如买不起的 req_own),16/17 也一定会出现,不会像「只给编号最小的 3 条」那样被卡住;同一天结果只取决于日期与候选,
+/// 再加上 day/offered 落盘,当天不会变。
+fn cafe_rotate_pick(day_no: i64, cands: &[i32]) -> Vec<i32> {
+    let n = cands.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = CAFE_DAILY_OFFER.min(n);
+    let start = (day_no.rem_euclid(n as i64) as usize * CAFE_DAILY_OFFER) % n;
+    (0..k).map(|j| cands[(start + j) % n]).collect()
+}
+
+/// 读活表里的任务号:已接/待领奖是字典(notifyQuestId),已完成是 NSNumber。
+fn cafe_live_ids(env: &mut Environment, arr: id, dict_elems: bool) -> Vec<i32> {
+    let mut out = Vec::new();
+    for o in cafe_array_items(env, arr) {
+        let q = if dict_elems {
+            cafe_entry_id(env, o)
+        } else {
+            cafe_int(env, o)
+        };
+        if let Some(q) = q {
+            out.push(q);
+        }
+    }
+    out
+}
 
 /// NSArray 的全部元素;不是数组(含 nil)返回空。
 fn cafe_array_items(env: &mut Environment, arr: id) -> Vec<id> {
@@ -1570,6 +1631,7 @@ fn cafe_entry_id(env: &mut Environment, entry: id) -> Option<i32> {
 ///   都扣人手 → 任务与 1 个工人被永久占住。其它类型的进度计数为负时按 0(`L` 参数,负值会被当成超大无符号数)。
 /// · 三个「服务器已有记录」旗标照 1062 回包写 1(0x22b948 / 0x22baac / 0x22bb76 均为 `movs r2,#1`)。旗标只有
 ///   updateLocal*NotifyQuestData 用来选上行包是 add 还是 setMod(selref 各 1 处,ivar 无其它直读),离线上行包被吞,不影响玩法。
+/// [2026-09-24 第四轮 K10 I2-02/I5-02/I5-1] 读回之后紧接着本地等价下发 1081 许愿任务池,见函数后半段注释。
 /// 在线(network_access)不做:由私服 1062/1081 原版下发。
 fn island_cafe_restore_and_offer(env: &mut Environment) {
     CAFE_SESSION_READY.store(false, O);
@@ -1597,10 +1659,23 @@ fn island_cafe_restore_and_offer(env: &mut Environment) {
         return;
     }
     let root = island_sidecar_load(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE);
+    // 当天任务池的日期与位图:只信档里的(无档/坏档 = 0 → 按今天重新选,见下半段)。
+    let mut offer_day = 0u32;
+    let mut offer_mask = 0u32;
     if root != nil && !crate::mole_items::is_kind_of(env, root, "NSDictionary") {
         log!("[MOLECHEAT] island: island_cafe.dat 根对象不是字典,按无档处理(不动内存里的咖啡任务表)");
     } else if root != nil {
         let now = now_cf_secs().max(0.0);
+        let dv = cafe_dict_get(env, root, "day");
+        offer_day = cafe_int(env, dv).filter(|&v| v > 0).map_or(0, |v| v as u32);
+        let offered = cafe_dict_get(env, root, "offered");
+        for o in cafe_array_items(env, offered) {
+            if let Some(q) = cafe_int(env, o) {
+                if (1..=CAFE_QUEST_MAX_ID).contains(&q) {
+                    offer_mask |= 1u32 << q;
+                }
+            }
+        }
         // 已完成
         let mut fin_ids: Vec<i32> = Vec::new();
         let fin_arr = cafe_dict_get(env, root, "finished");
@@ -1724,6 +1799,90 @@ fn island_cafe_restore_and_offer(env: &mut Environment) {
             clamped
         );
     }
+    // ── [2026-09-24 第四轮 K10 I2-02/I5-02/I5-1] 本地等价下发 1081 许愿任务池 ──
+    // 病根:-[CafeShop processTouched]@0x36dda8 在 0x36de26 直读 hasQuest(+345),为 0 就弹「NOT_HAVE_CAFE_QUEST」;hasQuest
+    //   只在两个 init(0x36db44 / 0x36dc72)按 [[NewSceneData sharedInstance] getAllShownNotifyQuestIds].count 算一次,
+    //   而 getAllShownNotifyQuestIds@0x222990 只并集 notifyQuestListFromServer_(+120)与已接/待领奖两张表;+120 唯一的写入口
+    //   -[NewSceneData addNotifyQuestList:]@0x21fe54 只被 1081 回包 -[NetworkManager parseWishQuestsList:pos:len:] 0x1c0962 调用
+    //   (请求方 getWishQuestList 在 LoadingHoliday updateLoading: 0x252eaa 发,离线被吞)→ 咖啡馆永远没有任务,
+    //   CafeQuest acceptWithQuestId: 0x36bf1e 的 questType==1 门也永远过不去。
+    // 做法:补回包,不拦 getter。照 parseWishQuestsList 的写法对每个任务号调一次 addNotifyQuestList:(签名 v12@0:4i8,参数是
+    //   int 任务号不是数组;方法内部 0x21fecc/0x21ff96/0x22005e 自己跳过已在已完成/已接/待领奖三表里的号,0x220136 numberWithInt:
+    //   后 addObject: 进 +120)。之后接取→已接→完成→待领奖→领奖→已完成全走原版。
+    // 选品规则移植者自拟(原版 1081 规则只在服务器、不可考):见 cafe_rotate_pick。17 条全部完成、且已跨天,就走原版
+    //   cleanAllFinishedNotifyQuestList@0x22251c 开新一轮(原版该方法唯一调用点是回主村 reset,这里等价于服务器侧重置)。
+    // 守卫:cafeQuestData_(+88,loadFileWithType:andSceneId: 在 sceneId==10 时 0x21e2ee 无条件加载)不足 17 条不下发,
+    //   免得 getCafeQuestDataWithId: 取不到数据;已有的 day/offered 原样保留,下次再下发。
+    let cqd_s = island_sel(env, "cafeQuestData");
+    let cqd: id = msg_send(env, (nsd, cqd_s));
+    let cnt_s = island_sel(env, "count");
+    let n_def: crate::mem::GuestUSize = if cqd != nil {
+        msg_send(env, (cqd, cnt_s))
+    } else {
+        0
+    };
+    if n_def as i32 != CAFE_QUEST_MAX_ID {
+        log!(
+            "[MOLECHEAT] island: 咖啡馆许愿任务池:cafeQuestData 只有 {} 条(应为 {}),表未加载好,本次不下发",
+            n_def,
+            CAFE_QUEST_MAX_ID
+        );
+        CAFE_OFFER_DAY.store(offer_day, O);
+        CAFE_OFFER_MASK.store(offer_mask, O);
+        CAFE_SESSION_READY.store(true, O);
+        return;
+    }
+    let (day_no, ymd) = cafe_day_key(now_cf_secs());
+    let mut new_round = false;
+    let reuse = offer_day == ymd && (offer_mask & !CAFE_OFFER_MASK_ALL) == 0;
+    if !reuse {
+        let fin_now = cafe_live_ids(env, fin, false);
+        if (1..=CAFE_QUEST_MAX_ID).all(|q| fin_now.contains(&q)) {
+            let s = island_sel(env, "cleanAllFinishedNotifyQuestList");
+            let _: () = msg_send(env, (nsd, s));
+            new_round = true;
+        }
+        let mut taken = cafe_live_ids(env, acc, true);
+        taken.extend(cafe_live_ids(env, unr, true));
+        taken.extend(cafe_live_ids(env, fin, false));
+        let cands: Vec<i32> = (1..=CAFE_QUEST_MAX_ID).filter(|q| !taken.contains(q)).collect();
+        offer_mask = cafe_rotate_pick(day_no, &cands)
+            .into_iter()
+            .fold(0u32, |m, q| m | (1u32 << q));
+        offer_day = ymd;
+    }
+    CAFE_OFFER_DAY.store(offer_day, O);
+    CAFE_OFFER_MASK.store(offer_mask, O);
+    // 先用原版 cleanOldNotifyQuestList@0x2201cc 清 +120(原版回主村 reset 0x21e074 也清它;这里只为同一会话重复调用时幂等,
+    //   addNotifyQuestList: 自己不查 +120 里的重复),再逐个下发。
+    let clean_old = island_sel(env, "cleanOldNotifyQuestList");
+    let _: () = msg_send(env, (nsd, clean_old));
+    let add_s = island_sel(env, "addNotifyQuestList:");
+    let offered: Vec<i32> = (1..=CAFE_QUEST_MAX_ID)
+        .filter(|q| offer_mask & (1u32 << q) != 0)
+        .collect();
+    for &q in &offered {
+        let _: () = msg_send(env, (nsd, add_s, q));
+    }
+    let srv_s = island_sel(env, "notifyQuestListFromServer");
+    let srv: id = msg_send(env, (nsd, srv_s));
+    let pool = cafe_live_ids(env, srv, false);
+    let shown_s = island_sel(env, "getAllShownNotifyQuestIds");
+    let shown: id = msg_send(env, (nsd, shown_s));
+    let n_shown: crate::mem::GuestUSize = if shown != nil {
+        msg_send(env, (shown, cnt_s))
+    } else {
+        0
+    };
+    log!(
+        "[MOLECHEAT] island: 咖啡馆许愿任务池(本地等价 1081,日期 {}{}{})→ 今日任务 {:?},可接 {:?},咖啡馆可见 {} 条(选品规则为移植者自拟,非原版数据)",
+        ymd,
+        if reuse { ",沿用当天已选" } else { ",按天轮转新选" },
+        if new_round { ",17 条已全部完成且已跨天→开新一轮" } else { "" },
+        offered,
+        pool,
+        n_shown
+    );
     CAFE_SESSION_READY.store(true, O);
 }
 
@@ -1763,6 +1922,27 @@ fn island_cafe_flush(env: &mut Environment) -> Option<String> {
         let _: () = msg_send(env, (root, sfk, arr, k));
     }
     let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    // [2026-09-24 第四轮 K10 I2-02/I5-02] 当天任务池的日期与任务号,保证同一天重进岛/重启下发同一份。
+    {
+        let nwi = island_sel(env, "numberWithInt:");
+        let day_num: id = msg_send(env, (num_cls, nwi, CAFE_OFFER_DAY.load(O) as i32));
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, "day");
+        let _: () = msg_send(env, (root, sfk, day_num, k));
+        let offered = island_alloc_init(env, "NSMutableArray");
+        if offered != nil {
+            let add_obj = island_sel(env, "addObject:");
+            let mask = CAFE_OFFER_MASK.load(O);
+            for q in 1..=CAFE_QUEST_MAX_ID {
+                if mask & (1u32 << q) != 0 {
+                    let n: id = msg_send(env, (num_cls, nwi, q));
+                    let _: () = msg_send(env, (offered, add_obj, n));
+                }
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "offered");
+            let _: () = msg_send(env, (root, sfk, offered, k));
+            release(env, offered);
+        }
+    }
     let nwd = island_sel(env, "numberWithDouble:");
     let saved_at: id = msg_send(env, (num_cls, nwd, now_cf_secs()));
     let k = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
