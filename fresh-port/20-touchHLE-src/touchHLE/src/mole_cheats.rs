@@ -2536,6 +2536,12 @@ fn save_island_ships(env: &mut Environment) -> Option<String> {
         release(env, entry);
         total += 1;
     }
+    // [2026-09-16] 这里【刻意】不加 `total == 0 就不写` 的护栏(与 save_island_map / save_island_fragments
+    //   的 cnt==0 早退不对称,是有理由的):① 读档失败回退默认岛时,build_default_island_mapdata 必定注入
+    //   一艘 TMMapDataShip(objectId 34001,key "39")→ total 恒 ≥1;② 布局坏档保护中由上面的
+    //   ISLAND_LOAD_FAILED & ISLAND_FILE_MAP 早退顶住;③ 船档自身坏档由 island_save_blocked 顶住;
+    //   ④ 内存里真的既无船也无咖啡馆时,写空数组与内存一致,不是丢档(load_island_ships 按
+    //   (kind, objectId, ord) 匹配,本来也没有对象可回填)。加护栏反而会留下一份过期的旧船档。
     let arch_cls = env.objc.get_known_class("NSKeyedArchiver", &mut env.mem);
     let arch_s = island_sel(env, "archivedDataWithRootObject:");
     let data: id = msg_send(env, (arch_cls, arch_s, out));
