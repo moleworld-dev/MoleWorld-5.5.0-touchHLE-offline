@@ -328,8 +328,11 @@ fn pages() -> Vec<Page> {
                 ("主线任务跳转", Dev(D::Quest(QuestFamily::Main))),
                 ("限时任务跳转", Dev(D::Quest(QuestFamily::Time))),
                 ("VIP任务跳转", Dev(D::Quest(QuestFamily::Vip))),
-                ("工人数 = 20", SetWorkers(20)),
-                ("房间数 = 20", UserInfoSet("setTotalRooms:", 20)),
+                // [2026-09-24 第四轮 K14 N-D2-4] 标签注明作用范围:两项都只写主村 [[GameData sharedInstance] userInfoData]。
+                // 岛上工人走 NewSceneData.userInfoDataInNewScene(-[WrapperManager currentUserInfoData]@0x261828 在
+                // curSceneId==10 时切过去),岛上点击在 run_action 里拒绝并提示。按钮个数与位置不变。
+                ("工人数 = 20(仅主村)", SetWorkers(20)),
+                ("房间数 = 20(仅主村)", UserInfoSet("setTotalRooms:", 20)),
             ],
         },
         // 1 召唤(NPC/功能层)。
@@ -1239,6 +1242,24 @@ fn run_action(env: &mut Environment, action: Action) {
             std::process::exit(0);
         }
         Action::UserInfoSet(selector, val) => {
+            // [2026-09-24 第四轮 K14 N-D2-4] 「房间数 = 20」只改主村 UserInfoData(user_info_data 固定取
+            // [GameData sharedInstance].userInfoData),不在主村时拒绝,不写也不存。写了 toast,handle_touch 不会再刷「已执行」。
+            if selector == "setTotalRooms:" {
+                if let Some((cur, island)) = outside_main_village(env) {
+                    log!(
+                        "[MOLEMENU] 拒绝「房间数 = {}」:curSceneId={} 岛会话活跃={}",
+                        val,
+                        cur,
+                        island
+                    );
+                    set_toast(if cur == 10 || island {
+                        "房间只在主村:此按钮只改主村房间数,请回主村再用".to_string()
+                    } else {
+                        format!("此按钮只改主村房间数,请在主村使用(当前 curSceneId={},可能正在切换场景)", cur)
+                    });
+                    return;
+                }
+            }
             let ui = user_info_data(env);
             if ui == nil {
                 return;
@@ -1249,6 +1270,25 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] UserInfoData {} {}", selector, val);
         }
         Action::SetWorkers(n) => {
+            // [2026-09-24 第四轮 K14 N-D2-4] 岛上工人不归这个按钮管:岛上一律走 NewSceneUserInfoData
+            // (-[ActorManager changeAvailableMolerForTask:] 0x9da30 岛分支读 curIdleWorkerCount/curTotalWorkersCount,
+            // 抬头显示也读这两项),这里写的主村 totalWorkers/availableWorkers 要回主村后由 -[GameManager createIdleWorkers:]
+            // 才生效,岛上什么都不变却会报「已执行」。也不能改成直接写岛上计数:岛上摩尔实体靠 initMoleActors:/addWorker:
+            // 生成,只改数字会让计数和实体脱节。所以不在主村时拒绝,不写也不存,提示去摩尔公寓雇用。
+            if let Some((cur, island)) = outside_main_village(env) {
+                log!(
+                    "[MOLEMENU] 拒绝「工人数 = {}」:curSceneId={} 岛会话活跃={}",
+                    n,
+                    cur,
+                    island
+                );
+                set_toast(if cur == 10 || island {
+                    "岛上工人请到摩尔公寓雇用;此按钮只改主村工人".to_string()
+                } else {
+                    format!("此按钮只改主村工人,请在主村使用(当前 curSceneId={},可能正在切换场景)", cur)
+                });
+                return;
+            }
             let ui = user_info_data(env);
             if ui == nil {
                 return;
@@ -1357,6 +1397,34 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
         SliderKind::Workers | SliderKind::Rooms => crate::mole_cheats::is_on("max_facility"),
         SliderKind::Gold | SliderKind::VipGold => false,
     };
+    // [2026-09-24 第四轮 K14 N-D2-4] 不在主村(判定同「工人数 = 20」的门)时,「工人」改读岛档
+    // [[NewSceneData sharedInstance] userInfoDataInNewScene](T@"NewSceneUserInfoData",getter@0x223cf4)的
+    // curTotalWorkersCount(Ti,getter@0x3239c4 读 +8),与岛上抬头显示同源;max_facility 不拦岛上的 getter,
+    // 所以不标作弊覆盖。只读显示,不写存档。「房间」岛上没有对应数值,照旧读主村并在名字里注明。
+    if matches!(kind, SliderKind::Workers | SliderKind::Rooms) && outside_main_village(env).is_some() {
+        if matches!(kind, SliderKind::Rooms) {
+            let ui = user_info_data(env);
+            if ui == nil {
+                return ("房间(主村)", 0, max, overridden);
+            }
+            let s = sel(env, "totalRooms");
+            let cur: i32 = msg_send(env, (ui, s));
+            return ("房间(主村)", cur as i64, max, overridden);
+        }
+        let nsd = game_singleton(env, "NewSceneData", "sharedInstance");
+        let island_ui: id = if nsd != nil {
+            let s = sel(env, "userInfoDataInNewScene");
+            msg_send(env, (nsd, s))
+        } else {
+            nil
+        };
+        if island_ui == nil {
+            return ("岛上工人", 0, max, false);
+        }
+        let s = sel(env, "curTotalWorkersCount");
+        let cur: i32 = msg_send(env, (island_ui, s));
+        return ("岛上工人", cur as i64, max, false);
+    }
     let ui = user_info_data(env);
     if ui == nil {
         return (name, 0, max, overridden);
@@ -1467,6 +1535,20 @@ fn cur_scene_id(env: &mut Environment) -> i32 {
     }
     let s = sel(env, "curSceneId");
     msg_send(env, (sm, s))
+}
+
+/// [2026-09-24 第四轮 K14 N-D2-4] 只改主村 UserInfoData 的按钮(工人数/房间数 = 20)与「工人」滑块共用的场景判定,
+/// 口径同召唤 TestLayer(G-09):curSceneId 不是 1(10 = 黄金岛,2 = 切场景过场,-1 = 单例还没建)或岛会话仍活跃
+/// (进出岛过场)都算不在主村。只看 island_session_active() 会漏掉在线进岛(在线时离线岛标志恒为 false)。
+/// 返回 Some((curSceneId, 岛会话是否活跃)) = 不在主村;None = 在主村。会发宿主消息,只在菜单事件里调用。
+fn outside_main_village(env: &mut Environment) -> Option<(i32, bool)> {
+    let cur = cur_scene_id(env);
+    let island = crate::mole_cheats::island_session_active();
+    if cur != 1 || island {
+        Some((cur, island))
+    } else {
+        None
+    }
 }
 
 fn summon_class(env: &mut Environment, name: &str, z: i32) {
