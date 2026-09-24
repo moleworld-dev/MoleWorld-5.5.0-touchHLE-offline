@@ -861,13 +861,18 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
 /// 活动状态却停在最新,该领的奖励领不到或重复发。vip.dat 由 mole_items.rs SIDE_FILE 写,已在清单里。
 /// 刻意不收游戏自己的 3.dat(GameData.inappPurchaseInfo_ 内购交易记录)与 purchasereceipt.dat(购买凭证):
 /// 那是内购记账不是玩法进度,回滚它们只会让交易记录与贝壳数对不上。
-const SAVE_FILES: [&str; 8] = [
+const SAVE_FILES: [&str; 12] = [
     "userinfo.dat",
     "map.dat",
     "island_map.dat",
     "island_userinfo.dat",
     "island_ships.dat",
     "island_fragments.dat",
+    // [2026-09-24 第四轮骨架] 四份新岛侧档(仓库/咖啡馆/贝壳树/成就与小游戏),与另一份清单同步。
+    "island_storage.dat",
+    "island_cafe.dat",
+    "island_shelltree.dat",
+    "island_misc.dat",
     "vip.dat",
     "mole_activity.dat",
 ];

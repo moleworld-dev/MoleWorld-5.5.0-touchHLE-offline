@@ -22,7 +22,7 @@ use crate::Environment;
 
 /// 删档目标:沙盒 Documents 下的全部玩家存档。与 mole_dev 快照清单 SAVE_FILES 保持同一组文件。
 /// - userinfo.dat / map.dat:主村存档;
-/// - island_*.dat:黄金岛 4 份离线岛档,不删的话重置后岛上进度还留着;
+/// - island_*.dat:黄金岛 8 份离线岛档(布局/进度/船/碎片 + 仓库/咖啡馆/贝壳树/成就与小游戏),不删的话重置后岛上进度还留着;
 /// - vip.dat(mole_items:VIP 三值/登录日与连续天数/累计在线毫秒)与 mole_activity.dat(mole_activity:签到/脚印兑换/
 ///   海底寻宝等,经 -[GameData pathForDataFile:]@0x75374 落在 Documents):不绑定用户 ID,不删的话新档会继承旧号的
 ///   VIP 等级、连续登录天数和当天已签到状态。
@@ -30,13 +30,18 @@ use crate::Environment;
 /// 刻意不删偏好 plist:菜单删档后会 synchronize 一次 NSUserDefaults(保住音量等偏好),删了也会被写回;
 /// 主档已删时 -[GameData loadUserInfoData]@0x75704 读不到文件就在 0x7576e 直接返回,不校验 isEncrypt,
 /// 不会弹 HACK_USERINFO_DATA_ERROR。
-const SAVE_FILES: [&str; 8] = [
+const SAVE_FILES: [&str; 12] = [
     "userinfo.dat",
     "map.dat",
     "island_map.dat",
     "island_userinfo.dat",
     "island_ships.dat",
     "island_fragments.dat",
+    // [2026-09-24 第四轮骨架] 四份新岛侧档(仓库/咖啡馆/贝壳树/成就与小游戏),与另一份清单同步。
+    "island_storage.dat",
+    "island_cafe.dat",
+    "island_shelltree.dat",
+    "island_misc.dat",
     "vip.dat",
     "mole_activity.dat",
 ];

@@ -202,6 +202,17 @@ const ISLAND_FILE_MAP: u32 = 1 << 0;
 const ISLAND_FILE_USERINFO: u32 = 1 << 1;
 const ISLAND_FILE_SHIPS: u32 = 1 << 2;
 const ISLAND_FILE_FRAGMENTS: u32 = 1 << 3;
+/// [2026-09-24 第四轮骨架] 新增四份岛侧档的坏档保护位,规则与上面四份完全相同(读档走 island_sidecar_load、
+///   落盘走 island_sidecar_save)。island_storage.dat=仓库/飞鸟/增强道具,island_cafe.dat=咖啡馆许愿任务三张表,
+///   island_shelltree.dat=超级贝壳树成长值与倒计时,island_misc.dat=岛成就累计计数与小游戏前三名。
+#[allow(dead_code)]
+const ISLAND_FILE_STORAGE: u32 = 1 << 4;
+#[allow(dead_code)]
+const ISLAND_FILE_CAFE: u32 = 1 << 5;
+#[allow(dead_code)]
+const ISLAND_FILE_SHELLTREE: u32 = 1 << 6;
+#[allow(dead_code)]
+const ISLAND_FILE_MISC: u32 = 1 << 7;
 thread_local! {
     /// 上次岛存档落盘时刻(节流用)。
     static ISLAND_LAST_FLUSH: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -2766,6 +2777,119 @@ fn island_resend_quest4_action(env: &mut Environment) {
 /// [扫描修 2026-09-15] F10-6 以前每次落盘打 5 行(节拍 1 行 + 四个 save_* 各 1 行),建岛期间 1.5s 一组持续刷屏。
 ///   现在四个 save_* 只返回摘要,这里汇总成【一行】log!:`island: <reason> → 存盘 island_userinfo.dat(..) / 存盘 island_map.dat(..) / …`。
 ///   每个实际写入的文件名仍以「存盘 island_xxx.dat」原样出现(无头测试依赖该关键字);没写的文件不出现(与以前一致)。
+/// [2026-09-24 第四轮骨架] 通用岛侧档读档:Documents/<fname> 走 NSKeyedUnarchiver unarchiveObjectWithFile:。
+///   · 文件不存在 → 清保护位,返回 nil(正常无档,调用方按默认值处理);
+///   · 文件存在但解档为 nil → island_note_load_failure(改名隔离成 .corrupt;隔离失败则保持保护位、本会话不覆盖);
+///   · 成功 → 清保护位,返回根对象(解档器返回的是自动释放对象,调用方要长期持有就自己 retain 或拷贝)。
+///   与 island_map/userinfo/ships/fragments 四份老档同一口径。
+#[allow(dead_code)]
+fn island_sidecar_load(env: &mut Environment, fname: &str, bit: u32) -> id {
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return nil;
+    }
+    let unarch_cls = env.objc.get_known_class("NSKeyedUnarchiver", &mut env.mem);
+    if unarch_cls == nil {
+        return nil;
+    }
+    let s = island_sel(env, "unarchiveObjectWithFile:");
+    let loaded: id = msg_send(env, (unarch_cls, s, path));
+    if loaded == nil {
+        island_note_load_failure(env, path, bit, fname);
+        return nil;
+    }
+    island_note_load_ok(bit);
+    loaded
+}
+
+/// [2026-09-24 第四轮骨架] 通用岛侧档落盘:保护位置位时先问 island_save_blocked(原路径仍是未隔离的坏档就跳过),
+///   再 archivedDataWithRootObject: + writeToFile:atomically:YES。返回落盘摘要「存盘 xxx.dat(ok=..)」供 island_flush 汇总;
+///   root 为 nil 或归档失败返回 None。成功只打 log_dbg!,ok=false 用 log!(与四份老档一致)。root 的所有权不变(不 release)。
+#[allow(dead_code)]
+fn island_sidecar_save(env: &mut Environment, fname: &str, bit: u32, root: id) -> Option<String> {
+    if (ISLAND_LOAD_FAILED.load(O) & bit) != 0 {
+        let p = island_data_path(env, fname);
+        if island_save_blocked(env, p, bit, fname) {
+            return None;
+        }
+    }
+    if root == nil {
+        return None;
+    }
+    let arch_cls = env.objc.get_known_class("NSKeyedArchiver", &mut env.mem);
+    if arch_cls == nil {
+        return None;
+    }
+    let arch_s = island_sel(env, "archivedDataWithRootObject:");
+    let data: id = msg_send(env, (arch_cls, arch_s, root));
+    if data == nil {
+        log!("[MOLECHEAT] island: 存盘 {} 失败(归档返回 nil)", fname);
+        return None;
+    }
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return None;
+    }
+    let write_s = island_sel(env, "writeToFile:atomically:");
+    let ok: bool = msg_send(env, (data, write_s, path, true));
+    if ok {
+        log_dbg!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
+    } else {
+        log!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
+    }
+    Some(format!("存盘 {}(ok={})", fname, ok))
+}
+
+// ════════ [2026-09-24 第四轮骨架] 岛档统一挂钩点 ════════
+// 各实施包只在自己的「── [Kx] ──」槽位注释【下方】追加调用行,不改签名、不动别的槽位,也不删槽位注释
+// (槽位注释是合并锚点:相邻两包的插入之间隔着一行未改动的注释,git 合并不会冲突)。
+
+/// 进岛布局就绪挂钩:build_default_island_mapdata 两条分支(读档岛/默认岛)在 setMapData: 与 restore_seqid_cursor
+/// 之后、return true 之前各调一次。此刻 NewSceneData.mapData 已就位,时序早于 LoadingHoliday case3 的
+/// -[ObjectManager removeAllObjects](0x252f9e)与 loadNewScene→loadMapFromData→loadMapObjects,
+/// 也早于 CafeShop 两个 init(hasQuest 只在 init 算一次)与 HolidayVillageLayer onEnter 的 8 次 checkConditions:。
+/// 跑在 getAllObjectsListFromServerWithStartId: 臂内(该臂 return true 吞掉原方法),可以自由发宿主消息,不涉及 r0-r3。
+fn island_after_layout_ready(env: &mut Environment) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_after_layout_ready");
+    // ── [K4] 未来时间戳收敛 ──
+    // ── [K9] 仓库/飞鸟/增强道具回灌 mapData 键 8/11/21 ──
+    // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
+    // ── [K11] 超级贝壳树侧档读入缓存 ──
+    // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
+    let _ = env;
+}
+
+/// 落盘前置挂钩:island_flush 在主档 saveUserinfoToLocal 之后、save_island_userinfo 之前调用。
+/// 此刻 ObjectManager 活表仍满载岛对象(unloadMap 尚未执行)。
+fn island_flush_prepare(env: &mut Environment) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_flush_prepare");
+    // ── [K9] 仓库/飞鸟/增强道具落盘 + 清掉读档时注入 mapData 的 8/11/21 键 ──
+    let _ = env;
+}
+
+/// 落盘附加挂钩:island_flush 在 save_island_fragments 之后调用,返回各侧档的落盘摘要,并入 island_flush 的汇总日志。
+fn island_flush_extras(env: &mut Environment) -> Vec<String> {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_flush_extras");
+    #[allow(unused_mut)]
+    let mut out: Vec<String> = Vec::new();
+    // ── [K10] 咖啡馆 island_cafe.dat ──
+    // ── [K11] 超级贝壳树 island_shelltree.dat ──
+    // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
+    let _ = &mut *env;
+    out
+}
+
+/// 岛档计时快进挂钩:K4 的 island_ff_offline 在回拨完 island_map.dat / island_userinfo.dat 之后调用,
+/// 各侧档把自己存的绝对时间按 secs 回拨(等价于这段时间已经流逝)。只在主村、离线、不在岛会话时被调用。
+#[allow(dead_code)]
+fn island_ff_extras(env: &mut Environment, secs: f64) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_ff_extras(secs={})", secs);
+    // ── [K9] island_storage.dat 增强道具剩余时间 ──
+    // ── [K10] island_cafe.dat 已接打工类任务开始时刻 ──
+    // ── [K11] island_shelltree.dat 倒计时起点 ──
+    let _ = env;
+}
+
 fn island_flush(env: &mut Environment, reason: &str) {
     // 先清脏标记:落盘过程中若又有新变化(理论上 merge/归档本身不会触发),会重新置脏、下个节拍再存。
     ISLAND_FLUSHING.store(true, O);
@@ -2785,16 +2909,21 @@ fn island_flush(env: &mut Environment, reason: &str) {
             let _: () = msg_send(env, (nsd, save_ui));
         }
     }
+    // [2026-09-24 第四轮骨架] 落盘前置挂钩(活表仍满载,见函数注释)。
+    island_flush_prepare(env);
     let s_ui = save_island_userinfo(env);
     // ★必须在真 startNewSceneFrom→unloadMap 清空 ObjectManager 活表【之前】,此刻活表满载岛对象。
     let merged = merge_new_island_objects_into_mapdata(env);
     let s_map = save_island_map(env);
     let s_ships = save_island_ships(env);
     let s_frag = save_island_fragments(env);
+    // [2026-09-24 第四轮骨架] 新侧档落盘挂钩,摘要并入下面的汇总日志。
+    let extras = island_flush_extras(env);
     ISLAND_LAST_FLUSH.with(|c| c.set(Some(Instant::now())));
     ISLAND_FLUSHING.store(false, O);
     // [扫描修 2026-09-15] F10-6 汇总成一行(见函数注释)。
-    let parts: Vec<String> = [s_ui, s_map, s_ships, s_frag].into_iter().flatten().collect();
+    let mut parts: Vec<String> = [s_ui, s_map, s_ships, s_frag].into_iter().flatten().collect();
+    parts.extend(extras);
     let body = if parts.is_empty() {
         "本次没有需要写入的岛档".to_string()
     } else {
@@ -3332,6 +3461,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         load_island_ships(env); // [审计修] 船 shipState/待领奖品、咖啡馆 isNew(不在 NSCoding 里)
         fix_stuck_ships(env); // [审计修] 唯一会永久卡死的船状态组合兜底
         restore_seqid_cursor(env); // [P3-a] 抬 seqId 游标到已存最大,防新放置撞号
+        island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(读档岛)
         return true;
     }
     // ★[审计修 2026-09-11] 全新岛补"新岛"标志 newGame|=1。原版置位点是 -[NewSceneCommand parseMapDataWithPackageData:atIndex:]
@@ -3453,6 +3583,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片(默认岛首进通常无,空过)
     inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片(真新岛档:31006/31008 走商店购买,31005/31007 按任务 81/83 进度补)
     restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001-90008,抬游标到 90008 防新放置撞号
+    island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(默认岛)
 
     log!("[MOLECHEAT] island: injected default mapData (5 shops 30101-30105 / restaurant 30002 / apartment 30001 / ship 34001)");
     true
@@ -4840,6 +4971,12 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   消息路由与 main 完全一致;没把 FriendsVillageLayer 加进 CLASSES,免得它的每条消息都进 intercept 和三个子模块。
         //   (UserInfoData mapExtend / ObjectManager checkMapExtendError 两个 mapExtend 臂的类已在 CLASSES 里。)
         || (cfg!(target_os = "ios") && matches!(sel, "getFriendsInfo" | "loadMapFromData:"))
+        // ════ [2026-09-24 第四轮骨架] 粗筛槽位:各实施包只在自己的槽位注释下方追加 `|| (...)` 行,不动别的槽位 ════
+        // ── [K3] ──
+        // ── [K7] ──
+        // ── [K8] ──
+        // ── [K11] ──
+        // ── [K13] ──
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
