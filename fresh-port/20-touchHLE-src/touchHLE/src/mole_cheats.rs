@@ -4706,6 +4706,8 @@ fn island_flush(env: &mut Environment, reason: &str) {
     // [2026-09-24 第四轮 K3 I6-5] 本轮写盘失败标志先清(四个 save_* 与 island_sidecar_save 在 writeToFile:atomically: 返回 NO 时置位);
     //   放在时间旅行闸之前:闸内提前返回时本轮"没有失败",末次落盘的当场重试不会被上一轮的旧标志误触发。
     ISLAND_SAVE_FAILED.store(false, O);
+    // [2026-09-24 第五轮补挖 M-M6-1] 一进门就取走「跳过主档写」标志,任何早退都不会把它留给之后的节拍/离岛/生命周期落盘。
+    let skip_main_save = ISLAND_SKIP_MAIN_SAVE_ONCE.swap(false, O);
     // [2026-09-24 第四轮 K3 I7-01] 时间旅行落盘闸:开发者「时间旅行」偏移(只增不减、只在本进程)期间,岛上所有计时
     //   (TMMapDataShip.beginDiscoverTime/beginFixTime、TMMapDataShop.beginTime、TMMapDataRestaurant.beginUpgradeTime、
     //   各 coolingTime、curQuestResult、NpcData.lastCoolDownTime 等)都是"未来"时刻;写进岛档后重启回到现实时间,
@@ -4735,7 +4737,13 @@ fn island_flush(env: &mut Environment, reason: &str) {
     ISLAND_DIRTY.store(false, O);
     // 先让游戏自己把主存档(经济/等级)落盘,再存我们的岛档。注:saveUserinfoToLocal@0x21dcac 归档的是【主村】
     // UserInfoData(GameData.userInfoData_),与岛 NewSceneUserInfoData 无关,岛进度由下面 save_island_userinfo 负责。
-    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    // [2026-09-24 第五轮补挖 M-M6-1] 关键操作即时落盘且本批原版已经自己存过主档(见 ISLAND_BATCH_MAIN_SAVED)→ 不再重复写。
+    let nsd_cls = if skip_main_save {
+        log_dbg!("[MOLECHEAT] island: {}:本批原版已存过主档,跳过重复的 saveUserinfoToLocal", reason);
+        nil
+    } else {
+        env.objc.get_known_class("NewSceneData", &mut env.mem)
+    };
     if nsd_cls != nil {
         let sh = env
             .objc
@@ -4900,6 +4908,15 @@ pub fn island_lifecycle_flush(env: &mut Environment, reason: &str, only_if_dirty
 /// [2026-09-24 第四轮 K3 I5-04] 「关键操作即时落盘」已排队(moleIslandFlushNow 还没触发)。置位期间不再重复排队,
 /// 由 moleIslandFlushNow 臂(或岛功能总闸关闭时的兜底)清零。
 static ISLAND_FLUSH_NOW_PENDING: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第五轮补挖 M-M6-1] 本批即时落盘排队之后,原版是否已经自己存过主档(且之后没有再改主村 UserInfoData)。
+///   原版 -[NewSceneData addGoldInNewScene:]@0x21f748 在 0x21f7a2、addXpInNewScene: 在 0x21f6fe 各自立即 saveUserinfoToLocal,
+///   addVipGoldInNewScene: 在 0x21f65a 经 saveUserinfoBothInLocalAndRemote 转调同一方法;这时 island_flush 开头再存一次主档
+///   (整份 UserInfoData 归档 + AES 加密写盘)纯属重复。由置脏臂维护:排队时清零,之后见到 NewSceneData saveUserinfoToLocal
+///   置 1,再见到主村 UserInfoData 的 add*/set* 清零(改了还没存)。
+static ISLAND_BATCH_MAIN_SAVED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第五轮补挖 M-M6-1] 下一次 island_flush 跳过开头那次主档写(只由 moleIslandFlushNow 臂在确认本批已存过主档时置位,
+///   island_flush 一进门就取走并清零,早退路径也不会留给后面的节拍/离岛落盘)。
+static ISLAND_SKIP_MAIN_SAVE_ONCE: AtomicBool = AtomicBool::new(false);
 
 /// [2026-09-24 第四轮 K3 I5-04] 这条消息是不是「关键操作」:原版在这些点上已经【立即】写了主档(或改了只存在岛档里的进度指针),
 /// 岛档却要等节拍(每秒一拍、距上次 ≥1.5 秒)才写,窗口内强杀就会出现"钱扣了/奖励领了、岛上没变"或任务指针回滚可重复领奖。
@@ -5020,6 +5037,7 @@ fn island_request_flush_now(env: &mut Environment) {
     if ISLAND_FLUSH_NOW_PENDING.swap(true, O) {
         return; // 已经排过一次,这条调用栈返回后那一次会把本次变化一起写掉
     }
+    ISLAND_BATCH_MAIN_SAVED.store(false, O); // [第五轮补挖 M-M6-1] 新批次:还没看到原版存主档
     let saved = [
         env.cpu.regs()[0],
         env.cpu.regs()[1],
@@ -10618,15 +10636,52 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //   GameManager 不实现该选择子,必须 return true 吞掉。宿主自排的选择子、栈上没有游戏方法体,可自由发消息。
         //   不看 1.5 秒节流(这正是要绕开的窗口),但看写盘失败的退避(免得连续失败时每次操作都重跑整套落盘)。
         if sel == "moleIslandFlushNow" {
+            // [2026-09-24 第五轮补挖 M-M6-1] 只在解释器构建(iOS / cpu_interpreter)上:距上次落盘不到 1 秒就不立刻落,
+            //   按剩余时间再排一次(PENDING 保持置位,期间的关键操作不重复排队),连点收店/进货时第一次立即落盘、
+            //   之后最迟约 1 秒合并成一次;解释器下一整轮归档(每个 TMMapData 的 encodeWithCoder: 都在 guest 里跑)
+            //   加主档加密写盘会明显掉帧。桌面 JIT 构建保持立即落盘。节拍先落了盘也无妨:到时 DIRTY 已清,这里直接空转。
+            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+            {
+                let since = ISLAND_LAST_FLUSH.with(|c| c.get()).map(|t| t.elapsed().as_secs_f64());
+                if let Some(el) = since {
+                    if el < 1.0 && ON_ISLAND.load(O) && ISLAND_DIRTY.load(O) && !ISLAND_FLUSHING.load(O) {
+                        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+                        let gm: id = if gm_cls != nil {
+                            let smgr = island_sel(env, "sharedManager");
+                            msg_send(env, (gm_cls, smgr))
+                        } else {
+                            nil
+                        };
+                        if gm != nil {
+                            let now_s = island_sel(env, "moleIslandFlushNow");
+                            let perform = island_sel(env, "performSelector:withObject:afterDelay:");
+                            let _: () = msg_send(env, (gm, perform, now_s, nil, (1.0 - el).max(0.05)));
+                            return true;
+                        }
+                    }
+                }
+            }
             ISLAND_FLUSH_NOW_PENDING.store(false, O);
+            let batch_saved = ISLAND_BATCH_MAIN_SAVED.swap(false, O);
             if ON_ISLAND.load(O)
                 && ISLAND_DIRTY.load(O)
                 && !ISLAND_FLUSHING.load(O)
                 && island_retry_ready()
             {
+                ISLAND_SKIP_MAIN_SAVE_ONCE.store(batch_saved, O);
                 island_flush(env, "关键操作即时落盘");
             }
             return true;
+        }
+
+        // [2026-09-24 第五轮补挖 M-M6-1] 原版存过主档之后又改了主村 UserInfoData(add*/set*)→ 本批主档还没存,落盘时照常写。
+        //   纯原子;UserInfoData 已在 CLASSES。存主档过程中若调到 UserInfoData 的 set*,只会让这批多写一次(安全方向)。
+        if ON_ISLAND.load(O)
+            && class == "UserInfoData"
+            && (sel.starts_with("add") || sel.starts_with("set"))
+            && ISLAND_FLUSH_NOW_PENDING.load(O)
+        {
+            ISLAND_BATCH_MAIN_SAVED.store(false, O);
         }
 
         // ★[审计修 2026-09-11] 置脏:岛上经营/任务/剧情/成就/扩地/工人数都落在 NewSceneUserInfoData 的 set*/add*,
@@ -10659,6 +10714,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 || (class == "UserInfoData" && matches!(sel, "addGold:" | "addXp:" | "addVipGold:")))
         {
             island_mark_dirty();
+            // [2026-09-24 第五轮补挖 M-M6-1] 本批即时落盘排队中、原版自己存了主档 → 记下,落盘时不再重复写(见 ISLAND_BATCH_MAIN_SAVED)。
+            if class == "NewSceneData"
+                && sel == "saveUserinfoToLocal"
+                && ISLAND_FLUSH_NOW_PENDING.load(O)
+                && !ISLAND_FLUSHING.load(O)
+            {
+                ISLAND_BATCH_MAIN_SAVED.store(true, O);
+            }
             // [2026-09-24 第四轮 K3 I5-04] 关键操作(扣款/发奖/任务指针/扩地/新放置)再排一次即时落盘,见 island_request_flush_now。
             //   它内部发宿主消息前后整体快照/恢复 r0-r3,本臂之后照旧往下走、按原逻辑放行真方法。
             if island_is_key_op(class, sel) {
