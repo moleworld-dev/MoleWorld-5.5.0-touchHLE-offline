@@ -148,6 +148,15 @@ pub const CLASSES: ClassExports = objc_classes! {
             return nil;
         }
     };
+    // [2026-09-24 第四轮 K2 I6-1] 再校验 $top。原来只查 $version/$archiver/$objects:一个这三项都合法、
+    //   却缺 $top(或 $top 不是字典)的档,unarchiveObjectWithData: 随后发 decodeObjectForKey:"root" 时
+    //   get_value_to_decode_for_key 取 plist["$top"] 直接 Rust panic,整个模拟器退出,mole_cheats 的
+    //   坏档隔离(island_note_load_failure 改名 .corrupt)永远轮不到 → 每次进岛必崩。
+    //   这里挡掉后返回 nil,alloc 出来的壳由调用方 unarchiveObjectWithData: 释放(与上面几条 return nil 同口径)。
+    if plist.get("$top").and_then(|v| v.as_dictionary()).is_none() {
+        log!("[!] NSKeyedUnarchiver: 缺 $top 字典(或它不是字典)— 返回 nil");
+        return nil;
+    }
 
     let host_obj = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
     assert!(host_obj.already_unarchived.is_empty());
@@ -318,14 +327,26 @@ fn borrow_host_obj(env: &mut Environment, unarchiver: id) -> &mut NSKeyedUnarchi
 fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -> Option<&Value> {
     let key = to_rust_string(env, key); // TODO: avoid copying string
     let host_obj = borrow_host_obj(env, unarchiver);
+    // [2026-09-24 第四轮 K2 I6-1] 原来 plist["$objects"]/plist["$top"] 下标与两处 unwrap 在坏档上会 panic。
+    //   $top 已由 initForReadingWithData: 校验;当前对象只会在 unarchive_key 的字典分支里设为 current_key
+    //   (UID 已查过界),正常档这里恒能取到字典。仍改成 get + as_dictionary,取不到就记日志按「键不存在」
+    //   返回 None,各 decodeXxxForKey: 走默认值,不再 panic 整个模拟器。
     let scope = match host_obj.current_key {
-        Some(current_uid) => {
-            &host_obj.plist["$objects"].as_array().unwrap()[current_uid.get() as usize]
-        }
-        None => &host_obj.plist["$top"],
-    }
-    .as_dictionary()
-    .unwrap();
+        Some(current_uid) => host_obj
+            .plist
+            .get("$objects")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.get(current_uid.get() as usize)),
+        None => host_obj.plist.get("$top"),
+    };
+    let Some(scope) = scope.and_then(|v| v.as_dictionary()) else {
+        log!(
+            "[!] NSKeyedUnarchiver: 取键 {:?} 时当前作用域({:?})不是字典(坏档?)— 按键不存在处理",
+            key,
+            host_obj.current_key.map(|u| u.get())
+        );
+        return None;
+    };
     scope.get(&key)
 }
 

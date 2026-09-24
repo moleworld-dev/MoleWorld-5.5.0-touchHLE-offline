@@ -98,9 +98,17 @@ pub enum Action {
     /// 一键进入 NewScene 可建筑黄金岛(scene id 10):arm 进岛(开功能/开窗/注入默认岛
     /// mapData)后直接 `[SceneMannager startNewSceneFrom:1 toScene:10]`。
     EnterIsland,
-    /// 岛上一键回主村:走原版 `-[HolidayVillageLayer returnToMainVillage]`(=点岛上飞机后确认框的
-    /// 回调路径),会触发 gobackMainVillage → 我们的退岛存盘(island_map/userinfo/fragments)。
+    /// 岛上一键回主村:调原版 `-[HolidayVillageLayer gobackMainVillage]`@0x23d15c(与点岛上飞机后确认框的回调
+    /// 同一路径,0x23d458 把它作为 showWithTarget:selector: 的回调选择子)。
+    /// [2026-09-24 第四轮 K14 N-D5-3] 不走 returnToMainVillage(断网专用,会 setConnectFirstInThisOpen:1);
+    /// 退岛存盘在 mole_cheats 的 startNewSceneFrom 10→1 出口,不在 gobackMainVillage 上。
     ExitIsland,
+    /// [2026-09-24 第四轮 K14 I4-04] 黄金岛探险船 GM:一键修好,走原版贝壳加速修船的同一出口 -[DiscoveryShip quickFixShip]。
+    /// 仅离线且在岛上可用,见 ship_quick_fix。
+    ShipQuickFix,
+    /// [2026-09-24 第四轮 K14 I4-04] 黄金岛探险船 GM:立即返航,把 beginDiscoverTime_ 拨到出海时长之前,
+    /// 由原版 innerUpdate: 自己结算返航与礼物。仅离线且在岛上可用,见 ship_return_now。
+    ShipReturnNow,
     /// [扫描修 2026-09-15] 开发工具按钮:调用 mole_dev 的约定函数,DevResult 文案写底部 toast。
     Dev(DevTool),
     /// [扫描修 2026-09-15] 隐藏物品页按钮:调用 mole_items 的约定函数。
@@ -140,6 +148,8 @@ pub enum DevTool {
     BuildingStore,
     CameraCenter,
     Trace,
+    /// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进:分钟 = 寄存器值,主村离线执行、下次进岛生效(mole_dev::island_fast_forward_minutes)。
+    IslandFastForward,
 }
 
 /// [扫描修 2026-09-15] 隐藏物品页的按钮种类(F1-1 / F1-5 / F4-1)。
@@ -328,8 +338,11 @@ fn pages() -> Vec<Page> {
                 ("主线任务跳转", Dev(D::Quest(QuestFamily::Main))),
                 ("限时任务跳转", Dev(D::Quest(QuestFamily::Time))),
                 ("VIP任务跳转", Dev(D::Quest(QuestFamily::Vip))),
-                ("工人数 = 20", SetWorkers(20)),
-                ("房间数 = 20", UserInfoSet("setTotalRooms:", 20)),
+                // [2026-09-24 第四轮 K14 N-D2-4] 标签注明作用范围:两项都只写主村 [[GameData sharedInstance] userInfoData]。
+                // 岛上工人走 NewSceneData.userInfoDataInNewScene(-[WrapperManager currentUserInfoData]@0x261828 在
+                // curSceneId==10 时切过去),岛上点击在 run_action 里拒绝并提示。按钮个数与位置不变。
+                ("工人数 = 20(仅主村)", SetWorkers(20)),
+                ("房间数 = 20(仅主村)", UserInfoSet("setTotalRooms:", 20)),
             ],
         },
         // 1 召唤(NPC/功能层)。
@@ -368,18 +381,22 @@ fn pages() -> Vec<Page> {
             layout: Layout::ColumnFirst3,
             parent: None,
             buttons: vec![
-                ("Mini: 切水果", MiniGame(1)),
-                ("Mini: 拍虫子", MiniGame(2)),
-                ("Mini: 挖矿石", MiniGame(3)),
-                ("Mini: 敲木桩", MiniGame(4)),
-                ("Mini: 钓鱼", MiniGame(5)),
+                // [2026-09-24 第五轮补挖 M-M3-3] 菜单召唤是「试玩」:callbackTarget 传 nil,-[MiniGameManager callCallback]@0xf48dc
+                //   在 0xf48f0 判空跳过,摩尔豆和经验只在建筑回调 -[Building onMiniGameFinished]@0xb22c4(0xb254e addGold: /
+                //   0xb25cc addXp:)里入账,所以不发奖励、也不计建筑冷却;结算界面上的数值只是显示。标签照实写明。
+                ("Mini试玩: 切水果(不发奖励)", MiniGame(1)),
+                ("Mini试玩: 拍虫子(不发奖励)", MiniGame(2)),
+                ("Mini试玩: 挖矿石(不发奖励)", MiniGame(3)),
+                ("Mini试玩: 敲木桩(不发奖励)", MiniGame(4)),
+                ("Mini试玩: 钓鱼(不发奖励)", MiniGame(5)),
                 // [扫描修 2026-09-15] F9-3:-[MiniGameManager enterMiniGame:stage:]@0xf3fe8 共 8 个小游戏,补上 7 和 8。
                 //   7 占卜屋:和建筑入口走同一条已打补丁的分支(依赖「修复占卜功能」,默认开);
-                //   8 左左右右 = 黄金岛 18 级建筑「沙滩WC」的 WashRoomGame,图集自己加载;在主村召唤时奖励记进主村账本,
-                //     不完全忠实但可接受。
+                //   8 左左右右 = 黄金岛 18 级建筑「沙滩WC」的 WashRoomGame,图集自己加载。
                 //   不加 6 涂鸦馆:图集缺失,大概率黑屏或空精灵帧。
-                ("Mini: 占卜屋", MiniGame(7)),
-                ("Mini: 左左右右(沙滩WC)", MiniGame(8)),
+                // [2026-09-24 第五轮补挖 M-M3-3] 8 号在岛上不召唤:-[WashRoomGame updateTop3Record]@0x35c230 会把试玩成绩写进
+                //   NewSceneData.top3RecordOfMiniGame_,岛上会随 island_misc.dat 落盘,混进岛上沙滩WC的真实前三名(见 mini_game)。
+                ("Mini试玩: 占卜屋(不发奖励)", MiniGame(7)),
+                ("Mini试玩: 左左右右(沙滩WC,不发奖励)", MiniGame(8)),
                 // [2026-09-16] G-02 丝尔特三键先止损:原实现丢弃了 -[GameData loadMapdataFromResource:]@0x7e11c /
                 // loadUserInfoFromResource:@0x7df8c 的返回值(两者只解档返回、不写 mapdata_),无参 saveMapData 存的是当前场景
                 // 对象,reloadMapFromNewSceneData@0x24642c 在 nextSceneId_==0 时直接返回——什么都没做,「拷贝」还报成功。
@@ -419,7 +436,9 @@ fn pages() -> Vec<Page> {
                 // 工人房间补满在岛上不做(全局拦岛上工人 getter 会把 99 写进岛档),只管主村。按钮位置与开关键名不变。
                 ("冷却归零(主村+黄金岛)", ToggleCheat("no_cooldown")),
                 ("建筑瞬完成(主村+黄金岛)", ToggleCheat("instant_build")),
-                ("工人房间补满(仅主村)", ToggleCheat("max_facility")),
+                // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 删掉 totalRooms 臂、工人 getter 改按调用点白名单返 99,
+                // 不再补房间,标签去掉「房间」。以前的旧逻辑已经经 encodeWithCoder: 写进 userinfo.dat 的 99 无法自动还原。开关键名不变。
+                ("工人补满(仅主村)", ToggleCheat("max_facility")),
                 ("产出×10(收菜)", ToggleCheat("harvest_mult")),
                 ("任务秒完成免费(主村+黄金岛)", ToggleCheat("free_quest")),
                 ("小游戏奖励满", ToggleCheat("minigame_reward")),
@@ -466,6 +485,11 @@ fn pages() -> Vec<Page> {
                 // —— 黄金岛(从黄金岛页移来)——
                 ("▶ 一键进入黄金岛", EnterIsland),
                 ("◀ 岛上一键回主村(存档)", ExitIsland),
+                // [2026-09-24 第四轮 K14 I4-04] 探险船 GM 两项(仅离线且在岛上)。插在第 11、12 项,前 11 项顺序不动;
+                // 本页按钮 19→21,每列仍 7 行,无头测试坐标 tap 178 519 / 220 517 仍落在进岛/回村上(layout_selfcheck 核对)。
+                // 本页已到 21 个上限,再加按钮会变成每列 8 行、坐标漂移。
+                ("探险船一键修好(离线GM)", ShipQuickFix),
+                ("探险船立即返航(离线GM)", ShipReturnNow),
                 ("可建筑黄金岛·热点开关", ToggleCheat("enable_newscene_island")),
                 ("修复加勒比寻宝", ToggleCheat("fix_golden_island")),
                 // [扫描修 2026-09-15] F10-9:原「直达终点(弃用)」「打开加勒比黄金岛(弃用)」移出本页——它们和「一键进入黄金岛」
@@ -525,6 +549,8 @@ fn pages() -> Vec<Page> {
                 ("时间旅行+24h(不可回退)", Dev(D::TimeTravelHours(24))),
                 ("存档快照:保存", Dev(D::SnapshotSave)),
                 ("快照:下次启动恢复", Dev(D::SnapshotRestore)),
+                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 11 行首格),不挪动前面任何按钮的坐标。
+                ("岛档快进(分钟)", Dev(D::IslandFastForward)),
             ],
         },
         // 6 [扫描修 2026-09-15] F1-1/F1-5/F4-1 隐藏物品:进商店开关、节日商店模式、目录浏览(放到地图 / 入仓库)。
@@ -1239,6 +1265,24 @@ fn run_action(env: &mut Environment, action: Action) {
             std::process::exit(0);
         }
         Action::UserInfoSet(selector, val) => {
+            // [2026-09-24 第四轮 K14 N-D2-4] 「房间数 = 20」只改主村 UserInfoData(user_info_data 固定取
+            // [GameData sharedInstance].userInfoData),不在主村时拒绝,不写也不存。写了 toast,handle_touch 不会再刷「已执行」。
+            if selector == "setTotalRooms:" {
+                if let Some((cur, island)) = outside_main_village(env) {
+                    log!(
+                        "[MOLEMENU] 拒绝「房间数 = {}」:curSceneId={} 岛会话活跃={}",
+                        val,
+                        cur,
+                        island
+                    );
+                    set_toast(if cur == 10 || island {
+                        "房间只在主村:此按钮只改主村房间数,请回主村再用".to_string()
+                    } else {
+                        format!("此按钮只改主村房间数,请在主村使用(当前 curSceneId={},可能正在切换场景)", cur)
+                    });
+                    return;
+                }
+            }
             let ui = user_info_data(env);
             if ui == nil {
                 return;
@@ -1249,6 +1293,25 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] UserInfoData {} {}", selector, val);
         }
         Action::SetWorkers(n) => {
+            // [2026-09-24 第四轮 K14 N-D2-4] 岛上工人不归这个按钮管:岛上一律走 NewSceneUserInfoData
+            // (-[ActorManager changeAvailableMolerForTask:] 0x9da30 岛分支读 curIdleWorkerCount/curTotalWorkersCount,
+            // 抬头显示也读这两项),这里写的主村 totalWorkers/availableWorkers 要回主村后由 -[GameManager createIdleWorkers:]
+            // 才生效,岛上什么都不变却会报「已执行」。也不能改成直接写岛上计数:岛上摩尔实体靠 initMoleActors:/addWorker:
+            // 生成,只改数字会让计数和实体脱节。所以不在主村时拒绝,不写也不存,提示去摩尔公寓雇用。
+            if let Some((cur, island)) = outside_main_village(env) {
+                log!(
+                    "[MOLEMENU] 拒绝「工人数 = {}」:curSceneId={} 岛会话活跃={}",
+                    n,
+                    cur,
+                    island
+                );
+                set_toast(if cur == 10 || island {
+                    "岛上工人请到摩尔公寓雇用;此按钮只改主村工人".to_string()
+                } else {
+                    format!("此按钮只改主村工人,请在主村使用(当前 curSceneId={},可能正在切换场景)", cur)
+                });
+                return;
+            }
             let ui = user_info_data(env);
             if ui == nil {
                 return;
@@ -1333,6 +1396,9 @@ fn run_action(env: &mut Environment, action: Action) {
         Action::OpenCaribbean => open_caribbean(env),
         Action::EnterIsland => enter_island(env),
         Action::ExitIsland => exit_island(env),
+        // [2026-09-24 第四轮 K14 I4-04] 探险船 GM,两者都自己写 toast。
+        Action::ShipQuickFix => ship_quick_fix(env),
+        Action::ShipReturnNow => ship_return_now(env),
         // [扫描修 2026-09-15] 开发工具 / 隐藏物品页。
         Action::Dev(tool) => run_dev_tool(env, tool),
         Action::Hidden(h) => run_hidden(env, h),
@@ -1344,6 +1410,7 @@ fn run_action(env: &mut Environment, action: Action) {
 /// 读某滑块种类的(显示名, 当前值, 上限, 是否被作弊覆盖)。当前值实时读游戏 UserInfoData。
 /// [2026-09-16] G-11 宿主 msg_send 同样经过 objc_msgSend 的作弊钩子:FORCE_LEVEL 开着时 curLevel 返回强制等级,
 /// max_facility 开着时 totalWorkers/totalRooms 恒返回 99。读法不改,只把「被覆盖」标出来,免得玩家以为存档已改。
+/// [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4)后 max_facility 不再覆盖宿主读到的工人/房间值,见下面 overridden。
 fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i64, bool) {
     let (name, max): (&'static str, i64) = match kind {
         SliderKind::Level => ("等级", 52),
@@ -1354,9 +1421,40 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
     };
     let overridden = match kind {
         SliderKind::Level => crate::mole_cheats::level() > 0,
-        SliderKind::Workers | SliderKind::Rooms => crate::mole_cheats::is_on("max_facility"),
+        // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 只对 MAXFAC_GATE_LRS 里的人力门/HUD 调用点返回 99,
+        // 宿主 msg_send 的返回地址不在白名单里,这里读到的就是存档真值;totalRooms 臂整条删了。所以工人/房间不再标
+        // 「作弊覆盖」(否则开着开关时会误报)。与开关改名同一提交,K13 未合入时一起回退。
+        SliderKind::Workers | SliderKind::Rooms => false,
         SliderKind::Gold | SliderKind::VipGold => false,
     };
+    // [2026-09-24 第四轮 K14 N-D2-4] 不在主村(判定同「工人数 = 20」的门)时,「工人」改读岛档
+    // [[NewSceneData sharedInstance] userInfoDataInNewScene](T@"NewSceneUserInfoData",getter@0x223cf4)的
+    // curTotalWorkersCount(Ti,getter@0x3239c4 读 +8),与岛上抬头显示同源;max_facility 不拦岛上的 getter,
+    // 所以不标作弊覆盖。只读显示,不写存档。「房间」岛上没有对应数值,照旧读主村并在名字里注明。
+    if matches!(kind, SliderKind::Workers | SliderKind::Rooms) && outside_main_village(env).is_some() {
+        if matches!(kind, SliderKind::Rooms) {
+            let ui = user_info_data(env);
+            if ui == nil {
+                return ("房间(主村)", 0, max, overridden);
+            }
+            let s = sel(env, "totalRooms");
+            let cur: i32 = msg_send(env, (ui, s));
+            return ("房间(主村)", cur as i64, max, overridden);
+        }
+        let nsd = game_singleton(env, "NewSceneData", "sharedInstance");
+        let island_ui: id = if nsd != nil {
+            let s = sel(env, "userInfoDataInNewScene");
+            msg_send(env, (nsd, s))
+        } else {
+            nil
+        };
+        if island_ui == nil {
+            return ("岛上工人", 0, max, false);
+        }
+        let s = sel(env, "curTotalWorkersCount");
+        let cur: i32 = msg_send(env, (island_ui, s));
+        return ("岛上工人", cur as i64, max, false);
+    }
     let ui = user_info_data(env);
     if ui == nil {
         return (name, 0, max, overridden);
@@ -1469,6 +1567,20 @@ fn cur_scene_id(env: &mut Environment) -> i32 {
     msg_send(env, (sm, s))
 }
 
+/// [2026-09-24 第四轮 K14 N-D2-4] 只改主村 UserInfoData 的按钮(工人数/房间数 = 20)与「工人」滑块共用的场景判定,
+/// 口径同召唤 TestLayer(G-09):curSceneId 不是 1(10 = 黄金岛,2 = 切场景过场,-1 = 单例还没建)或岛会话仍活跃
+/// (进出岛过场)都算不在主村。只看 island_session_active() 会漏掉在线进岛(在线时离线岛标志恒为 false)。
+/// 返回 Some((curSceneId, 岛会话是否活跃)) = 不在主村;None = 在主村。会发宿主消息,只在菜单事件里调用。
+fn outside_main_village(env: &mut Environment) -> Option<(i32, bool)> {
+    let cur = cur_scene_id(env);
+    let island = crate::mole_cheats::island_session_active();
+    if cur != 1 || island {
+        Some((cur, island))
+    } else {
+        None
+    }
+}
+
 fn summon_class(env: &mut Environment, name: &str, z: i32) {
     let cls = env.objc.get_known_class(name, &mut env.mem);
     if cls == nil {
@@ -1567,6 +1679,13 @@ fn summon_class(env: &mut Environment, name: &str, z: i32) {
 }
 
 fn mini_game(env: &mut Environment, id_: i32) {
+    // [2026-09-24 第五轮补挖 M-M3-3] 左左右右在岛上(或进出岛过场中)不试玩:成绩会写进岛上沙滩WC的前三名并随 island_misc.dat 落盘。
+    //   主村召唤不受影响(主村这份 NewSceneData 前三名回岛前会被 island_misc.dat 覆盖,不落盘)。
+    if id_ == 8 && outside_main_village(env).is_some() {
+        set_toast("岛上请点已建成的沙滩WC游玩(菜单试玩的成绩会混进岛上前三名)".to_string());
+        log!("[MOLEMENU] 拒绝岛上试玩左左右右(免得试玩成绩写进岛上前三名)");
+        return;
+    }
     let mgr = game_singleton(env, "MiniGameManager", "shareInstance");
     if mgr == nil {
         log!("[MOLEMENU] MiniGameManager == nil");
@@ -1578,6 +1697,7 @@ fn mini_game(env: &mut Environment, id_: i32) {
     let select: u32 = 0; // NULL SEL
     let _: () = msg_send(env, (mgr, s, id_, play_type, target, select));
     log!("[MOLEMENU] startMiniGame {}", id_);
+    set_toast("试玩模式:结算界面上的摩尔豆/经验不入账,要拿奖励请点已建成的对应建筑".to_string());
 }
 
 /// 一键收获全部。`ObjectManager.farms` 是游戏自己的地块数组(比 tweak 注入的 gFarmTable 干净)。
@@ -1804,9 +1924,15 @@ fn open_caribbean(env: &mut Environment) {
     teardown(env);
 }
 
-/// 岛上一键回主村:找当前村庄层(岛上=HolidayVillageLayer),调原版 returnToMainVillage
-/// (setConnectFirstInThisOpen:1 + gobackMainVillage)。gobackMainVillage 被 mole_cheats 拦截做退岛存盘,
-/// 再由原版 startNewSceneFrom:10 toScene:1 回主村。不在岛上(无该方法)则只提示。
+/// 岛上一键回主村:找当前村庄层(岛上=HolidayVillageLayer),调原版 gobackMainVillage(和点飞机确认同路径:
+/// -[HolidayVillageLayer checkSpecailZone:rect:] 在 0x23d456-0x23d468 弹 MessageBox 确认框,回调选择子就是它),
+/// 由原版 startNewSceneFrom:10 toScene:1 回主村。不在岛上(无该方法)则只提示。
+/// [2026-09-24 第四轮 K14 N-D5-3] 以前发的是 returnToMainVillage@0x23d6c4:它在 0x23d6e2-0x23d6f4 先
+/// [[NetworkManager sharedInstance] setConnectFirstInThisOpen:1] 再调 gobackMainVillage,原版只在断网弹框关闭(0x23b6e4)
+/// 与收包错误分支(0x23eaae)走它。在线模式回村后 startGame: 排的 sendGameData2Server: 在 0x21064 读到这个标志,就改发
+/// getLocalUserAndMapInfo(1001)重拉,回包可能弹存档比对框或用云端覆盖本地;离线时 0x20f7c 的 isReachable 门先返回,不受影响。
+/// 现在直接发 gobackMainVillage,不去动 connectFirstInThisOpen 本身(不走断网路径就是忠于原版)。
+/// 退岛存盘在 mole_cheats 的 startNewSceneFrom 10→1 出口(island_flush),不在 gobackMainVillage 上(那里没有钩子臂)。
 fn exit_island(env: &mut Environment) {
     let wm = game_singleton(env, "WrapperManager", "sharedManager");
     let village: id = if wm != nil {
@@ -1815,15 +1941,16 @@ fn exit_island(env: &mut Environment) {
     } else {
         nil
     };
-    if village == nil || !env.objc.object_has_method_named(&env.mem, village, "returnToMainVillage") {
-        log!("[MOLEMENU] currentVillageLayer/returnToMainVillage unavailable (need to be on island)");
+    // gobackMainVillage 与 returnToMainVillage 一样只在 HolidayVillageLayer 上实现,「在岛上」的判定语义不变。
+    if village == nil || !env.objc.object_has_method_named(&env.mem, village, "gobackMainVillage") {
+        log!("[MOLEMENU] currentVillageLayer/gobackMainVillage unavailable (need to be on island)");
         set_toast("回主村失败:你现在不在黄金岛上".to_string());
         return;
     }
     // ★[深扫修 2026-09-11] #19 岛上 gameMode 前置门(写法与 enter_island 的门①一致)。
     //   根因:岛上拿起建筑进入移动/放置态时 NewGameManager.gameMode=2/3(NewSceneMoveLayer onButtonMoveSelected:
     //   0x2b35b2/0x2b3602),9/11 是菜单瞬态。原版的离岛入口(点飞机 gobackMainVillage)只在浏览态(=1)可点,只有本菜单
-    //   绕过 UI 直接 returnToMainVillage。离岛加载 -[LoadingMainVillage updateLoading:] 在 0x2543b6 把岛上 gameMode 拷进
+    //   绕过 UI 直接发离岛方法(K14 N-D5-3 起为 gobackMainVillage,以前是 returnToMainVillage)。离岛加载 -[LoadingMainVillage updateLoading:] 在 0x2543b6 把岛上 gameMode 拷进
     //   主村 GameManager,0x254f48 见 ≠1 就跳过 [GameData loadFromLocal] → 主村不重读档、loadMapObjects/createIdleWorkers
     //   在内存旧值上再扣一轮工人(可扣成负数并被存盘),且主村 VillageLayer processTouch 读到 ≠1 直接不响应点击。
     //   修法:≠1 就拒绝并提示,不自动复位(resetGamemode 只管 9/11,管不了移动层的 2/3;代调 NewSceneMoveLayer detech
@@ -1850,10 +1977,158 @@ fn exit_island(env: &mut Environment) {
         set_toast("回主村失败:场景切换进行中,稍后再试".to_string());
         return;
     }
-    let s = sel(env, "returnToMainVillage");
+    // [2026-09-24 第四轮 K14 N-D5-3] 无参数(v8@0:4);菜单动作在 UIKit 事件处理里执行,不在 drawScene 帧栈,可直接发。
+    let s = sel(env, "gobackMainVillage");
     let _: () = msg_send(env, (village, s));
-    log!("[MOLEMENU] exit island -> [village returnToMainVillage]");
+    log!("[MOLEMENU] exit island -> [village gobackMainVillage](同飞机确认路径)");
     teardown(env);
+}
+
+/// [2026-09-24 第四轮 K14 I4-04] 探险船 GM 的共用前置:仅离线(在线时船的进度由服务器同步,setModObjectToServer: 会真发包)、
+/// 在岛上(curSceneId==10 且岛会话活跃),然后取 [[ObjectManager sharedManager] getDiscovership](@0x46a40,@8@0:4)。
+/// getDiscovership 自己在 0x46a8e 判 curSceneId==10,遍历 ObjectManager.objects 找 objectId==34001(0x46b4e)
+/// 且 isKindOfClass:DiscoveryShip(0x46b6a)的对象,找不到返回 nil。失败时返回给玩家看的原因。
+/// 会发宿主消息,只在菜单点击事件里调用(不在 drawScene 帧栈,也不在 intercept 钩子里)。
+fn island_discovery_ship(env: &mut Environment) -> Result<id, String> {
+    if env.options.network_access {
+        return Err("在线模式下船的进度由服务器同步,不能用 GM 操作".to_string());
+    }
+    let cur = cur_scene_id(env);
+    if cur != 10 || !crate::mole_cheats::island_session_active() {
+        return Err("请在黄金岛上使用".to_string());
+    }
+    let om = game_singleton(env, "ObjectManager", "sharedManager");
+    if om == nil {
+        return Err("ObjectManager 还没初始化".to_string());
+    }
+    let s = sel(env, "getDiscovership");
+    let ship: id = msg_send(env, (om, s));
+    if ship == nil {
+        return Err("岛上没找到探险船".to_string());
+    }
+    Ok(ship)
+}
+
+/// [2026-09-24 第四轮 K14 I4-04] 探险船一键修好:shipState!=2(未修好)时发原版 -[DiscoveryShip quickFixShip]@0x362e20(v8@0:4)。
+/// 它是原版贝壳加速修船的同一出口(-[DiscoveryShipView onChooseUse] 扣完贝壳后在 0x366aee 调它,本菜单不扣贝壳):
+/// isFixing_=0、shipState=2(0x362e5c)、[[NewSceneQuest sharedInstance] checkAction:15 object:](修船任务进度)、
+/// beginFixTime_=0、unschedule innerUpdate:、播放待命动画、canSail_=1、挂出海旗 sailFlag,最后 setModObjectToServer:
+/// (离线由 mole_cheats 的回写钩子按 seqId 写回岛 mapData 并置脏落盘)。修船不占工人,不需要还工人。
+/// shipState==2 时不发:quickFixShip 会无条件新建 sailFlag 覆盖旧的,已修好再发会叠出第二面旗。
+fn ship_quick_fix(env: &mut Environment) {
+    let ship = match island_discovery_ship(env) {
+        Ok(ship) => ship,
+        Err(e) => {
+            log!("[MOLEMENU] 探险船一键修好:{}", e);
+            set_toast(format!("探险船一键修好失败:{}", e));
+            return;
+        }
+    };
+    let s = sel(env, "shipState");
+    let state: i32 = msg_send(env, (ship, s));
+    if state == 2 {
+        log!("[MOLEMENU] 探险船一键修好:shipState=2,已经修好");
+        set_toast("探险船已经修好了(待出海或出海中),不需要再修".to_string());
+        return;
+    }
+    let s = sel(env, "quickFixShip");
+    let _: () = msg_send(env, (ship, s));
+    let s = sel(env, "shipState");
+    let after: i32 = msg_send(env, (ship, s));
+    log!("[MOLEMENU] 探险船一键修好:shipState {} → {}(原版 quickFixShip)", state, after);
+    set_toast(format!("探险船已修好(shipState {} → {}),点船即可出海", state, after));
+}
+
+/// [2026-09-24 第四轮 K14 I4-04] 探险船立即返航:只在出海中(isSailing,c8@0:4)时,把 beginDiscoverTime_ 写成
+/// now − discoverTime_ − 1,由原版每秒一次的 innerUpdate:(出海时 -[DiscoveryShip onButtonDiscoverSelected] 在 0x362460
+/// 以 1.0 秒间隔排定)自己结算:0x36279a-0x3627ee 算 now−begin ≥ discoverTime_ 后,经 checkIsShipInScreen 门
+/// (船坞在屏幕内时原版会推迟)播放返航动画、清 isSailing_/beginDiscoverTime_、setModObjectToServer:、记 lastSailingTime,
+/// 之后原版挂领奖旗、发礼物。这里不伪造礼物、不发消息改状态,只拨一个时间戳。
+/// now 取 [[NewSceneTimer sharedInstance] getCurrentServerTime](L8@0:4,宿主消息同样经过 mole_cheats 对它的钩子,
+/// 与原版 innerUpdate: 取的是同一个时钟)。偏移从 guest 的 _OBJC_IVAR 槽现读(兼容 touchHLE 非脆弱 ivar 修正写回):
+/// re.py ivar DiscoveryShip 核得 discoverTime_ 槽 0xb07c24(静态 +396,L)、beginDiscoverTime_ 槽 0xb07c30(静态 +416,d)、
+/// 末尾 ivar updateCount 槽 0xb07c58(静态 +452,i),实例大小 456。三者都不小于静态值、相对位置不变,否则放弃不写。
+fn ship_return_now(env: &mut Environment) {
+    let ship = match island_discovery_ship(env) {
+        Ok(ship) => ship,
+        Err(e) => {
+            log!("[MOLEMENU] 探险船立即返航:{}", e);
+            set_toast(format!("探险船立即返航失败:{}", e));
+            return;
+        }
+    };
+    let s = sel(env, "isSailing");
+    let sailing: u8 = msg_send(env, (ship, s));
+    if sailing == 0 {
+        log!("[MOLEMENU] 探险船立即返航:船不在出海中");
+        set_toast("探险船现在没有出海,不需要返航".to_string());
+        return;
+    }
+    // 静态布局(objc_meta:instanceSize 456;discoverTime_ +396;beginDiscoverTime_ +416;最后一个 ivar updateCount +452,i)。
+    const SLOT_DISCOVER_TIME: u32 = 0xb07c24;
+    const SLOT_BEGIN_DISCOVER_TIME: u32 = 0xb07c30;
+    const SLOT_UPDATE_COUNT: u32 = 0xb07c58;
+    const STATIC_OFF_DISCOVER: u32 = 396;
+    const STATIC_OFF_BEGIN: u32 = 416;
+    const STATIC_OFF_UPDATE_COUNT: u32 = 452;
+    let read_slot = |env: &Environment, slot: u32| -> u32 {
+        env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(slot))
+    };
+    let off_discover = read_slot(env, SLOT_DISCOVER_TIME);
+    let off_begin = read_slot(env, SLOT_BEGIN_DISCOVER_TIME);
+    let off_update = read_slot(env, SLOT_UPDATE_COUNT);
+    // 非脆弱 ivar 修正只会把整个类的 ivar 统一往后挪,三者相对位置不变;beginDiscoverTime_ 后面还有本类的 updateCount,
+    // 相对位置对得上就说明 beginDiscoverTime_ 的 8 字节整个落在实例内。任何一项对不上都不写。
+    let layout_ok = off_discover >= STATIC_OFF_DISCOVER
+        && off_begin >= STATIC_OFF_BEGIN
+        && off_begin < 0x1000
+        && off_begin.checked_sub(off_discover) == Some(STATIC_OFF_BEGIN - STATIC_OFF_DISCOVER)
+        && off_update.checked_sub(off_begin) == Some(STATIC_OFF_UPDATE_COUNT - STATIC_OFF_BEGIN);
+    if !layout_ok {
+        log!(
+            "[MOLEMENU] 探险船立即返航:ivar 偏移异常(discoverTime_={} beginDiscoverTime_={} updateCount={}),放弃",
+            off_discover,
+            off_begin,
+            off_update
+        );
+        set_toast("探险船立即返航失败:船的内存布局和预期不符,没有改动".to_string());
+        return;
+    }
+    let discover: u32 = env
+        .mem
+        .read(crate::mem::ConstPtr::<u32>::from_bits(ship.to_bits() + off_discover));
+    let timer = game_singleton(env, "NewSceneTimer", "sharedInstance");
+    if timer == nil {
+        set_toast("探险船立即返航失败:NewSceneTimer 还没初始化".to_string());
+        return;
+    }
+    let s = sel(env, "getCurrentServerTime");
+    let now: u32 = msg_send(env, (timer, s));
+    let target = now as f64 - discover as f64 - 1.0;
+    // innerUpdate: 在 0x362740 见 beginDiscoverTime_<=0 就走修船分支,不结算出海;拨不出正数就不写。
+    if target < 1.0 {
+        log!(
+            "[MOLEMENU] 探险船立即返航:now={} discoverTime_={},算出的起点 {} 不是正数,放弃",
+            now,
+            discover,
+            target
+        );
+        set_toast("探险船立即返航失败:游戏时钟异常,没有改动".to_string());
+        return;
+    }
+    let begin_ptr: crate::mem::MutPtr<f64> = Ptr::from_bits(ship.to_bits() + off_begin);
+    let old: f64 = env.mem.read(begin_ptr);
+    env.mem.write(begin_ptr, target);
+    log!(
+        "[MOLEMENU] 探险船立即返航:beginDiscoverTime_ {} → {}(now={} discoverTime_={}),交给原版 innerUpdate: 结算",
+        old,
+        target,
+        now,
+        discover
+    );
+    set_toast(
+        "已把出海时间拨到期,原版每秒检查一次并结算返航(船在屏幕内时原版可能要等镜头移开),返航后点领奖旗领奖".to_string(),
+    );
 }
 
 /// 一键进入 NewScene 可建筑黄金岛(scene id 10)。arm 进岛(开功能/开窗/预注入默认岛
@@ -1992,6 +2267,10 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
         DevTool::BuildingStore => ("打开建设商店".to_string(), dev::open_building_store(env)),
         DevTool::CameraCenter => ("相机回中".to_string(), dev::camera_center(env)),
         DevTool::Trace => ("选择子跟踪".to_string(), dev::toggle_trace()),
+        DevTool::IslandFastForward => (
+            format!("岛档快进 {} 分钟", reg),
+            dev::island_fast_forward_minutes(env, reg),
+        ),
     };
     match result {
         Ok(text) => {
@@ -2008,6 +2287,13 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
                 // [2026-09-16] 复审修:去掉重复的「限时任务」前缀。连同 quest_jump 的正文整句约 1040pt,超出 992 宽的 toast
                 // (UILabel 单行不裁剪,居中后两侧溢出屏外),缩短后能放下。
                 shown.push_str("(需不在 gameMode 0/6、等级≥needLevel,由雅丽激活)");
+            }
+            if matches!(tool, DevTool::Quest(QuestFamily::Island)) {
+                // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转也补发了 [[NewSceneQuest sharedInstance] activate:0](见 mole_dev::quest_jump)。
+                // -[NewSceneQuest activate:]@0x328190 的门:NewGameManager.gameMode 不为 0(0x3281d0)/6(0x3281e6);
+                // checkCanActivate 里岛等级≥needLevel(0x32841e)。等级不够时置不上 canActivate 是原版行为。
+                // toast 超宽会自动折行(add_toast),不必再缩短 quest_jump 的正文。
+                shown.push_str("(需不在 gameMode 0/6、岛等级≥needLevel;布兰头顶出感叹号后点击接任务)");
             }
             set_toast(shown);
         }
@@ -2028,7 +2314,7 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
             (label.to_string(), color(env, 0.42, 0.36, 0.22, 1.0))
         }
         DevTool::Spacer => (String::new(), color(env, 0.0, 0.0, 0.0, 0.0)),
-        DevTool::Quest(_) | DevTool::Story | DevTool::Weather => {
+        DevTool::Quest(_) | DevTool::Story | DevTool::Weather | DevTool::IslandFastForward => {
             (format!("{} #{}", label, reg), color(env, 0.16, 0.45, 0.7, 1.0))
         }
         DevTool::Trace => {
@@ -2072,10 +2358,11 @@ fn dev_confirm(action: Action) -> Option<(u32, String)> {
         // [2026-09-16] X4-02 确认文案补上活动中心的限制:旅行期间 mole_activity 侧档只写内存(F2-05),付费操作的扣款和发奖
         // 却照常写进主档,所以这些操作在旅行中被禁用(拦截在 mole_activity.rs);旅行中拍快照时,主档是旅行后的,
         // 活动档还是旅行前的。文案超过一行,底部 toast 会自动折行(add_toast)。
+        // [2026-09-24 第四轮 K3 I7-01] 补黄金岛:旅行期间岛档一律不落盘(mole_cheats::island_flush 开头的落盘闸);每次进岛都从磁盘读岛档,离岛再进或重启后都回到旅行前。
         Action::Dev(DevTool::TimeTravelHours(h)) => Some((
             1000 + h.clamp(0, 1_000_000) as u32,
             format!(
-                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。再点一次确认",
+                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。黄金岛进度在旅行期间不保存,离岛再进或重启后都回到旅行前。再点一次确认",
                 h
             ),
         )),
@@ -2250,6 +2537,8 @@ fn run_hidden(env: &mut Environment, h: HiddenAct) {
 /// 而不是让测试莫名其妙地超时。只在不匹配时打日志。
 /// [2026-09-16] F2-04 Button.frame 存的是 1024 设计坐标,这里按 4:3 横屏右换算核对设计布局,宽屏下同样成立;
 /// 宽屏(--fill-screen)跑无头测试时实际要 tap 的 guest y 需加 ox(1188 宽为 +82),x 不变。
+/// [2026-09-24 第四轮 K14 I4-04] 「开发者 / 调试」页加了两项探险船 GM(第 11、12 项),按钮 19→21,每列仍 7 行,
+/// 上面三个坐标都不变,所以这里不用改;若以后超过 21 个会变成每列 8 行,下面的核对会在日志里报警。
 fn layout_selfcheck(dev_title: &str, page_idx: usize, buttons: &[Button]) {
     let hit = |gx: f32, gy: f32| -> Option<Action> {
         let (lx, ly) = (1024.0 - gy, gx);

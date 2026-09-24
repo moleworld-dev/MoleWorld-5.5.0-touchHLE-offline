@@ -202,6 +202,17 @@ const ISLAND_FILE_MAP: u32 = 1 << 0;
 const ISLAND_FILE_USERINFO: u32 = 1 << 1;
 const ISLAND_FILE_SHIPS: u32 = 1 << 2;
 const ISLAND_FILE_FRAGMENTS: u32 = 1 << 3;
+/// [2026-09-24 第四轮骨架] 新增四份岛侧档的坏档保护位,规则与上面四份完全相同(读档走 island_sidecar_load、
+///   落盘走 island_sidecar_save)。island_storage.dat=仓库/飞鸟/增强道具,island_cafe.dat=咖啡馆许愿任务三张表,
+///   island_shelltree.dat=超级贝壳树成长值与倒计时,island_misc.dat=岛成就累计计数与小游戏前三名。
+#[allow(dead_code)]
+const ISLAND_FILE_STORAGE: u32 = 1 << 4;
+#[allow(dead_code)]
+const ISLAND_FILE_CAFE: u32 = 1 << 5;
+#[allow(dead_code)]
+const ISLAND_FILE_SHELLTREE: u32 = 1 << 6;
+#[allow(dead_code)]
+const ISLAND_FILE_MISC: u32 = 1 << 7;
 thread_local! {
     /// 上次岛存档落盘时刻(节流用)。
     static ISLAND_LAST_FLUSH: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -1012,6 +1023,9 @@ fn island_put(env: &mut Environment, dict: id, key: &'static str, obj: id) {
         .objc
         .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (dict, set_s, arr, key_ns));
+    // [2026-09-24 第四轮 K1 I2-4] arr 是本函数 alloc/init 的 +1,dict 的 setObject:forKey: 已 retain → 交还这份 +1。
+    //   obj 的所有权归调用方(addObject: 已 retain,调用方放完自己 release)。
+    release(env, arr);
 }
 
 /// 同 island_put,但【同 key 已有数组则追加】而非覆盖——放多个同族建筑(如 5 个商店都在 key
@@ -1034,6 +1048,9 @@ fn island_put_append(env: &mut Environment, dict: id, key: &'static str, obj: id
             .objc
             .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
         let _: () = msg_send(env, (dict, set_s, arr, key_ns));
+        // [2026-09-24 第四轮 K1 I2-4] 只在新建分支交还 alloc 的 +1(dict 已 retain,下面 addObject: 照常可用);
+        //   objectForKey: 取回的既有数组是 +0,绝不能 release,否则过释放、之后 addObject: 打野指针。
+        release(env, arr);
     }
     let add_s = env
         .objc
@@ -1107,6 +1124,14 @@ fn load_island_map(env: &mut Environment) -> bool {
         .register_host_selector("count".to_string(), &mut env.mem);
     let cnt: crate::mem::GuestUSize = msg_send(env, (loaded, count_s));
     if cnt == 0 {
+        // [2026-09-24 第四轮 K1 I6-3] 空布局档按坏档处理。以前直接 return false 回退默认岛,而上面 island_note_load_ok 已清了
+        //   MAP 位、默认岛分支又不读船档 → 首个节拍 save_island_map 把默认岛写进 island_map.dat、save_island_ships 把默认岛那艘
+        //   「需修船」写进 island_ships.dat,玩家真实船态/待领奖品/咖啡馆 isNew 一起被覆盖,两份档都没留 .corrupt。
+        //   save_island_map 自己「空不写」,正常流程不会产出空档,出现即写残/外部改坏。现走与解档失败同一条路:文件仍在原路径
+        //   → 改名 .corrupt 并连带隔离 island_ships.dat(island_note_load_failure 里 bit==MAP 那段);隔离失败 → 保持 MAP 位,
+        //   save_island_map 与 save_island_ships 双双拒写。上面的 island_note_load_ok 不挪(先清后置,结果一样)。
+        log!("[MOLECHEAT] island: ⚠️ island_map.dat 解档出空布局(count=0)→ 按坏档处理");
+        island_note_load_failure(env, path, ISLAND_FILE_MAP, "island_map.dat");
         return false;
     }
     let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
@@ -1188,6 +1213,7 @@ fn save_island_map(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_map.dat(count={} ok={})", cnt, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_map.dat(count={} ok={})", cnt, ok);
     }
     Some(format!("存盘 island_map.dat(count={} ok={})", cnt, ok))
@@ -1208,6 +1234,13 @@ const ISLAND_FRAG_BY_QUEST_KEY: &str = "moleSandFragByQuest";
 ///   · 31006/31008(以及火山 31009/31011)= 岛建设商店 20 贝壳可买(shop_type=1 sub=2);
 ///   · 31005/31007 = 岛农场任务 81/83 的 rew_potato(-[NewSceneQuest rewardXP:vipGold:buildValue:]@0x32a49c ≥1000 走物品分支
 ///     → GET_ITEM_FROM_QUEST 框 → addAdventureMapFragment:@0x32a6d6);火山 31010/31012 = 咖啡任务 16/17 的 rew_object。
+///   [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 火山 31010/31012 原版与离线都来自咖啡任务 16/17(离线任务链已由
+///     island_cafe_restore_and_offer 复活):完成后 -[NewSceneData deleteAcceptedNotifyQusetFromLocalList:] 0x2209c0 以
+///     currentRewardObjectID=0 调 updateUnrewardNotifyQuest:andCurrentRewardObjectID:@0x2212f0,本地按 cafeQuestData 生成待领奖
+///     物品表(含 rewardObjectID);领奖 CafeShop recieveCafeRewards:@0x36def0 → NewRewardsLayer addObjectToMap: 0x373b14
+///     → onAddDiscoveryGiftOrCafeGiftOnMap:target:selector: → addNewObject2Map:gift: 0x25c5b4 addAdventureMapFragment:,
+///     随后由 save_island_fragments 落 island_fragments.dat。本函数不兜底火山,也不做「买齐 31009/31011 就补发」
+///     (那等于白送两条咖啡任务的奖励)。
 /// [2026-09-16] A1-02+A2-02 从「每次进岛无条件补 4 块」降级为兜底,分三种情况:
 ///   (a) 老档:island_fragments.dat 不存在、island_map.dat 存在,且 island_userinfo.dat 里没有 ISLAND_FRAG_BY_QUEST 标记
 ///       (P4-b 之前的档,或从没正常退岛落盘过)→ 照旧补齐 4 块。否则老档的 31006/31008 会凭空消失,任务又早就做完、
@@ -1369,6 +1402,7 @@ fn save_island_fragments(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok);
     }
     Some(format!("存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok))
@@ -1380,6 +1414,8 @@ fn save_island_fragments(env: &mut Environment) -> Option<String> {
 /// 本函数只负责【恢复买到的/已得的】;[2026-09-16] A1-02+A2-02 起 inject_sandgarden_fragments 只做兜底
 /// (老档补齐 4 块,其余只补任务 81/83 已完成却缺的 31005/31007),规则见该函数注释。
 /// [扫描修 2026-09-15] F1-3/F5-10 纠错:以前这里写成"火山必需",实为沙原碎片;火山 31010/31012 来自咖啡任务 16/17。
+/// [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 原版与离线都来自咖啡任务 16/17(离线任务链已复活,见 island_cafe_restore_and_offer),
+///   领奖时经 addNewObject2Map:gift: 0x25c5b4 进 mapFragments_,本函数照常恢复。
 fn load_island_fragments(env: &mut Environment) {
     let path = island_data_path(env, "island_fragments.dat");
     if path == nil {
@@ -1453,6 +1489,552 @@ fn load_island_fragments(env: &mut Environment) {
     }
 }
 
+// ════════ [2026-09-24 第四轮 K10] 咖啡馆许愿任务链:三张状态表持久化 ════════
+// 咖啡任务的全部状态挂在 NewSceneData 的三张本地表上(re.py ivar NewSceneData):
+//   acceptedNotifyQusetListInLocal_(+124,元素 NSMutableDictionary{notifyQuestId, notifyQuestRequireThingsCount})、
+//   unrewardNotifyQuestListInLocal_(+132,元素 NSMutableDictionary{notifyQuestId, unrewardObjectsListArr})、
+//   finishedNotifyQuestListInLocal_(+140,元素 NSNumber)。
+// 原版它们只靠上行包(-[NetworkManager updateLocalAcceptedNotifyQuestData]@0x224104 等)留在服务器,进岛由 1062 回包
+// -[NewSceneCommand parseMapDataWithPackageData:atIndex:] 经三个本地入口灌回(0x22b0d8 addAcceptedNotifyQusetListInLocal:
+// wihtFinishedRequireThingsCount: / 0x22b228 updateUnrewardNotifyQuest:andUnrewardObjectsIds: / 0x22b5e0
+// addFinishedNotifyQuestWithQuestId:);回主村时 -[NewSceneData resetNewSceneDataExceptObjectData] 在 0x21e086/0x21e098/0x21e0aa
+// 把三张表清空。离线没有这两头 → 接了的任务退岛即丢、完成的任务下次还能重接重复领奖。
+// 这里用侧档 island_cafe.dat 充当「服务器那一份」:落盘在 island_flush(离岛出口早于 0x2543fe 的 reset,此刻表还满),
+// 读回在 island_after_layout_ready(早于 CafeShop 两个 init 读 getAllShownNotifyQuestIds 算 hasQuest)。
+
+/// [2026-09-24 第四轮 K10 I5-3] 咖啡馆许愿任务侧档(保护位 ISLAND_FILE_CAFE)。
+/// 根字典:accepted / unreward / finished(即上面三张表原样归档)+ savedAt(落盘时刻 CFAbsoluteTime,仅诊断用)
+/// + day(当天任务池日期 yyyymmdd)/ offered(当天下发的任务号 NSNumber 数组)。
+const ISLAND_CAFE_FILE: &str = "island_cafe.dat";
+/// cafeQuestHV.dat 共 17 条咖啡任务,ID 1..=17。
+const CAFE_QUEST_MAX_ID: i32 = 17;
+/// cafeQuestHV.dat 里 req_work(派遣摩尔打工)的任务:2/8/11/13/16/17。-[CafeQuestData initWithDict:] 0x36d4fc 把
+/// req_work 解析成 questType 7;这类任务接取时 -[CafeQuest acceptWithQuestId:] 0x36c608 取 getCurrentServerTime 当
+/// notifyQuestRequireThingsCount 存(开始时刻),-[CafeQuestData innerUpdate:]@0x36d7f0 用「现在 − 开始时刻 ≥ 所需秒数」判完成。
+const CAFE_REQ_WORK_IDS: [i32; 6] = [2, 8, 11, 13, 16, 17];
+/// 已接上限:-[NewSceneData addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:] 0x22050c
+/// `cmp r0,#2 / bhi` 已有 3 条就拒绝。
+const CAFE_ACCEPTED_MAX: usize = 3;
+/// 本次进岛 island_cafe_restore_and_offer 是否已跑完。没跑过(在线、表未建好)就不落盘,免得拿空表盖掉玩家进度。
+static CAFE_SESSION_READY: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K10 I2-02/I5-02] 每天下发的咖啡任务条数。移植者自拟:原版 1081 的下发规则只在服务器,不可考;
+/// 取 3 条,与已接上限 CAFE_ACCEPTED_MAX 一致(一天的任务正好都能同时接下)。
+const CAFE_DAILY_OFFER: usize = 3;
+/// 当前任务池对应的日期(yyyymmdd,北京时间日界)与当天下发的任务号位图(bit N = 任务 N)。
+/// 随 island_cafe.dat 的 day / offered 键往返,保证同一天无论进出岛几次、重启几次,下发的都是同一份。
+static CAFE_OFFER_DAY: AtomicU32 = AtomicU32::new(0);
+static CAFE_OFFER_MASK: AtomicU32 = AtomicU32::new(0);
+/// 任务号 1..=17 对应的全部合法位。
+const CAFE_OFFER_MASK_ALL: u32 = ((1u32 << (CAFE_QUEST_MAX_ID + 1)) - 1) & !1;
+
+/// 北京时间(UTC+8)日界的 (自 1970-01-01 的天数, yyyymmdd)。与 mole_activity 的 daily_day_key(每日任务选题种子)
+/// 同一口径:unix 秒 + 28800 后按 86400 取整,再用 Howard Hinnant civil_from_days 拆年月日(那两个函数在 mole_activity
+/// 里是私有的,本包只许改本文件,这里按同一算法复刻)。now_cf 为 CFAbsoluteTime(含开发者时间旅行偏移)。
+fn cafe_day_key(now_cf: f64) -> (i64, u32) {
+    let cf = if now_cf.is_finite() { now_cf } else { 0.0 };
+    let unix = cf.floor() as i64 + 978_307_200;
+    let days = (unix + 28_800).div_euclid(86_400);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (days, (y.max(0) as u32) * 10_000 + m * 100 + d)
+}
+
+/// [2026-09-24 第四轮 K10 I2-02/I5-02] 当天的咖啡任务选品(移植者自拟,原版 1081 规则不可考)。
+/// 候选 = 1..=17 里不在已接/待领奖/已完成三张表的任务号(升序);按天轮转取连续 CAFE_DAILY_OFFER 条:
+/// 起点 = (天数 × 3) mod 候选数。候选不变时起点每天前进 3,⌈候选数/3⌉ 天内每条都会轮到一次——玩家即便一直不接某几条
+/// (比如买不起的 req_own),16/17 也一定会出现,不会像「只给编号最小的 3 条」那样被卡住;同一天结果只取决于日期与候选,
+/// 再加上 day/offered 落盘,当天不会变。
+fn cafe_rotate_pick(day_no: i64, cands: &[i32]) -> Vec<i32> {
+    let n = cands.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = CAFE_DAILY_OFFER.min(n);
+    let start = (day_no.rem_euclid(n as i64) as usize * CAFE_DAILY_OFFER) % n;
+    (0..k).map(|j| cands[(start + j) % n]).collect()
+}
+
+/// 读活表里的任务号:已接/待领奖是字典(notifyQuestId),已完成是 NSNumber。
+fn cafe_live_ids(env: &mut Environment, arr: id, dict_elems: bool) -> Vec<i32> {
+    let mut out = Vec::new();
+    for o in cafe_array_items(env, arr) {
+        let q = if dict_elems {
+            cafe_entry_id(env, o)
+        } else {
+            cafe_int(env, o)
+        };
+        if let Some(q) = q {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// NSArray 的全部元素;不是数组(含 nil)返回空。
+fn cafe_array_items(env: &mut Environment, arr: id) -> Vec<id> {
+    if arr == nil || !crate::mole_items::is_kind_of(env, arr, "NSArray") {
+        return Vec::new();
+    }
+    let cnt_s = island_sel(env, "count");
+    let n: crate::mem::GuestUSize = msg_send(env, (arr, cnt_s));
+    let oai = island_sel(env, "objectAtIndex:");
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let o: id = msg_send(env, (arr, oai, i));
+        out.push(o);
+    }
+    out
+}
+
+/// NSNumber → intValue;不是 NSNumber(含 nil)返回 None,不给坏档里的异类对象发 intValue。
+fn cafe_int(env: &mut Environment, obj: id) -> Option<i32> {
+    if obj == nil || !crate::mole_items::is_kind_of(env, obj, "NSNumber") {
+        return None;
+    }
+    let s = island_sel(env, "intValue");
+    let v: i32 = msg_send(env, (obj, s));
+    Some(v)
+}
+
+/// dict[key](dict 须已确认是 NSDictionary)。
+fn cafe_dict_get(env: &mut Environment, dict: id, key: &'static str) -> id {
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+    let s = island_sel(env, "objectForKey:");
+    msg_send(env, (dict, s, k))
+}
+
+/// 本地表元素(字典)里的 notifyQuestId;不是字典或 id 越界返回 None。
+fn cafe_entry_id(env: &mut Environment, entry: id) -> Option<i32> {
+    if !crate::mole_items::is_kind_of(env, entry, "NSDictionary") {
+        return None;
+    }
+    let v = cafe_dict_get(env, entry, "notifyQuestId");
+    cafe_int(env, v).filter(|q| (1..=CAFE_QUEST_MAX_ID).contains(q))
+}
+
+/// [2026-09-24 第四轮 K10 I5-3/I8-2] 进岛读回 island_cafe.dat,经原版 1062 回包用的同一组本地入口灌回三张表。
+/// 挂在 island_after_layout_ready(读档岛/默认岛两条分支都会调),时序早于 CafeShop 两个 init。
+/// · 无档 → 不动内存里的表(正常离线首进岛,表本来就是空的);坏档 → island_sidecar_load 负责隔离/保护位,同样不动;
+/// · 读到档:先用原版清表方法 cleanAcceptedOldNotifyQuestList@0x220a3c / cleanAllUnrewardNotifyQuestList@0x221e10 /
+///   cleanAllFinishedNotifyQuestList@0x22251c(removeAllObjects,数组本体不换),再逐条走
+///   addFinishedNotifyQuestWithQuestId:@0x22219c(v12@0:4i8)、updateUnrewardNotifyQuest:andUnrewardObjectsIds:@0x2218e8
+///   (v16@0:4i8@12,方法内部新建可变字典 + addObjectsFromArray: 拷一份可变数组)、addAcceptedNotifyQusetListInLocal:
+///   wihtFinishedRequireThingsCount:@0x220478(c16@0:4i8L12,方法内部新建可变字典)。元素全由原版方法重建成可变容器,
+///   之后 modAcceptNotifyQuestData:withRequireThingsCount:@0x220d08 / updateUnrewardNotifyQuest:andCurrentRewardObjectID:
+///   @0x2212f0 对元素 setObject:forKey: 都安全,不依赖解档出来的容器是否可变。
+/// · 校验:任务号 1..=17;同一任务只留状态最靠后的一张表(已完成 > 待领奖 > 已接,对应原版迁移方向);待领奖物品表
+///   必须是非空的 NSNumber 数组(空表在 0x22195a 走 deleteUnrewardNotifyQuest:@0x221104,它只在表里找到同号时才
+///   removeObject:+addFinishedNotifyQuestWithQuestId:(0x221250/0x221280);刚清过的表里找不到 → 原版等于什么也不做,
+///   这里直接丢弃,结果一致);已接最多 3 条。
+/// · req_work 任务的开始时刻若比现在晚 60 秒以上(时间旅行偏移不落盘、回拨过系统时钟),夹到现在,免得倒计时卡住。
+///   [复核修 2026-09-24 K10] 开始时刻 <1(档里缺键 / 手改档 / 坏值)同样夹到现在:-[CafeQuestData innerUpdate:] 0x36d87a
+///   `cmp r0,#1 / blt` 小于 1 永不判完成,而 -[CafeQuest minusNeededWorkers] 0x36cf98 对已接(状态 2)打工任务每次进岛
+///   都扣人手 → 任务与 1 个工人被永久占住。其它类型的进度计数为负时按 0(`L` 参数,负值会被当成超大无符号数)。
+/// · 三个「服务器已有记录」旗标照 1062 回包写 1(0x22b948 / 0x22baac / 0x22bb76 均为 `movs r2,#1`)。旗标只有
+///   updateLocal*NotifyQuestData 用来选上行包是 add 还是 setMod(selref 各 1 处,ivar 无其它直读),离线上行包被吞,不影响玩法。
+/// [2026-09-24 第四轮 K10 I2-02/I5-02/I5-1] 读回之后紧接着本地等价下发 1081 许愿任务池,见函数后半段注释。
+/// 在线(network_access)不做:由私服 1062/1081 原版下发。
+fn island_cafe_restore_and_offer(env: &mut Environment) {
+    CAFE_SESSION_READY.store(false, O);
+    if env.options.network_access {
+        return;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return;
+    }
+    // 三个 getter(0x223dc4/0x223de4/0x223e04)裸取 ivar,返回 -[NewSceneData init] 0x2192ac/0x2192da/0x219308 建好的本体。
+    let g_acc = island_sel(env, "acceptedNotifyQusetListInLocal");
+    let g_unr = island_sel(env, "unrewardNotifyQuestListInLocal");
+    let g_fin = island_sel(env, "finishedNotifyQuestListInLocal");
+    let acc: id = msg_send(env, (nsd, g_acc));
+    let unr: id = msg_send(env, (nsd, g_unr));
+    let fin: id = msg_send(env, (nsd, g_fin));
+    if acc == nil || unr == nil || fin == nil {
+        log!("[MOLECHEAT] island: 咖啡馆许愿任务:NewSceneData 的本地任务表还没建好(nil),本次不读档也不落盘");
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE);
+    // 当天任务池的日期与位图:只信档里的(无档/坏档 = 0 → 按今天重新选,见下半段)。
+    let mut offer_day = 0u32;
+    let mut offer_mask = 0u32;
+    if root != nil && !crate::mole_items::is_kind_of(env, root, "NSDictionary") {
+        log!("[MOLECHEAT] island: island_cafe.dat 根对象不是字典,按无档处理(不动内存里的咖啡任务表)");
+    } else if root != nil {
+        let now = now_cf_secs().max(0.0);
+        let dv = cafe_dict_get(env, root, "day");
+        offer_day = cafe_int(env, dv).filter(|&v| v > 0).map_or(0, |v| v as u32);
+        let offered = cafe_dict_get(env, root, "offered");
+        for o in cafe_array_items(env, offered) {
+            if let Some(q) = cafe_int(env, o) {
+                if (1..=CAFE_QUEST_MAX_ID).contains(&q) {
+                    offer_mask |= 1u32 << q;
+                }
+            }
+        }
+        // 已完成
+        let mut fin_ids: Vec<i32> = Vec::new();
+        let fin_arr = cafe_dict_get(env, root, "finished");
+        for o in cafe_array_items(env, fin_arr) {
+            if let Some(q) = cafe_int(env, o) {
+                if (1..=CAFE_QUEST_MAX_ID).contains(&q) && !fin_ids.contains(&q) {
+                    fin_ids.push(q);
+                }
+            }
+        }
+        // 待领奖
+        let mut unr_entries: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut dropped = 0u32;
+        let unr_arr = cafe_dict_get(env, root, "unreward");
+        for o in cafe_array_items(env, unr_arr) {
+            let Some(q) = cafe_entry_id(env, o) else {
+                dropped += 1;
+                continue;
+            };
+            if fin_ids.contains(&q) || unr_entries.iter().any(|e| e.0 == q) {
+                dropped += 1;
+                continue;
+            }
+            let list = cafe_dict_get(env, o, "unrewardObjectsListArr");
+            let items = cafe_array_items(env, list);
+            let mut objs: Vec<i32> = Vec::with_capacity(items.len());
+            for it in items {
+                if let Some(v) = cafe_int(env, it) {
+                    objs.push(v);
+                } else {
+                    objs.clear();
+                    break;
+                }
+            }
+            if objs.is_empty() {
+                dropped += 1;
+                continue;
+            }
+            unr_entries.push((q, objs));
+        }
+        // 已接
+        let mut acc_entries: Vec<(i32, i32)> = Vec::new();
+        let mut clamped = 0u32;
+        let acc_arr = cafe_dict_get(env, root, "accepted");
+        for o in cafe_array_items(env, acc_arr) {
+            let Some(q) = cafe_entry_id(env, o) else {
+                dropped += 1;
+                continue;
+            };
+            if fin_ids.contains(&q)
+                || unr_entries.iter().any(|e| e.0 == q)
+                || acc_entries.iter().any(|e| e.0 == q)
+                || acc_entries.len() >= CAFE_ACCEPTED_MAX
+            {
+                dropped += 1;
+                continue;
+            }
+            let cv = cafe_dict_get(env, o, "notifyQuestRequireThingsCount");
+            let mut cnt = cafe_int(env, cv).unwrap_or(0);
+            if CAFE_REQ_WORK_IDS.contains(&q) {
+                if cnt < 1 || (cnt as f64) > now + 60.0 {
+                    cnt = now.min(i32::MAX as f64).max(1.0) as i32;
+                    clamped += 1;
+                }
+            } else if cnt < 0 {
+                cnt = 0;
+            }
+            acc_entries.push((q, cnt));
+        }
+        // 先清表(原版方法),再走原版 1062 同款入口逐条灌回。
+        for name in [
+            "cleanAcceptedOldNotifyQuestList",
+            "cleanAllUnrewardNotifyQuestList",
+            "cleanAllFinishedNotifyQuestList",
+        ] {
+            let s = island_sel(env, name);
+            let _: () = msg_send(env, (nsd, s));
+        }
+        let add_fin = island_sel(env, "addFinishedNotifyQuestWithQuestId:");
+        for &q in &fin_ids {
+            let _: () = msg_send(env, (nsd, add_fin, q));
+        }
+        let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+        let nwi = island_sel(env, "numberWithInt:");
+        let add_obj = island_sel(env, "addObject:");
+        let upd_unr = island_sel(env, "updateUnrewardNotifyQuest:andUnrewardObjectsIds:");
+        for (q, objs) in &unr_entries {
+            let arr = island_alloc_init(env, "NSMutableArray");
+            if arr == nil {
+                continue;
+            }
+            for &v in objs {
+                let n: id = msg_send(env, (num_cls, nwi, v));
+                let _: () = msg_send(env, (arr, add_obj, n));
+            }
+            let _: () = msg_send(env, (nsd, upd_unr, *q, arr));
+            // 原方法把内容 addObjectsFromArray: 拷进自己新建的数组,这份 +1 用完即放。
+            release(env, arr);
+        }
+        let add_acc = island_sel(env, "addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:");
+        for &(q, cnt) in &acc_entries {
+            let ok: bool = msg_send(env, (nsd, add_acc, q, cnt as u32));
+            if !ok {
+                log!("[MOLECHEAT] island: 咖啡任务 {} 回灌已接表被原版拒绝(已满 3 条或重复)", q);
+            }
+        }
+        for name in [
+            "setHasAcceptedNotifyQusetYetFlag:",
+            "setExistUnrewardNotifyQuests:",
+            "setHasFinishedNotifyQusetYetFlag:",
+        ] {
+            let s = island_sel(env, name);
+            let _: () = msg_send(env, (nsd, s, true));
+        }
+        log!(
+            "[MOLECHEAT] island: 读回 island_cafe.dat 咖啡馆许愿任务 → 已接 {:?} / 待领奖 {:?} / 已完成 {:?}(丢弃坏条目 {} 条,打工开始时刻夹回现在 {} 条)",
+            acc_entries,
+            unr_entries.iter().map(|e| e.0).collect::<Vec<i32>>(),
+            fin_ids,
+            dropped,
+            clamped
+        );
+    }
+    // ── [2026-09-24 第四轮 K10 I2-02/I5-02/I5-1] 本地等价下发 1081 许愿任务池 ──
+    // 病根:-[CafeShop processTouched]@0x36dda8 在 0x36de26 直读 hasQuest(+345),为 0 就弹「NOT_HAVE_CAFE_QUEST」;hasQuest
+    //   只在两个 init(0x36db44 / 0x36dc72)按 [[NewSceneData sharedInstance] getAllShownNotifyQuestIds].count 算一次,
+    //   而 getAllShownNotifyQuestIds@0x222990 只并集 notifyQuestListFromServer_(+120)与已接/待领奖两张表;+120 唯一的写入口
+    //   -[NewSceneData addNotifyQuestList:]@0x21fe54 只被 1081 回包 -[NetworkManager parseWishQuestsList:pos:len:] 0x1c0962 调用
+    //   (请求方 getWishQuestList 在 LoadingHoliday updateLoading: 0x252eaa 发,离线被吞)→ 咖啡馆永远没有任务,
+    //   CafeQuest acceptWithQuestId: 0x36bf1e 的 questType==1 门也永远过不去。
+    // 做法:补回包,不拦 getter。照 parseWishQuestsList 的写法对每个任务号调一次 addNotifyQuestList:(签名 v12@0:4i8,参数是
+    //   int 任务号不是数组;方法内部 0x21fecc/0x21ff96/0x22005e 自己跳过已在已完成/已接/待领奖三表里的号,0x220136 numberWithInt:
+    //   后 addObject: 进 +120)。之后接取→已接→完成→待领奖→领奖→已完成全走原版。
+    // 选品规则移植者自拟(原版 1081 规则只在服务器、不可考):见 cafe_rotate_pick。17 条全部完成、且已跨天,就走原版
+    //   cleanAllFinishedNotifyQuestList@0x22251c 开新一轮(原版该方法唯一调用点是回主村 reset,这里等价于服务器侧重置)。
+    // 守卫:cafeQuestData_(+88,loadFileWithType:andSceneId: 在 sceneId==10 时 0x21e2ee 无条件加载)不足 17 条不下发,
+    //   免得 getCafeQuestDataWithId: 取不到数据;已有的 day/offered 原样保留,下次再下发。
+    let cqd_s = island_sel(env, "cafeQuestData");
+    let cqd: id = msg_send(env, (nsd, cqd_s));
+    let cnt_s = island_sel(env, "count");
+    let n_def: crate::mem::GuestUSize = if cqd != nil {
+        msg_send(env, (cqd, cnt_s))
+    } else {
+        0
+    };
+    if n_def as i32 != CAFE_QUEST_MAX_ID {
+        log!(
+            "[MOLECHEAT] island: 咖啡馆许愿任务池:cafeQuestData 只有 {} 条(应为 {}),表未加载好,本次不下发",
+            n_def,
+            CAFE_QUEST_MAX_ID
+        );
+        CAFE_OFFER_DAY.store(offer_day, O);
+        CAFE_OFFER_MASK.store(offer_mask, O);
+        CAFE_SESSION_READY.store(true, O);
+        return;
+    }
+    let (day_no, ymd) = cafe_day_key(now_cf_secs());
+    let mut new_round = false;
+    let reuse = offer_day == ymd && (offer_mask & !CAFE_OFFER_MASK_ALL) == 0;
+    if !reuse {
+        let fin_now = cafe_live_ids(env, fin, false);
+        if (1..=CAFE_QUEST_MAX_ID).all(|q| fin_now.contains(&q)) {
+            let s = island_sel(env, "cleanAllFinishedNotifyQuestList");
+            let _: () = msg_send(env, (nsd, s));
+            new_round = true;
+        }
+        let mut taken = cafe_live_ids(env, acc, true);
+        taken.extend(cafe_live_ids(env, unr, true));
+        taken.extend(cafe_live_ids(env, fin, false));
+        let cands: Vec<i32> = (1..=CAFE_QUEST_MAX_ID).filter(|q| !taken.contains(q)).collect();
+        offer_mask = cafe_rotate_pick(day_no, &cands)
+            .into_iter()
+            .fold(0u32, |m, q| m | (1u32 << q));
+        offer_day = ymd;
+    }
+    CAFE_OFFER_DAY.store(offer_day, O);
+    CAFE_OFFER_MASK.store(offer_mask, O);
+    // 先用原版 cleanOldNotifyQuestList@0x2201cc 清 +120(原版回主村 reset 0x21e074 也清它;这里只为同一会话重复调用时幂等,
+    //   addNotifyQuestList: 自己不查 +120 里的重复),再逐个下发。
+    let clean_old = island_sel(env, "cleanOldNotifyQuestList");
+    let _: () = msg_send(env, (nsd, clean_old));
+    let add_s = island_sel(env, "addNotifyQuestList:");
+    let offered: Vec<i32> = (1..=CAFE_QUEST_MAX_ID)
+        .filter(|q| offer_mask & (1u32 << q) != 0)
+        .collect();
+    for &q in &offered {
+        let _: () = msg_send(env, (nsd, add_s, q));
+    }
+    let srv_s = island_sel(env, "notifyQuestListFromServer");
+    let srv: id = msg_send(env, (nsd, srv_s));
+    let pool = cafe_live_ids(env, srv, false);
+    let shown_s = island_sel(env, "getAllShownNotifyQuestIds");
+    let shown: id = msg_send(env, (nsd, shown_s));
+    let n_shown: crate::mem::GuestUSize = if shown != nil {
+        msg_send(env, (shown, cnt_s))
+    } else {
+        0
+    };
+    log!(
+        "[MOLECHEAT] island: 咖啡馆许愿任务池(本地等价 1081,日期 {}{}{})→ 今日任务 {:?},可接 {:?},咖啡馆可见 {} 条(选品规则为移植者自拟,非原版数据)",
+        ymd,
+        if reuse { ",沿用当天已选" } else { ",按天轮转新选" },
+        if new_round { ",17 条已全部完成且已跨天→开新一轮" } else { "" },
+        offered,
+        pool,
+        n_shown
+    );
+    CAFE_SESSION_READY.store(true, O);
+}
+
+/// [2026-09-24 第四轮 K10 I5-3/I8-2] 咖啡馆三张表落盘到 island_cafe.dat,挂在 island_flush_extras。
+/// 只在岛上、离线、且本次进岛已跑过 island_cafe_restore_and_offer 时写(离岛出口在 startNewSceneFrom 10→1 前置臂,
+/// 早于 LoadingMainVillage 0x2543fe 的 reset,此刻三张表还满)。三张活表原样放进根字典归档(与 npcs 同一做法),
+/// 根字典是本函数 +1,归档后放掉。坏档保护由 island_sidecar_save 按 ISLAND_FILE_CAFE 位处理。
+fn island_cafe_flush(env: &mut Environment) -> Option<String> {
+    if env.options.network_access || !ON_ISLAND.load(O) || !CAFE_SESSION_READY.load(O) {
+        return None;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    let g_acc = island_sel(env, "acceptedNotifyQusetListInLocal");
+    let g_unr = island_sel(env, "unrewardNotifyQuestListInLocal");
+    let g_fin = island_sel(env, "finishedNotifyQuestListInLocal");
+    let acc: id = msg_send(env, (nsd, g_acc));
+    let unr: id = msg_send(env, (nsd, g_unr));
+    let fin: id = msg_send(env, (nsd, g_fin));
+    if acc == nil || unr == nil || fin == nil {
+        return None;
+    }
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return None;
+    }
+    let sfk = island_sel(env, "setObject:forKey:");
+    for (key, arr) in [("accepted", acc), ("unreward", unr), ("finished", fin)] {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let _: () = msg_send(env, (root, sfk, arr, k));
+    }
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    // [2026-09-24 第四轮 K10 I2-02/I5-02] 当天任务池的日期与任务号,保证同一天重进岛/重启下发同一份。
+    {
+        let nwi = island_sel(env, "numberWithInt:");
+        let day_num: id = msg_send(env, (num_cls, nwi, CAFE_OFFER_DAY.load(O) as i32));
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, "day");
+        let _: () = msg_send(env, (root, sfk, day_num, k));
+        let offered = island_alloc_init(env, "NSMutableArray");
+        if offered != nil {
+            let add_obj = island_sel(env, "addObject:");
+            let mask = CAFE_OFFER_MASK.load(O);
+            for q in 1..=CAFE_QUEST_MAX_ID {
+                if mask & (1u32 << q) != 0 {
+                    let n: id = msg_send(env, (num_cls, nwi, q));
+                    let _: () = msg_send(env, (offered, add_obj, n));
+                }
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "offered");
+            let _: () = msg_send(env, (root, sfk, offered, k));
+            release(env, offered);
+        }
+    }
+    let nwd = island_sel(env, "numberWithDouble:");
+    let saved_at: id = msg_send(env, (num_cls, nwd, now_cf_secs()));
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let _: () = msg_send(env, (root, sfk, saved_at, k));
+    let cnt_s = island_sel(env, "count");
+    let na: crate::mem::GuestUSize = msg_send(env, (acc, cnt_s));
+    let nu: crate::mem::GuestUSize = msg_send(env, (unr, cnt_s));
+    let nf: crate::mem::GuestUSize = msg_send(env, (fin, cnt_s));
+    let res = island_sidecar_save(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE, root);
+    release(env, root);
+    res.map(|s| format!("{}[咖啡任务 已接 {} 待领奖 {} 已完成 {}]", s, na, nu, nf))
+}
+
+/// [2026-09-24 第四轮 K10 I5-3] 岛档计时快进:island_cafe.dat 里已接 req_work 任务的开始时刻回拨 secs 秒
+/// (等价于这段时间已经流逝)。由 K4 的 island_ff_extras 在主村、离线、不在岛会话时调用;在岛上不做(活表才是权威,
+/// 下一次落盘会盖掉侧档)。开始时刻最小夹到 1:-[CafeQuestData innerUpdate:] 0x36d87a `cmp r0,#1 / blt` 小于 1 不判完成。
+/// 解档出来的根字典/元素是自动释放对象,这里 mutableCopy(+1)后改、存、放,不改原对象。
+fn island_cafe_ff(env: &mut Environment, secs: f64) {
+    if env.options.network_access || ON_ISLAND.load(O) || !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE);
+    if root == nil || !crate::mole_items::is_kind_of(env, root, "NSDictionary") {
+        return;
+    }
+    let acc_arr = cafe_dict_get(env, root, "accepted");
+    let items = cafe_array_items(env, acc_arr);
+    if items.is_empty() {
+        return;
+    }
+    let new_acc = island_alloc_init(env, "NSMutableArray");
+    if new_acc == nil {
+        return;
+    }
+    let add_obj = island_sel(env, "addObject:");
+    let mcopy = island_sel(env, "mutableCopy");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwi = island_sel(env, "numberWithInt:");
+    let key_cnt = crate::frameworks::foundation::ns_string::get_static_str(env, "notifyQuestRequireThingsCount");
+    let mut shifted: Vec<i32> = Vec::new();
+    for o in items {
+        if let Some(q) = cafe_entry_id(env, o) {
+            let cv = cafe_dict_get(env, o, "notifyQuestRequireThingsCount");
+            if let Some(start) = cafe_int(env, cv) {
+                if CAFE_REQ_WORK_IDS.contains(&q) && start >= 1 {
+                    let copy: id = msg_send(env, (o, mcopy));
+                    if copy != nil {
+                        let nv = ((start as f64) - secs).max(1.0) as i32;
+                        let n: id = msg_send(env, (num_cls, nwi, nv));
+                        let _: () = msg_send(env, (copy, sfk, n, key_cnt));
+                        let _: () = msg_send(env, (new_acc, add_obj, copy));
+                        release(env, copy);
+                        shifted.push(q);
+                        continue;
+                    }
+                }
+            }
+        }
+        let _: () = msg_send(env, (new_acc, add_obj, o));
+    }
+    if shifted.is_empty() {
+        release(env, new_acc);
+        return;
+    }
+    let root2: id = msg_send(env, (root, mcopy));
+    if root2 == nil {
+        release(env, new_acc);
+        return;
+    }
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, "accepted");
+    let _: () = msg_send(env, (root2, sfk, new_acc, k));
+    release(env, new_acc);
+    let res = island_sidecar_save(env, ISLAND_CAFE_FILE, ISLAND_FILE_CAFE, root2);
+    release(env, root2);
+    log!(
+        "[MOLECHEAT] island: 快进 {} 秒 → island_cafe.dat 已接打工任务 {:?} 开始时刻回拨({})",
+        secs,
+        shifted,
+        res.unwrap_or_else(|| "未写盘".to_string())
+    );
+}
+
 /// [P5 地基] 确保 NewSceneData.userInfoDataInNewScene 存在 —— NPC(createAllNpcs)/任务(NewSceneQuest)/
 /// 剧情(NewSceneStory)/成就 全靠它当【本地载体】。离线首进岛它可能为 nil(原版靠 1001 回包填,离线无)
 /// → 这些系统无处挂。nil 则 alloc-init 一个(init 默认 nextQuestId=1/nextStoryId=1/extendMap=1/空 npcs+
@@ -1484,9 +2066,35 @@ fn ensure_island_userinfo(env: &mut Environment, nsd: id) {
     // 从 _OBJC_IVAR_$_NewSceneData.userInfoDataInNewScene_ 读偏移=4)。原来 msg setUserInfoDataInNewScene:
     // 是【不存在的 selector】→ touchHLE no-op 静默丢弃 → ivar 仍 nil、新对象泄漏、内容持久化整条失效。
     // 改直写 ivar(self+4):alloc-init 的 +1 转给 ivar(NewSceneData dealloc 时 -1 平衡)。
-    let slot: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(nsd.to_bits() + 4);
+    // [2026-09-24 第四轮 K2 I7-08] 偏移不再写死 4,改从 _OBJC_IVAR 槽 0xb05d4c 现读(re.py ivar NewSceneData 实读:
+    //   userInfoDataInNewScene_ +4、槽 0xb05d4c;getter@0x223cf4 同样读这个槽),与 guard_userinfo_before_load
+    //   (槽 0xb038c4)/farm_ivar_offsets 同一规矩:引擎的非脆弱 ivar 修正若改了偏移,getter 读的是修正后的槽,
+    //   写死 4 就会写错位置 → ivar 仍 nil,内容持久化整条静默失效(C1 故障重现,见 feedback_touchhle_nonfragile_ivar_fixup)。
+    //   槽读到 0 或 ≥0x1000 视为异常:回退静态真值 4(从二进制实核),不放弃——放弃 = ivar 保持 nil = 原样搬回 C1。
+    //   写完用真 getter 回读确认,不一致就报警(本函数在进岛注入序列里,不在帧栈钩子上,可发消息)。
+    let mut off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05d4c));
+    if off == 0 || off >= 0x1000 {
+        log!(
+            "[MOLECHEAT] island: ⚠️ NewSceneData.userInfoDataInNewScene_ 的 ivar 槽 0xb05d4c 读到异常偏移 {:#x} → 回退静态真值 4",
+            off
+        );
+        off = 4;
+    }
+    let slot: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(nsd.to_bits() + off);
     env.mem.write(slot, newui.to_bits());
-    log!("[MOLECHEAT] island: 补建 NewSceneUserInfoData(直写 ivar self+4,载体挂上)");
+    log!(
+        "[MOLECHEAT] island: 补建 NewSceneUserInfoData(直写 ivar self+{},载体挂上)",
+        off
+    );
+    let back: id = msg_send(env, (nsd, ui_s));
+    if back != newui {
+        log!(
+            "[MOLECHEAT] island: ⚠️ 补建 NewSceneUserInfoData 后 getter 回读不一致(写入 {:?} @+{},读回 {:?})→ 岛任务/剧情/成就/扩地/NPC 持久化可能失效",
+            newui,
+            off,
+            back
+        );
+    }
 }
 
 /// [P5 内容持久化] 通用存档路径 = Documents/<fname>(走 GameData.pathForDataFile:)。失败回 nil。
@@ -1644,6 +2252,9 @@ fn island_save_blocked(env: &mut Environment, path: id, bit: u32, fname: &str) -
             "[MOLECHEAT] island: 跳过落盘 {}(原路径仍是未隔离的坏档,绝不用当前内存里的默认数据覆盖)",
             fname
         );
+        // [2026-09-24 第四轮 K3 I7-07] 首次跳过某文件时只挂一个"待提示",不在这里弹框:本函数跑在 island_flush 里,
+        //   而 island_flush 还在退出链(失活/终止)与离岛 startNewSceneFrom 10→1 的换场边界上跑。由 moleIslandTick 在岛上弹一次。
+        ISLAND_BLOCK_PROMPT_PENDING.store(true, O);
     }
     true
 }
@@ -1877,6 +2488,7 @@ fn save_island_userinfo(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_userinfo.dat(任务/剧情/成就/扩地 ok={})", ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_userinfo.dat(任务/剧情/成就/扩地 ok={})", ok);
     }
     Some(format!("存盘 island_userinfo.dat(ok={})", ok))
@@ -1903,6 +2515,72 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
         // [深扫修 2026-09-11] #7 区分无档/坏档(坏档隔离或禁止覆盖)。
         island_note_load_failure(env, path, ISLAND_FILE_USERINFO, "island_userinfo.dat");
         return false;
+    }
+    // [2026-09-24 第四轮 K2 I6-2] 解档非 nil ≠ 档有效:形状 + 已知键校验,必须在 island_note_load_ok 清保护位之前。
+    //   根因:原来只判 dict==nil。解出空字典、非字典根(字符串/数组)、或错档(比如被换成 island_map.dat,根是以
+    //   "28"/"29" 为键的布局字典)时照样清保护位、下面的 objectForKey: 全部取空跳过、最后 return true —— 岛进度
+    //   停在 -[NewSceneUserInfoData init] 默认值,1.5 秒后首个节拍把默认值写回 island_userinfo.dat,坏档没被改名成
+    //   .corrupt、原始数据不可恢复;had_userinfo=true 还让全新岛判据失效、开场剧情不播。
+    //   判据(任一成立即当坏档):根对象不是 NSDictionary(isKindOfClass:);count==0;下面这张已知键表一个都不命中。
+    //   ★非字典判据用 isKindOfClass: 而不用「响应 objectForKey:」:_touchHLE_NSMutableArray 为坏档伪字典带了
+    //   objectForKey:/setObject:forKey: 等空操作(ns_array.rs),根是数组的错档(比如被换成 island_ships.dat)会通过
+    //   响应检查,随后每次 objectForKey: 都调 note_dict_as_array_corruption 置全局 SAVE_HAS_DICT_AS_ARRAY → 本会话
+    //   checkInAlreadyUnlockList: 恒返 1、主村与岛上新成就一个都不记录不发奖。先判类就不会对数组发任何字典消息。
+    //   已知键表 = save_island_userinfo 自 a890e3b 起历来写过的全部键(git 历史逐版核对:7 个标量 + curQuestResult +
+    //   npcs + achieveAlreadyUnlock 从未变过,09-16 起多一个 ISLAND_FRAG_BY_QUEST_KEY),命中 1 个即有效,老档不会被误判。
+    //   不采纳「落盘侧全是默认值就不写」的护栏:全新岛的合法状态恰好就是那组默认值,会误伤;读档侧走
+    //   island_note_load_failure 后,save_island_userinfo 现有的保护位检查已足以挡住覆盖。
+    {
+        let is_dict: bool = {
+            let dcls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+            let isk = island_sel(env, "isKindOfClass:");
+            msg_send(env, (dict, isk, dcls))
+        };
+        let why: Option<String> = if !is_dict {
+            Some("根对象不是字典".to_string())
+        } else {
+            let cnt_s = island_sel(env, "count");
+            let n: crate::mem::GuestUSize = msg_send(env, (dict, cnt_s));
+            if n == 0 {
+                Some("空字典".to_string())
+            } else {
+                let ofk0 = island_sel(env, "objectForKey:");
+                let mut hit = false;
+                for key in [
+                    "nextQuestId",
+                    "curQuestId",
+                    "nextStoryId",
+                    "extendMap",
+                    "buildValue",
+                    "curTotalWorkersCount",
+                    "curIdleWorkerCount",
+                    "curQuestResult",
+                    "npcs",
+                    "achieveAlreadyUnlock",
+                    ISLAND_FRAG_BY_QUEST_KEY,
+                ] {
+                    let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+                    let o: id = msg_send(env, (dict, ofk0, k));
+                    if o != nil {
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    None
+                } else {
+                    Some(format!("{} 个键里没有一个岛进度键(错档?)", n))
+                }
+            }
+        };
+        if let Some(why) = why {
+            log!(
+                "[MOLECHEAT] island: ⚠️ island_userinfo.dat 解档非 nil 但内容无效({})→ 按坏档处理(隔离/禁写),本次按无档",
+                why
+            );
+            island_note_load_failure(env, path, ISLAND_FILE_USERINFO, "island_userinfo.dat");
+            return false;
+        }
     }
     island_note_load_ok(ISLAND_FILE_USERINFO);
     let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
@@ -1933,7 +2611,7 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
         ("setNextQuestId:", "nextQuestId"),
         ("setCurQuestId:", "curQuestId"),
         ("setNextStoryId:", "nextStoryId"),
-        ("setExtendMap:", "extendMap"),
+        // [2026-09-24 第四轮 K2 I7-4] ("setExtendMap:", "extendMap") 从这张表拿出去,在下面单独读回并规整。
         ("setBuildValue:", "buildValue"),
         ("setCurTotalWorkersCount:", "curTotalWorkersCount"),
     ] {
@@ -1944,6 +2622,38 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
             let v: i32 = msg_send(env, (num, iv));
             let s = env.objc.register_host_selector(setter.to_string(), &mut env.mem);
             let _: () = msg_send(env, (ui, s, v));
+        }
+    }
+    // [2026-09-24 第四轮 K2 I7-4 读档半] 岛扩地掩码 extendMap(NewSceneUserInfoData.extendMap_ +36,getter 0x3239a4)
+    //   读回时夹到「最长连续低位前缀」。合法值只有 1/3/7/15/31:-[HolidayVillageLayer setAreas]@0x23b708 只注册了
+    //   这 5 个区键(0x23b7ca/0x23bcb2/0x23c092/0x23c3f4/0x23c944 的立即数);curVisibleArea@0x23cf28 在 0x23cf86
+    //   `and r2,r0,#0x1f` 后查 visibleAreas_,查不到走 0x23cfcc 返回 CGRectZero(curWalkableArea/curBornArea 同构)
+    //   → 可视/可行走/出生三区同时塌 0,整岛拖不动、摩尔无处出生,且值已落盘、重进照样复现。
+    //   原版置位端 addNewObject2Map:gift: 的四处 orr(0x25c280 #2 / 0x25c318 #4 / 0x25c55c #8 / 0x25c62c #0x10)
+    //   靠 getLockType4Object: 的扩地顺序锁 5 保证连续;坏档或绕过顺序锁(全解锁跳序买)会造出 5/9/11/17 这类非法值。
+    //   规整规则:v=raw&0x1f,从位 0(底图,-[NewSceneUserInfoData init]@0x3232d4 默认就写 1)起只保留连续置位的
+    //   低位(9/17/0→1、11→3;超出 0x1f 的坏值含负数→1),只向下夹、不向上抹平(否则等于白送扩地)。不挂全局 setExtendMap: 钩子
+    //   (游戏自己的购买链本来就连续)。缺键时保留 init 默认值 1。
+    {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, "extendMap");
+        let num: id = msg_send(env, (dict, ofk, k));
+        if num != nil {
+            let raw: i32 = msg_send(env, (num, iv));
+            // 超出 5 位(含负数)只可能来自坏档:按底图 1 处理,不按 raw&0x1f 取成 31(那等于白送满扩地)。
+            let v = if (raw as u32) > 0x1f { 1 } else { raw as u32 };
+            let mut m: u32 = 1;
+            while m < 0x1f && (v & (m + 1)) != 0 {
+                m = m * 2 + 1;
+            }
+            if m != raw as u32 {
+                log!(
+                    "[MOLECHEAT] island: extendMap 非法({})→规整为 {}(合法值仅 1/3/7/15/31,只保留连续低位前缀)",
+                    raw,
+                    m
+                );
+            }
+            let s = island_sel(env, "setExtendMap:");
+            let _: () = msg_send(env, (ui, s, m as i32));
         }
     }
     // [2026-09-16] A1-02+A2-02 读回沙原碎片「按任务进度兜底」标记(见 ISLAND_FRAG_BY_QUEST;函数开头已清零)。
@@ -2054,6 +2764,266 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
     }
     log!("[MOLECHEAT] island: 读回 island_userinfo.dat(任务/剧情/成就/扩地进度恢复)");
     true
+}
+
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛侧档 island_misc.dat:NSKeyedArchiver 根字典,键见下面几个常量。
+const ISLAND_MISC_FILE: &str = "island_misc.dat";
+/// 根字典键:NSMutableDictionary<NSNumber 成就号 → NSNumber 累计数/状态位>,原样照抄 NewSceneData.achievementStateRecord_。
+const ISLAND_MISC_KEY_ACH: &str = "achievementStateRecord";
+/// [2026-09-24 第四轮 K12 I7-05] 根字典键:NSMutableArray<NSNumber>,原样照抄 NewSceneData.top3RecordOfMiniGame_
+/// (岛上沙滩 WC 小游戏「左左右右」的前三名成绩)。
+const ISLAND_MISC_KEY_TOP3: &str = "top3RecordOfMiniGame";
+
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛成就累计计数落盘 → island_misc.dat(挂在 island_flush_extras 的 K12 槽位)。
+///
+/// **病根**:「累计做 N 次」类岛成就的进度存在 NewSceneData.achievementStateRecord_(+84,槽 0xb05d98,
+/// NSMutableDictionary,键/值都是 `numberWithUnsignedInt:` 出来的 NSNumber)。玩法侧两个计数点(checkAchieve:itemId:
+/// 按 achieveType 分派):类型 0x10/0x400/0x800 走 -[NewSceneAchievement checkReqConditionOk:itemId:]@0x335fbc——
+/// 0x336138 取表、0x33619c 首次写 1、0x33620e 写 count+1、0x33628a `cmp/bhs` 与 requireConditions 的需求数比较;
+/// 类型 0x20(建店类)走 -[NewSceneAchievement checkBuildShopOK:]@0x335af8——0x335bd2 取表、0x335c44 写 count+1。
+/// 另外 -[NewSceneAchievement saveAchieveUnlockData:] 在 0x335080 把已解锁项写成 0x10000000 状态位。
+/// 原版把这张表交给服务器存:唯一的填充来源是 1062
+/// -[NewSceneCommand parseMapDataWithPackageData:atIndex:](0x22b1c6 取选择子),NewSceneData init 只 alloc 空表,
+/// 回主村时 -[NewSceneData resetNewSceneDataExceptObjectData](LoadingMainVillage updateLoading: 0x2543fa 调)在
+/// 0x21e030 removeAllObjects。离线没有 1062 → 每次进岛从 0 数起。200_0.dat 的成就 14-18(薯条/西瓜/布丁/香草甜筒/
+/// 烤肉各卖出 100 份,触发点 -[NewSceneShop onAlarmFlagTouched] 0x31ff2a 每次收货 checkConditions:0x800 只 +1)
+/// 除非一次进岛连卖 100 份,永远解不开;其它「累计 N 次」条目同理。
+///
+/// **做法**(补全原版该由服务器保管的数据,让原版判定链自己跑):只在岛上(ON_ISLAND)把这张表原样归档写盘——
+/// 不在岛上时它已被 reset 清空,写盘等于拿空表覆盖玩家进度。值整值照抄(可能带 0x10000000 状态位):
+/// 回档后 -[NewSceneAchievement checkConditions:itemId:] 在 0x334ab4 先问 checkInAlreadyUnlockList:(读的是已随
+/// island_userinfo.dat 持久化的 achieveAlreadyUnlock),0x334abc `bne` 直接跳过已解锁项,不会重复发奖。
+/// 在线模式由私服 1062 下发,这里一律不动。归档对象是 NewSceneData 上的活表,不是 userInfoDataInNewScene
+/// (后者没有这个字段)。返回落盘摘要并入 island_flush 的汇总日志。
+/// [2026-09-24 第四轮 K12 I7-05] 同一份档再存 top3RecordOfMiniGame 键(小游戏前三名,病根与读回见 island_misc_restore_top3)。
+fn island_misc_flush(env: &mut Environment) -> Option<String> {
+    if env.options.network_access || ONLINE_MODE.load(O) || !ON_ISLAND.load(O) {
+        return None;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    // -[NewSceneData achievementStateRecord]@0x223cb0(@8@0:4,纯 ivar 读)
+    let ach_s = island_sel(env, "achievementStateRecord");
+    let ach: id = msg_send(env, (nsd, ach_s));
+    // [2026-09-24 第四轮 K12 I7-05] -[NewSceneData top3RecordOfMiniGame]@0x223e44(@8@0:4,纯 ivar 读 +152,
+    //   槽 0xb05de0;0xb05de4 是 mapFragments_,别弄混)。元素是 -[WashRoomGame updateTop3Record] 0x35c40e
+    //   numberWithInt: 出来的 NSNumber,原样归档。
+    let top3_s = island_sel(env, "top3RecordOfMiniGame");
+    let top3: id = msg_send(env, (nsd, top3_s));
+    if ach == nil && top3 == nil {
+        return None;
+    }
+    let cnt_s = island_sel(env, "count");
+    let ach_n: crate::mem::GuestUSize = if ach != nil {
+        msg_send(env, (ach, cnt_s))
+    } else {
+        0
+    };
+    let top3_n: crate::mem::GuestUSize = if top3 != nil {
+        msg_send(env, (top3, cnt_s))
+    } else {
+        0
+    };
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return None;
+    }
+    let sfk = island_sel(env, "setObject:forKey:");
+    if ach != nil {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
+        let _: () = msg_send(env, (root, sfk, ach, k));
+    }
+    if top3 != nil {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_TOP3);
+        let _: () = msg_send(env, (root, sfk, top3, k));
+    }
+    let r = island_sidecar_save(env, ISLAND_MISC_FILE, ISLAND_FILE_MISC, root);
+    // root 是本函数 alloc-init 的 +1,归档已结束;活表 ach/top3 是 getter 取回的,不 release。
+    release(env, root);
+    r.map(|s| format!("{}[成就累计 {} 项/小游戏前三 {} 条]", s, ach_n, top3_n))
+}
+
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 进岛读回 island_misc.dat(挂在 island_after_layout_ready 的 K12 槽位)。
+/// 时序:布局就绪挂钩早于 HolidayVillageLayer onEnter 的 8 次 checkConditions: 与玩家的第一次收货,
+/// 等价于原版 1062 在进岛加载时把服务器保管的计数下发下来。
+/// · 无档 / 坏档(island_sidecar_load 已按统一口径隔离或置保护位)→ 保持 NewSceneData init/reset 后的空表;
+/// · 缺 achievementStateRecord 键 = 老档语义,跳过;
+/// · 有键:逐项校验键/值都是 NSNumber(手改坏的项丢弃并记数,避免游戏对非 NSNumber 发 unsignedIntValue),
+///   灌进一张新 alloc 的 NSMutableDictionary,发 -[NewSceneData setAchievementStateRecord:]@0x223cc0
+///   (v12@0:4@8,属性 `&,N`,0x223cdc 走 _objc_setProperty 自带 retain 并释放旧表)后放掉我们的 +1。
+///   setter 必须给可变容器:checkReqConditionOk: 会直接对它 setObject:forKey:。接收者是 NewSceneData。
+/// · [2026-09-24 第四轮 K12 I7-05] 小游戏前三名由 island_misc_restore_top3 读回,与成就计数互不依赖。
+fn island_misc_restore(env: &mut Environment) {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return;
+    }
+    // 解档器返回的是自动释放对象;下面只从中取值灌进我们自己的新容器,不长期持有它。
+    let root = island_sidecar_load(env, ISLAND_MISC_FILE, ISLAND_FILE_MISC);
+    if root == nil {
+        return;
+    }
+    let dict_cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if !island_misc_is_kind(env, root, dict_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 根对象不是字典,忽略(下次落盘按当前进度重写)");
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let cnt_s = island_sel(env, "count");
+    let oai_s = island_sel(env, "objectAtIndex:");
+    // [2026-09-24 第四轮 K12 I7-05] 小游戏前三名先恢复(与成就计数互不依赖;成就段有多处提前 return)。
+    island_misc_restore_top3(env, nsd, root);
+    let sfk = island_sel(env, "setObject:forKey:");
+    let uiv = island_sel(env, "unsignedIntValue");
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
+    let ach_in: id = msg_send(env, (root, ofk, k));
+    if ach_in == nil {
+        return; // 老档没有这个键
+    }
+    if !island_misc_is_kind(env, ach_in, dict_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 的 achievementStateRecord 不是字典,跳过");
+        return;
+    }
+    let fresh = island_alloc_init(env, "NSMutableDictionary");
+    if fresh == nil {
+        return;
+    }
+    let ak_s = island_sel(env, "allKeys");
+    let keys: id = msg_send(env, (ach_in, ak_s));
+    let n: crate::mem::GuestUSize = if keys != nil {
+        msg_send(env, (keys, cnt_s))
+    } else {
+        0
+    };
+    let mut kept: Vec<(u32, u32)> = Vec::new();
+    let mut dropped = 0u32;
+    for i in 0..n {
+        let key: id = msg_send(env, (keys, oai_s, i));
+        let val: id = if key != nil {
+            msg_send(env, (ach_in, ofk, key))
+        } else {
+            nil
+        };
+        if !island_misc_is_kind(env, key, num_cls) || !island_misc_is_kind(env, val, num_cls) {
+            dropped += 1;
+            continue;
+        }
+        let _: () = msg_send(env, (fresh, sfk, val, key));
+        let kv: u32 = msg_send(env, (key, uiv));
+        let vv: u32 = msg_send(env, (val, uiv));
+        kept.push((kv, vv));
+    }
+    let set_s = island_sel(env, "setAchievementStateRecord:");
+    let _: () = msg_send(env, (nsd, set_s, fresh));
+    release(env, fresh);
+    kept.sort_unstable();
+    let desc: Vec<String> = kept
+        .iter()
+        .map(|&(k, v)| {
+            if v & 0x1000_0000 != 0 {
+                format!("{}={:#x}", k, v)
+            } else {
+                format!("{}={}", k, v)
+            }
+        })
+        .collect();
+    log!(
+        "[MOLECHEAT] island: 读回 island_misc.dat 岛成就累计 {} 项 [{}]{}",
+        kept.len(),
+        desc.join(","),
+        if dropped > 0 {
+            format!("(丢弃非数字项 {} 个)", dropped)
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// [2026-09-24 第四轮 K12] island_misc.dat 读档校验用:`[obj isKindOfClass:cls]`(c12@0:4#8),obj/cls 为 nil 时返回 false。
+fn island_misc_is_kind(env: &mut Environment, obj: id, cls: id) -> bool {
+    if obj == nil || cls == nil {
+        return false;
+    }
+    let s = island_sel(env, "isKindOfClass:");
+    msg_send(env, (obj, s, cls))
+}
+
+/// [2026-09-24 第四轮 K12 I7-05] 读回岛上沙滩 WC 小游戏「左左右右」的前三名成绩(island_misc_restore 调用)。
+///
+/// **病根**:前三名存在 NewSceneData.top3RecordOfMiniGame_(+152,槽 0xb05de0;紧挨着的 0xb05de4 是
+/// mapFragments_,写错槽会把玩家的探险碎片数组指针覆盖掉)。唯一的填充来源是服务器 1062
+/// -[NewSceneCommand parseMapDataWithPackageData:atIndex:](0x22b0ca 取选择子);玩法侧 -[WashRoomGame updateTop3Record]
+/// (0x35c2a0 取表,0x35c40e numberWithInt: + insertObject:atIndex: 写入)与 -[WashRoomLevelChoose init](0x35cfa0 取表,
+/// 0x35d1dc 按 count 判界后 stringWithFormat:"%d" 贴标签)只读写内存;回主村时 resetNewSceneDataExceptObjectData 在
+/// 0x21e0c4 removeAllObjects。离线没有 1062 → 退岛重进就只剩本次会话打出来的成绩。
+///
+/// **做法**(补全原版该由服务器保管的数据):缺 top3RecordOfMiniGame 键 = 老档,跳过;有键就只保留 NSNumber 元素
+/// (保持原顺序)灌进一张新 alloc 的 NSMutableArray——等价于「先清空再灌」,不会每次进岛翻倍——然后发
+/// -[NewSceneData setTop3RecordOfMiniGame:]@0x223e54(v12@0:4@8,属性 `&,N`,0x223e70 走 _objc_setProperty 自带 retain
+/// 并释放旧数组)再放掉我们的 +1。必须给可变数组:updateTop3Record 会对它 removeObjectAtIndex:/insertObject:atIndex:。
+/// 接收者是 NewSceneData(不是 userInfoDataInNewScene),不直写 ivar。落盘见 island_misc_flush。
+fn island_misc_restore_top3(env: &mut Environment, nsd: id, root: id) {
+    let ofk = island_sel(env, "objectForKey:");
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_TOP3);
+    let src: id = msg_send(env, (root, ofk, k));
+    if src == nil {
+        return; // 老档没有这个键
+    }
+    let arr_cls = env.objc.get_known_class("NSArray", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if !island_misc_is_kind(env, src, arr_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 的 top3RecordOfMiniGame 不是数组,跳过");
+        return;
+    }
+    let fresh = island_alloc_init(env, "NSMutableArray");
+    if fresh == nil {
+        return;
+    }
+    let cnt_s = island_sel(env, "count");
+    let oai_s = island_sel(env, "objectAtIndex:");
+    let add_s = island_sel(env, "addObject:");
+    let iv = island_sel(env, "intValue");
+    let n: crate::mem::GuestUSize = msg_send(env, (src, cnt_s));
+    let mut kept: Vec<i32> = Vec::new();
+    let mut dropped = 0u32;
+    for i in 0..n {
+        let o: id = msg_send(env, (src, oai_s, i));
+        if !island_misc_is_kind(env, o, num_cls) {
+            dropped += 1;
+            continue;
+        }
+        let _: () = msg_send(env, (fresh, add_s, o));
+        let v: i32 = msg_send(env, (o, iv));
+        kept.push(v);
+    }
+    let set_s = island_sel(env, "setTop3RecordOfMiniGame:");
+    let _: () = msg_send(env, (nsd, set_s, fresh));
+    release(env, fresh);
+    log!(
+        "[MOLECHEAT] island: 读回 island_misc.dat 小游戏前三 {:?}{}",
+        kept,
+        if dropped > 0 {
+            format!("(丢弃非数字项 {} 个)", dropped)
+        } else {
+            String::new()
+        }
+    );
 }
 
 /// [P2b] 快照 TMMapData → mapData 的类型 key(只在"全表按 seqId 找不到、需要新增条目"时才用)。
@@ -2170,6 +3140,334 @@ fn island_userinfo_data(env: &mut Environment) -> id {
     msg_send(env, (nsd, ui_s))
 }
 
+// ════════ [2026-09-24 第四轮 K11] 超级贝壳树(32015)离线复活 ════════
+// 原版这棵树的「成长值 / 36 小时倒计时起点 / 可收获标志」全部由服务器下发:
+//   · 1085 回包 -[NetworkManager parseSuperShellTreeInfoFromServer:pos:len:]@0x1c0790 按 0x1c07ea
+//     getUniqueObjectByObjectId:32015 找到活树,0x1c0862 setGrowthValue:、0x1c08ba setBeginCountDownTime:,
+//     然后 parseData 在 0xe74e8 起把回包分发给 NetworkManager.delegateSuperShellTree 的 onCommandReceived:;
+//   · 可收获标志 GameData.canHarvestSuperShellTree_ 全二进制唯一写入点是圣诞奖励回包
+//     -[NetworkManager parseChristmasRewardFlagFromServer:pos:len:]@0x1c074a。
+// 离线三者都没人写 → 树点了只 unselect(processTouched 0x36acee beq)、面板永不弹、头顶永不出收获图标。
+// 这里补一个离线等价的「服务器应答」,让原版 onCommandReceived:/updateView/收获链自己跑。
+
+/// 超级贝壳树的物品号(propertyHV 32015,limit_count=1;原版回包解析在 0x1c07de `movw r2,#0x7d0f` 查活表)。
+const SHELLTREE_OBJECT_ID: i32 = 32015;
+/// 成长值满值:-[NewGameManager activateWaterSuperShellTree]@0x2469c2 `cmp r0,#0x13` + `it hi` + `pophi`,>19 即浇满。
+const SHELLTREE_FULL_GROWTH: u32 = 20;
+/// [2026-09-24 第四轮 K11 I2-01] 离线「服务器侧」贝壳树状态:倒计时起点(CFAbsoluteTime 秒,0=没有进行中的倒计时)
+///   与成长值。只在应答(moleIslandShellTreeInfo)、收获/删除时的重置(resetSuperShellTreeInfo)与读档时改写。
+static SHELLTREE_BC: AtomicU32 = AtomicU32::new(0);
+static SHELLTREE_GV: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 集成补漏] 本次进岛因 island_map.dat 缺失/无效回退到默认岛,而 island_shelltree.dat 还在原路径 →
+///   本会话不读也不覆盖它(与 K1 对 island_ships.dat 的做法同一规则)。每次进岛在 build_default_island_mapdata 开头清零。
+static SHELLTREE_HOLD_FOR_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K11 I2-01] 取活表里的超级贝壳树,与原版 1085 回包解析同法:0x1c07d6 [ObjectManager sharedManager]
+///   → 0x1c07ea getUniqueObjectByObjectId:32015(签名 @12@0:4i8;@0x41dbc 只返回 isFinished 的唯一物件)
+///   → 0x1c0820 isKindOfClass:[SuperShellTree class]。没有(还没建好/已删除/不在岛上)返回 nil。
+fn island_shelltree_live(env: &mut Environment) -> id {
+    let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
+    let tree_cls = env.objc.get_known_class("SuperShellTree", &mut env.mem);
+    if om_cls == nil || tree_cls == nil {
+        return nil;
+    }
+    let sm = island_sel(env, "sharedManager");
+    let om: id = msg_send(env, (om_cls, sm));
+    if om == nil {
+        return nil;
+    }
+    let g = island_sel(env, "getUniqueObjectByObjectId:");
+    let obj: id = msg_send(env, (om, g, SHELLTREE_OBJECT_ID));
+    if obj == nil {
+        return nil;
+    }
+    let isk = island_sel(env, "isKindOfClass:");
+    let is_tree: bool = msg_send(env, (obj, isk, tree_cls));
+    if is_tree {
+        obj
+    } else {
+        nil
+    }
+}
+
+/// [2026-09-24 第四轮 K11 I2-01 / I3-3] 离线等价的 1085「贝壳树信息」回包。由 getSuperShellTreeInfo: 臂用
+///   performSelector:withObject:afterDelay:0 排到运行循环 perform 相位,接收者是 NetworkManager(r0),栈上没有游戏方法体,
+///   可以自由发宿主消息;选择子由 intercept 无条件接住(NetworkManager 不实现它)。
+///   ① 复刻 parseSuperShellTreeInfoFromServer: 的写入:有活树时 setGrowthValue:(0x36af14,v12@0:4L8)、
+///      setBeginCountDownTime:(0x36b870,v12@0:4L8)。取值 = 离线「服务器侧」状态;倒计时起点为 0(新树或刚收获)时
+///      开始新一轮:起点=当前岛时钟、成长值=20。原版成长值要靠好友来浇水(activateWaterSuperShellTree 只在串门
+///      gameMode 6 生效),离线没有好友,这里是移植者自拟的设计等价「好友已浇满」,不是原版数据。
+///      purchaseTime_ 一律不碰:它是「首次收获时刻」,只由原版 setHarvestTimes:@0x36af46 写(树的寿命从它起算)。
+///   ② 复刻 parseData 的分发(0xe74e8-0xe751e):对 NetworkManager.delegateSuperShellTree 发 onCommandReceived:(代理不在
+///      或不响应时退回活树本身)。原版 onCommandReceived:@0x36b784 自己收加载遮罩(0x36b7b4 hideLoadingLayer)→ [nil errorID]
+///      为 0 → m_view 在(showInfoView 路径)就 showWithTarget:self selector:onViewClosed 弹面板 → updateView 刷新
+///      倒计时/收获图标 → activateWaterSuperShellTree(自家岛 0x246968 gameMode!=6 早退)。参数传 nil:
+///      唯一读它的是 0x36b7c6 [r5 errorID],nil 消息返回 0 = 「成功」。
+///   ③ 既没有代理也没有活树:只收掉 showInfoView 在 0x36aea6 挂上的加载遮罩,不留永不消失的转圈。
+fn island_shelltree_answer(env: &mut Environment) {
+    let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+    let tree = island_shelltree_live(env);
+    if tree != nil {
+        let mut bc = SHELLTREE_BC.load(O);
+        let mut gv = SHELLTREE_GV.load(O);
+        let fresh = bc == 0;
+        if fresh {
+            bc = now_cf_secs().max(1.0) as u32;
+        }
+        // 倒计时一旦开始,原版的成长值必然已浇满(满了服务器才开始 36 小时),离线同样保持满值。
+        if gv < SHELLTREE_FULL_GROWTH {
+            gv = SHELLTREE_FULL_GROWTH;
+        }
+        let s_gv = island_sel(env, "setGrowthValue:");
+        let _: () = msg_send(env, (tree, s_gv, gv));
+        let s_bc = island_sel(env, "setBeginCountDownTime:");
+        let _: () = msg_send(env, (tree, s_bc, bc));
+        SHELLTREE_BC.store(bc, O);
+        SHELLTREE_GV.store(gv, O);
+        island_mark_dirty();
+        log!(
+            "[MOLECHEAT] island: 贝壳树应答 bc={} gv={}{}",
+            bc,
+            gv,
+            if fresh { "(开始新一轮 36 小时倒计时)" } else { "(续上已有倒计时)" }
+        );
+    } else {
+        log!("[MOLECHEAT] island: 贝壳树应答:活表里没有已建好的贝壳树(32015),只做回包分发/收加载遮罩");
+    }
+    let ocr = island_sel(env, "onCommandReceived:");
+    let mut target: id = nil;
+    if nm != nil && env.objc.object_has_method_named(&env.mem, nm, "delegateSuperShellTree") {
+        let g = island_sel(env, "delegateSuperShellTree");
+        let d: id = msg_send(env, (nm, g));
+        if d != nil {
+            let rs = island_sel(env, "respondsToSelector:");
+            let responds: bool = msg_send(env, (d, rs, ocr));
+            if responds {
+                target = d;
+            }
+        }
+    }
+    if target == nil {
+        target = tree;
+    }
+    if target != nil {
+        let _: () = msg_send(env, (target, ocr, nil));
+    } else {
+        let ll_cls = env.objc.get_known_class("LoadingLayer", &mut env.mem);
+        if ll_cls != nil {
+            let sh = island_sel(env, "sharedInstance");
+            let ll: id = msg_send(env, (ll_cls, sh));
+            if ll != nil {
+                let hide = island_sel(env, "hideLoadingLayer");
+                let _: () = msg_send(env, (ll, hide));
+            }
+        }
+    }
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 贝壳树旁路档。取证:TMMapDataSuperShellTree 只有 purchaseTime_(+24)/harvestTimes_(+28)
+///   两个 ivar,encodeWithCoder:@0xce3a8 也只编这两个;+[NewGameManager saveTMMapDataFromObject:] 的 type==0x28 分支
+///   (0x244660 起)同样只写 setPurchaseTime:/setHarvestTimes:。活树的 beginCountDownTime_(+356)与 growthValue_(+360)
+///   原版每次进岛由 1085 回包重新下发,离线没有服务器 → 退岛再进倒计时从头来。这里把离线「服务器侧」状态存成
+///   根字典 {beginCountDownTime: NSNumber(u32,CF 秒), growthValue: NSNumber(u32), savedAt: NSNumber(double,落盘时刻,诊断用)},
+///   树已删除时写空字典。isAvailable_(+364)不存:它是 updateView 从 purchaseTime_ 现算的派生量(0x36b1b2 在重算分支里),
+///   而 purchaseTime/harvestTimes 已随 island_map.dat 的 TMMapDataSuperShellTree 持久化、purchaseTime 已在 ISLAND_TIME_FIELDS。
+///   growthValue 是计数(上限 20),不进纪元迁移;倒计时起点的「未来值」在读档时夹到现在。
+const SHELLTREE_FILE: &str = "island_shelltree.dat";
+
+/// [2026-09-24 第四轮 K11 I2-04] 解析侧档根对象 → (倒计时起点, 成长值)。根不是字典返回 None;缺键或值不是 NSNumber 按 0
+///   (不对非 NSNumber 发数值消息,坏档/手改档不会落到未实现的选择子上)。
+fn island_shelltree_read(env: &mut Environment, root: id) -> Option<(u32, u32)> {
+    if root == nil {
+        return None;
+    }
+    let dict_cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if dict_cls == nil || num_cls == nil {
+        return None;
+    }
+    let isk = island_sel(env, "isKindOfClass:");
+    let is_dict: bool = msg_send(env, (root, isk, dict_cls));
+    if !is_dict {
+        return None;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let uiv = island_sel(env, "unsignedIntValue");
+    let get = |env: &mut Environment, key: &'static str| -> u32 {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let v: id = msg_send(env, (root, ofk, k));
+        if v == nil {
+            return 0;
+        }
+        let is_num: bool = msg_send(env, (v, isk, num_cls));
+        if !is_num {
+            return 0;
+        }
+        msg_send(env, (v, uiv))
+    };
+    let bc = get(env, "beginCountDownTime");
+    let gv = get(env, "growthValue");
+    Some((bc, gv))
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 组侧档根字典(+1 NSMutableDictionary,调用方 release)。entry 为 None = 树已删除,写空字典。
+///   NSNumber 都是自动释放对象,放进字典后不 release;键用 get_static_str(不泄漏 +1 串)。
+fn island_shelltree_root(env: &mut Environment, entry: Option<(u32, u32)>) -> id {
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return nil;
+    }
+    if let Some((bc, gv)) = entry {
+        let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+        let n_u32 = island_sel(env, "numberWithUnsignedInt:");
+        let n_f64 = island_sel(env, "numberWithDouble:");
+        let sfk = island_sel(env, "setObject:forKey:");
+        let bc_num: id = msg_send(env, (num_cls, n_u32, bc));
+        let gv_num: id = msg_send(env, (num_cls, n_u32, gv));
+        let at_num: id = msg_send(env, (num_cls, n_f64, now_cf_secs()));
+        for (key, num) in [
+            ("beginCountDownTime", bc_num),
+            ("growthValue", gv_num),
+            ("savedAt", at_num),
+        ] {
+            if num == nil {
+                continue;
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+            let _: () = msg_send(env, (root, sfk, num, k));
+        }
+    }
+    root
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 进岛读档(K1 的 island_after_layout_ready 挂钩调用):此刻活树还没建(loadMapObjects 在
+///   更晚的 loadNewScene 里),只把侧档读进离线状态,等 initWithMapData:type: 0x36a846 发的 getSuperShellTreeInfo: 应答时
+///   再经真 setter 写到活树上。倒计时起点比现在晚 60 秒以上(改过系统时间/时间旅行后回退)就夹到现在,免得 36 小时永远走不完。
+///   island_map.dat 坏档保护中(内存里是默认岛,没有这棵树)时不读,免得以后新买的树继承旧档的倒计时。
+fn island_shelltree_load(env: &mut Environment) {
+    SHELLTREE_BC.store(0, O);
+    SHELLTREE_GV.store(0, O);
+    // [2026-09-24 第四轮 集成补漏] 布局档缺失/无效回退默认岛时保住贝壳树侧档:默认岛布局里没有树,不拦的话首个节拍
+    //   island_shelltree_flush 按「布局里没有树 = 树已删除」写空字典,玩家事后把原布局档放回,树回来了倒计时却从头开始
+    //   (最多白等 36 小时)。这里置保护位后直接返回、不走 island_sidecar_load(它读档成功会 island_note_load_ok 清位),
+    //   保护位让 island_sidecar_save → island_save_blocked 本会话跳过它;下次走读档岛分支时本标志为假,照常读档清位。
+    if SHELLTREE_HOLD_FOR_DEFAULT.load(O) {
+        ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHELLTREE, O);
+        log!("[MOLECHEAT] island: island_map.dat 缺失/无效(当前是默认岛),本会话不读也不覆盖 island_shelltree.dat");
+        return;
+    }
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
+        log!("[MOLECHEAT] island: island_map.dat 坏档保护中(当前是默认岛),不读 island_shelltree.dat");
+        return;
+    }
+    let root = island_sidecar_load(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE);
+    if root == nil {
+        return; // 无档(或坏档已由 island_sidecar_load 隔离/保护):按新树处理
+    }
+    let Some((mut bc, mut gv)) = island_shelltree_read(env, root) else {
+        log!("[MOLECHEAT] island: island_shelltree.dat 根对象不是字典,按无档处理(下次落盘覆盖)");
+        return;
+    };
+    let now = now_cf_secs();
+    if bc != 0 && (bc as f64) > now + 60.0 {
+        let nb = now.max(1.0) as u32;
+        log!("[MOLECHEAT] island: 贝壳树倒计时起点在未来({} > 现在 {:.0})→ 夹到现在 {}", bc, now, nb);
+        bc = nb;
+    }
+    if gv > SHELLTREE_FULL_GROWTH {
+        gv = SHELLTREE_FULL_GROWTH;
+    }
+    SHELLTREE_BC.store(bc, O);
+    SHELLTREE_GV.store(gv, O);
+    log!("[MOLECHEAT] island: 读回 island_shelltree.dat(贝壳树倒计时起点 bc={} 成长值 gv={})", bc, gv);
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 落盘(K1 的 island_flush_extras 挂钩调用;此刻活表仍满载岛对象、新放置的建筑已合并进 mapData)。
+///   · 有活树:读 beginCountDownTime(0x36b860,L8@0:4)/growthValue(0x36b880)。唯一例外:活树起点为 0 而离线状态非 0 ——
+///     只会出现在「读档建树后、getSuperShellTreeInfo: 应答还没跑到」的窗口(initWithMapData:type: 不恢复这两项),
+///     此时以离线状态为准,免得进岛那一拍的节拍落盘把正在走的 36 小时抹成 0。收获时重置臂先把离线状态清零、原版再把
+///     活树起点置 0,两者一致,不受这条影响。
+///   · 布局里没有 TMMapDataSuperShellTree(树已删除/收纳)→ 写空字典并清离线状态,不管活表里还查不查得到树:
+///     -[ObjectManager uniqueObjects_] 只在 addObject:(0x43b12,limit_count==1)写入、removeAllObjects(0x46746)清空,
+///     removeObject:@0x44198 不动它 → onChooseDelete/收纳之后那棵树仍被字典持有,getUniqueObjectByObjectId: 照样返回它
+///     (isFinished 也还是 1)。只看活表会把已删掉的树的倒计时写回侧档,下次买的新树直接继承旧倒计时;
+///     布局是 merge_new_island_objects_into_mapdata 刚并过新放置建筑、删除/收纳已由 deleteObjectFromServer: 臂移除的结果,可信。
+///   · 布局里有但活表里还没有(还没加载成活对象)→ 不写,保留侧档原样。
+///   只在岛上落盘;island_map.dat 坏档保护中(内存是默认岛)不写,与 island_ships.dat 同口径。
+fn island_shelltree_flush(env: &mut Environment) -> Option<String> {
+    if !ON_ISLAND.load(O) {
+        return None;
+    }
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
+        if (ISLAND_BLOCK_LOGGED.fetch_or(ISLAND_FILE_SHELLTREE, O) & ISLAND_FILE_SHELLTREE) == 0 {
+            log!("[MOLECHEAT] island: 跳过落盘 island_shelltree.dat(island_map.dat 坏档保护中,当前是默认岛)");
+        }
+        return None;
+    }
+    let in_layout = island_all_objects(env)
+        .iter()
+        .any(|(_, cname)| cname == "TMMapDataSuperShellTree");
+    let entry = if !in_layout {
+        // 树已删除/收纳(见函数注释:活表里可能还残留着它,不能以活表为准)。
+        SHELLTREE_BC.store(0, O);
+        SHELLTREE_GV.store(0, O);
+        None
+    } else {
+        let tree = island_shelltree_live(env);
+        if tree == nil {
+            return None;
+        }
+        let g_bc = island_sel(env, "beginCountDownTime");
+        let g_gv = island_sel(env, "growthValue");
+        let bc: u32 = msg_send(env, (tree, g_bc));
+        let gv: u32 = msg_send(env, (tree, g_gv));
+        let cache_bc = SHELLTREE_BC.load(O);
+        if bc == 0 && cache_bc != 0 {
+            Some((cache_bc, SHELLTREE_GV.load(O)))
+        } else {
+            Some((bc, gv))
+        }
+    };
+    let root = island_shelltree_root(env, entry);
+    if root == nil {
+        return None;
+    }
+    let r = island_sidecar_save(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE, root);
+    release(env, root);
+    log_dbg!("[MOLECHEAT] island: 贝壳树侧档内容 {:?}(None=树已删除,写空字典)", entry);
+    r
+}
+
+/// [2026-09-24 第四轮 K11 I2-04] 岛档计时快进(K4 的 island_ff_extras 挂钩调用,只在主村、离线、不在岛会话时):
+///   把侧档里的倒计时起点回拨 secs 秒,等价于这段时间已经流逝;不低于 1(0 的语义是「没有进行中的倒计时」,
+///   会让下次查询重开一轮)。起点为 0 或无档不动。离线状态不用改:下次进岛 island_after_layout_ready 会重读侧档。
+fn island_shelltree_ff(env: &mut Environment, secs: f64) {
+    if !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE);
+    let Some((bc, gv)) = island_shelltree_read(env, root) else {
+        return;
+    };
+    if bc == 0 {
+        return;
+    }
+    let nb = ((bc as f64) - secs).max(1.0) as u32;
+    let out = island_shelltree_root(env, Some((nb, gv)));
+    if out == nil {
+        return;
+    }
+    let r = island_sidecar_save(env, SHELLTREE_FILE, ISLAND_FILE_SHELLTREE, out);
+    release(env, out);
+    log!(
+        "[MOLECHEAT] island: 快进 island_shelltree.dat:贝壳树倒计时起点 {} → {}(回拨 {:.0} 秒)→ {}",
+        bc,
+        nb,
+        secs,
+        r.unwrap_or_else(|| "未写入".to_string())
+    );
+}
+
 /// [P2b 经营进度回写] 升级餐厅/雇用公寓/出海等改的是活建筑,游戏把快照喂 setModObjectToServer:
 /// (离线被吞、从不写回 mapData)→ 退岛 archive 的只是进岛初始态、经营进度丢。这里把快照按
 /// objectSequenceId 写回 [NewSceneData mapData][key] 数组(find→replace,无则 add),使 island_map.dat
@@ -2221,11 +3519,14 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
         .objc
         .register_host_selector("objectForKey:".to_string(), &mut env.mem);
     let mut arr: id = msg_send(env, (md, ofk, keystr));
+    // [2026-09-24 第四轮 K2 I2-4] 新建分支的 +1 由本函数平衡,见下方 release。
+    let mut created = false;
     if arr == nil {
         arr = island_alloc_init(env, "NSMutableArray");
         if arr == nil {
             return;
         }
+        created = true;
         let sfk = env
             .objc
             .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
@@ -2235,6 +3536,14 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
         .objc
         .register_host_selector("addObject:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (arr, add, snap));
+    // [2026-09-24 第四轮 K2 I2-4] island_alloc_init 给的是 alloc+init 的 +1;可变字典 setObject:forKey: 已自己 retain,
+    //   这份 +1 原来无人平衡,每新建一个类型桶就泄漏一个数组。只在新建分支放(objectForKey: 取回的既有数组是 +0,
+    //   绝不能 release)。放在 addObject: 之后而不是紧跟 setObject:forKey::mapData 若是坏档塌成的伪字典
+    //   (NSMutableArray 的 setObject:forKey: 是吞掉不存的空操作,见 ns_array.rs)就没人 retain,先放会让
+    //   addObject: 打到已释放对象;放在最后则两种情况都平衡(正常时 md 持有,伪字典时数组连同 snap 的那次 retain 一起释放)。
+    if created {
+        release(env, arr);
+    }
     log_dbg!(
         "[MOLECHEAT] island: 经营态写回 mapData[key={}] seqId={} (add)",
         key,
@@ -2248,7 +3557,63 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
 ///   黄金岛 getCurrentServerTime 钩子(岛上计时)、作物瞬熟算的 beginTime 目标、cf_fix_residue 的"未来"判据
 ///   都会和游戏读到的时钟差一个偏移(岛计时整体落后、残留修正误判)。偏移只增不减、在线模式由 mole_dev 拒绝设置,
 ///   所以无条件相加即可;单调时钟(Instant/mach_absolute_time)不受影响,本文件的节拍节流仍用 Instant。
+/// [2026-09-24 第四轮 K4 I4-05] 改成【单调】实现,墙钟取值挪到 wall_cf_secs。
+///   根因:原版 -[NewSceneTimer getCurrentServerTime]@0x22f60c 返回 latestServerTime_(+8)+currentTimerCount_(+12)
+///   (0x22f67e-0x22f68a),计数器由每秒调度一次的 -[NewSceneTimer timeCounterAdded]@0x22f54c(`adds r2,#1`)累加,
+///   会话内与设备时钟无关、只增不减;回前台时原版重新向服务器 getServerTime 对时。以前这里直读宿主墙钟,
+///   系统时间一往回拨,岛上的「现在」当场倒退,刚写下的 beginTime/beginDiscoverTime/beginUpgradeTime 全变成未来值
+///   (DiscoveryShip 完成判据 0x361e4e vsub + 0x361e56 vcmpe 恒判未完成),还会被节拍落盘写进 island_map.dat。
+///   做法(移植者自拟的离线等价):t = max(上次返回值 + 距上次的单调流逝, 墙钟 CF 秒 + 时间旅行偏移)。
+///   墙钟回拨 → 按单调时钟继续走、不倒退;休眠后墙钟领先 → 向前追平(等价原版回前台对时);时间旅行偏移只增不减,
+///   仍即时生效。进程内状态,重启后从墙钟重新起算(与原版每次登录由服务器 1065 重新对时同理)。
+///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据、未来时间戳收敛 island_clamp_future_timestamps。
+///   该臂主村与岛共用(selref 0xade774 共 86 处):主村水塔 -[WaterTower innerupdate:]、-[RewardBox currentTime]、
+///   -[DailySignLayer getServerTime]、各活动倒计时也随之单调,与原版「服务器时间不随设备时钟回拨」一致;
+///   主村作物进度 -[CropInfoView updateObjectProgress:] 在主村分支直读 CFAbsoluteTimeGetCurrent(0xc435e),不受影响。
+///   ★游戏自己直读 CFAbsoluteTimeGetCurrent 的计时(作物 -[Farm innerupdate:]、NPC 冷却 -[NpcActor checkGiftMode:]
+///   0xef9de)不走 NewSceneTimer,凡是要与它们对齐的地方用 wall_cf_secs,不要用本函数。
 fn now_cf_secs() -> f64 {
+    let wall = wall_cf_secs();
+    let now = Instant::now();
+    let mut g = ISLAND_MONO_CLOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (t, lead_before) = match *g {
+        Some((last_t, last_at, last_lead)) => {
+            let mono = last_t + now.saturating_duration_since(last_at).as_secs_f64();
+            (if wall > mono { wall } else { mono }, last_lead)
+        }
+        None => (wall, 0.0),
+    };
+    let lead = t - wall;
+    *g = Some((t, now, lead));
+    drop(g);
+    // 墙钟回拨(领先量突增)/追平时各打一行,供无头测试核对;平时不打印(领先量稳定,不会刷屏)。
+    if lead - lead_before > 2.0 {
+        log!(
+            "[MOLECHEAT] island: 宿主墙钟回拨约 {:.0} 秒 → 岛时钟按单调计时继续 t={:.0}(墙钟 {:.0},领先 {:.0} 秒)",
+            lead - lead_before,
+            t,
+            wall,
+            lead
+        );
+    } else if lead_before > 2.0 && lead <= 0.0 {
+        log!(
+            "[MOLECHEAT] island: 宿主墙钟已追上岛时钟 t={:.0}(此前领先 {:.0} 秒)",
+            t,
+            lead_before
+        );
+    }
+    t
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] now_cf_secs 的单调状态:(上次返回的 CF 秒, 当时的 Instant, 当时领先墙钟的秒数)。
+static ISLAND_MONO_CLOCK: Mutex<Option<(f64, Instant, f64)>> = Mutex::new(None);
+
+/// [2026-09-24 第四轮 K4 I4-05] guest 可见的墙钟 CFAbsoluteTime 秒(SystemTime::now + 时间旅行偏移,
+/// 即原 now_cf_secs 的实现,与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源)。游戏直读 CFAbsoluteTimeGetCurrent 的
+/// 计时(作物、NPC 冷却)要和它对齐,不能用单调的 now_cf_secs。
+fn wall_cf_secs() -> f64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -2351,8 +3716,10 @@ pub(crate) fn farm_instant_mature_at(env: &mut Environment, recv: u32) -> bool {
     }
     let begin_ptr: MutPtr<f64> = Ptr::from_bits(recv + off_begin);
     let begin: f64 = env.mem.read(begin_ptr);
-    // now_cf_secs 与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源(SystemTime::now + 时间旅行偏移,见 F7-5),真方法紧接着取的 now 只会≥它。
-    let target = now_cf_secs() - mature as f64 - 0.5;
+    // wall_cf_secs 与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源(SystemTime::now + 时间旅行偏移,见 F7-5),真方法紧接着取的 now 只会≥它。
+    // [2026-09-24 第四轮 K4 I4-05] now_cf_secs 已改成单调(墙钟回拨后会领先墙钟),这里必须用墙钟:
+    //   否则 target 可能落在 guest 的「现在」之后,innerupdate 0x485ce 见 elapsed<0 把 beginTime 重置成 now,瞬熟变成重种。
+    let target = wall_cf_secs() - mature as f64 - 0.5;
     if begin <= target {
         return true; // 本来就已过成熟点,交给原版
     }
@@ -2565,6 +3932,7 @@ fn save_island_ships(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok);
     }
     Some(format!("存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok))
@@ -2631,11 +3999,15 @@ fn load_island_ships(env: &mut Environment) {
         }
         let Some(obj) = hit else { continue };
         if kind == 1 {
+            // [2026-09-24 第四轮 K2 I5-8] 读侧不再只回填 1/2,全量回填,与 save_island_ships 的无条件保存对称。
+            //   原来丢弃 0 与 ≥3:原版 shipState 不止两种取值(-[DiscoveryShip innerUpdate:]@0x362966 对 ≥3 走 unschedule 分支,
+            //   checkIsFixShipFinished@0x3620bc 把 0 或 >2 归一成 1,parseMapDataWithPackageData:atIndex: 可下发任意值),
+            //   被丢弃的值会让 mapData 里的 shipState_ 停在 NSCoding 缺省 0(encodeWithCoder:@0xcd860 不编该字段),
+            //   下一拍被归一成 1 = 船退回「需修船」。回填 0 无副作用(目标对象在读档/默认岛两条路径上本来就是 0);
+            //   不另设上界(原版 innerUpdate 只判 ≥3,没约定最大值)。
             if let Some(state) = get(env, "shipState") {
-                if state == 1 || state == 2 {
-                    let s2 = island_sel(env, "setShipState:");
-                    let _: () = msg_send(env, (obj, s2, state));
-                }
+                let s2 = island_sel(env, "setShipState:");
+                let _: () = msg_send(env, (obj, s2, state));
             }
             let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "gifts"); // [扫描修 2026-09-15] F10-7
             let gifts: id = msg_send(env, (entry, ofk, gk));
@@ -2689,6 +4061,57 @@ fn fix_stuck_ships(env: &mut Environment) {
         let begin: f64 = msg_send(env, (obj, s2));
         let smid: i32 = msg_send(env, (obj, s3));
         let onb: i32 = msg_send(env, (obj, s4));
+        // [2026-09-24 第四轮 K2 I4-06] 待领礼物与航线/人数对不上 → 复位成原版「礼物领完」的干净可出海态。
+        //   根因:load_island_ships 把船档里的 rewardObjId 原样 new 成 DiscoverRewardData 塞回 showGiftsList,不校验。
+        //   -[DiscoveryShip initWithMapData:type:] 见列表非空(0x360a52-0x360aac)就调 initShowGiftsListData:@0x361844,
+        //   它拿每个 rewardObjId 去 getDiscoveryRewardsListWithMapId:searchMapId_ sailMoleNum:onBoardMoleNum_ 返回的那行里配,
+        //   配不上就不加(列表变空),但 0x361a9a 照样无条件挂领奖旗;onAlarmFlagTouched@0x3610d8 空列表也弹 NewRewardsLayer,
+        //   没有 cell 可点 → 永远不回调 minusGiftOfShowGiftsList:@0x363470 摘旗 → 船挂着消不掉的旗、再也点不出航海面板。
+        //   240_0.dat 只有 801/802/803 × molenumber 1-4;航线/人数落在外面就必然配不上。原版里「有待领礼物」只出现在
+        //   getSailGifts@0x361ad0 之后,它入口就要求 onBoardMoleNum≥1(0x361b04)且 searchMapId∈801..=804(0x361b18 subw #0x321/
+        //   cmp #3),并把 isSailing/beginDiscoverTime 清 0(0x361d4e/0x361d58);两字段一直保留到礼物领完才由
+        //   minusGiftOfShowGiftsList:(0x36357c/0x363592)清 0。所以「礼物非空 + 航线/人数非法」原版不可达,只来自档不一致。
+        //   上界取 804 与 onButtonDiscoverSelected 0x36231e `cmp #3` 一致(收得比原版严会误伤)。只做范围校验,
+        //   不发 getDiscoveryRewardsListWithMapId: 逐项比对(多一次 guest 消息换一点精度不值,范围已挡住已知触发路径)。
+        //   复位 = 礼物领完后的原版终态:showGiftsList 给空 NSMutableArray(不传 nil,免得 initWithMapData:type: 0x360b84
+        //   「二次读为 nil」的异常分支可达;setShowGiftsList: 走 _objc_setProperty 自带 retain,新建的 +1 用后 release)、
+        //   searchMapId/onBoardMoleNum 置 0、isSailing 置 NO,beginDiscoverTime 也置 0(getSailGifts 本就清它;若残留 >0,
+        //   checkIsDiscoverFinished@0x361f98 会把 isSailing 又置回 1、船重新「出海」)。此时 checkIsDiscoverFinished 走
+        //   begin<=0 && isSailing==0 返回 YES,不挂旗,船回到可出海态。必须在建筑实例化之前做(本函数就在
+        //   load_island_ships 之后、实例化之前;实例化后旗已挂上,改 TMMapData 没用)。
+        {
+            let sg = island_sel(env, "showGiftsList");
+            let gifts: id = msg_send(env, (obj, sg));
+            let gn: crate::mem::GuestUSize = if gifts != nil {
+                let cnt_s = island_sel(env, "count");
+                msg_send(env, (gifts, cnt_s))
+            } else {
+                0
+            };
+            if gn > 0 && (!(801..=804).contains(&smid) || !(1..=4).contains(&onb)) {
+                let empty = island_alloc_init(env, "NSMutableArray");
+                if empty != nil {
+                    let ssg = island_sel(env, "setShowGiftsList:");
+                    let _: () = msg_send(env, (obj, ssg, empty));
+                    release(env, empty);
+                    let ssm = island_sel(env, "setSearchMapId:");
+                    let _: () = msg_send(env, (obj, ssm, 0i32));
+                    let sob = island_sel(env, "setOnBoardMoleNum:");
+                    let _: () = msg_send(env, (obj, sob, 0i32));
+                    let sis = island_sel(env, "setIsSailing:");
+                    let _: () = msg_send(env, (obj, sis, false));
+                    let sbd = island_sel(env, "setBeginDiscoverTime:");
+                    let _: () = msg_send(env, (obj, sbd, 0.0f64));
+                    log!(
+                        "[MOLECHEAT] island: 船礼物校验复位(待领 {} 件,但 searchMapId={} onBoard={} 配不上 240_0.dat 奖励行)→ 清空礼物/航线/人数、isSailing=0,船回到可出海态",
+                        gn,
+                        smid,
+                        onb
+                    );
+                    continue;
+                }
+            }
+        }
         if sailing != 0 && begin <= 0.0 && (smid < 1 || onb <= 0) {
             let set = island_sel(env, "setIsSailing:");
             let _: () = msg_send(env, (obj, set, false));
@@ -2700,6 +4123,391 @@ fn fix_stuck_ships(env: &mut Environment) {
             );
         }
     }
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 进岛读档后收敛「超前」的计时起点(由 island_after_layout_ready 调用,读档岛/默认岛两条分支都跑,
+/// 读档岛在 fix_stuck_ships 之后)。
+/// 病根:用过开发者「时间旅行」(偏移只在进程内、重启归零)或宿主系统时间回拨过的会话,会把「未来」的起点写进岛档;
+///   重启后这几个字段原版【不自愈】,要等现实时间追上才恢复:
+///   · TMMapDataShip.beginDiscoverTime/beginFixTime:-[DiscoveryShip checkIsDiscoverFinished] 0x361e4e vsub + 0x361e56 vcmpe + blt
+///     (now−begin < 时长就不完成),没有负差重置 → 船永远停在海上点不动 / 修船进度条永远不动;
+///   · NewSceneUserInfoData.curQuestResult(打工类任务 questType 7 的开始时刻):-[NewSceneQuest update:] 0x329ef0 vsub +
+///     0x329ef4 vcmpe + 0x329efc bge,负差只在显示处钳 0(0x329efe-0x329f0c),完成要等 now−begin ≥ requireCount;
+///   · NpcData.lastCoolDownTime:-[YaliNpcActor checkCooltimeOver] 0x1b9934 vsub 后有符号比较、无重置,NPC 一直在冷却。
+/// 做法(移植者自拟的离线等价,语义同 Restaurant/Apartment 原版的「负差重置成 now」自愈):比「现在 + 60 秒」还晚的一律夹到「现在」,
+///   即从这一刻重新计时;每处 log!。60 秒容差防浮点/落盘抖动。判定用含时间旅行偏移的时钟,旅行会话内进岛不会误夹。
+///   · 船与打工任务走 NewSceneTimer(0x361e2a / 0x329eb4 取 getCurrentServerTime)→ 用单调的 now_cf_secs;
+///   · NPC 冷却直读 CFAbsoluteTimeGetCurrent(0x1b992a、-[NpcActor checkGiftMode:] 0xef9de,写入点 exitGiftMode: 0x1b9a6c
+///     同样取 CFAbsoluteTimeGetCurrent)→ 用墙钟 wall_cf_secs。
+///   刻意不推广到 Restaurant/Apartment/Shop:它们原版 innerupdate 自己会把负差重置成 now(0x31c20c、0x320c9e、0x31dc30),
+///   再夹一次会和原版逻辑打架、让在建/训练进度被清两次。curQuestResult 的计数型取值远小于阈值、4294967295 哨兵单独排除。
+///   只改 mapData 快照与岛 userInfo,不影响在线与主村。
+fn island_clamp_future_timestamps(env: &mut Environment) {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return;
+    }
+    let now = now_cf_secs();
+    let limit = now + 60.0;
+    let mut fixed = 0;
+    // ① 探险船:mapData 里的 TMMapDataShip 快照(此刻 DiscoveryShip 还没实例化,initWithMapData: 读的就是它)。
+    for (obj, cname) in island_all_objects(env) {
+        if cname != "TMMapDataShip" {
+            continue;
+        }
+        // 两个 getter 都是 d8@0:4、setter 都是 v16@0:4d8(objc 元数据核对)。
+        for (getter, setter, what) in [
+            ("beginDiscoverTime", "setBeginDiscoverTime:", "出海开始"),
+            ("beginFixTime", "setBeginFixTime:", "修船开始"),
+        ] {
+            if !env.objc.object_has_method_named(&env.mem, obj, getter)
+                || !env.objc.object_has_method_named(&env.mem, obj, setter)
+            {
+                continue;
+            }
+            let g = island_sel(env, getter);
+            let v: f64 = msg_send(env, (obj, g));
+            if v > limit {
+                let s = island_sel(env, setter);
+                let _: () = msg_send(env, (obj, s, now));
+                log!(
+                    "[MOLECHEAT] island: 未来时间戳收敛 TMMapDataShip.{}({})超前 {:.0} 秒 → 夹到现在 {:.0}",
+                    getter,
+                    what,
+                    v - now,
+                    now
+                );
+                fixed += 1;
+            }
+        }
+    }
+    let ui = island_userinfo_data(env);
+    if ui != nil {
+        // ② 打工类任务开始时刻(curQuestResult d8@0:4 / setCurQuestResult: v16@0:4d8)。
+        if env.objc.object_has_method_named(&env.mem, ui, "curQuestResult") {
+            let g = island_sel(env, "curQuestResult");
+            let v: f64 = msg_send(env, (ui, g));
+            if v > limit && v < 4294967295.0 {
+                let s = island_sel(env, "setCurQuestResult:");
+                let _: () = msg_send(env, (ui, s, now));
+                log!(
+                    "[MOLECHEAT] island: 未来时间戳收敛 岛任务 curQuestResult(打工开始时刻)超前 {:.0} 秒 → 夹到现在 {:.0}",
+                    v - now,
+                    now
+                );
+                fixed += 1;
+            }
+        }
+        // ③ NPC 冷却(NpcData lastCoolDownTime d8@0:4 / setLastCoolDownTime: v16@0:4d8),按墙钟判定。
+        let wall = wall_cf_secs();
+        let wall_limit = wall + 60.0;
+        let s_npcs = island_sel(env, "npcs");
+        let npcs: id = msg_send(env, (ui, s_npcs));
+        if npcs != nil && env.objc.object_has_method_named(&env.mem, npcs, "objectAtIndex:") {
+            let s_cnt = island_sel(env, "count");
+            let s_oai = island_sel(env, "objectAtIndex:");
+            let s_lcd = island_sel(env, "lastCoolDownTime");
+            let s_slcd = island_sel(env, "setLastCoolDownTime:");
+            let n: crate::mem::GuestUSize = msg_send(env, (npcs, s_cnt));
+            for i in 0..n {
+                let npc: id = msg_send(env, (npcs, s_oai, i));
+                if npc == nil
+                    || !env.objc.object_has_method_named(&env.mem, npc, "lastCoolDownTime")
+                    || !env.objc.object_has_method_named(&env.mem, npc, "setLastCoolDownTime:")
+                {
+                    continue;
+                }
+                let v: f64 = msg_send(env, (npc, s_lcd));
+                if v > wall_limit {
+                    let _: () = msg_send(env, (npc, s_slcd, wall));
+                    log!(
+                        "[MOLECHEAT] island: 未来时间戳收敛 NPC[{}].lastCoolDownTime 超前 {:.0} 秒 → 夹到现在 {:.0}",
+                        i,
+                        v - wall,
+                        wall
+                    );
+                    fixed += 1;
+                }
+            }
+        }
+    }
+    if fixed > 0 {
+        // 直接置脏(此刻还在加载、ON_ISLAND 未置,island_mark_dirty 会忽略;写法同 build_default_island_mapdata 新岛 newGame 段):
+        //   上岛后首个节拍就把收敛后的值写回岛档。否则本会话没有别的改动时盘上仍是未来值,一旦被强杀,下次进岛又从那一刻重新计时。
+        ISLAND_DIRTY.store(true, O);
+        log!("[MOLECHEAT] island: 未来时间戳收敛共 {} 处(从进岛这一刻重新计时)", fixed);
+    }
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 岛档快进的取值规则:只动「像 CF 绝对时间戳」的值——≥1e6 秒(CF 纪元下任何真实时刻
+/// 都远大于它)且 <4294967295(NewSceneQuest 等处的哨兵);0(未开始/冷却已结束)、旧的小基准值、时长/计数一律不动。
+/// 回拨后不低于 1(u32 字段 0 有「未开始」语义)。返回 None = 不改。
+fn island_ff_shift(v: f64, secs: f64) -> Option<f64> {
+    if !(v >= 1.0e6 && v < 4294967295.0) {
+        return None;
+    }
+    let nv = (v - secs).max(1.0);
+    if nv < v {
+        Some(nv)
+    } else {
+        None
+    }
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 岛档快进读盘:Documents/<fname> 不存在 → Ok(nil);存在但解档为 nil 或根对象不响应 `must`
+/// → Err(什么都不写、也不改名隔离,坏档留给下次进岛的读档流程按 #7 规则处理);成功 → Ok(根对象,解档器返回的自动释放对象)。
+fn island_ff_load(env: &mut Environment, fname: &str, must: &str) -> Result<id, String> {
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return Err(format!("取不到 {} 的存档路径(GameData 未就绪)", fname));
+    }
+    if !guest_file_exists(env, path) {
+        return Ok(nil);
+    }
+    let unarch_cls = env.objc.get_known_class("NSKeyedUnarchiver", &mut env.mem);
+    if unarch_cls == nil {
+        return Err("NSKeyedUnarchiver 不可用".to_string());
+    }
+    let s = island_sel(env, "unarchiveObjectWithFile:");
+    let root: id = msg_send(env, (unarch_cls, s, path));
+    if root == nil || !env.objc.object_has_method_named(&env.mem, root, must) {
+        return Err(format!(
+            "{} 存在但解档失败或格式不对(坏档/写残),为免覆盖不回拨;下次进岛时读档流程会自动隔离它",
+            fname
+        ));
+    }
+    Ok(root)
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 一份 mapData 形状的字典(key → NSArray<TMMapData>)里的全部对象,附精确类名。
+/// 与 island_all_objects 同构,区别是作用在岛档快进从盘上解出来的字典上(不碰 NewSceneData 的活表);值不是数组的条目跳过。
+fn island_ff_dict_objects(env: &mut Environment, md: id) -> Vec<(id, String)> {
+    let mut out = Vec::new();
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let ofk = island_sel(env, "objectForKey:");
+    let keys: id = msg_send(env, (md, ak));
+    if keys == nil {
+        return out;
+    }
+    let nk: crate::mem::GuestUSize = msg_send(env, (keys, cnt));
+    for ki in 0..nk {
+        let k: id = msg_send(env, (keys, oai, ki));
+        let arr: id = msg_send(env, (md, ofk, k));
+        if arr == nil || !env.objc.object_has_method_named(&env.mem, arr, "objectAtIndex:") {
+            continue;
+        }
+        let n: crate::mem::GuestUSize = msg_send(env, (arr, cnt));
+        for i in 0..n {
+            let obj: id = msg_send(env, (arr, oai, i));
+            if obj == nil {
+                continue;
+            }
+            let cls = crate::objc::ObjC::read_isa(obj, &env.mem);
+            let name = env.objc.get_class_name(cls).to_string();
+            out.push((obj, name));
+        }
+    }
+    out
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进(验证工具:开发工具页「岛档快进」按钮 / 文本命令 `island ff <分钟>`,
+/// 经 mole_dev::island_fast_forward_minutes 调用;UIKit 事件分派上下文,不在帧栈里,可以自由发宿主消息)。
+/// 背景:开发工具「对象计时快进」(-[TestLayer updateTime] 对活对象 setAccTime:)在岛上被拒,岛上的售卖/升级/出海/修船/
+///   公寓/打工任务全都没法无头验证;而直接改岛上的活对象也没用——离岛时 -[NewSceneData updateBeginTime]→setModObjectToServer:
+///   与我们的回写/节拍落盘会拿活对象把改动覆盖掉。所以反过来:在主村、离线、没有岛会话时,把【盘上】岛档里的绝对时间一律
+///   减 secs(等价于这段时间已经流逝),下次进岛读档时原版计时逻辑自己算出「已完成」。移植者自拟的调试工具,不是原版功能。
+/// 前置:离线;不在岛会话(进岛窗口/在岛/加载/离岛过渡都算);全部岛档坏档保护位为 0;两份岛档都能正常解档。
+///   任一不满足直接拒绝、什么都不写。校验通过后先调 mole_dev::snapshot_save 存一份快照(失败就不改),可用快照撤销。
+/// 回拨范围:
+///   · island_map.dat:ISLAND_TIME_FIELDS 列出的每个绝对时间字段(规则见 island_ff_shift);
+///   · island_userinfo.dat:curQuestResult(打工开始时刻,>1e6 且非哨兵才改)、npcs 各 NpcData.lastCoolDownTime;
+///   · 其余岛侧档由 island_ff_extras 各包自己回拨;
+///   · 主村主档里的出海冷却:DiscoveryShip.lastSailingTime(+448,L)由 -[DiscoveryShip initWithMapData:type:] 0x360a1c 从
+///     [[GameData sharedInstance] getLocalUserInfoDataFromGameData] 的 getLastDiscoverShipSailingTime(L8@0:4,
+///     attributeValue_[0xff000004])灌入,-[DiscoveryShip checkIsSailingAlready] 0x3610b0 用 now−lastSailingTime ≥ coolDownTime_
+///     判冷却结束 → 同样回拨,写回用 setDiscoverShipSailingTime:(v12@0:4L8),再 -[GameData saveUserInfoData](v8@0:4)落盘。
+pub fn island_ff_offline(env: &mut Environment, secs: f64) -> Result<String, String> {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return Err("在线模式下岛上进度以服务器为准,不能回拨岛档".to_string());
+    }
+    if island_session_active() {
+        return Err(
+            "黄金岛上不能快进岛档(离岛落盘会用岛上内存把改动覆盖掉),请回主村执行,下次进岛生效".to_string(),
+        );
+    }
+    if !(secs.is_finite() && secs >= 1.0) {
+        return Err("快进的秒数必须是正数".to_string());
+    }
+    let bad = ISLAND_LOAD_FAILED.load(O);
+    if bad != 0 {
+        return Err(format!(
+            "有岛档处于坏档保护中(保护位 {:#x}:本会话读档失败且未能隔离),为免覆盖不回拨",
+            bad
+        ));
+    }
+    // ① 先把两份岛档都读进来并校验,坏档直接拒绝(此时什么都还没写)。
+    let md = island_ff_load(env, "island_map.dat", "allKeys")?;
+    let ui = island_ff_load(env, "island_userinfo.dat", "objectForKey:")?;
+    if md == nil && ui == nil {
+        return Err("还没有岛档(没上过岛或删过档),没有可快进的计时".to_string());
+    }
+    // ② 改盘之前先存快照(主村时 snapshot_save 会先让游戏把主档/地图落盘),失败就不动。
+    let snap = crate::mole_dev::snapshot_save(env)
+        .map_err(|e| format!("回拨前保存快照失败:{},为安全起见没有改动岛档", e))?;
+    log!("[MOLECHEAT] island: 岛档快进 {} 秒:回拨前快照 → {}", secs, snap);
+    // island_sidecar_save 的摘要固定是「存盘 <文件>(ok=<bool>)」,归档失败返回 None。
+    let wrote = |r: &Option<String>| r.as_deref().map_or(false, |s| s.contains("ok=true"));
+    let mut failed: Vec<&str> = Vec::new();
+    // ③ island_map.dat:布局里各对象的绝对时间。
+    let mut map_n = 0;
+    if md != nil {
+        for (obj, cname) in island_ff_dict_objects(env, md) {
+            let Some((_, fields)) = ISLAND_TIME_FIELDS.iter().find(|(c, _)| *c == cname) else {
+                continue;
+            };
+            for &(getter, setter, is_double) in fields.iter() {
+                if !env.objc.object_has_method_named(&env.mem, obj, getter)
+                    || !env.objc.object_has_method_named(&env.mem, obj, setter)
+                {
+                    continue;
+                }
+                let g = island_sel(env, getter);
+                let st = island_sel(env, setter);
+                if is_double {
+                    let v: f64 = msg_send(env, (obj, g));
+                    if let Some(nv) = island_ff_shift(v, secs) {
+                        let _: () = msg_send(env, (obj, st, nv));
+                        log_dbg!("[MOLECHEAT] island: 岛档快进 {}.{} {} → {}", cname, getter, v, nv);
+                        map_n += 1;
+                    }
+                } else {
+                    let v: u32 = msg_send(env, (obj, g));
+                    if let Some(nv) = island_ff_shift(v as f64, secs) {
+                        let _: () = msg_send(env, (obj, st, nv as u32));
+                        log_dbg!("[MOLECHEAT] island: 岛档快进 {}.{} {} → {}", cname, getter, v, nv as u32);
+                        map_n += 1;
+                    }
+                }
+            }
+        }
+        if map_n > 0 {
+            let r = island_sidecar_save(env, "island_map.dat", ISLAND_FILE_MAP, md);
+            if !wrote(&r) {
+                failed.push("island_map.dat");
+            }
+        }
+    }
+    // ④ island_userinfo.dat:打工开始时刻与 NPC 冷却。根字典先 mutableCopy(+1,归档后 release),npcs 数组里的 NpcData 原地改。
+    let mut ui_n = 0;
+    if ui != nil {
+        let mc = island_sel(env, "mutableCopy");
+        let mu: id = msg_send(env, (ui, mc));
+        if mu != nil {
+            let ofk = island_sel(env, "objectForKey:");
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "curQuestResult");
+            let num: id = msg_send(env, (mu, ofk, k));
+            if num != nil && env.objc.object_has_method_named(&env.mem, num, "doubleValue") {
+                let dv = island_sel(env, "doubleValue");
+                let v: f64 = msg_send(env, (num, dv));
+                if let Some(nv) = island_ff_shift(v, secs) {
+                    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+                    let nwd = island_sel(env, "numberWithDouble:");
+                    let nn: id = msg_send(env, (num_cls, nwd, nv)); // 自动释放,放进字典后不 release
+                    let sfk = island_sel(env, "setObject:forKey:");
+                    let _: () = msg_send(env, (mu, sfk, nn, k));
+                    log_dbg!("[MOLECHEAT] island: 岛档快进 curQuestResult {} → {}", v, nv);
+                    ui_n += 1;
+                }
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "npcs");
+            let npcs: id = msg_send(env, (mu, ofk, k));
+            if npcs != nil && env.objc.object_has_method_named(&env.mem, npcs, "objectAtIndex:") {
+                let s_cnt = island_sel(env, "count");
+                let s_oai = island_sel(env, "objectAtIndex:");
+                let s_lcd = island_sel(env, "lastCoolDownTime");
+                let s_slcd = island_sel(env, "setLastCoolDownTime:");
+                let n: crate::mem::GuestUSize = msg_send(env, (npcs, s_cnt));
+                for i in 0..n {
+                    let npc: id = msg_send(env, (npcs, s_oai, i));
+                    if npc == nil
+                        || !env.objc.object_has_method_named(&env.mem, npc, "lastCoolDownTime")
+                        || !env.objc.object_has_method_named(&env.mem, npc, "setLastCoolDownTime:")
+                    {
+                        continue;
+                    }
+                    let v: f64 = msg_send(env, (npc, s_lcd));
+                    if let Some(nv) = island_ff_shift(v, secs) {
+                        let _: () = msg_send(env, (npc, s_slcd, nv));
+                        ui_n += 1;
+                    }
+                }
+            }
+            if ui_n > 0 {
+                let r = island_sidecar_save(env, "island_userinfo.dat", ISLAND_FILE_USERINFO, mu);
+                if !wrote(&r) {
+                    failed.push("island_userinfo.dat");
+                }
+            }
+            release(env, mu);
+        }
+    }
+    // ⑤ 其余岛侧档(仓库/咖啡馆/贝壳树)各自回拨。
+    island_ff_extras(env, secs);
+    // ⑥ 主村主档里的出海冷却起点。
+    let mut sail: Option<(u32, u32)> = None;
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    if gd_cls != nil {
+        let sh = island_sel(env, "sharedInstance");
+        let gd: id = msg_send(env, (gd_cls, sh));
+        if gd != nil {
+            let gl = island_sel(env, "getLocalUserInfoDataFromGameData");
+            let uid: id = msg_send(env, (gd, gl));
+            if uid != nil
+                && env.objc.object_has_method_named(&env.mem, uid, "getLastDiscoverShipSailingTime")
+                && env.objc.object_has_method_named(&env.mem, uid, "setDiscoverShipSailingTime:")
+            {
+                let g = island_sel(env, "getLastDiscoverShipSailingTime");
+                let v: u32 = msg_send(env, (uid, g));
+                if let Some(nv) = island_ff_shift(v as f64, secs) {
+                    let s = island_sel(env, "setDiscoverShipSailingTime:");
+                    let _: () = msg_send(env, (uid, s, nv as u32));
+                    let save = island_sel(env, "saveUserInfoData");
+                    let _: () = msg_send(env, (gd, save));
+                    sail = Some((v, nv as u32));
+                }
+            }
+        }
+    }
+    let sail_text = match sail {
+        Some((a, b)) => format!("出海冷却起点 {} → {}", a, b),
+        None => "出海冷却无需回拨".to_string(),
+    };
+    log!(
+        "[MOLECHEAT] island: 岛档快进 {} 秒 → island_map.dat {} 处 / island_userinfo.dat {} 处 / {}{}",
+        secs,
+        map_n,
+        ui_n,
+        sail_text,
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(" / ⚠️ 写盘失败:{}", failed.join("、"))
+        }
+    );
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} 写盘失败(其余已回拨,可用「快照:下次启动恢复」撤销)",
+            failed.join("、")
+        ));
+    }
+    Ok(format!(
+        "已把岛档计时回拨 {} 分钟(布局 {} 处、岛任务/NPC {} 处,{}),下次进岛生效;回拨前已存快照",
+        (secs / 60.0).round() as i64,
+        map_n,
+        ui_n,
+        sail_text
+    ))
 }
 
 /// [2026-09-16 黄金岛审查修 I5-01] 补发岛农场任务 4 的完成动作 action 13。
@@ -2766,13 +4574,176 @@ fn island_resend_quest4_action(env: &mut Environment) {
 /// [扫描修 2026-09-15] F10-6 以前每次落盘打 5 行(节拍 1 行 + 四个 save_* 各 1 行),建岛期间 1.5s 一组持续刷屏。
 ///   现在四个 save_* 只返回摘要,这里汇总成【一行】log!:`island: <reason> → 存盘 island_userinfo.dat(..) / 存盘 island_map.dat(..) / …`。
 ///   每个实际写入的文件名仍以「存盘 island_xxx.dat」原样出现(无头测试依赖该关键字);没写的文件不出现(与以前一致)。
+/// [2026-09-24 第四轮骨架] 通用岛侧档读档:Documents/<fname> 走 NSKeyedUnarchiver unarchiveObjectWithFile:。
+///   · 文件不存在 → 清保护位,返回 nil(正常无档,调用方按默认值处理);
+///   · 文件存在但解档为 nil → island_note_load_failure(改名隔离成 .corrupt;隔离失败则保持保护位、本会话不覆盖);
+///   · 成功 → 清保护位,返回根对象(解档器返回的是自动释放对象,调用方要长期持有就自己 retain 或拷贝)。
+///   与 island_map/userinfo/ships/fragments 四份老档同一口径。
+#[allow(dead_code)]
+fn island_sidecar_load(env: &mut Environment, fname: &str, bit: u32) -> id {
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return nil;
+    }
+    let unarch_cls = env.objc.get_known_class("NSKeyedUnarchiver", &mut env.mem);
+    if unarch_cls == nil {
+        return nil;
+    }
+    let s = island_sel(env, "unarchiveObjectWithFile:");
+    let loaded: id = msg_send(env, (unarch_cls, s, path));
+    if loaded == nil {
+        island_note_load_failure(env, path, bit, fname);
+        return nil;
+    }
+    island_note_load_ok(bit);
+    loaded
+}
+
+/// [2026-09-24 第四轮骨架] 通用岛侧档落盘:保护位置位时先问 island_save_blocked(原路径仍是未隔离的坏档就跳过),
+///   再 archivedDataWithRootObject: + writeToFile:atomically:YES。返回落盘摘要「存盘 xxx.dat(ok=..)」供 island_flush 汇总;
+///   root 为 nil 或归档失败返回 None。成功只打 log_dbg!,ok=false 用 log!(与四份老档一致)。root 的所有权不变(不 release)。
+#[allow(dead_code)]
+fn island_sidecar_save(env: &mut Environment, fname: &str, bit: u32, root: id) -> Option<String> {
+    if (ISLAND_LOAD_FAILED.load(O) & bit) != 0 {
+        let p = island_data_path(env, fname);
+        if island_save_blocked(env, p, bit, fname) {
+            return None;
+        }
+    }
+    if root == nil {
+        return None;
+    }
+    let arch_cls = env.objc.get_known_class("NSKeyedArchiver", &mut env.mem);
+    if arch_cls == nil {
+        return None;
+    }
+    let arch_s = island_sel(env, "archivedDataWithRootObject:");
+    let data: id = msg_send(env, (arch_cls, arch_s, root));
+    if data == nil {
+        log!("[MOLECHEAT] island: 存盘 {} 失败(归档返回 nil)", fname);
+        return None;
+    }
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return None;
+    }
+    let write_s = island_sel(env, "writeToFile:atomically:");
+    let ok: bool = msg_send(env, (data, write_s, path, true));
+    if ok {
+        log_dbg!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
+    } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 新侧档同一口径:交给 island_flush 重新置脏并退避重试
+        log!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
+    }
+    Some(format!("存盘 {}(ok={})", fname, ok))
+}
+
+// ════════ [2026-09-24 第四轮骨架] 岛档统一挂钩点 ════════
+// 各实施包只在自己的「── [Kx] ──」槽位注释【下方】追加调用行,不改签名、不动别的槽位,也不删槽位注释
+// (槽位注释是合并锚点:相邻两包的插入之间隔着一行未改动的注释,git 合并不会冲突)。
+
+/// 进岛布局就绪挂钩:build_default_island_mapdata 两条分支(读档岛/默认岛)在 setMapData: 与 restore_seqid_cursor
+/// 之后、return true 之前各调一次。此刻 NewSceneData.mapData 已就位,时序早于 LoadingHoliday case3 的
+/// -[ObjectManager removeAllObjects](0x252f9e)与 loadNewScene→loadMapFromData→loadMapObjects,
+/// 也早于 CafeShop 两个 init(hasQuest 只在 init 算一次)与 HolidayVillageLayer onEnter 的 8 次 checkConditions:。
+/// 跑在 getAllObjectsListFromServerWithStartId: 臂内(该臂 return true 吞掉原方法),可以自由发宿主消息,不涉及 r0-r3。
+fn island_after_layout_ready(env: &mut Environment) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_after_layout_ready");
+    // ── [K4] 未来时间戳收敛 ──
+    island_clamp_future_timestamps(env); // [2026-09-24 第四轮 K4 I4-05] 船/打工任务/NPC 冷却的超前起点夹到现在
+    // ── [K9] 仓库/飞鸟/增强道具回灌 mapData 键 8/11/21 ──
+    island_storage_inject(env); // [2026-09-24 第四轮 K9] island_storage.dat → mapData,交给原版 loadMapObjects 回填
+    // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
+    island_cafe_restore_and_offer(env);
+    // ── [K11] 超级贝壳树侧档读入缓存 ──
+    island_shelltree_load(env); // [2026-09-24 第四轮 K11 I2-04]
+    // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
+    island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] island_misc.dat 读回岛成就累计计数与小游戏前三名
+    let _ = env;
+}
+
+/// 落盘前置挂钩:island_flush 在主档 saveUserinfoToLocal 之后、save_island_userinfo 之前调用。
+/// 此刻 ObjectManager 活表仍满载岛对象(unloadMap 尚未执行)。
+fn island_flush_prepare(env: &mut Environment) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_flush_prepare");
+    // ── [K9] 仓库/飞鸟/增强道具落盘 + 清掉读档时注入 mapData 的 8/11/21 键 ──
+    island_storage_flush(env); // [2026-09-24 第四轮 K9] 活表 → island_storage.dat,并移除注入键
+    let _ = env;
+}
+
+/// 落盘附加挂钩:island_flush 在 save_island_fragments 之后调用,返回各侧档的落盘摘要,并入 island_flush 的汇总日志。
+fn island_flush_extras(env: &mut Environment) -> Vec<String> {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_flush_extras");
+    #[allow(unused_mut)]
+    let mut out: Vec<String> = Vec::new();
+    // ── [K10] 咖啡馆 island_cafe.dat ──
+    if let Some(sum) = island_cafe_flush(env) {
+        out.push(sum);
+    }
+    // ── [K11] 超级贝壳树 island_shelltree.dat ──
+    out.extend(island_shelltree_flush(env)); // [2026-09-24 第四轮 K11 I2-04]
+    // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
+    out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01/I7-05] 只在岛上落盘,摘要并入汇总
+    let _ = &mut *env;
+    out
+}
+
+/// 岛档计时快进挂钩:K4 的 island_ff_offline 在回拨完 island_map.dat / island_userinfo.dat 之后调用,
+/// 各侧档把自己存的绝对时间按 secs 回拨(等价于这段时间已经流逝)。只在主村、离线、不在岛会话时被调用。
+#[allow(dead_code)]
+fn island_ff_extras(env: &mut Environment, secs: f64) {
+    log_dbg!("[MOLECHEAT] island: 挂钩 island_ff_extras(secs={})", secs);
+    // ── [K9] island_storage.dat 增强道具剩余时间 ──
+    island_storage_ff(env, secs); // [2026-09-24 第四轮 K9] savedAt 前拨 secs,下次进岛多扣这段剩余秒
+    // ── [K10] island_cafe.dat 已接打工类任务开始时刻 ──
+    island_cafe_ff(env, secs);
+    // ── [K11] island_shelltree.dat 倒计时起点 ──
+    island_shelltree_ff(env, secs); // [2026-09-24 第四轮 K11 I2-04]
+    let _ = env;
+}
+
 fn island_flush(env: &mut Environment, reason: &str) {
+    // [2026-09-24 第四轮 K3 I6-5] 本轮写盘失败标志先清(四个 save_* 与 island_sidecar_save 在 writeToFile:atomically: 返回 NO 时置位);
+    //   放在时间旅行闸之前:闸内提前返回时本轮"没有失败",末次落盘的当场重试不会被上一轮的旧标志误触发。
+    ISLAND_SAVE_FAILED.store(false, O);
+    // [2026-09-24 第五轮补挖 M-M6-1] 一进门就取走「跳过主档写」标志,任何早退都不会把它留给之后的节拍/离岛/生命周期落盘。
+    let skip_main_save = ISLAND_SKIP_MAIN_SAVE_ONCE.swap(false, O);
+    // [2026-09-24 第四轮 K3 I7-01] 时间旅行落盘闸:开发者「时间旅行」偏移(只增不减、只在本进程)期间,岛上所有计时
+    //   (TMMapDataShip.beginDiscoverTime/beginFixTime、TMMapDataShop.beginTime、TMMapDataRestaurant.beginUpgradeTime、
+    //   各 coolingTime、curQuestResult、NpcData.lastCoolDownTime 等)都是"未来"时刻;写进岛档后重启回到现实时间,
+    //   -[DiscoveryShip checkIsDiscoverFinished] 0x361e56 vcmpe + 0x361e5e blt.w 对未来起点恒判未完成(不像餐厅/公寓会把起点重置成 now),
+    //   cf_fix_residue 只修超前 15.5 年以上的残留 → 出海/NPC 冷却/打工任务长期卡死且不可逆。照 mole_items.rs on_enter_village
+    //   与 mole_activity 侧档的既有做法:旅行期间岛档只留在内存、不落盘。每次进岛 build_default_island_mapdata 都从磁盘读岛档,
+    //   所以离岛再进、或重启后,岛上进度都回到旅行前(离岛那次 startNewSceneFrom 10→1 的落盘同样被本闸跳过)。
+    //   · 放在置 FLUSHING / 清 DIRTY 之前:不清 DIRTY、不更新 ISLAND_LAST_FLUSH(旅行只在重启时结束,留给那之后);
+    //   · 节拍因此每拍都会走到这里(due 恒真),日志只在第一次打(偏移只增不减,一次就够),本分支零消息;
+    //   · 有意连开头那次 [NewSceneData saveUserinfoToLocal](主档)也一起跳过:游戏自己的存档路径(add*InNewScene: 等)照常写主档,
+    //     这里只是不再额外触发,不是漏写。四个 save_island_* 只有本函数一个调用点,不再各加重复闸。
+    let tt_offset = crate::libc::time::time_offset_secs();
+    if tt_offset != 0 {
+        if !ISLAND_TT_SKIP_LOGGED.swap(true, O) {
+            log!(
+                "[MOLECHEAT] island: 时间旅行中不保存岛档(偏移 {} 秒,{}):岛上进度只留在内存,离岛再进或重启后都回到旅行前",
+                tt_offset,
+                reason
+            );
+        }
+        return;
+    }
+    // [2026-09-24 第四轮 K3 N-D6-1] 整轮落盘与合并各自计时,log_dbg! 打出来供改前改后对比(大岛铺路场景)。
+    let t_flush = Instant::now();
     // 先清脏标记:落盘过程中若又有新变化(理论上 merge/归档本身不会触发),会重新置脏、下个节拍再存。
     ISLAND_FLUSHING.store(true, O);
     ISLAND_DIRTY.store(false, O);
     // 先让游戏自己把主存档(经济/等级)落盘,再存我们的岛档。注:saveUserinfoToLocal@0x21dcac 归档的是【主村】
     // UserInfoData(GameData.userInfoData_),与岛 NewSceneUserInfoData 无关,岛进度由下面 save_island_userinfo 负责。
-    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    // [2026-09-24 第五轮补挖 M-M6-1] 关键操作即时落盘且本批原版已经自己存过主档(见 ISLAND_BATCH_MAIN_SAVED)→ 不再重复写。
+    let nsd_cls = if skip_main_save {
+        log_dbg!("[MOLECHEAT] island: {}:本批原版已存过主档,跳过重复的 saveUserinfoToLocal", reason);
+        nil
+    } else {
+        env.objc.get_known_class("NewSceneData", &mut env.mem)
+    };
     if nsd_cls != nil {
         let sh = env
             .objc
@@ -2785,16 +4756,42 @@ fn island_flush(env: &mut Environment, reason: &str) {
             let _: () = msg_send(env, (nsd, save_ui));
         }
     }
+    // [2026-09-24 第四轮骨架] 落盘前置挂钩(活表仍满载,见函数注释)。
+    island_flush_prepare(env);
     let s_ui = save_island_userinfo(env);
     // ★必须在真 startNewSceneFrom→unloadMap 清空 ObjectManager 活表【之前】,此刻活表满载岛对象。
+    let t_merge = Instant::now();
     let merged = merge_new_island_objects_into_mapdata(env);
+    let merge_ms = t_merge.elapsed().as_secs_f64() * 1000.0;
     let s_map = save_island_map(env);
     let s_ships = save_island_ships(env);
     let s_frag = save_island_fragments(env);
+    // [2026-09-24 第四轮骨架] 新侧档落盘挂钩,摘要并入下面的汇总日志。
+    let extras = island_flush_extras(env);
     ISLAND_LAST_FLUSH.with(|c| c.set(Some(Instant::now())));
     ISLAND_FLUSHING.store(false, O);
     // [扫描修 2026-09-15] F10-6 汇总成一行(见函数注释)。
-    let parts: Vec<String> = [s_ui, s_map, s_ships, s_frag].into_iter().flatten().collect();
+    let mut parts: Vec<String> = [s_ui, s_map, s_ships, s_frag].into_iter().flatten().collect();
+    parts.extend(extras);
+    // [2026-09-24 第四轮 K3 I6-5] 有岛档写盘失败(writeToFile:atomically: 返回 NO;坏档保护的跳过返回 None、不算失败):
+    //   以前 DIRTY 已在开头清掉、调用方又不看返回值,失败后只剩日志,要等玩家恰好再产生一次变化才会重写 → 留下错版组合。
+    //   现在重新置脏,让节拍在 10 秒后自动重试(退避:别每 1.5 秒重跑一次含主档 AES 加密的整套落盘)。
+    //   不做"任一档失败就跳过后续档":四个文件各自 tmp+rename 原子写,userinfo 已先写成功时跳过 map/ships/fragments 只会扩大损失面;
+    //   也不做跨档代号/按最旧一代回滚(fragments 为空时按设计不写文件,代号天然落后,按最旧一代为准等于每次进岛回滚真实进度)。
+    let failed = ISLAND_SAVE_FAILED.load(O);
+    let failed_names = if failed {
+        island_failed_file_names(&parts)
+    } else {
+        String::new()
+    };
+    if failed {
+        ISLAND_DIRTY.store(true, O);
+        ISLAND_RETRY_AFTER
+            .with(|c| c.set(Some(Instant::now() + std::time::Duration::from_secs(ISLAND_RETRY_BACKOFF_SECS))));
+    } else {
+        ISLAND_RETRY_AFTER.with(|c| c.set(None));
+    }
+    ISLAND_FAILED_FILES.with(|c| *c.borrow_mut() = failed_names.clone());
     let body = if parts.is_empty() {
         "本次没有需要写入的岛档".to_string()
     } else {
@@ -2804,6 +4801,335 @@ fn island_flush(env: &mut Environment, reason: &str) {
         log!("[MOLECHEAT] island: {} → {}(合并新放置建筑 {} 个)", reason, body, merged);
     } else {
         log!("[MOLECHEAT] island: {} → {}", reason, body);
+    }
+    if failed {
+        log!(
+            "[MOLECHEAT] island: 岛档写盘失败({})→ 已重新标记为未保存,节拍 {} 秒后自动重试",
+            failed_names,
+            ISLAND_RETRY_BACKOFF_SECS
+        );
+    }
+    log_dbg!(
+        "[MOLECHEAT] island: island_flush 耗时 {:.1} ms(其中合并新放置 {:.1} ms)",
+        t_flush.elapsed().as_secs_f64() * 1000.0,
+        merge_ms
+    );
+}
+
+/// [2026-09-24 第四轮 K3 I7-01] 「时间旅行中不保存岛档」日志是否已打过(本进程只打一次,见 island_flush 开头)。
+static ISLAND_TT_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I6-5] 当前这轮 island_flush 里有岛档 writeToFile:atomically: 返回 NO。
+/// island_flush 开头清零;四个 save_island_* 与 island_sidecar_save 在 ok==false 分支置位;坏档保护的跳过(返回 None)不算。
+static ISLAND_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K3 I6-5] 写盘失败后节拍重试的退避秒数。
+const ISLAND_RETRY_BACKOFF_SECS: u64 = 10;
+thread_local! {
+    /// [2026-09-24 第四轮 K3 I6-5] 写盘失败后,节拍/即时落盘最早在这个时刻之后才重试(None = 不退避)。
+    static ISLAND_RETRY_AFTER: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// [2026-09-24 第四轮 K3 I6-5] 最近一轮 island_flush 写失败的文件名(顿号分隔,空 = 没失败),供末次落盘重试打日志。
+    static ISLAND_FAILED_FILES: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 从 island_flush 的落盘摘要里挑出 ok=false 的文件名。摘要格式统一是
+/// 「存盘 <文件名>(…ok=false)」(四个 save_island_* 与 island_sidecar_save),取「存盘 」之后、第一个括号之前。
+fn island_failed_file_names(parts: &[String]) -> String {
+    let names: Vec<&str> = parts
+        .iter()
+        .filter(|p| p.contains("ok=false"))
+        .map(|p| {
+            let s = p.strip_prefix("存盘 ").unwrap_or(p.as_str());
+            s.split(['(', '(']).next().unwrap_or(s)
+        })
+        .collect();
+    if names.is_empty() {
+        "未知文件".to_string()
+    } else {
+        names.join("、")
+    }
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 写盘失败的退避期是否已过(节拍 due 判定与关键操作即时落盘都看它)。
+fn island_retry_ready() -> bool {
+    ISLAND_RETRY_AFTER
+        .with(|c| c.get())
+        .map_or(true, |t| Instant::now() >= t)
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 末次落盘(离岛 startNewSceneFrom 10→1、应用失活/进后台/终止):这之后不会再有节拍替它重试
+/// (离岛后 ON_ISLAND 清零;进后台后线程挂起;终止后进程退出),所以有文件写失败时当场重试一次(不看退避),
+/// 仍失败就把文件名打进 log!。重试也跑整套 island_flush:各档幂等,且与节拍重试同一条路径,不另起一套写法。
+fn island_flush_final(env: &mut Environment, reason: &str) {
+    island_flush(env, reason);
+    if !ISLAND_SAVE_FAILED.load(O) {
+        return;
+    }
+    let names = ISLAND_FAILED_FILES.with(|c| c.borrow().clone());
+    log!(
+        "[MOLECHEAT] island: {} 有岛档写盘失败({})→ 末次落盘,当场重试一次",
+        reason,
+        names
+    );
+    island_flush(env, &format!("{}·重试", reason));
+    if ISLAND_SAVE_FAILED.load(O) {
+        let names = ISLAND_FAILED_FILES.with(|c| c.borrow().clone());
+        log!(
+            "[MOLECHEAT] island: {} 重试后仍写盘失败({}):这些岛档保持上一次成功写入的内容",
+            reason,
+            names
+        );
+    }
+}
+
+/// [2026-09-24 第四轮 K3 I7-02/I9-06] 应用生命周期后置落盘:由 frameworks/uikit/ui_application.rs 在
+/// send_will_resign_active / send_did_enter_background 的 pool drain 之前、exit() 的 WillTerminate 通知之后直接调用
+/// ——此刻委托回调与对应通知都已发完:-[iMoleVillageAppDelegate applicationWillResignActive:]@0xfdb8 在 0x10102 调的
+/// [NewSceneData updateBeginTime](0x21f49c)已让各岛对象在 onApplicationWillResignActive 里 setModObjectToServer: 回写进
+/// mapData(商铺 0x32050a/0x3205de、Building 0xb2c74、DiscoveryShip 0x36103e),这时落盘才收得全。
+/// 宿主直接调用、不在 intercept 里:零重入(不经 objc_msgSend 拦截)、不涉及 r0-r3 快照。
+/// 门控:离线岛总闸开、非在线模式、在岛上(离岛过渡/进岛加载中不写,离岛那次已在 startNewSceneFrom 10→1 臂落过)。
+/// only_if_dirty:失活那次无条件落(与原来退出落盘一致,顺带收下不经置脏路径的活对象字段);进后台/终止紧跟在失活之后,
+///   只在这之间又有变化(或上一轮失败被重新置脏)时再落,免得同一时刻连写两三遍。失败时 island_flush_final 当场重试一次。
+pub fn island_lifecycle_flush(env: &mut Environment, reason: &str, only_if_dirty: bool) {
+    if !ENABLE_NEWSCENE_ISLAND.load(O)
+        || env.options.network_access
+        || ONLINE_MODE.load(O)
+        || !ON_ISLAND.load(O)
+        || ISLAND_FLUSHING.load(O)
+    {
+        return;
+    }
+    if only_if_dirty && !ISLAND_DIRTY.load(O) {
+        return;
+    }
+    island_flush_final(env, reason);
+}
+
+/// [2026-09-24 第四轮 K3 I5-04] 「关键操作即时落盘」已排队(moleIslandFlushNow 还没触发)。置位期间不再重复排队,
+/// 由 moleIslandFlushNow 臂(或岛功能总闸关闭时的兜底)清零。
+static ISLAND_FLUSH_NOW_PENDING: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第五轮补挖 M-M6-1] 本批即时落盘排队之后,原版是否已经自己存过主档(且之后没有再改主村 UserInfoData)。
+///   原版 -[NewSceneData addGoldInNewScene:]@0x21f748 在 0x21f7a2、addXpInNewScene: 在 0x21f6fe 各自立即 saveUserinfoToLocal,
+///   addVipGoldInNewScene: 在 0x21f65a 经 saveUserinfoBothInLocalAndRemote 转调同一方法;这时 island_flush 开头再存一次主档
+///   (整份 UserInfoData 归档 + AES 加密写盘)纯属重复。由置脏臂维护:排队时清零,之后见到 NewSceneData saveUserinfoToLocal
+///   置 1,再见到主村 UserInfoData 的 add*/set* 清零(改了还没存)。
+static ISLAND_BATCH_MAIN_SAVED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第五轮补挖 M-M6-1] 下一次 island_flush 跳过开头那次主档写(只由 moleIslandFlushNow 臂在确认本批已存过主档时置位,
+///   island_flush 一进门就取走并清零,早退路径也不会留给后面的节拍/离岛落盘)。
+static ISLAND_SKIP_MAIN_SAVE_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I5-04] 这条消息是不是「关键操作」:原版在这些点上已经【立即】写了主档(或改了只存在岛档里的进度指针),
+/// 岛档却要等节拍(每秒一拍、距上次 ≥1.5 秒)才写,窗口内强杀就会出现"钱扣了/奖励领了、岛上没变"或任务指针回滚可重复领奖。
+///   · -[NewSceneData addGoldInNewScene:]@0x21f748 → 0x21f7a2 saveUserinfoToLocal;addVipGoldInNewScene:@0x21f600 → 0x21f65a
+///     saveUserinfoBothInLocalAndRemote;addXpInNewScene:@0x21f6a4 同样立即存主档;addBuildValueInNewScene:@0x21f7cc 本身不存,人气值只靠岛档。
+///     调用方含 -[NewSceneQuest postFinish]@0x32a2a0(0x32a30e rewardXP:vipGold:buildValue: 先发奖,0x32a334 才 setCurQuestId:0)、
+///     -[NewScenePorter finishBuild:] 扣款 0x26d428/0x26d502、商铺进货 -[NewSceneShop showCostGold:] 等。
+///   · -[NewSceneUserInfoData setCurQuestId:/setNextQuestId:/setExtendMap:]:任务指针与扩地(0x25c28a)只存在 island_userinfo.dat。
+///   · -[NetworkManager addObjectToServer:]:新放置建筑(finishBuild: 0x26d790、finishEdit 0x26fc98 等)要靠落盘时的合并才进 mapData。
+fn island_is_key_op(class: &str, sel: &str) -> bool {
+    match class {
+        "NewSceneData" => matches!(
+            sel,
+            "addGoldInNewScene:"
+                | "addVipGoldInNewScene:"
+                | "addXpInNewScene:"
+                | "addBuildValueInNewScene:"
+        ),
+        "NewSceneUserInfoData" => matches!(sel, "setCurQuestId:" | "setNextQuestId:" | "setExtendMap:"),
+        "NetworkManager" => sel == "addObjectToServer:",
+        // [2026-09-24 第五轮补挖 M-M1-2] 岛日常领奖/小游戏直调主村 UserInfoData 发奖(不经 add*InNewScene:,原版不当场存主档,
+        //   而 map.dat 已当场记为领过):排一次即时落盘,island_flush 开头的 saveUserinfoToLocal 把奖励写进 userinfo.dat。
+        "UserInfoData" => matches!(sel, "addGold:" | "addXp:"),
+        _ => false,
+    }
+}
+
+/// [2026-09-24 第五轮补挖 M-M3-1] 「全物品解锁」放开岛物品门槛锁时,照原版 -[NewSceneData getLockType4Object:]@0x21e560 尾段补算余额锁:
+///   0x21ec86 cost_gold≥1 且 0x21ecbc cost_gold > [[GameData sharedInstance].userInfoData gold] → 3;
+///   否则价格取 cost_vip_gold,0x21eb36 [self checkIsDiscountObj:objectId] 为真时取 0x21eb58/0x21eb68 折后 goodsPrice,
+///   0x21ed04 价格 > [[userInfoData vipGoldWithNewType] intValue] → 4;都够 → 0。签名:cost_gold/cost_vip_gold/gold i8@0:4、
+///   checkIsDiscountObj: c12@0:4i8、getDiscountObjInfoFormDiscountInfoList: @12@0:4L8、goodsPrice L8@0:4、vipGoldWithNewType @8@0:4。
+///   调用方(ALL_UNLOCK 臂)发完消息后 return true,只有 r0 有意义。
+fn allunlock_island_balance_lock(env: &mut Environment, nsd: id, obj: id, oid: i32) -> i32 {
+    let s_cg = island_sel(env, "cost_gold");
+    let cg: i32 = msg_send(env, (obj, s_cg));
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    if gd_cls == nil {
+        return 0;
+    }
+    let s_sh = island_sel(env, "sharedInstance");
+    let gd: id = msg_send(env, (gd_cls, s_sh));
+    let ui: id = if gd != nil {
+        let s_ui = island_sel(env, "userInfoData");
+        msg_send(env, (gd, s_ui))
+    } else {
+        nil
+    };
+    if ui == nil {
+        return 0;
+    }
+    if cg >= 1 {
+        let s_gold = island_sel(env, "gold");
+        let gold: i32 = msg_send(env, (ui, s_gold));
+        if cg > gold {
+            return 3;
+        }
+    }
+    let s_cv = island_sel(env, "cost_vip_gold");
+    let mut price: i32 = msg_send(env, (obj, s_cv));
+    let s_disc = island_sel(env, "checkIsDiscountObj:");
+    let disc: bool = msg_send(env, (nsd, s_disc, oid));
+    if disc {
+        let s_info = island_sel(env, "getDiscountObjInfoFormDiscountInfoList:");
+        let info: id = msg_send(env, (nsd, s_info, oid as u32));
+        if info != nil {
+            let s_gp = island_sel(env, "goodsPrice");
+            let gp: u32 = msg_send(env, (info, s_gp));
+            price = gp as i32;
+        }
+    }
+    let s_vg = island_sel(env, "vipGoldWithNewType");
+    let vg: id = msg_send(env, (ui, s_vg));
+    let have: i32 = if vg != nil {
+        let s_iv = island_sel(env, "intValue");
+        msg_send(env, (vg, s_iv))
+    } else {
+        0
+    };
+    if price > have {
+        4
+    } else {
+        0
+    }
+}
+
+/// [2026-09-24 第四轮 集成补漏] 咖啡馆许愿任务三张本地表(island_cafe.dat,K10)的写入点也要置脏。
+/// 根因:接任务 -[NewSceneData addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:]@0x220478、
+///   进度 modAcceptNotifyQuestData:withRequireThingsCount:@0x220d08、交任务 deleteAcceptedNotifyQusetFromLocalList:@0x220848
+///   (内部转 updateUnrewardNotifyQuest:andCurrentRewardObjectID:@0x2212f0)、领奖 deleteUnrewardNotifyQuest:@0x221104 /
+///   addFinishedNotifyQuestWithQuestId:@0x22219c 都只改内存表,原版随即发包给服务器;离线包被吞,又不经过任何置脏方法,
+///   只接一条收获类任务、不做别的操作就被强杀,这次接取与进度会丢。只置脏,不排即时落盘(领奖发的经验/摩尔豆本身走
+///   add*InNewScene: 已是关键操作)。
+fn island_is_cafe_table_op(sel: &str) -> bool {
+    matches!(
+        sel,
+        "addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:"
+            | "modAcceptNotifyQuestData:withRequireThingsCount:"
+            | "deleteAcceptedNotifyQusetFromLocalList:"
+            | "updateUnrewardNotifyQuest:andCurrentRewardObjectID:"
+            | "updateUnrewardNotifyQuest:andUnrewardObjectsIds:"
+            | "deleteUnrewardNotifyQuest:"
+            | "addFinishedNotifyQuestWithQuestId:"
+    )
+}
+
+/// [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘:把 [GameManager moleIslandFlushNow] 用 performSelector:withObject:afterDelay:0
+/// 排到运行循环的 perform 相位——在当前这条游戏调用栈整个返回之后才跑,postFinish 后续的 setCurQuestId:0/setCurQuestResult:、
+/// finishBuild: 之后的 addObjectToServer: 等都已完成,一次写盘全收;窗口从 ≤2.5 秒缩到约一帧。
+/// 不复用 moleIslandTick(会被 <600ms 的重复节拍去重吞掉),也不拦 saveUserinfoBothInLocalAndRemote(同步写盘会卡在游戏方法中段)。
+/// 由置脏臂调用(之后还要放行真方法):这里发了宿主消息,必须整体快照/恢复 r0-r3,否则真方法会拿上一次 msg_send 的返回值当 self。
+/// 只发 sharedManager 与 performSelector 两条轻量消息(afterDelay 是宿主实现,只登记 perform 请求,不同步跑任何游戏逻辑)。
+fn island_request_flush_now(env: &mut Environment) {
+    // 落盘过程中(island_flush 自己会触发 add*/set*)不排;时间旅行中落盘闸反正不写,也不排。
+    if ISLAND_FLUSHING.load(O) || crate::libc::time::time_offset_secs() != 0 {
+        return;
+    }
+    if ISLAND_FLUSH_NOW_PENDING.swap(true, O) {
+        return; // 已经排过一次,这条调用栈返回后那一次会把本次变化一起写掉
+    }
+    ISLAND_BATCH_MAIN_SAVED.store(false, O); // [第五轮补挖 M-M6-1] 新批次:还没看到原版存主档
+    let saved = [
+        env.cpu.regs()[0],
+        env.cpu.regs()[1],
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+    ];
+    let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+    let gm: id = if gm_cls != nil {
+        let smgr = island_sel(env, "sharedManager");
+        msg_send(env, (gm_cls, smgr))
+    } else {
+        nil
+    };
+    if gm == nil {
+        // 排不上就清掉排队标志,下次关键操作再试;这次的变化仍由节拍兜底。
+        ISLAND_FLUSH_NOW_PENDING.store(false, O);
+    } else {
+        let now_s = island_sel(env, "moleIslandFlushNow");
+        let perform = island_sel(env, "performSelector:withObject:afterDelay:");
+        let _: () = msg_send(env, (gm, perform, now_s, nil, 0.0f64));
+    }
+    env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+}
+
+/// [2026-09-24 第四轮 K3 I7-07] 岛档因坏档保护被禁写(原路径是解档失败、又没能改名隔离的坏档)时给玩家的一次性提示:
+/// island_save_blocked 首次跳过某文件时置位,由 moleIslandTick 在岛上弹原版 MessageBox 后清零。
+/// 以前只有一行日志,玩家整局照常玩、退出后岛上进度全没,而交任务的经验/贝壳已进主档,下次还能再领。
+static ISLAND_BLOCK_PROMPT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I7-07] 坏档保护位 → 文件名(提示里列出具体是哪几份)。
+const ISLAND_FILE_NAMES: [(u32, &str); 8] = [
+    (ISLAND_FILE_MAP, "island_map.dat"),
+    (ISLAND_FILE_USERINFO, "island_userinfo.dat"),
+    (ISLAND_FILE_SHIPS, "island_ships.dat"),
+    (ISLAND_FILE_FRAGMENTS, "island_fragments.dat"),
+    (ISLAND_FILE_STORAGE, "island_storage.dat"),
+    (ISLAND_FILE_CAFE, "island_cafe.dat"),
+    (ISLAND_FILE_SHELLTREE, "island_shelltree.dat"),
+    (ISLAND_FILE_MISC, "island_misc.dat"),
+];
+
+/// [2026-09-24 第四轮 K3 I7-07] 在岛上弹一次「岛档损坏且无法隔离,本次进度不会保存」。只在 moleIslandTick 臂里调用
+/// (宿主自排的选择子、perform 相位,栈上没有游戏方法体,不在 drawScene/mainLoop 帧栈上)。
+/// 调用序列照原版同类提示:[[MessageBox sharedInstance] showWithTarget:nil selector:0 title:nil message:msg type:6 vipgold:0]
+/// (type 6 只有「确定」、关框无回调),见 show_game_message_box。
+///   · 保护位已全部解除(玩家修好/删掉了文件,island_save_blocked 或读档已自愈)→ 不弹,直接清待提示;
+///   · 正有别的提示框在显示([mb parent] 非 nil,原版 -[MessageBox showWithTarget:…object:] 0xca672 此时直接返回、什么都不做)
+///     → 留着待提示,下一拍再试,免得这次提示被静默丢掉;
+///   · 不把 ISLAND_DIRTY 放回 true(否则每 1.5 秒重跑一次含主档 AES 的整套落盘);靠 island_save_blocked 已有的
+///     「原路径坏档没了就解除保护」在玩家下一次真实操作置脏时自愈。
+///   · 文案区分两种恢复方式:删掉文件 → 本会话下一次落盘时 island_save_blocked 发现原路径已空即解除保护(当场恢复);
+///     修好文件(原路径仍有文件)→ 本会话仍按保护跳过,要等下次进岛解档成功(island_note_load_ok)才解除。
+fn island_show_block_prompt(env: &mut Environment) {
+    let bits = ISLAND_LOAD_FAILED.load(O);
+    if bits == 0 {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        return;
+    }
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if mb_cls == nil {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        return;
+    }
+    let parent_s = island_sel(env, "parent");
+    let parent: id = msg_send(env, (mb, parent_s));
+    if parent != nil {
+        return; // 别的提示框还开着,下一拍再弹
+    }
+    let names: Vec<&str> = ISLAND_FILE_NAMES
+        .iter()
+        .filter(|(b, _)| (bits & *b) != 0)
+        .map(|(_, n)| *n)
+        .collect();
+    let text = format!(
+        "黄金岛存档文件损坏且无法隔离({}),本次岛上进度不会保存。删掉游戏 Documents 目录下对应的 .dat 文件后会自动恢复保存;修好文件则下次进岛时恢复。",
+        names.join("、")
+    );
+    let msg = crate::frameworks::foundation::ns_string::from_rust_string(env, text);
+    let shown = show_game_message_box(env, msg, 6, nil, SEL::null());
+    // MessageBox 只把文案 setString: 给自己的 CCLabelTTF(0xca6ee),不持有这个串 → 用完释放 from_rust_string 的 +1。
+    release(env, msg);
+    if shown {
+        ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
+        log!(
+            "[MOLECHEAT] island: 已弹「黄金岛存档文件损坏且无法隔离,本次岛上进度不会保存」提示({})",
+            names.join("、")
+        );
     }
 }
 
@@ -2895,7 +5221,495 @@ fn delete_island_object(env: &mut Environment, snap: id) {
     }
 }
 
+// ════════ [2026-09-24 第四轮 K9] 岛侧档 island_storage.dat:仓库(收纳箱)════════
+// 原版岛仓库挂在 ObjectManager 活对象上(goodsInStorage_,+296),持久化是【服务器权威】:
+//   · 写:收纳 -[NewSceneEditMenuLayer onChooseConfirm]@0x26a664(0x26a71e)与一键收纳 -[WrapperManager storeOnekey:]@0x392288
+//     (0x3923de)都调 -[ObjectManager addGoodsNumber:andCount:]@0x42ea0:键 [NSString stringWithFormat:@"%d",物品号]
+//     (0x42fde)→ 值 NSNumber 件数(0x42ff4 setObject:forKey:),随后 0x430f6 addStorageObjectToServerWithId:andCount: 上行
+//     (离线被 sendPacket:commandId: 吞掉)。取出 -[NewSceneEditMenuLayer onButtonOkSelected:] 0x2695de 本地 setValue:(n-1);
+//     取到只剩 0 件时改走 0x269846 removeObjectForKey: 直接删键(0x2695ca ble 分支)—— 岛会话内仓库的键会被删。
+//   · 读:1062 下发的 mapData 键 "11" → -[NewGameManager loadMapObjects:mapData:forNPC:] 跳表(tbh 表基 0x24234c,
+//     下标=键-1)→ 0x242ac4:枚举该字典 allKeys,[[NewSceneData sharedInstance] getObjectDataWithId:[键 intValue]] 非空
+//     就 [[[ObjectManager sharedManager] goodsInStorage] setObject:原值 forKey:原键](0x242be8,键值原样,无需伪造元素)。
+//   · 清:进岛 LoadingHoliday 0x252f9e unloadMap 与离岛 -[NewGameManager unloadMap] 0x2464f0 都走
+//     -[ObjectManager removeAllObjects],0x466ce 清空 goodsInStorage_。
+// 离线没有 1062 → 收纳进仓库的建筑(地图上已被 delete_island_object 删掉)退岛即连同买它的钱一起蒸发。
+// 做法(补全原版回包数据,让原版逻辑自己跑):落盘时从活表拷一份写 island_storage.dat;进岛布局就绪时把它放回
+// mapData["11"],由原版 loadMapObjects 在 case3 removeAllObjects 之后回填 —— 等价于服务器下发。
+// 不拦截任何原版方法;不做 recycledHouses(一键收纳只有 type 5 已建成房屋走 recycleHouseWithId:level:andNumber:@0x474cc,
+// 且 0x4753c 在 curSceneId==10 早退,而岛 propertyHV 580 件没有 type 5,岛上不可达)。
+// [2026-09-24 第四轮 K9 I3-04] 同一套路再管两样同样「挂在 ObjectManager、靠 1062 mapData 非数组键回灌」的岛状态:
+//   · 飞鸟 14182(15 贝壳,limit_count 1):-[NewSceneVillageMenuLayer addNewObject2Map:gift:] 0x25c198 addBird →
+//     0x25c1bc [ObjectManager addUnvisbleObject:2](@0x41f4c,对 unvisbleObjects_(+288,L)按位或),不产生地图对象。
+//     下发键 "8" → 跳表 0x242a66:[ObjectManager setUnvisbleObjects:[值 unsignedLongValue]](0x242abc,签名 v12@0:4L8);
+//     -[NewGameManager endLoadMap] 0x243a42 isHaveUnvisbleObject:2 成立才 0x243a66 addBird;限购 -[NewSceneData
+//     getLockType4Object:] 0x21e8ee 同一判据返回锁 6。removeAllObjects 0x46700 清零;该 ivar 的写入点只有 init / 按位或 /
+//     setter / removeAllObjects(槽 0xb03394 全部引用),岛会话内只增不减。NewSceneData.specialFlagBits_ 回主村被
+//     resetNewSceneDataExceptObjectData 0x21e060 清零,不能当源。
+//   · 增强道具 20201-20204(propertyHV type 28,wilt_time 10800/86400 秒):0x25c42a [ObjectManager addUnvisbleSpeedUpObject:]
+//     (@0x41f60)写 speedUpObjects_(+284):键 [NSNumber numberWithInt:物品号] → 值 [NSNumber numberWithInt:wilt_time]。
+//     -[CommonEffectController innerupdateMultipleObject:]@0x322a88 每秒(0x3229ec 间隔 1.0)把值减 1(间隔 >4s 再补扣
+//     流逝秒数),≤0 移除 —— 值就是剩余秒。下发键 "21" → 跳表 0x242e5e:[[WrapperManager sharedManager] currentGameMode]==1
+//     门(0x242e8c)过了才逐条回填 speedUpObjects,再 0x24300c setMultipleBegintime:getCurrentTime + 0x243024
+//     startMultipleObjects。removeAllObjects 0x46790 清空;全二进制没有 removeUnvisbleSpeedUpObject: 的调用点,只会到期移除。
+//     NewSceneData.multiToolsDic_ 离线恒空,不能当源。
+//   原版服务器按真实时间让加速卡过期,所以侧档另存落盘时刻 savedAt,读档时把「离岛期间流逝的秒数」从剩余秒里扣掉。
+
+/// [2026-09-24 第四轮 K9] 侧档文件名(坏档保护位 ISLAND_FILE_STORAGE,规则同其它岛档)。
+const ISLAND_STORAGE_FILE: &str = "island_storage.dat";
+/// [2026-09-24 第四轮 K9] 本次进岛 island_storage_inject 是否已跑完(已读过盘上侧档、把键交给了 mapData)。
+/// 没跑完就不落盘:那时 ObjectManager 活表里不是本岛会话回填出来的值,写下去会把盘上的仓库冲掉。
+static ISLAND_STORAGE_ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// [2026-09-24 第四轮 K9] 读档注入 mapData["11"] 的仓库键串。只用于本次进岛【首次落盘】时核对一次「原版回填了几种」
+    /// 并打日志,用完即清,【绝不】把活表里缺的键补回去:取出到 0 件时原版 0x269846 removeObjectForKey: 直接删键,
+    /// 「活表缺这个键」多半是玩家把它取光放回了地图,补回去就是凭空复制一份(可无限刷高价建筑)。键 11 的回填分支
+    /// 0x242ac4 没有 gameMode 之类的门,只逐条校验 getObjectDataWithId:,活表就是唯一可信来源。
+    static ISLAND_STORAGE_INJ_GOODS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// [2026-09-24 第四轮 K9] 上一次落盘内容摘要:变化时 log!,不变时 log_dbg!(节拍每 1.5s 可能落一次,防刷屏)。
+    static ISLAND_STORAGE_LAST_SUMMARY: RefCell<String> = const { RefCell::new(String::new()) };
+    /// [2026-09-24 第四轮 K9 I3-04] 读档注入 mapData["21"] 的增强道具:(注入时刻 now_cf, [(物品号, 注入时剩余秒)])。
+    /// 键 21 的回填有 currentGameMode==1 门(0x242e8c),门没过活表就是空的。落盘时活表里没有、按真实时间推算
+    /// 也还没到期的条目,按推算剩余秒原样带过去(保留旧值、不被空活表覆盖);活表里已有的说明回填成功,从这里删掉。
+    static ISLAND_STORAGE_INJ_SPEED: RefCell<(f64, Vec<(i32, i32)>)> = const { RefCell::new((0.0, Vec::new())) };
+}
+/// [2026-09-24 第四轮 K9 I3-04] 读档注入 mapData["8"] 的飞鸟等标志位。落盘时与活表按位或(该 ivar 岛会话内只增不减,
+/// 或上去只会补上万一没回填的位,不会复活玩家去掉的东西)。
+static ISLAND_STORAGE_INJ_UNV: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 K9 I3-04] 增强道具「回填没生效、保留旧值」这句 log! 每次进岛只打一次。
+static ISLAND_STORAGE_SPEED_WARNED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K9 I3-04] 推算剩余秒低于这个数就当作已到期(innerupdateMultipleObject: 每秒一跳,
+/// 留几秒余量吸收节拍抖动,免得把刚在游戏里正常到期的卡又带回去)。
+const ISLAND_STORAGE_SPEED_MARGIN: f64 = 5.0;
+
+/// [2026-09-24 第四轮 K9] obj 是否 isKindOfClass: <cls_name>(obj 为 nil 或类不存在返回 false)。读档校验用。
+fn island_storage_is_kind(env: &mut Environment, obj: id, cls_name: &str) -> bool {
+    if obj == nil {
+        return false;
+    }
+    let cls = env.objc.get_known_class(cls_name, &mut env.mem);
+    if cls == nil {
+        return false;
+    }
+    let s = island_sel(env, "isKindOfClass:");
+    msg_send(env, (obj, s, cls))
+}
+
+/// [2026-09-24 第四轮 K9] 从 mapData 移除本包读档时注入的非数组键(removeObjectForKey: 对不存在的键是空操作)。
+/// 目的:不让 save_island_map 把它们写进 island_map.dat,也不让本文件按「键 → 数组」遍历 mapData 的辅助函数
+/// (island_all_objects / island_find_by_seqid 等)长时间碰到非数组值。
+fn island_storage_strip_keys(env: &mut Environment, md: id) {
+    if md == nil {
+        return;
+    }
+    let rm = island_sel(env, "removeObjectForKey:");
+    for key in ["8", "11", "21"] {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let _: () = msg_send(env, (md, rm, k));
+    }
+}
+
+/// [2026-09-24 第四轮 K9 I3-01/I2-1] 进岛读档(island_after_layout_ready 的 K9 槽位调用):
+/// 读 island_storage.dat → goods 非空就把它的可变拷贝放进 [NewSceneData mapData]["11"]。
+/// 时序:此刻 mapData 刚 setMapData:,晚于它的是 LoadingHoliday case3 的 removeAllObjects(0x252f9e),再之后才是
+/// loadNewScene(0x240efa)→ -[NewGameManager loadMapFromData:forNPC:] 逐键调 loadMapObjects: 消费 —— 刚好不会被清掉。
+/// 键必须是 NSString(与 addGoodsNumber:andCount: 的 "%d" 键同型,否则之后加减件数对不上号)、值必须是 NSNumber
+/// (取出时 [值 intValue]);不符的条目丢弃。无档/坏档(已隔离或禁止覆盖)按空仓库处理。在线模式不生效。
+/// [2026-09-24 第四轮 K9 I3-04] 同时:unvisble≠0 → mapData["8"]=NSNumber(u32)(原版读 unsignedLongValue);
+/// speedUp 每项剩余秒减去 (now_cf − savedAt),不足 1 秒的丢弃,非空 → mapData["21"](键按原版 numberWithInt:物品号重建)。
+fn island_storage_inject(env: &mut Environment) {
+    ISLAND_STORAGE_ARMED.store(false, O);
+    ISLAND_STORAGE_INJ_GOODS.with(|c| c.borrow_mut().clear());
+    ISLAND_STORAGE_LAST_SUMMARY.with(|c| c.borrow_mut().clear());
+    ISLAND_STORAGE_INJ_UNV.store(0, O);
+    ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (0.0, Vec::new()));
+    ISLAND_STORAGE_SPEED_WARNED.store(false, O);
+    if env.options.network_access {
+        return;
+    }
+    let md = island_mapdata(env);
+    if md == nil {
+        return;
+    }
+    // 防御:mapData 是本次进岛新建/新读的,正常不会带这些键;万一旧档里混进来了,先清掉再按侧档重放。
+    island_storage_strip_keys(env, md);
+    let root = island_sidecar_load(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE);
+    if root == nil {
+        // 无档 = 从没存过;坏档 = island_sidecar_load 已改名隔离(隔离失败则保护位保持置位,落盘会被拦下)。
+        ISLAND_STORAGE_ARMED.store(true, O);
+        return;
+    }
+    if !island_storage_is_kind(env, root, "NSDictionary") {
+        log!("[MOLECHEAT] island: ⚠️ island_storage.dat 根对象不是字典 → 按无档处理(下次落盘会用当前内容覆盖)");
+        ISLAND_STORAGE_ARMED.store(true, O);
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let iv = island_sel(env, "intValue");
+    // ① 仓库 → mapData["11"]
+    let mut goods_total: i64 = 0;
+    let mut goods_snap: Vec<String> = Vec::new();
+    let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "goods");
+    let goods: id = msg_send(env, (root, ofk, gk));
+    if island_storage_is_kind(env, goods, "NSDictionary") {
+        let out = island_alloc_init(env, "NSMutableDictionary");
+        if out != nil {
+            let keys: id = msg_send(env, (goods, ak));
+            let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+            for i in 0..n {
+                let k: id = msg_send(env, (keys, oai, i));
+                let v: id = msg_send(env, (goods, ofk, k));
+                if !island_storage_is_kind(env, k, "NSString") || !island_storage_is_kind(env, v, "NSNumber") {
+                    continue;
+                }
+                let ks = crate::frameworks::foundation::ns_string::to_rust_string(env, k).into_owned();
+                let oid_ok = ks.parse::<i32>().map_or(false, |oid| oid > 0);
+                let c: i32 = msg_send(env, (v, iv));
+                // 件数 ≤0 的丢弃:原版取到 0 件就删键(0x269846),活表里本不会有 0 件条目,放回去只会在仓库列表里显示空格。
+                if !oid_ok || c <= 0 {
+                    continue;
+                }
+                // 键值原样放回(v 归 goods 字典所有,setObject:forKey: 自己 retain,这里不 release)。
+                let _: () = msg_send(env, (out, sfk, v, k));
+                goods_total += c as i64;
+                goods_snap.push(ks);
+            }
+            if !goods_snap.is_empty() {
+                let k11 = crate::frameworks::foundation::ns_string::get_static_str(env, "11");
+                let _: () = msg_send(env, (md, sfk, out, k11));
+            }
+            release(env, out); // alloc/init 的 +1:已被 mapData retain(或没放进去,直接释放)
+        }
+    }
+    let goods_kinds = goods_snap.len();
+    ISLAND_STORAGE_INJ_GOODS.with(|c| *c.borrow_mut() = goods_snap);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    // ② 飞鸟等标志位 → mapData["8"](原版 0x242aa8 取 unsignedLongValue,armv7 上 unsigned long 即 u32)
+    let uk = crate::frameworks::foundation::ns_string::get_static_str(env, "unvisble");
+    let unv_num: id = msg_send(env, (root, ofk, uk));
+    let mut unv: u32 = 0;
+    if island_storage_is_kind(env, unv_num, "NSNumber") {
+        let uiv = island_sel(env, "unsignedIntValue");
+        unv = msg_send(env, (unv_num, uiv));
+    }
+    if unv != 0 && num_cls != nil {
+        let nwu = island_sel(env, "numberWithUnsignedInt:");
+        let num: id = msg_send(env, (num_cls, nwu, unv));
+        let k8 = crate::frameworks::foundation::ns_string::get_static_str(env, "8");
+        let _: () = msg_send(env, (md, sfk, num, k8));
+        ISLAND_STORAGE_INJ_UNV.store(unv, O);
+    }
+    // ③ 增强道具 → mapData["21"]:剩余秒扣掉离岛期间真实流逝的时间
+    let now = now_cf_secs();
+    let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let saved_at: f64 = {
+        let sa: id = msg_send(env, (root, ofk, sak));
+        if island_storage_is_kind(env, sa, "NSNumber") {
+            let dv = island_sel(env, "doubleValue");
+            msg_send(env, (sa, dv))
+        } else {
+            0.0
+        }
+    };
+    // savedAt 缺失/非正/比现在还晚(时钟回拨)→ 不扣,宁可少扣也不把卡误判过期。
+    let elapsed = if saved_at > 0.0 && now > saved_at { now - saved_at } else { 0.0 };
+    let mut speed_snap: Vec<(i32, i32)> = Vec::new();
+    let mut speed_expired = 0;
+    let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+    let speed: id = msg_send(env, (root, ofk, spk));
+    if island_storage_is_kind(env, speed, "NSDictionary") && num_cls != nil {
+        let out = island_alloc_init(env, "NSMutableDictionary");
+        if out != nil {
+            let nwi = island_sel(env, "numberWithInt:");
+            let keys: id = msg_send(env, (speed, ak));
+            let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+            for i in 0..n {
+                let k: id = msg_send(env, (keys, oai, i));
+                let v: id = msg_send(env, (speed, ofk, k));
+                if !island_storage_is_kind(env, k, "NSNumber") || !island_storage_is_kind(env, v, "NSNumber") {
+                    continue;
+                }
+                let oid: i32 = msg_send(env, (k, iv));
+                let rem: i32 = msg_send(env, (v, iv));
+                if oid <= 0 || rem <= 0 {
+                    continue;
+                }
+                let left = rem as f64 - elapsed;
+                if left < 1.0 {
+                    speed_expired += 1;
+                    continue;
+                }
+                let left = left.floor() as i32; // left ≤ rem ≤ i32::MAX,不会溢出
+                let kn: id = msg_send(env, (num_cls, nwi, oid));
+                let vn: id = msg_send(env, (num_cls, nwi, left));
+                let _: () = msg_send(env, (out, sfk, vn, kn));
+                speed_snap.push((oid, left));
+            }
+            if !speed_snap.is_empty() {
+                let k21 = crate::frameworks::foundation::ns_string::get_static_str(env, "21");
+                let _: () = msg_send(env, (md, sfk, out, k21));
+            }
+            release(env, out); // alloc/init 的 +1:已被 mapData retain(或没放进去,直接释放)
+        }
+    }
+    let speed_n = speed_snap.len();
+    ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (now, speed_snap));
+    ISLAND_STORAGE_ARMED.store(true, O);
+    log!(
+        "[MOLECHEAT] island: 读回 island_storage.dat → 仓库 {} 种 {} 件(键 11)/ 飞鸟等标志 0x{:x}(键 8)/ 增强道具 {} 张(键 21,离岛流逝 {:.0} 秒,到期丢弃 {} 张),交给原版 loadMapObjects 回填",
+        goods_kinds,
+        goods_total,
+        unv,
+        speed_n,
+        elapsed,
+        speed_expired
+    );
+}
+
+/// [2026-09-24 第四轮 K9 I3-01/I2-1] 落盘(island_flush_prepare 的 K9 槽位调用;此刻 unloadMap 未跑、活表满载):
+/// 先把读档时注入 mapData 的键移除(此时 ON_ISLAND 已由 loadNewScene:10 置位,而原版在同一次 loadNewScene 里同步消费了
+/// 这些键,见 0x240efa → 0x245e96),再读 [[ObjectManager sharedManager] goodsInStorage] 做可变拷贝原样写 island_storage.dat
+/// (活表是唯一来源,不拿读档快照补键,原因见 ISLAND_STORAGE_INJ_GOODS)。只在「在岛上 + 本次进岛已读过侧档」时落盘;
+/// 在线模式不生效。
+/// [2026-09-24 第四轮 K9 I3-04] 另存 unvisble = [om unvisbleObjects] | 读档注入值、speedUp = [om speedUpObjects] 的拷贝
+/// (补上键 21 回填没生效、按真实时间又还没到期的读档条目)、savedAt = now_cf_secs()。
+fn island_storage_flush(env: &mut Environment) {
+    if env.options.network_access || !ON_ISLAND.load(O) || !ISLAND_STORAGE_ARMED.load(O) {
+        return;
+    }
+    let md = island_mapdata(env);
+    island_storage_strip_keys(env, md);
+    let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
+    if om_cls == nil {
+        return;
+    }
+    let sm = island_sel(env, "sharedManager");
+    let om: id = msg_send(env, (om_cls, sm));
+    if om == nil {
+        return;
+    }
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let mc = island_sel(env, "mutableCopy");
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let iv = island_sel(env, "intValue");
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwi = island_sel(env, "numberWithInt:");
+    // ① 仓库:活表的可变拷贝(+1)
+    let gis = island_sel(env, "goodsInStorage");
+    let live_goods: id = msg_send(env, (om, gis));
+    let goods: id = if live_goods != nil {
+        msg_send(env, (live_goods, mc))
+    } else {
+        island_alloc_init(env, "NSMutableDictionary")
+    };
+    if goods == nil {
+        release(env, root); // 拷贝失败就整次不写,绝不写出缺仓库的档
+        return;
+    }
+    let mut goods_kinds = 0;
+    let mut goods_total: i64 = 0;
+    if goods != nil {
+        // 本次进岛首次落盘:核对读档注入的键有几种在活表里,只打日志、不改数据(取走即清,之后的落盘不再核对)。
+        let snap = ISLAND_STORAGE_INJ_GOODS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if !snap.is_empty() {
+            let mut hit = 0usize;
+            for ks in &snap {
+                let k = crate::frameworks::foundation::ns_string::from_rust_string(env, ks.clone());
+                let cur: id = msg_send(env, (goods, ofk, k));
+                release(env, k); // from_rust_string 的 +1
+                if cur != nil {
+                    hit += 1;
+                }
+            }
+            if hit < snap.len() {
+                log!(
+                    "[MOLECHEAT] island: 仓库回填核对(本次进岛首次落盘):读档注入 {} 种,活表里现有其中 {} 种 —— 缺的若不是玩家已取光放回地图,就是原版 loadMapObjects 键 11 没回填(0x242ac4,请查)",
+                    snap.len(),
+                    hit
+                );
+            } else {
+                log_dbg!("[MOLECHEAT] island: 仓库回填核对:读档注入 {} 种全部在活表里", snap.len());
+            }
+        }
+        let keys: id = msg_send(env, (goods, ak));
+        let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+        for i in 0..n {
+            let k: id = msg_send(env, (keys, oai, i));
+            let v: id = msg_send(env, (goods, ofk, k));
+            if v != nil {
+                let c: i32 = msg_send(env, (v, iv));
+                goods_total += c as i64;
+            }
+        }
+        goods_kinds = n;
+        let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "goods");
+        let _: () = msg_send(env, (root, sfk, goods, gk));
+        release(env, goods); // mutableCopy / alloc-init 的 +1,已被 root retain
+    }
+    // ② [I3-04] 飞鸟等标志位:活表 unvisbleObjects(签名 L8@0:4 → u32)| 读档注入值
+    let uo = island_sel(env, "unvisbleObjects");
+    let live_unv: u32 = msg_send(env, (om, uo));
+    let unv = live_unv | ISLAND_STORAGE_INJ_UNV.load(O);
+    if num_cls != nil {
+        let nwu = island_sel(env, "numberWithUnsignedInt:");
+        let num: id = msg_send(env, (num_cls, nwu, unv));
+        let uk = crate::frameworks::foundation::ns_string::get_static_str(env, "unvisble");
+        let _: () = msg_send(env, (root, sfk, num, uk));
+    }
+    // ③ [I3-04] 增强道具:活表 speedUpObjects 的可变拷贝(+1),值 = 剩余秒;补上「回填没生效」的读档条目
+    let now = now_cf_secs();
+    let suo = island_sel(env, "speedUpObjects");
+    let live_speed: id = msg_send(env, (om, suo));
+    let speed: id = if live_speed != nil {
+        msg_send(env, (live_speed, mc))
+    } else {
+        island_alloc_init(env, "NSMutableDictionary")
+    };
+    if speed == nil {
+        release(env, root); // 同上:拷贝失败整次不写
+        return;
+    }
+    let mut speed_n: crate::mem::GuestUSize = 0;
+    let mut speed_carried = 0;
+    if speed != nil {
+        if num_cls != nil {
+            let (inj_t, snap) = ISLAND_STORAGE_INJ_SPEED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut keep: Vec<(i32, i32)> = Vec::new();
+            for (oid, rem) in snap {
+                let kn: id = msg_send(env, (num_cls, nwi, oid));
+                let cur: id = msg_send(env, (speed, ofk, kn));
+                if cur != nil {
+                    continue; // 原版已回填(之后到期由 innerupdateMultipleObject: 自己移除),不再跟踪
+                }
+                let left = rem as f64 - (now - inj_t).max(0.0);
+                if left < ISLAND_STORAGE_SPEED_MARGIN {
+                    continue; // 按真实时间也该到期了
+                }
+                let left = left.floor() as i32;
+                let vn: id = msg_send(env, (num_cls, nwi, left));
+                let _: () = msg_send(env, (speed, sfk, vn, kn));
+                speed_carried += 1;
+                keep.push((oid, rem));
+            }
+            ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (inj_t, keep));
+        }
+        if speed_carried > 0 && !ISLAND_STORAGE_SPEED_WARNED.swap(true, O) {
+            log!(
+                "[MOLECHEAT] island: ⚠️ 读档注入的增强道具有 {} 张没回填进活表(键 21 的 currentGameMode==1 门 0x242e8c 没过?)→ 保留旧值按真实时间续算,不用空活表覆盖",
+                speed_carried
+            );
+        }
+        speed_n = msg_send(env, (speed, cnt));
+        let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+        let _: () = msg_send(env, (root, sfk, speed, spk));
+        release(env, speed); // mutableCopy / alloc-init 的 +1,已被 root retain
+    }
+    if num_cls != nil {
+        let nwd = island_sel(env, "numberWithDouble:");
+        let num: id = msg_send(env, (num_cls, nwd, now));
+        let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+        let _: () = msg_send(env, (root, sfk, num, sak));
+    }
+    let saved = island_sidecar_save(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE, root);
+    release(env, root);
+    let Some(saved) = saved else { return };
+    let mut summary = format!("仓库 {} 种 {} 件", goods_kinds, goods_total);
+    // 剩余秒每秒都在变,摘要只记张数,免得每次落盘都算「变化」刷 log!。
+    summary.push_str(&format!(" / 飞鸟等标志 0x{:x} / 增强道具 {} 张", unv, speed_n));
+    let changed = ISLAND_STORAGE_LAST_SUMMARY.with(|c| {
+        let mut last = c.borrow_mut();
+        if *last == summary {
+            false
+        } else {
+            *last = summary.clone();
+            true
+        }
+    });
+    if changed {
+        log!("[MOLECHEAT] island: {}:{}", saved, summary);
+    } else {
+        log_dbg!("[MOLECHEAT] island: {}:{}", saved, summary);
+    }
+}
+
+/// [2026-09-24 第四轮 K9 I3-04] 岛档计时快进(island_ff_extras 的 K9 槽位调用;K4 的 island_ff_offline 只在主村、离线、
+/// 不在岛会话时调用):把 island_storage.dat 的 savedAt 往前拨 secs 秒,下次进岛读档时增强道具剩余秒就多扣 secs,
+/// 等价于这段时间已经流逝(到期的由 island_storage_inject 丢弃,原版进岛后 HUD 加速图标随之消失)。
+/// 仓库与飞鸟没有时间字段,不动。savedAt 缺失时按「现在」起拨。无档/坏档/无增强道具时什么都不做。
+fn island_storage_ff(env: &mut Environment, secs: f64) {
+    if env.options.network_access || island_session_active() || !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE);
+    if !island_storage_is_kind(env, root, "NSDictionary") {
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let cnt = island_sel(env, "count");
+    let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+    let speed: id = msg_send(env, (root, ofk, spk));
+    let n: crate::mem::GuestUSize = if island_storage_is_kind(env, speed, "NSDictionary") {
+        msg_send(env, (speed, cnt))
+    } else {
+        0
+    };
+    if n == 0 {
+        log_dbg!("[MOLECHEAT] island: 计时快进 island_storage.dat 没有增强道具,跳过");
+        return;
+    }
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if num_cls == nil {
+        return;
+    }
+    let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let sa: id = msg_send(env, (root, ofk, sak));
+    let saved_at: f64 = if island_storage_is_kind(env, sa, "NSNumber") {
+        let dv = island_sel(env, "doubleValue");
+        msg_send(env, (sa, dv))
+    } else {
+        0.0
+    };
+    let base = if saved_at > 0.0 { saved_at } else { now_cf_secs() };
+    let mc = island_sel(env, "mutableCopy");
+    let m: id = msg_send(env, (root, mc)); // +1
+    if m == nil {
+        return;
+    }
+    let nwd = island_sel(env, "numberWithDouble:");
+    let num: id = msg_send(env, (num_cls, nwd, base - secs));
+    let sfk = island_sel(env, "setObject:forKey:");
+    let _: () = msg_send(env, (m, sfk, num, sak));
+    let r = island_sidecar_save(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE, m);
+    release(env, m);
+    log!(
+        "[MOLECHEAT] island: 计时快进 island_storage.dat 增强道具 {} 张,savedAt 前拨 {:.0} 秒 → {}",
+        n,
+        secs,
+        r.unwrap_or_else(|| "未写入(坏档保护中或归档失败)".to_string())
+    );
+}
+
 /// [扫描修 2026-09-15] F10-6 返回本次合并的新放置对象个数(由 island_flush 汇总进一行日志);F10-7 动态键串用完即释放。
+/// [2026-09-24 第四轮 K3 N-D6-1] 只改算法、不改语义:以前每次落盘对【每个】活对象都先调
+///   +[NewGameManager saveTMMapDataFromObject:](0x243d8c,普通 Object 要过约 13 次 isKindOfClass: 再 alloc/init/十来个 set/autorelease),
+///   再在同键数组里逐个 objectAtIndex:+objectSequenceId 线性去重;地块全落进 mapData["1"](-[NewScenePorter finishBuild:] 0x26deb6
+///   对 type 4 地表装饰建 Object type:1),铺几百格后每 1.5 秒一次 O(N²) 客户端 getter,关键操作即时落盘后更频繁。
+///   现在:开头遍历一次 mapData.allValues,把已有的 objectSequenceId(TMMapDataBase 0xcc779,L8@0:4)收进 HashSet;活对象先发
+///   -[Object objSequenceId](0x41539,L8@0:4)——快照函数各分支都是原样抄这个值(0x243f06/0x24411e/…/0x2453d0 → setObjectSequenceId:),
+///   所以跟以前"快照 seq 为 0 就跳过/已在表就跳过"逐一等价;只有新对象才造快照、定键、入数组,并把 seq 补回集合。
+///   去重从"按键"变成"全表":seqId 在整张 mapData 里本来就唯一(island_find_by_seqid / writeback 都依赖这一点)。
+///   mapData 的值只处理数组(宿主侧 object_has_method 判 objectAtIndex:,零客户端消息),跳过其它包注入的字典/数字值。
 fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
     let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
     if om_cls == nil {
@@ -2972,20 +5786,47 @@ fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
     let add_s = env
         .objc
         .register_host_selector("addObject:".to_string(), &mut env.mem);
+    // [2026-09-24 第四轮 K3 N-D6-1] 活对象的 seq getter(-[Object objSequenceId],L8@0:4)。
+    let obj_seq_s = island_sel(env, "objSequenceId");
+    // ① 一次性收集 mapData 里已有的全部 seqId(读档对象、种子对象、上一拍已合并/回写的对象)。
+    let mut known: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let md_vals: id = msg_send(env, (md, av_s));
+    if md_vals != nil {
+        let nv: crate::mem::GuestUSize = msg_send(env, (md_vals, cnt_s));
+        for vi in 0..nv {
+            let v: id = msg_send(env, (md_vals, oai, vi));
+            // 只处理数组值;字典/数字等其它值(宿主侧判定,不发客户端消息)直接跳过。
+            if v == nil || !env.objc.object_has_method(&env.mem, v, oai) {
+                continue;
+            }
+            let an: crate::mem::GuestUSize = msg_send(env, (v, cnt_s));
+            for j in 0..an {
+                let old: id = msg_send(env, (v, oai, j));
+                if old == nil || !env.objc.object_has_method(&env.mem, old, seq_s) {
+                    continue;
+                }
+                let oseq: u32 = msg_send(env, (old, seq_s));
+                if oseq != 0 {
+                    known.insert(oseq);
+                }
+            }
+        }
+    }
     let mut merged = 0i32;
     for i in 0..n {
         let obj: id = msg_send(env, (all, oai, i));
         if obj == nil {
             continue;
         }
+        // ② 先读活对象 seq(1 次 getter):未分配(0)或已在表里 → 跳过,不再造快照、不再定键。
+        let seqid: u32 = msg_send(env, (obj, obj_seq_s));
+        if seqid == 0 || known.contains(&seqid) {
+            continue; // 未分配 seqId 无法去重/持久化;已在表 = 种子/读档/经营回写/上一拍已存
+        }
         // 活对象 → TMMapData 快照(原版编码器,按 class/type 各写各字段;Firework 返 nil)。
         let snap: id = msg_send(env, (ngm_cls, save_snap, obj));
         if snap == nil {
             continue;
-        }
-        let seqid: i32 = msg_send(env, (snap, seq_s));
-        if seqid == 0 {
-            continue; // 未分配 seqId,无法去重/持久化
         }
         // key:精确6类(island_class_to_key)优先,否则活对象 type 字符串(=mapData key)。
         let key: String = match island_class_to_key(env, snap) {
@@ -3007,24 +5848,15 @@ fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
                 continue;
             }
             let _: () = msg_send(env, (md, sfk, arr, keystr));
+            // [2026-09-24 第四轮 K3 N-D6-1 / I2-4] alloc/init 得到的 +1 已被 mapData retain,这里平衡掉(以前每新建一个键漏一个数组)。
+            //   arr 仍由 mapData 持有,下面 addObject: 照常可用。
+            release(env, arr);
         }
         // [扫描修 2026-09-15] F10-7 键串本轮已用完(objectForKey: 只读;setObject:forKey: 会 copy 键)→ 释放 from_rust_string 的 +1。
         release(env, keystr);
-        // 去重:该 seqId 已在数组(种子/经营回写已存)→ 跳过,绝不重复加。
-        let an: crate::mem::GuestUSize = msg_send(env, (arr, cnt_s));
-        let mut dup = false;
-        for j in 0..an {
-            let old: id = msg_send(env, (arr, oai, j));
-            let oseq: i32 = msg_send(env, (old, seq_s));
-            if oseq == seqid {
-                dup = true;
-                break;
-            }
-        }
-        if dup {
-            continue;
-        }
+        // 去重已在上面 ② 用全表 seq 集合做完(以前这里对同键数组逐个 objectAtIndex:+objectSequenceId 线性扫)。
         let _: () = msg_send(env, (arr, add_s, snap));
+        known.insert(seqid);
         merged += 1;
     }
     if merged > 0 {
@@ -3221,6 +6053,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     if nsd == nil {
         return false;
     }
+    // [2026-09-24 第四轮 集成补漏] 每次进岛重新判定是否要替贝壳树侧档挡覆盖(默认岛分支里按需置位)。
+    SHELLTREE_HOLD_FOR_DEFAULT.store(false, O);
     // [P5 地基] 先确保岛 userInfo 载体存在(NPC/任务/剧情/成就),持久化与默认两条路径都要。
     ensure_island_userinfo(env, nsd);
     start_island_tick(env);
@@ -3228,7 +6062,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     // [审查修 2026-09-13] D2 删掉读档前算的 userinfo_on_disk。根因:load 遇到坏档会先改名隔离,隔离成功后内存里已是
     //   init 默认进度,按"读档前磁盘上有档"判成老玩家就不补 newGame;首个节拍把默认进度写成新 island_userinfo.dat 后,
     //   以后每次进岛 had_userinfo 恒真,开场剧情永久不播。newGame 判据改为读档之后看 ISLAND_FILE_USERINFO 保护位(见下)。
-    let had_userinfo = load_island_userinfo(env);
+    // [2026-09-24 第四轮 K1 I6-04/I4-3] 返回值不再用:newGame 判据改看读档后的 nextStoryId(见 load_island_map 之前那段)。
+    load_island_userinfo(env);
     // [P3 商店空白治本] 建设庄园(NewStyleStoreMainLayer)读 NewSceneData.storeBuildingsArray_/
     //   storeDecorationsArray_、食材商店(ShopItemsLayer)读 5 个食材桶——这些桶 init 时全空,【只由
     //   LoadingHoliday case11 的 loadFileWithType:1 andSceneId:10 解 propertyHV.dat 本地填】(★岛的
@@ -3285,14 +6120,20 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     }
     // ★[P3 gameMode seed·补全原版 LoadingHoliday case4@0x252f38(workflow A 路实证)]:进岛后
     //   NewGameManager.gameMode 的"正常浏览态=1"靠原版 case4 `[NewGameManager setGameMode:
-    //   [GameManager gameMode]]`(主村 GameManager.gameMode 在 startGame: 里=1)拷过来 seed;离线进岛
-    //   常没完整跑到 case4(case2/3 是硬网络门)→ gameMode 残留 init 的 -1 → 所有 gameMode==1 严判失效:
+    //   [GameManager gameMode]]`(主村 GameManager.gameMode 在 startGame: 里=1)拷过来 seed;若没跑到
+    //   case4 → gameMode 残留 init 的 -1 → 所有 gameMode==1 严判失效:
     //   ①布兰的家 RestaurantView(0x249769)/②公寓 ApartmentView(0x3263fc)面板入口【直读
     //   NewGameManager.gameMode==1】(curSceneId 路由对它们无效!)③食材店 ShopItemsLayer(0x24be80)
     //   读 currentGameMode==1(curSceneId=10 修复后已正确路由到 NewGameManager.gameMode)。这里在进岛
     //   数据就绪点等价补一发:读主村 GameManager.gameMode 透传(异常≤0 兜底 1=岛浏览态),一次性、
     //   非每帧(gameMode 有合法瞬态 9 临时/11 编辑放置/0 串门,绝不每帧钉死 1)。与现有 3 个 LR 门 hook
     //   叠加无害;runtime 验证 gameMode=1 已落实后,那 3 个零散 LR hook 可化简删除(A 路结论)。
+    // [2026-09-24 第四轮 K1 I1-05 注释更正] 原注释称「离线进岛常没完整跑到 case4(case2/3 是硬网络门)」,不对:本函数由
+    //   getAllObjectsListFromServerWithStartId: 臂在 updateLoading:(0x252c38)curStep 2 那档(跳表项 → 0x252da0)触发,
+    //   原版 case4(curStep 4,跳表项 → 0x252eb0)在更晚一步照常执行,lastSceneId==1(0x252f36,从主村进岛恒成立)时于
+    //   0x252f84 `[[NewGameManager sharedManager] setGameMode:[[GameManager sharedManager] gameMode]]` 再拷一次主村
+    //   gameMode,会覆盖这里的 seed。那次拷贝由 K7 的 (NewGameManager, setGameMode:) LR==0x252f89 夹取臂兜底(非 1 夹成 1);
+    //   这里的 seed 只在 case4 不跑(lastSceneId≠1)时起作用,保留作兜底。
     {
         let sm_sel = env
             .objc
@@ -3322,6 +6163,59 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
             );
         }
     }
+    // ★[审计修 2026-09-11] 开场剧情没播完的岛补"新岛"标志 newGame|=1。原版置位点是 -[NewSceneCommand parseMapDataWithPackageData:atIndex:]
+    //   (0x22bd34 setNewGame: 旧值|1,条件:服务器下发的岛剧情进度 nextStoryId==0 且非串门);唯一消费者 -[NewGameManager checkActiveStoryQuest]
+    //   (0x246710,endLoadMap 末尾调用)在 0x2467c8 见到 bit0 就 [[NewSceneStory sharedInstance] startFromScratch](0x32f30c = nextSection:1)
+    //   播开场剧情并清位。离线 NewSceneUserInfoData init(0x323228)的 nextStoryId 默认是 1,永远满足不了原版 ==0 的条件;
+    //   而不置位时 checkActiveStoryQuest 走 -[NewSceneStory activate](0x32f324),它在 0x32f438/0x32f440 要 [section triggerLevel]>=1,
+    //   farmstoryHV 第 1 节没有 level 键 → 恒返回 NO,开场剧情永远不播。
+    // [2026-09-24 第四轮 K1 I6-04/I4-3] 判据由「没读到 island_userinfo.dat」改为「读档后 nextStoryId<=1」,并从默认岛分支上移到
+    //   这里,读档岛/默认岛两条路径共用。根因:原判据下首个节拍(约 1.5 秒)就把 island_userinfo.dat 写出去了,开场剧情(第 1 节 8 步)
+    //   中途退出/关窗/崩溃后,下次进岛 had_userinfo 恒真、且 island_map.dat 已存在走读档岛分支早返回,newGame 再也不置 → 第 1 节永久丢失。
+    //   nextStoryId 离线唯一写点是 -[NewSceneStory nextStep](0x32f5c4):0x32f5fc 判「当前步==stepCount」整节播完才在 0x32f748
+    //   setNextStoryId:(curSection+1),所以「nextStoryId<=1」精确等价于「开场第 1 节还没播完」;与原版服务器判据 ==0 等价(离线默认值是 1)。
+    //   播完的老档 nextStoryId>=2,绝不重播、不回退进度;剧情本身不发奖,重播第 1 节无副作用,播完 setNextStoryId:2 自动关掉条件。
+    //   前置保留两条:① 主村 GameManager.gameMode ∉ {0,6}(对应 checkActiveStoryQuest 0x24674a/0x24675a 的 currentGameMode 0/6 门;
+    //   沿用原写法读主村 GameManager——NewGameManager.gameMode 已被上面的 seed 段写成 1,读它判不出什么);
+    //   ② ISLAND_FILE_USERINFO 保护位未置:坏档改名隔离失败、原坏档仍在原路径时(本会话落盘被阻塞,玩家修好文件还能恢复旧进度)
+    //   内存里是 init 默认进度,nextStoryId=1 不可信,不补,免得给老玩家重播。
+    //   反之坏档改名隔离成功(原档已挪到 .corrupt、位已清)时,内存与之后落盘的都是默认进度(任务链也从第 1 条重来),
+    //   按新岛补播开场剧情,与 [审查修 2026-09-13] D2 的定案一致。以前读档岛分支早返回走不到这里,所以坏档注入 T6
+    //   (只截断 island_userinfo.dat、布局档完好)从来看不到 newGame;现在会出现一次,属预期。
+    //   nextStoryId 必须在 load_island_userinfo 之后读,读到的才是档里的值。置脏让首个节拍尽快写出 island_userinfo.dat。
+    //   不动 activate 的等级门、不往 farmstoryHV 加 level:第 2-24 节同样没有 level,靠 -[NewSceneQuest postFinish] 调 nextSection: 推进。
+    //   唯一残留窗口:第 1 节刚播完但 1.5 秒内退出会多播一次,可接受。
+    if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_USERINFO) == 0 {
+        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+        let sm_s = island_sel(env, "sharedManager");
+        let gm: id = msg_send(env, (gm_cls, sm_s));
+        let gmode: i32 = if gm != nil {
+            let g = island_sel(env, "gameMode");
+            msg_send(env, (gm, g))
+        } else {
+            -1
+        };
+        let ui_s = island_sel(env, "userInfoDataInNewScene");
+        let ui: id = msg_send(env, (nsd, ui_s));
+        // -[NewSceneUserInfoData nextStoryId]@0x323a44 属性 Ti(i32)。载体缺失时读不到进度,不补。
+        let next_story: i32 = if ui != nil {
+            let ns = island_sel(env, "nextStoryId");
+            msg_send(env, (ui, ns))
+        } else {
+            i32::MAX
+        };
+        if gmode != 0 && gmode != 6 && next_story <= 1 {
+            let ng = island_sel(env, "newGame");
+            let cur: i32 = msg_send(env, (nsd, ng));
+            let sng = island_sel(env, "setNewGame:");
+            let _: () = msg_send(env, (nsd, sng, cur | 1));
+            ISLAND_DIRTY.store(true, O);
+            log!(
+                "[MOLECHEAT] island: 开场剧情第 1 节未播完(nextStoryId={})→ newGame|=1,进岛将播开场剧情",
+                next_story
+            );
+        }
+    }
     // [P1 离线持久化] 先试读 island_map.dat;读到有效布局就用它、跳过默认岛注入(沙原碎片仍补)。
     if load_island_map(env) {
         assign_island_seqids(env); // [P2b/P3a 修] 读档对象没有 seqId(不在 NSCoding 键里)→ 补发,否则回写/合并全被 seqId==0 守卫跳过
@@ -3332,36 +6226,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         load_island_ships(env); // [审计修] 船 shipState/待领奖品、咖啡馆 isNew(不在 NSCoding 里)
         fix_stuck_ships(env); // [审计修] 唯一会永久卡死的船状态组合兜底
         restore_seqid_cursor(env); // [P3-a] 抬 seqId 游标到已存最大,防新放置撞号
+        island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(读档岛)
         return true;
-    }
-    // ★[审计修 2026-09-11] 全新岛补"新岛"标志 newGame|=1。原版置位点是 -[NewSceneCommand parseMapDataWithPackageData:atIndex:]
-    //   (0x22bd34,条件:服务器下发的岛剧情进度 nextStoryId==0 且非串门);唯一消费者 -[NewGameManager checkActiveStoryQuest]
-    //   (endLoadMap 末尾调用)见到 bit0 就 [[NewSceneStory sharedInstance] startFromScratch] 播开场剧情并清位。离线 NewSceneUserInfoData
-    //   init 的 nextStoryId 默认是 1,永远满足不了原版条件 → 新玩家的开场剧情走 activate 路径还要过等级/任务门,可能不播。
-    //   读档岛绝不能设:startFromScratch 会强播第 1 节、播完 setNextStoryId:2 把进度回退。置脏让首个节拍尽快写出
-    //   island_userinfo.dat,防止崩溃后再进岛重播。
-    // [审查修 2026-09-13] D2 判据改为(读档之后):没读到有效 island_userinfo.dat,且 ISLAND_FILE_USERINFO 保护位未置位。
-    //   · 文件不存在,或坏档已改名隔离成功(原档挪到 .corrupt,内存与之后落盘的都是全新进度)→ 位已清,按全新岛补 newGame;
-    //   · 隔离失败、原坏档仍在原路径(本会话落盘被阻塞,玩家修好文件后还能恢复旧进度)→ 位保持置位,不补,免得给老玩家重播。
-    //   顺带省掉一次读档前的 pathForDataFile: + fileExistsAtPath:。
-    if !had_userinfo && (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_USERINFO) == 0 {
-        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
-        let sm_s = island_sel(env, "sharedManager");
-        let gm: id = msg_send(env, (gm_cls, sm_s));
-        let gmode: i32 = if gm != nil {
-            let g = island_sel(env, "gameMode");
-            msg_send(env, (gm, g))
-        } else {
-            -1
-        };
-        if gmode != 0 && gmode != 6 {
-            let ng = island_sel(env, "newGame");
-            let cur: i32 = msg_send(env, (nsd, ng));
-            let sng = island_sel(env, "setNewGame:");
-            let _: () = msg_send(env, (nsd, sng, cur | 1));
-            ISLAND_DIRTY.store(true, O);
-            log!("[MOLECHEAT] island: 全新岛(无 island_userinfo.dat 或坏档已隔离)→ newGame|=1,进岛将播开场剧情");
-        }
     }
     let dict = island_alloc_init(env, "NSMutableDictionary");
     if dict == nil {
@@ -3377,7 +6243,20 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     const ISLAND_SHOPS: [(i32, f32, f32); 5] = [
         (30101, 22.0, 42.0),
         (30102, 27.0, 42.0),
-        (30103, 32.0, 42.0),
+        // [2026-09-24 第四轮 K16 N-D3-1] 快餐店 30103 从 (32,42) 挪到基础区 (17,48)。baseTile.x=line、.y=column
+        //   (-[Object initWithMapData:type:] 0x3b4f4/0x3b524 → tileAtLine:atColumn:needDummy:)。原 line=32 落在「扩充土地 I」
+        //   (31001,1 万豆/22 级;买下才 extendMap|=0x2,-[NewSceneVillageMenuLayer addNewObject2Map:gift:] 0x25c108/0x25c280):
+        //   -[NewScenePorter isReachable]@0x26b114 在 extendMap 无 0x2 位时 0x26b39a 要求 line<=28,checkCanPut: 0x271270
+        //   判不可达 → 0x2712ae canPut=0,拖离原位后再拖回就放不下(拿起不动直接确认仍可),还白占未买的地。
+        //   新坐标依据(全部按反汇编推算,未改原版逻辑):
+        //   · 占地:isFlip=0 时 Object.size=(length_y,length_x)=(3,4)(0x3b76c);-[Object setTiles] 与 checkCanPut:
+        //     逐格 [runtimeMap tile:base offsetX:0..w-1 offsetY:0..h-1],-[NewSceneMapBase tile:offsetX:offsetY:]@0x251198
+        //     给 column=C+ox-oy、line=L-⌊(ox+oy+(C&1))/2⌋,即占地朝 line 减小方向展开:(17,48) 占 line 15..17、column 45..50;
+        //   · isReachable(extendMap=1):17<=28、17+3>=1、48-4>=18、48+4<=65 全过;HolidayVillageMap regionOfTile: 恒 0;
+        //   · -[HolidayVillageMap setBkgTilesProperty]@0x267e2c 三张静态障碍表(0x9096c8/0x9097b8/0x90a3b0)无一格命中;
+        //   · 与另外四店、布兰的家 (11,39)、公寓 (15,26) 逐格无交集;用户实测档里同为 4×3 的烧烤店 30105 就放在 (17,48)。
+        //   seqId 仍按公式 90003、currentLevel 仍 4。只影响无 island_map.dat 的新档,老档走读档路径不迁移。
+        (30103, 17.0, 48.0),
         (30104, 22.0, 47.0),
         (30105, 27.0, 47.0),
     ];
@@ -3397,6 +6276,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
             obj_set_int(env, shop, "setSaleItemId:", 0);
             obj_set_int(env, shop, "setProperty:", 0);
             island_put_append(env, dict, "28", shop);
+            release(env, shop); // [2026-09-24 第四轮 K1 I2-4] 数组已 retain,交还 alloc 的 +1
         }
     }
     // 物件2 餐厅 TMMapDataRestaurant 30002 @(11,39) → key "29"
@@ -3416,6 +6296,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, rest, "setConstructValue:", 0);
         obj_set_int(env, rest, "setIslandValue:", 0);
         island_put(env, dict, "29", rest);
+        release(env, rest); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
     // 物件3 公寓/训练屋 TMMapDataApartment 30001 @(15,26) → key "32"
     let apt = island_alloc_init(env, "TMMapDataApartment");
@@ -3427,6 +6308,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, apt, "setMoleNumInWaitingQueue:", 0);
         obj_set_int(env, apt, "setLastMoleFinishTrainingTime:", 0);
         island_put(env, dict, "32", apt);
+        release(env, apt); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
     // [P4-a 航海] 默认岛注入 1 艘探险船 DiscoveryShip(objectId 34001,mapData key "39")。其余字段
     //   (isFixing/isSailing/searchMapId/onBoardMoleNum/beginFixTime/beginDiscoverTime)默认 0 = 原版
@@ -3438,21 +6320,62 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, ship, "setObjectSequenceId:", 90008); // 非0 seqId,出海状态回写命门
         island_set_point(env, ship, "setBaseTile:", 37.0, -30.0); // 原版 addDiscoveryShipOnMap 水域坐标
         island_put(env, dict, "39", ship);
+        release(env, ship); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
 
     let set_s = env
         .objc
         .register_host_selector("setMapData:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (nsd, set_s, dict));
+    // [2026-09-24 第四轮 K1 I2-4] -[NewSceneData setMapData:]@0x21f458 先 release 旧 ivar,再在 0x21f492 存参数的 mutableCopy
+    //   (浅拷贝,每个值数组再 retain 一次),不接管参数这份 +1 → 交还。之后的碎片/seqId/挂钩都只经 [nsd mapData] 拿 ivar 里
+    //   那份拷贝,不再引用 dict。以前默认岛这 8 个 TMMapData*、4 个数组和 dict 全都多一个 +1 永不释放。
+    //   与原版 -[LoadingHoliday createDefaultMapData](0x252508)同一所有权模式:对象 addObject: 后 release(0x2527ea),
+    //   数组 setValue:forKey: 后 release(0x252b54),dict 在 setMapData:(0x252b78)之后紧接着 release(0x252b80)。
+    release(env, dict);
+
+    // [2026-09-24 第四轮 K1 I4-03] 走到默认岛 = island_map.dat 不存在或无效(解档失败/空布局),若 island_ships.dat 还在原路径,
+    //   本会话就不覆盖它。根因:船档描述的是 island_map.dat 里那批船/咖啡馆,只在读档岛分支 load_island_ships 读回;
+    //   island_note_load_failure 对「文件不存在」只清位返回,走不到「布局隔离成功 → 船档一并隔离」那段,save_island_ships
+    //   的 MAP 位门与 SHIPS 位门全放行,首个节拍就拿默认船(shipState=0、无礼物)覆盖玩家的船态/出海战利品/咖啡馆 isNew。
+    //   做法:只置 ISLAND_FILE_SHIPS 保护位(与隔离失败时「本会话禁止覆盖」同一规则,代价是本会话默认岛的船态不落盘)。
+    //   · 不在这里补调 load_island_ships:默认船 searchMapId=0、onBoardMoleNum=0,把旧礼物回填上去会命中空奖励锁死(I4-06);
+    //   · 不改名隔离船档:那是一份完好的档,改名只会让玩家更难恢复;island_save_blocked 有「原路径文件没了就解除保护」的自愈。
+    //   坏档隔离成功时船档已随布局档改名(原路径不在)→ 这里不置位;船档随之隔离失败时 SHIPS 位已置,再置一次无副作用;
+    //   布局档本身隔离失败时 MAP 位已置(save_island_ships 先被 MAP 位门挡住),这里补 SHIPS 位只是多一道保险。
+    //   保护只管本会话:本会话节拍照常把默认岛写进 island_map.dat(MAP 位没置);下次进岛(同进程重进或重启)走读档岛分支,
+    //   load_island_ships 读档成功即 island_note_load_ok 清掉 SHIPS 位,并按 (kind, objectId, ord) 把旧船态/礼物回填到默认岛
+    //   那艘 34001 上,礼物与 searchMapId/onBoardMoleNum 对不上的由 fix_stuck_ships 的礼物校验(I4-06)兜底。
+    //   所以想原样恢复旧岛,要在离岛/退出之后、下次进岛之前把原布局档放回原名(覆盖本会话写出的默认岛档);
+    //   在岛上时放回会被下一次节拍用默认岛覆盖。
+    //   只在离线岛档路径上执行(在线模式 ENABLE_NEWSCENE_ISLAND 被强制关,不经过本函数)。
+    {
+        let sp = island_data_path(env, "island_ships.dat");
+        if guest_file_exists(env, sp) {
+            ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHIPS, O);
+            log!("[MOLECHEAT] island: island_map.dat 缺失/无效,本会话不覆盖 island_ships.dat(保留原船档;要恢复旧岛请在离岛/退出后、下次进岛前把原布局档放回原名)");
+        }
+    }
+    // [2026-09-24 第四轮 集成补漏] 贝壳树侧档(K11)同样描述 island_map.dat 里那棵树(键 40),同一规则:还在原路径就本会话不覆盖。
+    //   只置标志,由 island_after_layout_ready → island_shelltree_load 置保护位(见 SHELLTREE_HOLD_FOR_DEFAULT)。
+    {
+        let tp = island_data_path(env, SHELLTREE_FILE);
+        if guest_file_exists(env, tp) {
+            SHELLTREE_HOLD_FOR_DEFAULT.store(true, O);
+        }
+    }
 
     // ★Bug D(探险地图碎片)补偿:mapFragments 离线无回包→恒空→探险船凑不齐;原来无条件注入沙原 4 块 31005-31008。
     //   已抽成 inject_sandgarden_fragments,持久化路径也复用。
     //   [2026-09-16] A1-02+A2-02 已降级为兜底:真新岛档不送商店可买的 31006/31008,31005/31007 按任务 81/83 进度补,规则见该函数注释。
     // [扫描修 2026-09-15] F5-10 纠错:-[NewSceneData activatedAdventureMap] 判的是 12 槽 / 3 张图(0x222f12 cmp #0xb),
     //   不是"只判这 4 槽";这里只保证沙原一张图可探险,火山(31009-31012)仍靠商店购买 + 咖啡任务 16/17。
+    //   [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 火山:31009/31011 原版与离线都在岛建设商店买,31010/31012 原版与离线都来自
+    //   咖啡任务 16/17(离线任务链已由 island_cafe_restore_and_offer 复活,领奖走原版 addNewObject2Map:gift: → addAdventureMapFragment:)。
     load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片(默认岛首进通常无,空过)
     inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片(真新岛档:31006/31008 走商店购买,31005/31007 按任务 81/83 进度补)
     restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001-90008,抬游标到 90008 防新放置撞号
+    island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(默认岛)
 
     log!("[MOLECHEAT] island: injected default mapData (5 shops 30101-30105 / restaurant 30002 / apartment 30001 / ship 34001)");
     true
@@ -3482,6 +6405,114 @@ pub fn island_session_active() -> bool {
 /// 本次进岛请求是否已走到 gate#1(=真 enterNewIslands 通过了前置门)。
 pub fn island_gate1_hit() -> bool {
     ISLAND_GATE1_HIT.load(O)
+}
+
+/// [2026-09-24 第四轮 K7 I1-02] 本次进岛的 LoadingManager 单例指针:[LoadingManager enterLoadingWithDelegate:nextSceneId:10]
+/// 前置臂里记下 r0。updateLoading: 臂据它读 baseLoading_,只给【当前】加载器强清暂停(见 island_loader_is_current)。
+static ISLAND_LOADING_MGR: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 K7] 进岛加载期的「每次进岛只打一次」日志位(enterLoading:10 臂清零)。
+const K7_LOG_STALE_LOADER: u32 = 1 << 0;
+const K7_LOG_ALERT_PAUSE: u32 = 1 << 1;
+static ISLAND_K7_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// [2026-09-24 第四轮 K7 I1-02] loader 是不是 LoadingManager 当前持有的加载器(baseLoading_)。
+///   原版中止分支 -[LoadingHoliday alertView:didDismissWithButtonIndex:]@0x251de0 在 0x252064 发
+///   unscheduleSelector:forTarget: 时 r2 取的是 [sp+8] = 自己的 _cmd(alertView:didDismissWithButtonIndex:),不是 updateLoading:
+///   → 被中止的 LoadingHoliday 仍挂在调度器上(restartUpdateLoading@0x241eaa 用 scheduleSelector:forTarget:interval:paused: 挂的),
+///   每帧照跑 updateLoading:,原版全靠 showNetConnectErrorMessage 在 0x25213e 置的 updatePause_=1 把它冻住;LoadingManager
+///   也不释放它(下次 enterLoading 在 0x2382c0 直接覆盖 baseLoading_)。所以中止后再进岛时场上同时有新旧两个 LoadingHoliday,
+///   强清暂停只能作用于新的那个,否则旧的被解冻,会再跑一遍 freeCommonResources/endLoading,把新加载器的 exitLoading 抢先打掉。
+///   纯内存读:偏移从 _OBJC_IVAR_$_LoadingManager.baseLoading_ 槽(0xb05f3c)现读,读不到用 4(re.py ivar 实证 +4)。
+///   不知道管理器(0)或 baseLoading_ 为空时一律当作当前 —— 宁可沿用旧行为,也不冒「永远不清暂停 = 永久卡加载」的险。
+fn island_loader_is_current(env: &Environment, loader: u32) -> bool {
+    let mgr = ISLAND_LOADING_MGR.load(O);
+    if mgr == 0 {
+        return true;
+    }
+    let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f3c));
+    let off = if off != 0 && off < 0x100 { off } else { 4 };
+    let cur: u32 = env.mem.read(ConstPtr::<u32>::from_bits(mgr + off));
+    cur == 0 || cur == loader
+}
+
+/// [2026-09-24 第四轮 K7 I9-04] 本次进岛 state2 的 mapData 补注入是否已经判过(一次性闸;enterLoading:10 臂复位)。
+static ISLAND_REINJECT_TRIED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K7 I9-04] 本次进岛已吞掉的 LoadingHoliday 弹框数:前 4 次打完整诊断(log!),之后只打 log_dbg!。
+static ISLAND_ALERT_SWALLOWED: AtomicU32 = AtomicU32::new(0);
+
+/// [2026-09-24 第四轮 K7 I9-04] [[NewSceneData sharedInstance] mapData] 的 count;单例拿不到返回 None,mapData 为 nil 算 0。
+/// 会发宿主消息,调用方负责护住寄存器。
+fn island_mapdata_count(env: &mut Environment) -> Option<u32> {
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    let md = island_sel(env, "mapData");
+    let map: id = msg_send(env, (nsd, md));
+    if map == nil {
+        return Some(0);
+    }
+    let c = island_sel(env, "count");
+    let n: crate::mem::GuestUSize = msg_send(env, (map, c));
+    Some(n)
+}
+
+/// [2026-09-24 第四轮 K7 I9-04] state2(-[LoadingHoliday updateLoading:] 跳表 index2 = 0x252e3e,进入时 curStep_==3)判
+/// [[NewSceneData sharedInstance] mapData].count(0x252e68/0x252e7c cbnz)之前的兜底:此刻为 0 就补跑一次
+/// build_default_island_mapdata(读档岛/默认岛两条路径它自己选),本次进岛只判一次。正常进岛 state1 的
+/// getAllObjectsListFromServerWithStartId: 臂早已注入过,这里只读一次 count 就走;兜住的是 state1 注入没生效
+/// (ISLAND_INJECTED 残留、index1 走了 0x253a70 连接失败分支没发 getAllObjects、注入被别的调用清空)的情形——
+/// 原版在这里 count==0 会去 showNetConnectErrorMessage,而那时 curStep_ 已自增成 4,方法在 0x25210a(curStep_>3)直接返回、
+/// 什么都不弹,加载带着空 mapData 继续 → 进的是一座空岛。相位与 state1 注入相同(都在 updateLoading: 的调用栈上,
+/// 不在 drawScene 前置臂里),调用方负责快照/恢复 r0-r3。
+fn island_state2_reinject_if_empty(env: &mut Environment) {
+    if ISLAND_REINJECT_TRIED.swap(true, O) {
+        return;
+    }
+    if island_mapdata_count(env) != Some(0) {
+        return;
+    }
+    log!(
+        "[MOLECHEAT] island: state2 判 mapData 前 count=0(state1 注入 ISLAND_INJECTED={})→ 补注入一次(build_default_island_mapdata)",
+        ISLAND_INJECTED.with(|c| c.get())
+    );
+    ISLAND_INJECTED.with(|c| c.set(true));
+    let ok = build_default_island_mapdata(env);
+    let after = island_mapdata_count(env);
+    log!(
+        "[MOLECHEAT] island: state2 补注入结束 ok={} mapData.count={:?}",
+        ok,
+        after
+    );
+}
+
+/// [2026-09-24 第四轮 K7 I9-04] 吞 LoadingHoliday 三个断网/登录弹框之前留痕:把真实原因一起打出来,别让坏档/注入失败
+/// 被「网络连接中断」掩盖成无迹可查。本次进岛前 4 次打完整诊断(log!,会发几条宿主消息),之后只打一行 log_dbg!。
+fn island_loading_alert_swallow_log(env: &mut Environment, sel: &str) {
+    let n = ISLAND_ALERT_SWALLOWED.fetch_add(1, O);
+    if n >= 4 {
+        log_dbg!("[MOLECHEAT] island: 吞掉 LoadingHoliday {}(本次进岛第 {} 次)", sel, n + 1);
+        return;
+    }
+    let cnt = island_mapdata_count(env);
+    let path = island_map_path(env);
+    let map_exists = guest_file_exists(env, path);
+    let failed = ISLAND_LOAD_FAILED.load(O);
+    log!(
+        "[MOLECHEAT] island: 吞掉 LoadingHoliday {}(离线进岛不弹「网络连接中断」,也不走 reconnectUsingNewHD)诊断:mapData.count={:?} island_map.dat 存在={} 布局坏档保护={} ISLAND_LOAD_FAILED={:#x} ISLAND_INJECTED={} state2 补注入已判={}",
+        sel,
+        cnt,
+        map_exists,
+        (failed & ISLAND_FILE_MAP) != 0,
+        failed,
+        ISLAND_INJECTED.with(|c| c.get()),
+        ISLAND_REINJECT_TRIED.load(O)
+    );
 }
 
 // 曾有 force_gamemode_standby(把岛上 NewGameManager.gameMode 顶成 1),因会暂停 cocos2d director 冻结整岛而删除,勿复活。
@@ -4840,6 +7871,35 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   消息路由与 main 完全一致;没把 FriendsVillageLayer 加进 CLASSES,免得它的每条消息都进 intercept 和三个子模块。
         //   (UserInfoData mapExtend / ObjectManager checkMapExtendError 两个 mapExtend 臂的类已在 CLASSES 里。)
         || (cfg!(target_os = "ios") && matches!(sel, "getFriendsInfo" | "loadMapFromData:"))
+        // ════ [2026-09-24 第四轮骨架] 粗筛槽位:各实施包只在自己的槽位注释下方追加 `|| (...)` 行,不动别的槽位 ════
+        // ── [K3] ──
+        // [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘的宿主自排选择子(接收者 GameManager 已在 CLASSES,这里按裸 sel 再放一道,
+        //   与 intercept 里不绑类的 `sel == "moleIslandFlushNow"` 臂对应)。
+        || sel == "moleIslandFlushNow"
+        // ── [K7] ──
+        // [2026-09-24 第四轮 K7 N-D5-2] SceneMannager 不在 CLASSES:离岛过渡中才放行 loadMainVillageScene(每次回村一次)。
+        || (ISLAND_EXITING.load(O) && sel == "loadMainVillageScene")
+        // [2026-09-24 第四轮 K7 I1-02] 进岛加载期才放行 setIsChangeSceneButtonSelected:(中止善后臂,SceneMannager 不在 CLASSES)。
+        || (ISLAND_LOADING.load(O) && sel == "setIsChangeSceneButtonSelected:")
+        // ── [K8] ──
+        // [2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口吞掉打工归还的臂(ActorManager changeAvailableMolerForTask:)。按「受门控的 sel」
+        //   写法:没把 ActorManager 加进 CLASSES(那样它每帧的消息都要 to_string 两次、走完整条比较链);岛外只多一次原子读。
+        || (ON_ISLAND.load(O) && sel == "changeAvailableMolerForTask:")
+        // ── [K11] ──
+        // [2026-09-24 第四轮 K11 I2-01] 贝壳树离线应答是不绑类的裸 sel(intercept 里无条件接住,NetworkManager 不实现),
+        //   按不变量必须放进粗筛;另外三臂挂在 GameData/NetworkManager 上,两类已在 CLASSES。SuperShellTree 不加进 CLASSES。
+        || sel == "moleIslandShellTreeInfo"
+        // ── [K13] ──
+        // [2026-09-24 第四轮 K13 N-D2-3] 冷却归零覆盖宠物:(Animal, callAnimalSchedule:) 前置清 lastCoolDownTime(Animal 不进 CLASSES)。
+        || (NO_COOLDOWN.load(O) && sel == "callAnimalSchedule:")
+        // [2026-09-24 第五轮补挖 M-M3-2] 冷却归零的两条帧内前置臂(GameRoomState / OutputHanlder innerupdate:),开关关着时零成本。
+        || (NO_COOLDOWN.load(O) && sel == "innerupdate:")
+        // [2026-09-24 第四轮 K13 I4-04] 探险船三段时长:(DiscoveryShip, checkIsFixShipFinished/checkIsDiscoverFinished) 前置改 ivar
+        //   (DiscoveryShip 不进 CLASSES;臂里还要求 ON_ISLAND)。
+        || ((NO_COOLDOWN.load(O) || INSTANT_BUILD.load(O))
+            && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished"))
+        // [2026-09-24 第四轮 集成补漏] 岛上厕所小游戏前三名写入点置脏(WashRoomGame 不在 CLASSES,按门控 sel 写法)。
+        || (ON_ISLAND.load(O) && sel == "updateTop3Record")
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -5899,6 +8959,103 @@ fn sync_remote_upgrade_percent(env: &mut Environment) {
     );
 }
 
+// ───── [2026-09-24 第四轮 K5] 岛会话网络门「按调用点放行」表 ─────
+// 岛会话期(ISLAND_ENTER_WINDOW>0 || ON_ISLAND || ISLAND_LOADING)intercept 把 (任意类, isReachable) 与
+// (NetworkManager, isConnected) 顶成在线,这是进岛链与岛上触摸的刚需;但岛 HUD / 面板上一批纯联网按钮的原版离线分支
+// 也被一起顶掉了。下面两张表收的就是这些按钮回调里的门:调用方 LR 命中就不顶,落到 match 的 `_ => {}` 放行真 getter
+// (两条臂写 r0 之前都没有宿主 msg_send,r0/r1 原样),玩家在岛上看到的就是主村离线时同一句原版提示。
+// 只收按钮回调里的点:进岛链(HolidayVillageLayer/SceneMannager/LoadingHoliday/NewSceneEditMenuLayer)与岛上触摸派发上的门一个不收。
+// 写法:LR = blx 指令地址 + 4,带 Thumb 位;严格升序(binary_search);每条注释写「类.方法 + blx 地址 + 假分支原版文案」。
+// 下面的编译期自检保证升序与 Thumb 位(历史上 0x24bec2 漏 Thumb 位让整条门静默失效)。
+
+/// [2026-09-24 第四轮 K5] 岛会话期 (c, "isReachable") 通配臂【不】顶成 1 的调用点。
+const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
+    // [I8-04] -[UserInfoLayer checkActivityStatus] blx@0x5997a;假分支 0x59a1e 直接返回(不调度 onGetActivityStatusTimeOut、
+    //   不发 getActivityStatus)。正常到不了(下一条门已先拦住),收它是兜 onReturnToActionCenterPage 等别的入口。
+    0x5997f,
+    // [I8-04] -[UserInfoLayer onButtonActionFunctionsSelected:] 活动中心按钮 blx@0x5a42c;假分支 0x5a504 MessageBox
+    //   ACTION_CENTER_NETWARNING「该功能需要联网才能使用哦」(不走 checkActivityStatus → onGetActivityStatusTimeOut →
+    //   showActionCenterLayer:那条链会置 GameData.hasShowedNewActivities_ 内存标志并去 +[InGameScene scene] 懒建主村场景)。
+    //   ★同一方法假分支弹框之后 0x5a5ae isReachable(LR 0x5a5b3)/0x5a5ce isConnected(LR 0x5a5d3)是「可达却未连上就
+    //   disconnect + setState:2 + establishConnection 重连」,【不能收】:让它们继续被顶成在线,重连分支才保持不走。
+    0x5a431,
+    // [I8-03] -[UserInfoLayer onButtonCustomServiceFunctionsSelected:] 客服入口 blx@0x5aad4;假分支 0x5ab8a
+    //   MessageBox ACTION_CENTER_NETWARNING(不去建 CustomerServiceLayer)。
+    0x5aad9,
+    // [I8-03] -[WrapperManager userSelectedAdWallFromPlatform:] 免费贝壳墙选平台 blx@0x2627ac;假分支 0x262886
+    //   UIAlertView AD_NOT_AVAIL_TITLE / NETWORK_NOT_AVAIL(不去拉起广告墙平台)。
+    0x2627b1,
+    // [I8-03] -[WrapperManager addVipGoldByAllAdWalls] blx@0x262ac8;假分支 0x262b30 直接返回(不去各广告墙查积分)。
+    0x262acd,
+    // [I8-03/I5-05] -[NewSceneQuestLayer onButtonShare] 岛任务面板「分享」blx@0x32d6e2;假分支 0x32d716 SINAWEIBO_NO_CONNECT
+    //   (不走 0x32d70e takeScreenshotGetShareReward: 截图写相册 + 微博分享)。★不收同类 checkErrorMessage 的 0x32d4d9:
+    //   那是接任务前的网络自检,放行会让岛上每次接任务都弹断网框。
+    0x32d6e7,
+    // [I8-03] -[DailyQuestLayer onButtonShare] 日常任务面板「分享」blx@0x3459a6;假分支 0x3459da SINAWEIBO_NO_CONNECT。
+    0x3459ab,
+    // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e46;假分支 0x376eaa
+    //   showMessage: GET_EXCHANGE_INFO_ERROR + showTable:(无转圈层、不发包)。
+    0x376e4b,
+    // [I8-03] -[CustomerServiceLayer onButtonHotQuestionSelected] 热门问题 blx@0x3a4a70;假分支 0x3a4abc MessageBox IAP_NETWORK_ERROR
+    //   (不进 showFeedbackWithModule:)。下面三个按钮同构,各自两道门都已 re.py annot 逐条核对。
+    0x3a4a75,
+    // [I8-03] -[CustomerServiceLayer onButtonOnlineQuestionSelected] 在线提问 blx@0x3a4bb4;假分支 0x3a4c00 IAP_NETWORK_ERROR。
+    0x3a4bb9,
+    // [I8-03] -[CustomerServiceLayer onButtonGameForumSelected] 游戏论坛 blx@0x3a4cf8;假分支 0x3a4d44 IAP_NETWORK_ERROR。
+    0x3a4cfd,
+    // [I8-03] -[CustomerServiceLayer onButtonLookRecallSelected] 找回 blx@0x3a4e3c;假分支 0x3a4e88 IAP_NETWORK_ERROR。
+    0x3a4e41,
+    // [2026-09-16 E-01,本轮并入表] -[NewStyleStoreMainLayer onItemsMenuSelected:] 0x11 号菜单项「免费贝壳」blx@0x3b23c0;
+    //   假分支弹 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」,不进 onBuyVIPGold:。
+    //   (同类的 -[NewStyleStoreMainLayer onBuyVIPGold:] 门 0x3b2a8f 不收,那道门离线不可达:充值档 itemid 1..7 被 SHELLHOOK
+    //   (objc/messages.rs)整段接管;itemid 8 在 0x3b29c4 `cmp r2,#8` 就转去广告墙分支;其余 itemid 在 0x3b2a5e
+    //   getShopItemData: 取不到(100_0.dat 只有 1..7)、0x3b2a68 直接返回。)
+    0x3b23c5,
+];
+
+/// [2026-09-24 第四轮 K5] 岛会话期 (NetworkManager, isConnected) 臂【不】顶成 1 的调用点。
+const ISLAND_OFFLINE_CONNECTED_LRS: &[u32] = &[
+    // [I8-04] -[UserInfoLayer checkActivityStatus] blx@0x59998;假分支同上 0x59a1e 直接返回。
+    0x5999d,
+    // [I8-04] -[UserInfoLayer onButtonActionFunctionsSelected:] 活动中心按钮 blx@0x5a44c;假分支同上 0x5a504
+    //   ACTION_CENTER_NETWARNING。(0x5a5d3 不收,理由见 isReachable 表同名条目。)
+    0x5a451,
+    // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e64;假分支同上 GET_EXCHANGE_INFO_ERROR。
+    0x376e69,
+    // [I8-03] CustomerServiceLayer 四个按钮的第二道门(isReachable 为真才走到这里),假分支同上 IAP_NETWORK_ERROR:
+    //   onButtonHotQuestionSelected blx@0x3a4a8e。
+    0x3a4a93,
+    //   onButtonOnlineQuestionSelected blx@0x3a4bd2。
+    0x3a4bd7,
+    //   onButtonGameForumSelected blx@0x3a4d16。
+    0x3a4d1b,
+    //   onButtonLookRecallSelected blx@0x3a4e5a。
+    0x3a4e5f,
+];
+
+/// [2026-09-24 第四轮 K5] 编译期自检:LR 表严格升序且每条带 Thumb 位,不满足就编译失败。
+const fn island_lr_table_ok(t: &[u32]) -> bool {
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] & 1 == 0 {
+            return false;
+        }
+        if i > 0 && t[i - 1] >= t[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(island_lr_table_ok(ISLAND_OFFLINE_REACHABLE_LRS));
+const _: () = assert!(island_lr_table_ok(ISLAND_OFFLINE_CONNECTED_LRS));
+
+/// [2026-09-24 第四轮 K5] 调用方 LR 是否命中表。LR 先补 Thumb 位再查(Thumb 代码里的 blx 返回址本就是奇数,补位只为容错)。
+/// 只读寄存器,不发消息。
+fn island_lr_in(env: &Environment, table: &[u32]) -> bool {
+    table.binary_search(&(env.cpu.regs()[14] | 1)).is_ok()
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // ★[2026-06-22 飞机进岛卡死修复] 离线黄金岛总开关 ENABLE_NEWSCENE_ISLAND 默认 ON(飞机/作弊菜单
     // 两条进岛路径等价)。仅【在线模式】(--allow-network-access)强制 OFF——在线下岛 hook(网络门强制
@@ -6941,10 +10098,22 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // 全部 hook 仅在 ENABLE_NEWSCENE_ISLAND 开时生效;网络门强制仅在进岛窗口内,
     // 不污染主村离线行为(铁律:别动已修好的东西)。从 host 嵌套调 guest 的操作只在
     // 运行时就绪后发生(drawScene / 进岛序列),避开启动早期 yielder=None 的坑。
+    // [2026-09-24 第四轮 K3 I5-04] 即时落盘兜底:排队后开关被关掉,那一拍落到开关块外 → 吞掉并清排队标志(不落盘,
+    //   与下面节拍兜底同理)。GameManager 不实现该选择子,必须 return true;不清标志的话以后再也排不上。
+    if sel == "moleIslandFlushNow" && !ENABLE_NEWSCENE_ISLAND.load(O) {
+        ISLAND_FLUSH_NOW_PENDING.store(false, O);
+        return true;
+    }
     // ★[审查修 2026-09-11] 节拍兜底:处理臂在 ENABLE_NEWSCENE_ISLAND 块内,开关关着时排队的那一拍会被跳过、当 no-op 丢掉,
     //   闩锁卡在 true。这里吞掉并清闩锁(开关关着时不碰岛档,所以不落盘)。GameManager 不实现该选择子,必须 return true。
     if sel == "moleIslandTick" && !ENABLE_NEWSCENE_ISLAND.load(O) {
         ISLAND_TICK_RUNNING.store(false, O);
+        return true;
+    }
+
+    // [2026-09-24 第四轮 K11 I2-01] 贝壳树离线应答(自用选择子,NetworkManager 不实现)同理:开关关着(含在线模式强制关)时
+    //   排队到达的那一拍也必须吞掉,否则落到真派发 = 未实现的选择子。开关开着时由岛块里的同名臂处理。
+    if sel == "moleIslandShellTreeInfo" && !ENABLE_NEWSCENE_ISLAND.load(O) {
         return true;
     }
 
@@ -6956,6 +10125,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   拦 getter 而不调原版 reset:reset 会取消再重新调度 timeCounterAdded(touchHLE 有"取消后重调度不复活"的前科),
     //   且后台/掉帧时计数器不走;三个 ivar 除 NewSceneTimer 自身外无人直读(xref 实证)。返回类型 L,88 个调用点均按无符号用。
     //   原 getter 在 isConnected(岛上被强制为真)时每次调用都发 1065,拦下后顺带消除。仅离线;在线走私服 1065 原版路径。
+    // [2026-09-24 第四轮 K4 I4-05] 取值来源 now_cf_secs 已改成单调实现(原版计数器只增不减,见 now_cf_secs 注释),
+    //   宿主系统时间回拨时岛上「现在」不再倒退。本臂仍是写 r0 后 return true,不发宿主消息、不碰其它寄存器。
     if class == "NewSceneTimer" && sel == "getCurrentServerTime" && !env.options.network_access {
         env.cpu.regs_mut()[0] = now_cf_secs().max(0.0) as u32;
         return true;
@@ -7052,6 +10223,57 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             // target 为 nil 或有效指针:放行真方法(nil 由原版自己处理;gameMode 门已由 LR 收窄 hook 放行,布兰的家正常弹面板)。
         }
 
+        // ★[2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口里的打工归还不再虚增工人。
+        //   原版时序:-[NewGameManager loadMapFromData:forNPC:] 在 0x245e0e 把 ActorManager.m_isLoadMap 置 1,随后 loadMapObjects
+        //   重扣加载期占用(商铺售卖中 0x31d4fc hearWithTarget:…loadData:1、出海船 blx@0x360e64 changeAvailableMolerForTask:(-onBoard)),
+        //   再进 endLoadMap@0x243a08:0x243a78 createNpcs(NewSceneQuest init 注册每帧 update:)、0x243ae0 把 createIdleWorkers:
+        //   排到 1 秒后、0x243af2 同步 checkActiveStoryQuest。createIdleWorkers:@0x241f74 要到 1 秒后才在 0x241fde 清 m_isLoadMap,
+        //   然后 0x24200e 起跑 NewSceneQuest/DailyQuest/CafeQuest 的 minusNeededWorkers(给进行中的打工任务扣人),0x242090 按空闲数
+        //   initMoleActors:。而已完成未领奖的岛任务(curQuestResult=哨兵,随 island_userinfo.dat 落盘)经 checkLastTimeState 再 finish、
+        //   离岛期间到期的打工任务经 update:@0x329efc 判到期 finish,都早于这一步;finish 在 blx@0x32a22c(-[NewSceneQuest finish])
+        //   调 [ActorManager changeAvailableMolerForTask:+n],岛日常同构在 blx@0x3414f6(-[DailyQuest finishCurrentQuest])。
+        //   该方法岛上分支只在 0x9daa0「idle>=total」时跳过,否则 0x9dba6 changeAvailableWorkers:(+n)、0x9dbb0 起 addMoleForTask:n
+        //   (blx 在 0x9dbd4,与 n<0 的 releaseMoleForTask: 共用)直接生成 n 只摩尔(不看 m_isLoadMap)。宿主 load_island_userinfo
+        //   让空闲数从总数起算(占用由加载期自行重扣),这 n 个人本会话从没扣过 → 空闲数 = 总数−k+n(k = 加载期已重扣的占用),
+        //   地图还多刷 n 只摩尔。
+        //   做法(移植者自拟的离线等价,让结果回到原版联网时服务器下发的净值):m_isLoadMap 仍为 1 = createIdleWorkers: 还没跑 =
+        //   本会话尚未给任何打工任务扣过人,此时来自这两个返回址的 +n 一律是虚增,吞掉;之后 minusNeededWorkers 见已完成
+        //   (NewSceneQuest 0x32aea2 哨兵 / DailyQuest 0x341c90 result==-1)跳过,空闲数 = 总数−k。窗口外(已清 0)照原版放行;
+        //   k=0 时原版护栏本就挡掉,吞不吞一样;窗口内玩家用贝壳秒完成往次会话接的任务走同一个 blx,吞掉同样正确
+        //   (本会话 1 秒内先接取 blx@0x3291d8 扣人再秒完成才会误吞,手动操作做不到,不另设判据)。
+        //   不改成在 load_island_userinfo 里预扣 n:k=0 时护栏会因此放行,addMoleForTask + initMoleActors:(总数) 反而多刷。
+        //   LR = blx 地址 + 4 且带 Thumb 位:0x32a22c → 0x32a231、0x3414f6 → 0x3414fb。签名 v12@0:4i8(返回 void,两处调用点
+        //   返回后都不读 r0);本臂只读内存、不发消息、不动寄存器。m_isLoadMap 偏移从 _OBJC_IVAR 槽 0xb03e54 现读(实值 +260,BOOL,
+        //   getter 0x9fb40 / setter 0x9fb50 读同一槽),槽值异常就放行。ActorManager 不在 CLASSES,粗筛走 intercept_wants 的 [K8] 槽位。
+        if ON_ISLAND.load(O)
+            && !env.options.network_access
+            && class == "ActorManager"
+            && sel == "changeAvailableMolerForTask:"
+            && (env.cpu.regs()[2] as i32) > 0
+        {
+            let lr = env.cpu.regs()[14];
+            if lr == 0x32a231 || lr == 0x3414fb {
+                let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03e54));
+                let self_bits = env.cpu.regs()[0];
+                if off != 0 && off < 0x1000 && self_bits != 0 {
+                    let loading: u8 = env.mem.read(ConstPtr::<u8>::from_bits(self_bits + off));
+                    if loading != 0 {
+                        log!(
+                            "[MOLECHEAT] island: 进岛加载窗口内吞掉打工归还 +{}(LR={:#x},{};m_isLoadMap=1,createIdleWorkers: 尚未扣人)",
+                            env.cpu.regs()[2] as i32,
+                            lr,
+                            if lr == 0x32a231 {
+                                "岛任务 NewSceneQuest finish"
+                            } else {
+                                "岛日常 DailyQuest finishCurrentQuest"
+                            }
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
         // ★Bug B 续(公寓雇用按了没真出摩尔):点雇用 NewSceneApartment 走 setCurrentProduceMoleNums:(old+1)
         // 设"在产数";真摩尔靠 createInterupdate 每秒计时器等满 build_time(~3600s)才 addWorker:→
         // initMoleActors: 出来,而计时器由 onInfoViewClosed 才 schedule(布兰的家面板 LR 硬开,关闭可能
@@ -7108,6 +10330,59 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             env.cpu.regs_mut()[0..4].copy_from_slice(&saved_regs);
         }
 
+        // ════ [2026-09-24 第四轮 K11 I2-01 / I3-3] 超级贝壳树(32015)离线复活 ════
+        // 放在网络门 match 之前、公寓雇用臂之后的独立块(不贴着 showWithTarget:selector: 防崩块,那里是 K8 的插入点);
+        // 四个选择子与前后任何臂都不重名,顺序无关。只在岛上且离线时生效(在线模式下整个 ENABLE 块已被关掉,
+        // 这里再判一次 network_access 作双保险)。
+        // 自用选择子:getSuperShellTreeInfo: 臂排到运行循环的离线应答,无条件接住(NetworkManager 不实现它);
+        //   不在岛上/在线时到达就只吞掉。粗筛见 intercept_wants 的 K11 槽位(不绑类的裸 sel)。
+        if sel == "moleIslandShellTreeInfo" {
+            if ON_ISLAND.load(O) && !env.options.network_access {
+                island_shelltree_answer(env);
+            }
+            return true;
+        }
+        if ON_ISLAND.load(O) && !env.options.network_access {
+            match (class, sel) {
+                // ① 收获门:-[GameData canHarvestSuperShellTree](getter 0x8b914,c8@0:4,纯 ivar 读)。原版唯一写入者是
+                //   圣诞奖励回包 parseChristmasRewardFlagFromServer:pos:len:@0x1c074a,GameData init@0x6c18c 写 0,离线恒 NO →
+                //   processTouched@0x36acee 只 unselect、updateView@0x36b242 不挂收获图标。等价「服务器已下发可收获」返回 1。
+                //   本臂之前没有任何宿主消息,直接写 r0 早返回。另一个读点 -[NewGameManager generateSuperShellTreeReward:]
+                //   只在串门 gameMode 6 的浇水链上,离线不可达;不改成进岛时 setCanHarvestSuperShellTree:YES,GameData
+                //   在岛会话里若被重建会丢。
+                ("GameData", "canHarvestSuperShellTree") => {
+                    env.cpu.regs_mut()[0] = 1;
+                    return true;
+                }
+                // ② 1085 请求:-[NetworkManager getSuperShellTreeInfo:](imp 0x1cb6e8,v12@0:4L8,发 0x437),调用点
+                //   -[SuperShellTree initWithMapData:type:] 0x36a846(读档建树)与 showInfoView 0x36aef6(点树,之前 0x36aea6
+                //   已 showLoadingLayer)。离线包被吞、没有回包 → 面板不弹、转圈不收、成长值/倒计时永远是 0。
+                //   吞掉 void 方法,把离线应答 moleIslandShellTreeInfo 排到运行循环(与原版回包同样异步到达),
+                //   由 island_shelltree_answer 复刻 1085 的解析与分发。只发一条宿主消息且 return true,不需要恢复寄存器。
+                ("NetworkManager", "getSuperShellTreeInfo:") => {
+                    let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+                    let s_info = island_sel(env, "moleIslandShellTreeInfo");
+                    let pf = island_sel(env, "performSelector:withObject:afterDelay:");
+                    let _: () = msg_send(env, (nm, pf, s_info, nil, 0.0f64));
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
+                // ③ 收获/删除时的重置:-[NetworkManager resetSuperShellTreeInfo](imp 0x1cb730,v8@0:4,发 0x438)。调用点
+                //   -[SuperShellTreeView onButtonGainSelected:] 0x36a014、-[SuperShellTree onHarverstIconClicked] 0x36b5a2、
+                //   onChooseDelete 0x36b688。前两处紧接着把活树 beginCountDownTime 置 0、setHarvestTimes:+1(首次写 purchaseTime
+                //   并经 setModObjectToServer: 回写布局)、outputVipGold 出贝壳,这些都照原版跑。这里等价「服务器已清零」:
+                //   离线状态清成 (0,0),下次查询(再点树/下次进岛)自动开始新一轮 36 小时(updateView 0x36b0fa+0x36b0fe=129600 秒)。
+                ("NetworkManager", "resetSuperShellTreeInfo") => {
+                    SHELLTREE_BC.store(0, O);
+                    SHELLTREE_GV.store(0, O);
+                    island_mark_dirty();
+                    log!("[MOLECHEAT] island: 贝壳树重置(收获/删除,等价 0x438 已被服务器受理)→ 离线倒计时与成长值清零,下次查询开始新一轮");
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         // ★解 state1 等服务器回包的活锁(进岛加载卡死的根因):LoadingHoliday.updateLoading
         // 的唯一停点 state1(curStep_=2)置 updatePause_=1 后发 getAllObjects 等服务器回包;
         // 离线无回包→updatePause_ 永为1→每帧入口直接 return→curStep_ 永卡 2 = 活锁。每帧在
@@ -7116,14 +10391,107 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // ★[审计修 2026-09-11] 去掉 ISLAND_ENTER_WINDOW>0 前置:窗口按【帧】倒计时(1200 帧),进岛加载一慢(首次解图集/
         //   慢机器/掉帧)就先耗尽 → updatePause_ 不再被强清 → 永久卡在加载画面,且看门狗同谓词一起哑掉、不留痕迹。
         //   LoadingHoliday 只在 nextSceneId==10(进黄金岛)时才会被创建,仅按类名门控零回归。
-        if class == "LoadingHoliday" && sel == "updateLoading:" {
+        // [2026-09-24 第四轮 K7 I1-02] 改为只在进岛加载期(ISLAND_LOADING)、且只对 LoadingManager 当前持有的加载器强清。
+        //   原版中止(弹框 CANCEL)后被中止的 LoadingHoliday 并没有真正卸下调度(unschedule 传错了选择子,见 island_loader_is_current),
+        //   原版靠 updatePause_=1 把它永久冻住;以前这里只按类名强清,中止后它会被解冻,接着跑 index3 的 freeCommonResources
+        //   (0x252ebe,拆主村 NPC/公共资源)一路跑到 endLoading,把玩家留在的主村拆掉。中止臂(setIsChangeSceneButtonSelected:0)
+        //   清了 ISLAND_LOADING,这里就不再碰它;中止后再进岛时新旧两个加载器并存,只清新的。正常进岛 LoadingHoliday 只在
+        //   enterLoading:10 之后分配(0x238264 cmp r3,#0xa),到 loadNewScene:10 为止 ISLAND_LOADING 恒为真,对正常路径零回归。
+        //   仍不给 ISLAND_LOADING 加帧数超时(09-11 回滚过:超时清标志 = 网络门关闭 = 慢机器永久卡加载)。
+        if class == "LoadingHoliday" && sel == "updateLoading:" && ISLAND_LOADING.load(O) {
             let self_bits = env.cpu.regs()[0];
-            let cur_ptr: ConstPtr<i32> = Ptr::from_bits(self_bits + 0x10);
-            let cur: i32 = env.mem.read(cur_ptr);
-            if cur >= 2 {
-                let pause_ptr: MutPtr<u8> = Ptr::from_bits(self_bits + 0xc);
-                env.mem.write(pause_ptr, 0u8);
+            if island_loader_is_current(env, self_bits) {
+                let cur_ptr: ConstPtr<i32> = Ptr::from_bits(self_bits + 0x10);
+                let cur: i32 = env.mem.read(cur_ptr);
+                if cur >= 2 {
+                    let pause_ptr: MutPtr<u8> = Ptr::from_bits(self_bits + 0xc);
+                    // [2026-09-24 第四轮 K7 I1-04] 本加载器自己弹的系统框在场时不强清,直接放行真方法(它见 updatePause_!=0 就在
+                    //   0x252c5a 早退)。原版 showNetConnectErrorMessage@0x2520d0 在 0x25213e 故意置的暂停要等玩家点 CANCEL/RETRY;
+                    //   以前不分青红皂白下一拍就冲掉 → 框还挂着、加载已跑完切进岛,点「取消」又去中止一个已结束的加载。离线活锁
+                    //   (state1 等回包)照旧每帧解开,别处弹出的框(委托不是本加载器)不拖住它——原版里它们也不暂停 LoadingHoliday。
+                    //   判据是宿主 UIAlertView 队列里有没有委托 == self 的框(alert_pending_for_delegate),零消息,不在帧栈上发任何东西。
+                    if crate::frameworks::uikit::ui_view::ui_alert_view::alert_pending_for_delegate(
+                        env,
+                        Ptr::from_bits(self_bits),
+                    ) {
+                        if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_ALERT_PAUSE, O) & K7_LOG_ALERT_PAUSE) == 0 {
+                            log!("[MOLECHEAT] island: LoadingHoliday 自己的系统弹框在场 → 暂不强清 updatePause_(尊重原版弹框暂停,关框后由原版收尾)");
+                        }
+                    } else {
+                        env.mem.write(pause_ptr, 0u8);
+                    }
+                }
+                // [2026-09-24 第四轮 K7 I9-04] 这一拍真方法要跑 state2(跳表 index2,进入时 curStep_==3;tbh 表 0x252c84 第 3 项
+                //   0x00dd → 0x252e3e,实抠)判 mapData.count 时,先查一次、为 0 就补注入(见 island_state2_reinject_if_empty)。
+                //   只在暂停已解开(真方法这一拍确实会往下跑)时判,本次进岛只判一次。发过宿主消息,放行前整体恢复 r0-r3
+                //   (真方法要用 r0=self、r2=dt)。
+                if cur == 3 && !ISLAND_REINJECT_TRIED.load(O) {
+                    let pause_now: u8 = env.mem.read(ConstPtr::<u8>::from_bits(self_bits + 0xc));
+                    if pause_now == 0 {
+                        let saved_regs = [
+                            env.cpu.regs()[0],
+                            env.cpu.regs()[1],
+                            env.cpu.regs()[2],
+                            env.cpu.regs()[3],
+                        ];
+                        island_state2_reinject_if_empty(env);
+                        env.cpu.regs_mut()[0..4].copy_from_slice(&saved_regs);
+                    }
+                }
+            } else if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_STALE_LOADER, O) & K7_LOG_STALE_LOADER) == 0 {
+                log!(
+                    "[MOLECHEAT] island: 旧的(已中止的)LoadingHoliday {:#x} 仍挂在调度器上 → 保持原版暂停,不解冻",
+                    self_bits
+                );
             }
+        }
+
+        // [2026-09-24 第四轮 K7 I9-04] 进岛加载期吞掉 LoadingHoliday 自己的三个断网/登录弹框,与上面 HolidayVillageLayer 三框对称。
+        //   调用点(selref 实证):showNetConnectErrorMessage 5 处 = updateLoading: 0x252e86(state2 mapData 空)/0x253a66(index0 连接失败)/
+        //   0x253a78(index1 连接失败)+ onNewSceneLoadingCommandChangedTo: 0x253fcc + onNewSceneLoadingCommandReceived: 0x254274;
+        //   showLoginErrorMessage 0x253fd8/0x25410c、showMultiLoginErrorInNewScene 0x253f76 都在两个 NetworkManager 委托回调里。
+        //   离线单机弹「网络连接中断」是误报,且它的收尾 -[LoadingHoliday alertView:didDismissWithButtonIndex:]@0x251de0
+        //   index1(RETRY)会去 isReachable/isConnected/reconnectUsingNewHD(0x251f02)、index0 走中止分支。吞掉后加载按原步骤继续
+        //   (网络门在加载期把 isConnected/state 强制在线;index0/1 在 show 前已置的暂停由上面的臂下一拍解开),state2 的空 mapData
+        //   由上面的补注入兜底。吞之前必留痕(island_loading_alert_swallow_log,用 log! 打 mapData.count / island_map.dat / 保护位 /
+        //   ISLAND_INJECTED),坏档或注入失败不会再被「网络连接中断」掩盖。方法签名 v8@0:4(无参 void),r0 置 0 后 return true。
+        //   LoadingHoliday 已在 intercept_wants 的 CLASSES 里。
+        //   连带后果(有意):离线进岛加载期这三框不再出现,原版 CANCEL 中止分支与 RETRY 分支也就不会再被触发;下面的
+        //   setIsChangeSceneButtonSelected:0 中止臂、上面 updateLoading: 臂的 alert_pending_for_delegate 判据与「只清当前加载器」判定,
+        //   从此只作防御兜底(别的代码弹出的系统框、ISLAND_LOADING 为假时才到的迟到回调)。测它们要临时去掉本臂。
+        if class == "LoadingHoliday"
+            && matches!(
+                sel,
+                "showNetConnectErrorMessage" | "showLoginErrorMessage" | "showMultiLoginErrorInNewScene"
+            )
+            && ISLAND_LOADING.load(O)
+        {
+            island_loading_alert_swallow_log(env, sel);
+            env.cpu.regs_mut()[0] = 0;
+            return true;
+        }
+
+        // [2026-09-24 第四轮 K7 I1-05] 原版 LoadingHoliday 跳表 index3(0x252eb0,进入时 curStep_==4)在 [SceneMannager lastSceneId]==1
+        //   (0x252f36,进岛 from 恒为 1,故每次都跑)时于 0x252f84 执行 [[NewGameManager sharedManager] setGameMode:[[GameManager
+        //   sharedManager] gameMode]],把主村 gameMode 原样拷进岛,覆盖 state1 注入时 build_default_island_mapdata 写的 seed=1。
+        //   原版 -[VillageLayer enterNewIslands] 的前置门(0x375ee-0x37618)放行 gameMode ∈ {1,6,0},以 6 或 0 进岛时岛上
+        //   NewGameManager.gameMode 就成了 6/0,-[HolidayVillageLayer processTouch:withType:] 0x23d7e4 的 gameMode==1 门直接 bail
+        //   → 整局在岛上点建筑、点地面、点 NPC 全无反应。只夹这一次拷贝:LR==0x252f89(blx@0x252f84 的返回址 0x252f88 带 Thumb 位,
+        //   annot 实证;与 0x2497a9/0x32643b 同法推导),r2 不是 1 就改成 1;岛上合法瞬态 2/3/9/11 与主村所有 setGameMode:(另 132 个
+        //   调用点)LR 都不符,一律不碰,不会每帧钉死 gameMode。签名 v12@0:4i8,只改 r2,零消息,return false 放行真 setter。
+        //   不在 loadNewScene: 臂里补发 setGameMode:(那条臂在 endLoadingScene 调度栈上,真方法入口第一件事用 r2 写 curSceneId_,
+        //   加宿主消息要整体快照恢复 r0-r3)。build_default_island_mapdata 里的 seed 保留作兜底(lastSceneId≠1 时 index3 不拷贝)。
+        //   NewGameManager 已在 intercept_wants 的 CLASSES 里。
+        if class == "NewGameManager" && sel == "setGameMode:" && env.cpu.regs()[14] == 0x252f89 {
+            let copied = env.cpu.regs()[2] as i32;
+            if copied != 1 {
+                env.cpu.regs_mut()[2] = 1;
+                log!(
+                    "[MOLECHEAT] island: LoadingHoliday case4 拷贝 {} → 夹成 1(岛浏览态,主村 GameManager.gameMode 原样拷进岛会让岛上点击全部失效)",
+                    copied
+                );
+            }
+            return false;
         }
 
         // ★[审计修 2026-09-11] 进岛/在岛标志改为【事件驱动】(纯原子操作 + 读寄存器,无 msg_send):
@@ -7131,11 +10499,18 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //     已过网络门之后(0x24155e),LoadingHoliday 也只在此、仅 nextSceneId==10 时分配;r2=SceneMannager 自身。
         //   · ON_ISLAND:[SceneMannager loadNewScene:] 且 r2==10(唯一调用方 endLoadingScene;真方法入口第一件事写 curSceneId_=r2)。
         //     以前还要求 ISLAND_ENTER_WINDOW>0:加载超过 1200 帧就永远置不上 → 岛上全部 hook 静默失效。
-        //   · LoadingHoliday alertView:didDismissWithButtonIndex: 且 buttonIndex(r3)==0:原版的加载中止路径(不切场景)。
+        //   · [2026-09-24 第四轮 K7 I1-02] 加载中止:[SceneMannager setIsChangeSceneButtonSelected:0] 且 ISLAND_LOADING
+        //     (原版中止分支 0x252012 的真标记;以前挂在 LoadingHoliday alertView:didDismissWithButtonIndex: r3==0 上,不等价,见该臂)。
         if class == "LoadingManager" && sel == "enterLoadingWithDelegate:nextSceneId:" {
             if env.cpu.regs()[3] == 10 {
                 ISLAND_LOADING.store(true, O);
                 ISLAND_SCENE_MGR.store(env.cpu.regs()[2], O);
+                // [2026-09-24 第四轮 K7 I1-02] r0 = LoadingManager 单例;updateLoading: 臂据它认当前加载器。
+                ISLAND_LOADING_MGR.store(env.cpu.regs()[0], O);
+                ISLAND_K7_LOGGED.store(0, O);
+                // [2026-09-24 第四轮 K7 I9-04] 每次进岛重新开 state2 补注入闸、重置吞框诊断计数。
+                ISLAND_REINJECT_TRIED.store(false, O);
+                ISLAND_ALERT_SWALLOWED.store(0, O);
                 log!("[MOLECHEAT] island: >> enterLoading (加载场景开始,ISLAND_LOADING=true)");
             }
         } else if class == "SceneMannager" && sel == "loadNewScene:" && env.cpu.regs()[2] == 10 {
@@ -7146,20 +10521,69 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             ISLAND_SCENE_MGR.store(env.cpu.regs()[0], O);
             // ★【已回滚】曾在此 load_island_shop_atlases 补加载 4 个建筑商店图集——实测它把黄金岛渲染搞坏成全绿场地。
             log!("[MOLECHEAT] island: >> loadNewScene (建 GameNewScene),ON_ISLAND=true");
-        } else if class == "LoadingHoliday"
-            && sel == "alertView:didDismissWithButtonIndex:"
-            && env.cpu.regs()[3] == 0
+        } else if class == "SceneMannager"
+            && sel == "setIsChangeSceneButtonSelected:"
+            && (env.cpu.regs()[2] & 0xff) == 0
             && ISLAND_LOADING.load(O)
         {
+            // [2026-09-24 第四轮 K7 I1-02] 进岛被中止时的完整善后,改挂在中止的真标记上。
+            //   ① 触发点:原来挂在 (LoadingHoliday, alertView:didDismissWithButtonIndex:) 且 r3==0 上,并不等价于中止——原方法
+            //     index0 还要先匹配 NEW_SCENE_NETWORK_DISCONNECT / LOGIN_ERROR_IN_NEWSCENE / MULTI_LOGIN_ERROR_IN_NEWSCENE 三条文案
+            //     才走善后(0x251f08-0x251fe4),匹配不上落到 0x2520c8 直接返回、加载继续,那时却已把标志清了。
+            //     setIsChangeSceneButtonSelected: 全二进制 9 个调用点(selref 实证):GameManager 5 处——onStateChangedTo:(0x21a24/0x21bfa)
+            //     与 onCommandReceived:(0x2311c/0x238ce)4 处都在 isDownloadDataForEnterNewScene_(+313)为真的分支里,该位只由
+            //     updateGameDateForEnterNewSceneWithTarget:andCallback: 置(0x25d6e),它自己在 0x25d30 另有一处清 0,而整个方法离线被 gate#1
+            //     吞掉、从不执行,所以该位从不置位;VillageLayer enterNewIslands(0x37692)与 HolidayVillageLayer gobackMainVillage(0x23d1b8)传 1;
+            //     -[NewBaseLoading switchToNewScene](0x241d64)清 0 时已在 performSelector:(exitLoading)→endLoadingScene→loadNewScene:10
+            //     之后(该 performSelector 在 0x241d16/0x241d26 以 targetCallback_/selector_ 非空为前提,LoadingManager enterLoading 在
+            //     0x2382ea 恒以 setCallBack:self selector:exitLoading 设好),ISLAND_LOADING 已为假;宿主菜单的复位(mole_menu)要求
+            //     island_session_active() 为假。所以加载期只有中止分支
+            //     (-[LoadingHoliday alertView:didDismissWithButtonIndex:] 0x252012)会走到这里。
+            //   ② curSceneId_:中止分支只 setIsChangeSceneButtonSelected:0 / hideLoadingLayer / unscheduleSelector(传错了选择子)/
+            //     清两个 NetworkManager 委托,不恢复场景号;唯一的复位函数 -[SceneMannager restoreLastScene]@0x2415d8 零引用。
+            //     curSceneId_ 永卡 startNewSceneFrom@0x241520 写的 2 → -[NewStyleStoreItemsView loadObjectsDataByType:]@0x3b9534 按场景号
+            //     选数据源(1→GameData、10→NewSceneData、其余 nil)→ 主村建设庄园/食材店全空格,-[WrapperManager currentGameMode] 也路由错,
+            //     且不会自愈。照 -[SceneMannager endLoadingScene]@0x241660/0x241664 的语义写 curSceneId_=1、nextSceneId_=0
+            //     (进岛 from 恒为 1 = lastSceneId_,等价于 restoreLastScene)。r0 就是 SceneMannager 本体(sharedManager 的返回值),
+            //     偏移从 _OBJC_IVAR 槽 0xb05f94/0xb05f98 现读(兼容非脆弱 ivar 修正写回),读不到用 12/16(re.py ivar 实证)。
+            //   ③ 会话标志:清 ISLAND_LOADING 与 ISLAND_ENTER_WINDOW。[2026-09-16 I9-03] 的理由照旧:窗口 >0 会让岛网络门在主村继续生效
+            //     (isConnected=1/state=6/isReachable=1/吞 sendPacket),island_session_active() 为真还会让离线活动回环停摆约 20 秒。
+            //     被中止的加载器从此由 updateLoading: 臂的 ISLAND_LOADING 门与当前加载器判定保持原版暂停。
+            //   全程纯内存读写,不发消息、不改寄存器,return false 放行真 setter(它照原版把 isChangeSceneButtonSelected_ 清 0)。
+            let sm = env.cpu.regs()[0];
+            let off_cur: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f94));
+            let off_cur = if off_cur != 0 && off_cur < 0x100 { off_cur } else { 12 };
+            let off_next: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb05f98));
+            let off_next = if off_next != 0 && off_next < 0x100 { off_next } else { 16 };
+            let cur_ptr: MutPtr<i32> = Ptr::from_bits(sm + off_cur);
+            let next_ptr: MutPtr<i32> = Ptr::from_bits(sm + off_next);
+            let old_cur: i32 = env.mem.read(cur_ptr);
+            let old_next: i32 = env.mem.read(next_ptr);
+            env.mem.write(cur_ptr, 1i32);
+            env.mem.write(next_ptr, 0i32);
             ISLAND_LOADING.store(false, O);
-            // [2026-09-16 黄金岛审查修 I9-03] 网络窗口也要一起清。原来 ISLAND_ENTER_WINDOW 只在离岛臂
-            //   (startNewSceneFrom 10→1)清零,进岛半路被中止时它还揣着最多 1200 帧(约 20 秒)。
-            //   窗口 >0 会让岛网络门在【主村】继续生效:isConnected=1 / state=6 / isReachable=1 / 吞掉所有
-            //   sendPacket,同时 island_session_active() 为真会让整个离线活动回环停摆(mole_activity.rs:334)。
-            //   玩家表现:一次没进成的进岛之后,主村有约 20 秒「活动中心/签到/折扣点不开也不弹离线提示」的抽风期,
-            //   而且这期间接/交任务走的是在线分支。中止时清零,是这条路径上唯一安全且充分的收敛点。
             ISLAND_ENTER_WINDOW.store(0, O);
-            log!("[MOLECHEAT] island: 进岛加载被中止(LoadingHoliday 弹框 index0)→ 清加载标志与网络窗口");
+            log!(
+                "[MOLECHEAT] island: 进岛加载被中止(setIsChangeSceneButtonSelected:0)→ curSceneId 复位 1(原 {})、nextSceneId 清 0(原 {}),清加载标志与网络窗口",
+                old_cur,
+                old_next
+            );
+            return false;
+        } else if class == "SceneMannager" && sel == "loadMainVillageScene" {
+            // [2026-09-24 第四轮 K7 N-D5-2] 离岛标志的结束点改成事件驱动。回村整条链在同一次调度器 tick 里同步跑完:
+            //   -[NewBaseLoading endLoading]@0x241cce → switchToNewScene → 0x241d34 performSelector:(exitLoading)
+            //   → -[LoadingManager exitLoading]@0x23848a endLoadingScene → -[SceneMannager endLoadingScene] 0x241660 写
+            //   curSceneId_=1、0x241664 写 nextSceneId_=0 → 0x241668 loadMainVillageScene(全二进制唯一调用点,selref 实证)
+            //   → 0x241092/0x241138 startGame → startGame:。而 -[CCDirectorIOS drawScene] 先进前置臂、后 [CCScheduler tick:],
+            //   上面 drawScene 臂在这一帧只能读到 cur=2,ISLAND_EXITING 要到下一帧才清 → startGame: 被拦时
+            //   island_session_active() 仍为真,mole_activity 的进村补发(1074 日常/1058 公告/1112 烟花/1049 折扣)整段跳过,
+            //   回环队列也被清掉:回村后日常任务 NPC 头顶的「!」不再出现、公告星标不重置、春节回村不补放烟花。
+            //   在这里(写完 cur=1 之后、startGame: 之前)清掉它。纯原子操作:不发消息、不动寄存器、不 return,放行真方法。
+            //   此刻 ON_ISLAND 早已在离岛出口清掉,curSceneId 强制 10 的臂不受影响;drawScene 的 cur==1/10 判定与 3600 帧超时兜底保留。
+            //   SceneMannager 不在 intercept_wants 的 CLASSES 里,粗筛靠 [K7] 槽位的受门控 sel(ISLAND_EXITING 为真才放行)。
+            if ISLAND_EXITING.swap(false, O) {
+                log!("[MOLECHEAT] island: 离岛完成(loadMainVillageScene)→ curSceneId 已写 1,清离岛标志(startGame: 的进村补发照常)");
+            }
         }
         // 曾有 gobackMainVillage 前置钩子清离岛标志,因真方法 0x23d19c 读到 isChangeSceneButtonSelected 会早退、抢跑会误判离岛而删除,勿复活
         // (离岛统一走网络门块里 startNewSceneFrom:toScene: 10→1 全局出口)。
@@ -7182,13 +10606,23 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //   在 onButtonCallSelected: 方法体中段把 self 拆了,后面还要读 self->itemmoney,窗口危险且可能重入。
             island_resend_quest4_action(env);
             if ON_ISLAND.load(O) && ISLAND_DIRTY.load(O) {
+                // [2026-09-24 第四轮 K3 I6-5] 上一轮有岛档写盘失败时,退避期(10 秒)过了才重试。
                 let due = ISLAND_LAST_FLUSH
                     .with(|c| c.get())
-                    .map_or(true, |t| t.elapsed().as_millis() >= 1500);
+                    .map_or(true, |t| t.elapsed().as_millis() >= 1500)
+                    && island_retry_ready();
                 if due {
                     // [扫描修 2026-09-15] F10-6 节拍落盘只打一行:原因文本并入 island_flush 的汇总行(含「节拍落盘」与各「存盘 island_xxx.dat」)。
                     island_flush(env, "节拍落盘(岛上有未保存的变化)");
                 }
+            }
+            // [2026-09-24 第四轮 K3 I7-07] 岛档被坏档保护禁写时,在岛上(不在进岛加载/离岛过渡中)弹一次提示,见 island_show_block_prompt。
+            if ON_ISLAND.load(O)
+                && !ISLAND_EXITING.load(O)
+                && !ISLAND_LOADING.load(O)
+                && ISLAND_BLOCK_PROMPT_PENDING.load(O)
+            {
+                island_show_block_prompt(env);
             }
             if island_session_active() {
                 schedule_island_tick(env);
@@ -7198,38 +10632,128 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             return true;
         }
 
+        // [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘(由置脏臂里的 island_request_flush_now 用 afterDelay:0 排进来)。
+        //   GameManager 不实现该选择子,必须 return true 吞掉。宿主自排的选择子、栈上没有游戏方法体,可自由发消息。
+        //   不看 1.5 秒节流(这正是要绕开的窗口),但看写盘失败的退避(免得连续失败时每次操作都重跑整套落盘)。
+        if sel == "moleIslandFlushNow" {
+            // [2026-09-24 第五轮补挖 M-M6-1] 只在解释器构建(iOS / cpu_interpreter)上:距上次落盘不到 1 秒就不立刻落,
+            //   按剩余时间再排一次(PENDING 保持置位,期间的关键操作不重复排队),连点收店/进货时第一次立即落盘、
+            //   之后最迟约 1 秒合并成一次;解释器下一整轮归档(每个 TMMapData 的 encodeWithCoder: 都在 guest 里跑)
+            //   加主档加密写盘会明显掉帧。桌面 JIT 构建保持立即落盘。节拍先落了盘也无妨:到时 DIRTY 已清,这里直接空转。
+            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+            {
+                let since = ISLAND_LAST_FLUSH.with(|c| c.get()).map(|t| t.elapsed().as_secs_f64());
+                if let Some(el) = since {
+                    if el < 1.0 && ON_ISLAND.load(O) && ISLAND_DIRTY.load(O) && !ISLAND_FLUSHING.load(O) {
+                        let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+                        let gm: id = if gm_cls != nil {
+                            let smgr = island_sel(env, "sharedManager");
+                            msg_send(env, (gm_cls, smgr))
+                        } else {
+                            nil
+                        };
+                        if gm != nil {
+                            let now_s = island_sel(env, "moleIslandFlushNow");
+                            let perform = island_sel(env, "performSelector:withObject:afterDelay:");
+                            let _: () = msg_send(env, (gm, perform, now_s, nil, (1.0 - el).max(0.05)));
+                            return true;
+                        }
+                    }
+                }
+            }
+            ISLAND_FLUSH_NOW_PENDING.store(false, O);
+            let batch_saved = ISLAND_BATCH_MAIN_SAVED.swap(false, O);
+            if ON_ISLAND.load(O)
+                && ISLAND_DIRTY.load(O)
+                && !ISLAND_FLUSHING.load(O)
+                && island_retry_ready()
+            {
+                ISLAND_SKIP_MAIN_SAVE_ONCE.store(batch_saved, O);
+                island_flush(env, "关键操作即时落盘");
+            }
+            return true;
+        }
+
+        // [2026-09-24 第五轮补挖 M-M6-1] 原版存过主档之后又改了主村 UserInfoData(add*/set*)→ 本批主档还没存,落盘时照常写。
+        //   纯原子;UserInfoData 已在 CLASSES。存主档过程中若调到 UserInfoData 的 set*,只会让这批多写一次(安全方向)。
+        if ON_ISLAND.load(O)
+            && class == "UserInfoData"
+            && (sel.starts_with("add") || sel.starts_with("set"))
+            && ISLAND_FLUSH_NOW_PENDING.load(O)
+        {
+            ISLAND_BATCH_MAIN_SAVED.store(false, O);
+        }
+
         // ★[审计修 2026-09-11] 置脏:岛上经营/任务/剧情/成就/扩地/工人数都落在 NewSceneUserInfoData 的 set*/add*,
         //   经验/贝壳/金币/建设值/碎片走 NewSceneData 的 add*InNewScene:/addAdventureMapFragment:/setMapFragments:,
         //   新放置走 NetworkManager addObjectToServer:(这里只置脏不拦截,seqId 在它内部分配)。纯原子操作。
+        // [2026-09-24 第四轮 集成补漏] 另加咖啡馆许愿任务三张表的写入点(见 island_is_cafe_table_op)与岛上厕所小游戏
+        //   -[WashRoomGame updateTop3Record]@0x35c230(前三名只写内存、原版随即发 addTop3MiniGameRecord:/setModTop3MiniGameRecord:,
+        //   不经过任何置脏方法;island_misc.dat 由 K12 落盘)。WashRoomGame 不在 CLASSES,粗筛走 intercept_wants 的门控 sel 行。
+        // [2026-09-24 第五轮补挖 M-M1-2] 岛上直接改主村 UserInfoData 金币/经验/贝壳的发奖路径也置脏:岛日常领奖
+        //   -[DailyQuest postCurrentQuest]@0x34229c → rewardXP:gold:@0x342ec4 在 0x342f0c/0x342f6e 直接 [[GameData userInfoData] addXp:/addGold:]
+        //   (-[UserInfoData addGold:]@0xbb1d8、addXp:@0xbb040 本身不存盘),随后 0x342520 saveQuestResults → 0x7b19a 当场把
+        //   「已领/切下一条」写进 map.dat;岛上小游戏 -[Building onMiniGameFinished] 0xb254e/0xb25cc 同样直调。以前这条路不置脏,
+        //   领完奖后岛上没有别的操作就硬崩,map.dat 已记领过、userinfo.dat 却没有这笔奖励。addGold:/addXp: 另列为关键操作
+        //   (即时落盘会先 saveUserinfoToLocal,两份档一帧内对齐)。UserInfoData 已在 CLASSES。
+        // [2026-09-24 第五轮补挖 M-M2-1] 岛宠物领礼物:-[Animal exitGiftMode:]@0xdd4f0 在 0xdd632 写 NpcData.lastCoolDownTime,
+        //   只有带 update_build_value 的宠物才经 0xdd8a8 addBuildValueInNewScene: 置脏;16012~16016 这 5 只没有,冷却时刻要等
+        //   别的操作才落盘,硬崩后重进礼物又冒出来。0xdd8d0 [NetworkManager setModAnimalsOrNPCsWithData:] 是原版把冷却上报
+        //   服务器的点(只在 0xdd7e4 curSceneId==10 分支),离线当作「服务器已记账」置脏。NetworkManager 已在 CLASSES。
         if ON_ISLAND.load(O)
             && ((class == "NewSceneUserInfoData" && (sel.starts_with("set") || sel.starts_with("add")))
                 || (class == "NewSceneData"
                     && (sel.ends_with("InNewScene:")
                         || sel == "addAdventureMapFragment:"
                         || sel == "setMapFragments:"
-                        || sel == "saveUserinfoToLocal"))
-                || (class == "NetworkManager" && sel == "addObjectToServer:"))
+                        || sel == "saveUserinfoToLocal"
+                        || island_is_cafe_table_op(sel)))
+                || (class == "NetworkManager"
+                    && (sel == "addObjectToServer:" || sel == "setModAnimalsOrNPCsWithData:"))
+                || (class == "WashRoomGame" && sel == "updateTop3Record")
+                || (class == "UserInfoData" && matches!(sel, "addGold:" | "addXp:" | "addVipGold:")))
         {
             island_mark_dirty();
+            // [2026-09-24 第五轮补挖 M-M6-1] 本批即时落盘排队中、原版自己存了主档 → 记下,落盘时不再重复写(见 ISLAND_BATCH_MAIN_SAVED)。
+            if class == "NewSceneData"
+                && sel == "saveUserinfoToLocal"
+                && ISLAND_FLUSH_NOW_PENDING.load(O)
+                && !ISLAND_FLUSHING.load(O)
+            {
+                ISLAND_BATCH_MAIN_SAVED.store(true, O);
+            }
+            // [2026-09-24 第四轮 K3 I5-04] 关键操作(扣款/发奖/任务指针/扩地/新放置)再排一次即时落盘,见 island_request_flush_now。
+            //   它内部发宿主消息前后整体快照/恢复 r0-r3,本臂之后照旧往下走、按原逻辑放行真方法。
+            if island_is_key_op(class, sel) {
+                island_request_flush_now(env);
+            }
         }
 
         // ★[审计修 2026-09-11] 在岛上直接关窗口/Cmd+Q:touchHLE 的干净退出链(uikit.rs → ui_application::exit)
         //   依次给 AppDelegate 发 applicationWillResignActive: 与 applicationWillTerminate:,然后 process::exit。
         //   以前岛存档只在离岛时写 → 关窗 = 本局岛上进度全丢,而经济(金币/贝壳)早已即时写进 userinfo.dat
-        //   (买建筑扣的钱在、建筑没了;交任务的奖励在、任务指针回滚=可无限刷)。两个回调各落一次盘,幂等。
+        //   (买建筑扣的钱在、建筑没了;交任务的奖励在、任务指针回滚=可无限刷)。
+        // [2026-09-24 第四轮 K3 I7-02/I9-06] 这里原来是【前置】落盘(先 island_flush 再放行真方法),顺序反了:
+        //   -[iMoleVillageAppDelegate applicationWillResignActive:]@0xfdb8 在 0x10102 才调 [NewSceneData updateBeginTime](0x21f49c),
+        //   后者从 0x21f504 起取 onApplicationWillResignActive 逐个发给 ObjectManager 活对象,各对象在里面 setModObjectToServer:
+        //   推"暂停那一刻"的经营态(例:-[NewSceneShop onApplicationWillResignActive]@0x3203cc 的 0x32051c-0x3205e4 分支,
+        //   在 saleItemId≥1、beginTime==0、actorId≥1 即工人还在走向商铺时补 isShopping=1/beginTime=now 再回写;
+        //   Building 0xb2c74、DiscoveryShip 0x36103e 同类),这些回写落在我们落盘之后、只留在内存 →
+        //   切后台被杀再进岛,那家店按 beginTime=0 读档(0x31d44c-0x31d472)当场判卖完。安卓切后台还会接着发
+        //   applicationDidEnterBackground:(ui_application.rs send_did_enter_background,以前注释说"永不投递"已过时)。
+        //   现在改为宿主在 ui_application 的失活/进后台/终止三处,等委托回调与通知都发完、pool drain 之前调 island_lifecycle_flush,
+        //   天然零重入、零寄存器问题。本臂只打日志放行:不在臂内转发真方法(会重入同一臂无限递归),也不手动先调 updateBeginTime
+        //   (其 NewSceneShop 分支有 setOpacity:/setTexture:/removeChildByTag:cleanup: 等 UI 副作用 0x32044e/0x320460/0x320488,幂等未证)。
         if class == "iMoleVillageAppDelegate"
-            && (sel == "applicationWillResignActive:" || sel == "applicationWillTerminate:")
+            && (sel == "applicationWillResignActive:"
+                || sel == "applicationDidEnterBackground:"
+                || sel == "applicationWillTerminate:")
             && ON_ISLAND.load(O)
         {
-            let saved = [
-                env.cpu.regs()[0],
-                env.cpu.regs()[1],
-                env.cpu.regs()[2],
-                env.cpu.regs()[3],
-            ];
-            log!("[MOLECHEAT] island: 应用即将退出({})→ 岛存档落盘", sel);
-            island_flush(env, "应用退出落盘");
-            env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+            log!(
+                "[MOLECHEAT] island: 应用生命周期回调 {} → 放行原版回调,岛存档等回调与通知都发完后由宿主统一落盘",
+                sel
+            );
             return false;
         }
 
@@ -7244,7 +10768,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //   读到离线就走 showNetConnectErrorMessage;以前只靠帧窗口,加载一慢就踩到。
         if ISLAND_ENTER_WINDOW.load(O) > 0 || ON_ISLAND.load(O) || ISLAND_LOADING.load(O) {
             match (class, sel) {
-                ("NetworkManager", "isConnected") => {
+                // [2026-09-24 第四轮 K5 I9-02] 与下面 isReachable 通配臂同一套「按调用点放行」:LR 命中
+                //   ISLAND_OFFLINE_CONNECTED_LRS(兑换中心等纯联网按钮的门)就不顶,落到 `_ => {}` 放行真 getter
+                //   (-[NetworkManager isConnected]@0xe152c 只读 connected ivar +68,离线为 0)。本臂之前没有宿主 msg_send,
+                //   r0/r1 原样。只排 isReachable 挡不住:-[NetworkManager isReachable]@0xed2fc 读的是 isReachable_ ivar(+180),
+                //   一旦被置过 1(可达性回调 updateReachable: / setIsReachable:),第一道门就放过去了,只剩这道门能拦回离线分支。
+                ("NetworkManager", "isConnected")
+                    if !island_lr_in(env, ISLAND_OFFLINE_CONNECTED_LRS) =>
+                {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
                 }
@@ -7281,10 +10812,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                             env.cpu.regs()[3],
                         ];
                         log!("[MOLECHEAT] island: 离岛(startNewSceneFrom {}→{})→ 统一落盘", from, env.cpu.regs()[3] as i32);
-                        island_flush(env, "离岛统一落盘");
+                        island_flush_final(env, "离岛统一落盘"); // [2026-09-24 第四轮 K3 I6-5] 末次落盘失败当场重试一次
                         // 4 条离岛路径(gobackMainVillage/菜单返回/串门/exitNewIsland:)都经过这里,且 to==1 跳过网络门,
                         // 放行后必定成功(0x24142e beq)。在岛标志在此清,curSceneId→10 强制随之停止,不会误路由主村加载。
                         ON_ISLAND.store(false, O);
+                        // [2026-09-24 第四轮 集成补漏] 本次进岛的侧档「已注入/已恢复」标志随离岛失效:落盘已在上面做完,
+                        //   回主村后 LoadingMainVillage 的 reset(0x2543fe)会清空仓库活表与咖啡馆三张表。标志若残留,
+                        //   ON_ISLAND 万一异常残留(例如在岛上关掉「可建筑黄金岛」总闸再离岛,出口臂不跑)或将来出现
+                        //   绕过 build_default_island_mapdata 的进岛路径时,节拍/关窗落盘会把清空后的空表写进
+                        //   island_storage.dat / island_cafe.dat。下次进岛由各自的注入/恢复函数重新置位。
+                        ISLAND_STORAGE_ARMED.store(false, O);
+                        CAFE_SESSION_READY.store(false, O);
                         ISLAND_ENTER_WINDOW.store(0, O);
                         ISLAND_SCENE_MGR.store(saved[0], O);
                         ISLAND_EXIT_FRAMES.store(3600, O);
@@ -7347,8 +10885,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //   itemid 8 调 onBuyVIPGold:(广告墙「免费贝壳」),为假弹原版 IAP_NETWORK_ERROR「咦，你的设备没有连接网络哦」。以前岛上
                 //   这里通配成 1,岛上点它会进 SHELLHOOK 白送贝壳并误触发充值副作用,主村却弹离线提示。排除后落到下面 `_ => {}`,放行真
                 //   isReachable(本臂之前没有 msg_send,寄存器未动),岛上与主村一样弹原版离线提示。只精确排除这一个 LR,进岛链上其它门不受影响。
+                // [2026-09-24 第四轮 K5 I9-02] 按调用点排除改成查 ISLAND_OFFLINE_REACHABLE_LRS 表(E-01 的 0x3b23c5 并入表,判据不再分两处写),
+                //   表里只收岛 HUD/面板上纯联网按钮回调里的门(每条的类.方法与假分支文案见表注释),命中就落到下面 `_ => {}` 放行真 getter。
                 (c, "isReachable")
-                    if c != "NewScenePorter" && c != "Porter" && env.cpu.regs()[14] != 0x3b23c5 =>
+                    if c != "NewScenePorter"
+                        && c != "Porter"
+                        && !island_lr_in(env, ISLAND_OFFLINE_REACHABLE_LRS) =>
                 {
                     env.cpu.regs_mut()[0] = 1;
                     return true;
@@ -7388,6 +10930,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //     了选择子:storm 是直接循环 sendPacket,不走那个包装方法。)
                 (_, "sendPacket:commandId:") => {
                     return true; // 离线无服务器,发包=空过且每包序列化必卡 → 吞掉
+                }
+                // (a1) [2026-09-24 第四轮 K5 I9-05] 三参发包 -[NetworkManager sendPacket:commandId:sendFlag:](imp 0xe1e88,
+                //   签名 v20@0:4@8L12L16:r2=包数据、r3=commandId、sendFlag 在栈上)是另一条独立实现,上面 (a) 吞不到它。
+                //   岛上会走到的是 -[NetworkManager deleteAppendObjectsListWithSceneId:andObjectsList:]@0xea880 在 blx@0xeab6a
+                //   发的 1072(0xeab5c `mov.w r3,#0x430`,存档里有 sceneId=10 的附加物件时)。真方法在 isReachable_ ivar 为 1 时
+                //   (0xe1ea8 那道判断)会经 isTimeoutControllingPacketWithPacketCommandID:andSendFlag:(0xe1f34)把包登记进
+                //   UnreadPacketsDic_,之后 -[NetworkManager checkTimeOut]@0xe0748 判超时 → changeStateTo:withMessage: + disconnect,
+                //   岛上网络状态机被打成断线态。离线没有服务器,直接吞掉;方法返回 void,调用方不看返回值。
+                //   护栏:r3 为登录命令族(0x3e8 / 1234=0x4d2;-[NetworkManager loginWithDeviceInfoAndUserIDInfoInSendType:] 的三参
+                //   调用 r3 恒为 0x4d2)时不吞,落到 `_ => {}` 放行(臂内没发宿主 msg_send,寄存器原样)。在线模式整块本就不执行。
+                ("NetworkManager", "sendPacket:commandId:sendFlag:")
+                    if !matches!(env.cpu.regs()[3], 0x3e8 | 0x4d2) =>
+                {
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
                 }
                 // (a2) 缓冲回放包装也一并吞(belt-and-suspenders;其三调用方全空过)。
                 (_, "sendAllBufferDatas") | (_, "sendAllBuffDataInNewSceneLoading") => {
@@ -7753,11 +11310,71 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             // 这是 all_unlock 之前的空白(它只管"已解锁显示"),与既有
             // getLockType4ShopItem:shop:→0 同构。作物/物品/家具/宠物/头像/礼物/房间/音乐厅
             // 装扮/海洋岛物品在使用层面全部解锁。
+            // [2026-09-24 第四轮 K13 I7-4] 岛上 NewSceneData getLockType4Object:(i12@0:4@8)从统一返 0 中拆出:保留原版锁 6
+            //   (已拥有/限购)与扩地顺序锁 5,其余照旧全解锁。
+            //   根因:以前恒返回 0,原版「已拥有」锁 6 被一起跳过 —— 0x21e906-0x21e93a(31001 且 extendMap&0x2)、0x21e944-0x21e978
+            //   (31002 且 &0x4)、0x21e982-0x21e9d2(31003 且 &0x8)、0x21e9dc-0x21ea2c(31004 且 &0x10),以及 isHaveUnvisbleObject:
+            //   等限购判定。-[NewStyleStoreMainLayer onBuyItem:]@0x3b2620 只认这一个锁,于是已拥有的扩充土地能重复购买:
+            //   -[NewSceneVillageMenuLayer addNewObject2Map:gift:] 在 0x25c21a 等处 showCostGoldView: 照扣 1~4 万豆,0x25c280 的
+            //   orr 对已置位掩码无变化,0x25c6f6 saveUserinfoBothInLocalAndRemote 把扣款写进主档。扩地前置锁 5(0x21e6a4-0x21e77e:
+            //   req_id 未拥有时按 extendMap 位判 31002/31003/31004 的前一块)也被跳过,先买 31003 会造出 extendMap=9 这种跳序掩码,
+            //   岛上可视/可行走/出生三区同时塌成 0(读档规整那一半在 K2)。
+            //   做法:重入标志 ALLUNLOCK_REAL_CALL 置位 → 宿主 msg_send 同一选择子拿原版真值(参数原样取 r2,当 id)→ 清标志;
+            //   标志置位期间进来的那次(就是我们自己发的)直接放行真方法。真值 6 → 返回 6(覆盖扩地/飞鸟/贝壳树等已拥有与限购);
+            //   真值 5 且物品是扩充土地 31001..=31004 → 返回 5(保住扩地顺序);其余返回 0。发过消息后 return true,只有 r0 有意义
+            //   (r1-r3 调用者不保存);标志在唯一出口前清掉(guest 里出错本进程直接 panic,不存在「半路返回没清标志」的路径)。
+            //   GameData 与其它类的 getLockType4* 照旧返回 0。
+            ("NewSceneData", "getLockType4Object:") => {
+                static ALLUNLOCK_REAL_CALL: AtomicBool = AtomicBool::new(false);
+                if ALLUNLOCK_REAL_CALL.load(O) {
+                    return false;
+                }
+                let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
+                let obj: id = Ptr::from_bits(env.cpu.regs()[2]);
+                let s_lock = island_sel(env, "getLockType4Object:");
+                ALLUNLOCK_REAL_CALL.store(true, O);
+                let real: i32 = msg_send(env, (recv, s_lock, obj));
+                ALLUNLOCK_REAL_CALL.store(false, O);
+                let mut ret: i32 = 0;
+                if real != 0 && obj != nil {
+                    let s_oid = island_sel(env, "objectId");
+                    let oid: i32 = msg_send(env, (obj, s_oid));
+                    // [2026-09-24 第五轮补挖 M-M3-1] 余额锁 3(摩尔豆不够)/4(贝壳不够)也原样保留;其它门槛锁(1 等级、2 工人、
+                    //   15 VIP、0xe 等,以及非扩地的 5)在原版里提前返回、根本走不到余额检查,放开门槛时由宿主照原版补算一次余额。
+                    //   根因:以前除 6/扩地 5 外一律返回 0,-[NewStyleStoreMainLayer onBuyItem:]@0x3b2620 只看锁是否为 0,之后的确认回调
+                    //   与放置确认都不再验余额:豆袋(type 0x19)0 贝壳也能兑,-[UserInfoData addVipGold:] 0xbb474/0xbb49c 把负结果夹成 0,
+                    //   随后 0x25c040 照发 out_gold(25005 是 4 万豆)→ 无限刷钱;金币价物件经 -[NewScenePorter finishBuild:] 0x26d424
+                    //   addGoldInNewScene:(-cost_gold),-[UserInfoData addGold:] 0xbb20e 没有下限,0x21f7a2 立即把负数存进主档。
+                    if real == 6 || real == 3 || real == 4 || (real == 5 && (31001..=31004).contains(&oid)) {
+                        ret = real;
+                        static LOG1_ALLUNLOCK_KEEP: AtomicBool = AtomicBool::new(false);
+                        log_first_then_dbg!(
+                            LOG1_ALLUNLOCK_KEEP,
+                            "[MOLECHEAT] 全解锁:岛物品 {} 保留原版锁 {}(6=已拥有/限购,5=扩地前置未满足,3/4=摩尔豆/贝壳不够)",
+                            oid,
+                            real
+                        );
+                    } else {
+                        ret = allunlock_island_balance_lock(env, recv, obj, oid);
+                        if ret != 0 {
+                            static LOG1_ALLUNLOCK_BAL: AtomicBool = AtomicBool::new(false);
+                            log_first_then_dbg!(
+                                LOG1_ALLUNLOCK_BAL,
+                                "[MOLECHEAT] 全解锁:岛物品 {} 放开门槛锁 {},但余额不够 → 锁 {}(3=摩尔豆/4=贝壳)",
+                                oid,
+                                real,
+                                ret
+                            );
+                        }
+                    }
+                }
+                env.cpu.regs_mut()[0] = ret as u32;
+                return true;
+            }
             ("GameData", "getLockType4Crop:")
             | ("GameData", "getLockType4CropWithId:")
             | ("GameData", "getLockType4Object:")
             | ("GameData", "getLockType4Gift:")
-            | ("NewSceneData", "getLockType4Object:")
             | ("NewSceneData", "getLockType4Crop:")
             | ("DecorateRoomLayer", "getLockType4Decorate:")
             | ("MusicHallLayer", "getLockType4Decorate:") => {
@@ -7768,21 +11385,70 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
     }
 
-    // 工人/房间补满:三个 ivar getter 恒返回 99 → 收菜/建造永不卡人力、房间不卡容量。
+    // 工人补满:主村人力门/显示调用点上 totalWorkers/availableWorkers 返回 99 → 收菜/建造永不卡人力。
     // [2026-09-16] G-07 只管主村,菜单标签注明「仅主村」。岛上工人走 -[NewSceneUserInfoData curTotalWorkersCount]@0x3239c4,不在这里全局拦:
     //   save_island_userinfo 用宿主 msg_send 读这个 getter 写进 island_userinfo.dat,读档时再 setCurTotalWorkersCount: 写回,
-    //   恒返回 99 会把 99 永久存进岛档。另外已核实主村有同类问题(本包不改,另记):-[UserInfoData encodeWithCoder:]@0xb9f98
-    //   在 0xba0e2/0xba108/0xba17a 就是经 totalWorkers/availableWorkers/totalRooms 这三个 getter 取值编码的,开着开关时存档,
-    //   99 会写进 userinfo.dat,关掉开关后不会回退。
-    if MAX_FACILITY.load(O) {
-        match (class, sel) {
-            ("UserInfoData", "totalWorkers")
-            | ("UserInfoData", "availableWorkers")
-            | ("UserInfoData", "totalRooms") => {
-                env.cpu.regs_mut()[0] = 99;
-                return true;
-            }
-            _ => {}
+    //   恒返回 99 会把 99 永久存进岛档。
+    // [2026-09-24 第四轮 K13 I3-4] 改成按调用点 LR 的正向白名单,删掉 totalRooms 臂。
+    //   根因:以前三个 getter 对所有调用者恒返回 99,而 -[UserInfoData encodeWithCoder:]@0xb9f98 正是经这几个 getter 取值编码的
+    //   (0xba0e2 totalWorkers / 0xba108 availableWorkers / 0xba17a totalRooms);落盘入口 -[NewSceneData saveUserinfoToLocal]
+    //   归档它并加密写 userinfo.dat,岛上 island_flush 每次落盘都先调一遍(节拍 1.5 秒),99 必然被永久写进存档,关掉开关也回不去。
+    //   encodeUserInfoData(0xbc388/0xbc49c,上传)、intiWithUserInfo:(0xb9680/0xb96f8,复制)同样拿到 99。
+    //   现在只有下面 MAXFAC_GATE_LRS 里的调用点返回 99(LR = blx 地址 + 4,带 Thumb 位,逐个 re.py annot 核过),其余一律读真值。
+    //   收录的是「只做 >= 比较的人力/容量门」和「纯显示」;明确不收:encodeWithCoder:(0xba0e7/0xba10d)、ActorManager
+    //   changeAvailableMolerForTask:(0x9db2b/0x9db4d/0x9db93,读-改-写:归还分支 n>=1 在 0x9db4c「空闲 >= 总数」就跳过归还,
+    //   返回 99 会让任务完成后工人永远还不回来;扣减分支 n<0 在 0x9db92「空闲 < 1」就不扣,真值保证真没空闲时不扣)、
+    //   TaskManager sendMolesToPlayExpression(0x26039b,>=1 就 changeAvailableWorkers:-1)、
+    //   FriendVillageUnit(好友数据)、Story nextStep(新手引导)、intiWithUserInfo:/encodeUserInfoData(复制/上传)。
+    //   createIdleWorkers: 必须收:-[Object callConsumingWorker:] 过了人力门还要 [ActorManager hearWithTarget:selector:pos:]
+    //   (0x41034)叫到一只空闲摩尔才会开工,空闲摩尔数就是 createIdleWorkers: 按 availableWorkers 生成的。
+    //   已知后果(作弊语义,不另处理):门被放宽后,派工 subAvailableWorker / 任务扣减 changeAvailableWorkers:-n 都直接改 ivar,
+    //   -[UserInfoData addAvailableWorker:]@0xbb34c 只夹上限(<= totalWorkers_)不夹下限,真空闲不够时 availableWorkers 会暂时为负
+    //   并可能被存档;摩尔干完活/任务完成归还后自愈,而且读档时 -[GameData loadUserInfoData] 0x7591a → intiWithUserInfo:
+    //   (0xb96a2 取 totalWorkers → 0xb96bc 写 availableWorkers_)会把空闲数重置成总数,存档里的负值下次启动也会复位。
+    //   关掉开关后本局 HUD 可能短暂显示负数。
+    //   totalRooms 臂删掉:selref 全量只有 3 处(intiWithUserInfo:/encodeWithCoder:/encodeUserInfoData),全是复制/编码路径,
+    //   没有一个游戏门,拦它零收益、纯污染存档。已被旧逻辑写成 99 的 userinfo.dat 无法自动还原(不知道真值)。
+    //   纯改返回寄存器,不发消息;没命中白名单就往下走,最后放行真 getter。
+    if MAX_FACILITY.load(O)
+        && class == "UserInfoData"
+        && matches!(sel, "availableWorkers" | "totalWorkers")
+    {
+        // (选择子, 调用点 LR)。共享尾块(DailyQuest/CafeQuest)里同一条 blx 也会给岛上的 curIdleWorkerCount 用,
+        // 按选择子+类名一起匹配,不会误中。
+        const MAXFAC_GATE_LRS: [(&str, u32); 20] = [
+            ("availableWorkers", 0x1c1d3),  // -[GameManager createIdleWorkers:]+0x15a:生成空闲摩尔(派工要有摩尔应答)
+            ("availableWorkers", 0x40d5b),  // -[Object callConsumingWorker:]+0x76:收菜/建造派工门 >=1
+            ("availableWorkers", 0x54659),  // -[UserInfoLayer init]:HUD 工人数显示
+            ("availableWorkers", 0x58dbb),  // -[UserInfoLayer updateWorkerNumber]:HUD 工人数显示
+            ("availableWorkers", 0x64579),  // -[VillageMenuLayer canBuyMultiple:]:连续购买门 >=2
+            ("availableWorkers", 0x7cfed),  // -[GameData getLockType4Crop:]:下种人力锁 2
+            ("availableWorkers", 0x7d9af),  // -[GameData getLockType4Object:]:摆放人力锁 2
+            ("availableWorkers", 0x125f4d), // -[Quest accept]:任务人力门
+            ("availableWorkers", 0x14c501), // -[OutputHanlder onGifFlagTouched]:主村领产出人力门 >=1
+            ("availableWorkers", 0x1d967d), // -[TimeQuest accept]
+            ("availableWorkers", 0x340da7), // -[DailyQuest accept](共享尾块 blx@0x340da2)
+            ("availableWorkers", 0x38802b), // -[VipQuest accept]
+            ("availableWorkers", 0x36bb01), // -[CafeQuest checkCanAcceptCafeQuestWithQuestId:](共享尾块 blx@0x36bafc)
+            ("availableWorkers", 0x36c493), // -[CafeQuest acceptWithQuestId:](共享尾块 blx@0x36c48e)
+            ("totalWorkers", 0x5466d),      // -[UserInfoLayer init]:HUD 显示
+            ("totalWorkers", 0x58dcf),      // -[UserInfoLayer updateWorkerNumber]:HUD 显示
+            ("totalWorkers", 0x64557),      // -[VillageMenuLayer canBuyMultiple:]:连续购买门(已占 < 总数)
+            ("totalWorkers", 0x7d3bd),      // -[GameData getLockType4Object:]:type 0x13 锁 9(总数−按房间数 > 109 才锁)
+            ("totalWorkers", 0x7dac3),      // -[GameData getLockType4Object:]:锁 7(已占 >= 总数)
+            ("totalWorkers", 0xd2825),      // -[BuildingView showBuildingInfo:]:信息面板显示
+        ];
+        static LOG1_MAXFAC_GATE: AtomicBool = AtomicBool::new(false);
+        let lr = env.cpu.regs()[14];
+        if MAXFAC_GATE_LRS.iter().any(|&(s, l)| s == sel && l == lr) {
+            log_first_then_dbg!(
+                LOG1_MAXFAC_GATE,
+                "[MOLECHEAT] 工人补满:{} 在人力门/显示调用点 LR={:#x} → 99(编码/复制/读改写点照旧读真值)",
+                sel,
+                lr
+            );
+            env.cpu.regs_mut()[0] = 99;
+            return true;
         }
     }
 
@@ -7993,6 +11659,65 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         ret_double(env, 0.0);
         return true;
     }
+    // [2026-09-24 第四轮 K13 I4-04] 探险船三段时长(修船 5h / 出海 3h / 冷却 12h)接入「建筑瞬完成」「冷却归零」。
+    //   根因:三段时长不是选择子,是 DiscoveryShip 自己的 ivar(u32):-[DiscoveryShip initWithTile:sprite:size:data:] 非 VIP 分支
+    //   0x3600b2 写死 discoverTime_=10800、0x3600ba coolDownTime_=43200,0x3600da fixTime_=18000(VIP 分支读 250_1.dat,
+    //   initWithMapData:type: 在 0x3606c2-0x36071c 同构再写一遍);innerUpdate:/checkIs*Finished/checkIsSailingAlready 直接读
+    //   ivar,上面两个开关的任何一条臂都管不到。
+    //   做法:以 checkIsFixShipFinished / checkIsDiscoverFinished(c8@0:4)作前置钩子,两个 init 都在写死时长之后调它们
+    //   (0x360400/0x36041a、0x360afc/0x360cba/0x360cd2),改了立刻生效:INSTANT_BUILD → fixTime_(槽 0xb07c2c)与
+    //   discoverTime_(槽 0xb07c24)写 1;NO_COOLDOWN → coolDownTime_(槽 0xb07c28)写 1。偏移一律从槽现读(DiscoveryShip
+    //   继承 Object,正是非脆弱 ivar 修正写回的形状),偏移为 0 或越过实例大小(456,objc_meta instanceSize)就不写。
+    //   置 1 不置 0:checkIsSailingAlready@0x36104c 靠 now−lastSailingTime >= coolDownTime_ 判冷却,1 秒足够且保守。
+    //   +[NewGameManager saveTMMapDataFromObject:] 船分支(0x244548-0x24462a)不拷这三项、NSCoding 也不编,改了不落盘,
+    //   关掉开关重进岛自动恢复原值;已放下的船要重进岛(重建对象)才生效。只在 ON_ISLAND(离线岛会话,在线模式下总闸关闭、
+    //   永不置位)生效。只写 ivar,不发消息、不动寄存器,放行真方法。粗筛走 intercept_wants 末尾 [K13] 槽位,DiscoveryShip
+    //   不进 CLASSES(免得它每帧 innerUpdate:/visit 都走完整条比较链)。
+    if (INSTANT_BUILD.load(O) || NO_COOLDOWN.load(O))
+        && class == "DiscoveryShip"
+        && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished")
+        && ON_ISLAND.load(O)
+    {
+        const SHIP_INSTANCE_SIZE: u32 = 456;
+        const SLOT_DISCOVER_TIME: u32 = 0xb07c24;
+        const SLOT_COOLDOWN_TIME: u32 = 0xb07c28;
+        const SLOT_FIX_TIME: u32 = 0xb07c2c;
+        let recv = env.cpu.regs()[0];
+        let instant = INSTANT_BUILD.load(O);
+        let nocool = NO_COOLDOWN.load(O);
+        let targets: [(u32, bool); 3] = [
+            (SLOT_FIX_TIME, instant),
+            (SLOT_DISCOVER_TIME, instant),
+            (SLOT_COOLDOWN_TIME, nocool),
+        ];
+        let mut changed = false;
+        for (slot, on) in targets {
+            if !on || recv == 0 {
+                continue;
+            }
+            let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(slot));
+            // 写成 off > 大小 − 4:槽值若是垃圾(接近 u32::MAX),off + 4 在 debug 构建里会溢出 panic。
+            if off == 0 || off > SHIP_INSTANCE_SIZE - 4 {
+                continue;
+            }
+            let p: MutPtr<u32> = Ptr::from_bits(recv + off);
+            if env.mem.read(p) > 1 {
+                env.mem.write(p, 1u32);
+                changed = true;
+            }
+        }
+        if changed {
+            static LOG1_SHIP_TIMES: AtomicBool = AtomicBool::new(false);
+            log_first_then_dbg!(
+                LOG1_SHIP_TIMES,
+                "[MOLECHEAT] 探险船时长:{} 前置改写(瞬完成={} → 修船/出海 1 秒,冷却归零={} → 冷却 1 秒)",
+                sel,
+                instant,
+                nocool
+            );
+        }
+        return false;
+    }
     if NO_COOLDOWN.load(O) {
         match (class, sel) {
             ("Building", "getCurLevelCoolTime")
@@ -8006,14 +11731,137 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             | ("SpacialObject", "getLastCooldownTime")
             | ("YellowDuck", "getLastCooldownTime")
             | ("Building", "getLastGameCoolTime")
-            | ("NewSceneRestaurant", "getOutCoolTime")
             | ("MCNpcActor", "getCurLevelCooltime:") => {
                 ret_double(env, 0.0);
                 return true;
             }
+            // [2026-09-24 第四轮 K13 I2-06] 布兰的家(岛餐厅)冷却时长:两个初始化调用点放行真值,其余照旧返回 0。
+            //   根因:-[NewSceneRestaurant initWithMapData:type:] 在 lastCoolTime_(槽 0xb076e8,+368)为 0 时,0x31b61c 取
+            //   getCurrentServerTime、0x31b630 blx getOutCoolTime、0x31b636 `subs r0,r5,r0` → lastCoolTime_ = now − 冷却时长
+            //   (原版 43200 = levelupHV 30002 saleFinishCostTime)= 一进岛立刻可收;-[... initWithTile:sprite:size:data:] 在
+            //   0x31b372/0x31b386/0x31b38a 有同构的一段。这里返回 0 会让 lastCoolTime_ = now = 刚开始冷却:开着开关时无感
+            //   (其余调用点仍返回 0),关掉开关后反而要等满 12 小时;若本局餐厅发过 setModObjectToServer:(升级/领收益),这个坏值
+            //   还会经 getLastCooldownTime → saveTMMapDataFromObject: 落进 island_map.dat。
+            //   做法:LR 为这两次 blx 的返回址(0x31b630+4 → 0x31b635、0x31b386+4 → 0x31b38b,带 Thumb 位)时放行真方法;
+            //   OutputHanlder innerupdate:(0x14b826)/ccTouchBegan:(0x14ca60)/processTouched(0x14cbea)与 onUpgradeFinishHandler
+            //   (0x31c374)照旧返回 0,作弊效果不变。不用「lastCoolTime==now 就回补」:与刚领完收益的正常状态无法区分。
+            //   签名 I8@0:4(返回 unsigned int),以前按 double 写 r0:r1 也等价于 r0=0,这里改成只写 r0。纯改寄存器,不发消息。
+            ("NewSceneRestaurant", "getOutCoolTime") => {
+                const LR_INIT_WITH_MAPDATA: u32 = 0x31b635;
+                const LR_INIT_WITH_TILE: u32 = 0x31b38b;
+                let lr = env.cpu.regs()[14];
+                if lr == LR_INIT_WITH_MAPDATA || lr == LR_INIT_WITH_TILE {
+                    return false;
+                }
+                env.cpu.regs_mut()[0] = 0;
+                return true;
+            }
+            // [2026-09-24 第四轮 K13 N-D2-3] 宠物送礼冷却(主村 + 黄金岛的小狗/小龟/浣熊/气球鱼等 Animal)。
+            //   根因:冷却由 -[Animal callAnimalSchedule:]@0xdd958(v16@0:4d8)自己算:0xdd9e2 [ObjectData use_cool_down]、
+            //   0xdd9f8 [m_npcData lastCoolDownTime]、0xdda28 getCurrentTime,m_remainTime = max(0, use+last−now) 后按它调度
+            //   enterGiftMode;不经过上面任何一条臂,开关对宠物无效(岛宠物 use_cool_down 28800~86400,要等 8~24 小时)。
+            //   做法:前置把 self.m_npcData(Actor ivar,槽 0xb03d78,现值 +572)的 lastCoolDownTime_(NpcData ivar,槽 0xb03fe4,
+            //   现值 +8,double)写成 0.0,再放行真方法 → 算出 m_remainTime=0 立即进送礼状态。偏移一律从槽现读(兼容非脆弱
+            //   ivar 修正写回),偏移为 0 或超出实例大小(Animal 692、NpcData 24,objc_meta instanceSize)就什么都不写。
+            //   只读写内存,不发消息、不动寄存器。TransAnimal 自带空的 callAnimalSchedule:(0x25e774),运行时类名不同,不会误中。
+            //   语义与 Building 臂一致:在宠物创建时生效(进场景/回村/购买/从收纳放出,原版只在 initAnimal 0xdcd14 调它);
+            //   0 随 npcs 落进 island_userinfo.dat / 主村 userinfo.dat(cf_fix_residue 不动 0),关掉开关后保持已冷却。
+            //   本局领完礼物原版不会重新调度(exitGiftMode: 只写 lastCoolDownTime=now),要再领得重进场景,这是原版节奏,不补调度。
+            //   粗筛走 intercept_wants 末尾 [K13] 槽位的 NO_COOLDOWN 门控,没把 Animal 加进 CLASSES。
+            ("Animal", "callAnimalSchedule:") => {
+                const ANIMAL_INSTANCE_SIZE: u32 = 692;
+                const NPCDATA_INSTANCE_SIZE: u32 = 24;
+                let recv = env.cpu.regs()[0];
+                let off_npc: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03d78));
+                // 越界护栏写成 off <= 大小 − 字段宽:槽值若是垃圾(接近 u32::MAX),off + 4 在 debug 构建里会溢出 panic。
+                if recv != 0 && off_npc != 0 && off_npc <= ANIMAL_INSTANCE_SIZE - 4 {
+                    let npc: u32 = env.mem.read(ConstPtr::<u32>::from_bits(recv + off_npc));
+                    let off_last: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03fe4));
+                    if npc != 0 && off_last != 0 && off_last <= NPCDATA_INSTANCE_SIZE - 8 {
+                        let last_ptr: MutPtr<f64> = Ptr::from_bits(npc + off_last);
+                        if env.mem.read(last_ptr) != 0.0 {
+                            env.mem.write(last_ptr, 0.0f64);
+                            static LOG1_ANIMAL_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                            log_first_then_dbg!(
+                                LOG1_ANIMAL_COOLDOWN,
+                                "[MOLECHEAT] 冷却归零:Animal callAnimalSchedule: 前置清 lastCoolDownTime → 0(宠物立即可送礼)"
+                            );
+                        }
+                    }
+                }
+                return false;
+            }
             ("YaliNpcActor", "checkCooltimeOver") => {
                 env.cpu.regs_mut()[0] = 1; // YES — cooldown over
                 return true;
+            }
+            // [2026-09-24 第五轮补挖 M-M3-2] 建筑小游戏(沙滩WC、健身馆等)的游戏冷却当场归零。
+            //   根因:上面 Building getLastGameCoolTime 臂只影响快照/面板进度,真正的判定 -[GameRoomState innerupdate:]@0xda3f8 在
+            //   0xda504 直接读 ivar lastGameTime_(槽 0xb04368,+28,double),0xda51c 用 now−lastGameTime_ 与 gameDuration_ 比,
+            //   够了才 showGameIcon;isReady4Game 读同一个 ivar。开关写着「主村+黄金岛」,本局 12 小时内却一直不出游戏图标,
+            //   点开面板进度又按 0 显示「已冷却完」,前后矛盾。
+            //   做法:前置把 lastGameTime_ 写成 0.0(与重进场景读档到 0 的效果相同,不需要取 now),原版随即自己出图标;
+            //   玩完 setStateGamePlayed@0xdad18 写 now,下一拍再次清零。偏移从槽现读,为 0 或超出实例大小(44)就不写。
+            //   跑在 CCScheduler 帧栈上:只读写内存,不发消息、不动寄存器,照旧放行真方法。粗筛走 intercept_wants 末尾的
+            //   NO_COOLDOWN 门控 innerupdate:,没把 GameRoomState 加进 CLASSES。
+            ("GameRoomState", "innerupdate:") => {
+                const GAMEROOMSTATE_INSTANCE_SIZE: u32 = 44;
+                let recv = env.cpu.regs()[0];
+                let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04368));
+                if recv != 0 && off != 0 && off <= GAMEROOMSTATE_INSTANCE_SIZE - 8 {
+                    let p: MutPtr<f64> = Ptr::from_bits(recv + off);
+                    if env.mem.read(p) != 0.0 {
+                        env.mem.write(p, 0.0f64);
+                        static LOG1_GAMEROOM_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                        log_first_then_dbg!(
+                            LOG1_GAMEROOM_COOLDOWN,
+                            "[MOLECHEAT] 冷却归零:GameRoomState innerupdate: 前置清 lastGameTime → 0(建筑小游戏立即可玩)"
+                        );
+                    }
+                }
+                return false;
+            }
+            // [2026-09-24 第五轮补挖 M-M3-2] 装饰/建筑产出(水上物件每日经验、特殊装饰、小黄鸭等)的产出冷却当场归零。
+            //   根因:-[OutputHanlder innerupdate:]@0x14b600 在 0x14b68a 直接读 ivar lastCoolDownTime_(槽 0xb04ba4,+240,double)
+            //   判冷却,上面 Building/SpacialObject/YellowDuck getLastCooldownTime 臂只经快照写进存档,本局不生效(退岛重进或在编辑
+            //   模式里挪一下才能领,而且每挪一次领一次)。
+            //   做法:只处理 objectTarget_(槽 0xb04b9c,+236)的运行时类恰好是 Building / SpacialObject / YellowDuck 的处理器,
+            //   与上面 getter 臂同一口径;不碰 NewSceneRestaurant(走 0x14b790 分支按 getOutCoolTime 判,K13 已刻意不把 0 写进餐厅档)。
+            //   前置把 lastCoolDownTime_ 写成 0.0;领奖后 -[OutputHanlder onGifFlagTouched] 在 0x14c750 重新调度 innerupdate:,
+            //   下一拍再次清零。类名经 isa 在宿主侧读,不发 guest 消息;偏移从槽现读,越界(实例大小 260)就不写。只读写内存。
+            ("OutputHanlder", "innerupdate:") => {
+                const OUTPUTHANLDER_INSTANCE_SIZE: u32 = 260;
+                let recv = env.cpu.regs()[0];
+                let off_t: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04b9c));
+                let off_c: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb04ba4));
+                if recv != 0
+                    && off_t != 0
+                    && off_t <= OUTPUTHANLDER_INSTANCE_SIZE - 4
+                    && off_c != 0
+                    && off_c <= OUTPUTHANLDER_INSTANCE_SIZE - 8
+                {
+                    let target: id = env.mem.read(ConstPtr::<id>::from_bits(recv + off_t));
+                    if target != nil {
+                        let cls = crate::objc::ObjC::read_isa(target, &env.mem);
+                        let hit = cls != nil
+                            && matches!(
+                                env.objc.get_class_name(cls),
+                                "Building" | "SpacialObject" | "YellowDuck"
+                            );
+                        if hit {
+                            let p: MutPtr<f64> = Ptr::from_bits(recv + off_c);
+                            if env.mem.read(p) != 0.0 {
+                                env.mem.write(p, 0.0f64);
+                                static LOG1_OUTPUT_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                                log_first_then_dbg!(
+                                    LOG1_OUTPUT_COOLDOWN,
+                                    "[MOLECHEAT] 冷却归零:OutputHanlder innerupdate: 前置清 lastCoolDownTime → 0(装饰/建筑产出立即可领)"
+                                );
+                            }
+                        }
+                    }
+                }
+                return false;
             }
             _ => {}
         }

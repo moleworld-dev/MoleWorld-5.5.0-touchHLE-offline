@@ -49,6 +49,11 @@
 //! 离线时原版只在 isConnected 门内(startGame:+0xb04)或点 NPC 发现列表为空时发 1074,没人应答,点日常 NPC 就弹「没有连接网络」。
 //! 主村由回环应答;黄金岛不走回环(岛上会话吞掉全部 sendPacket),在宿主侧照 parseDailyTaskListWithSceneId:pos:len: 的做法
 //! 构造 DailyQuestList,再交给原版 updateDailyQuestListInHolidayVillageWithCurrentServerData:。选题规则见 daily_values_for_today。
+//!
+//! # 黄金岛限时折扣 1073([2026-09-24] 第四轮 K6 I8-4)
+//! 进岛 -[HolidayVillageLayer onEnter] 发 getDiscountObjectsListFormServerWithMapId:10。岛上会话吞掉全部 sendPacket,与每日任务同一写法:
+//! 接住请求、排一次运行循环回调,在宿主侧照 parseDiscountListWithSceneId:pos:len: 岛分支构造 DiscountInfo 交给 NewSceneData,
+//! 建设庄园的划线价/买得起判定/扣款全走原版。选品规则为移植者自拟,非原版数据(见 island_discount_candidates);MOLE_DISCOUNT=off 同样关闭。
 
 use crate::frameworks::foundation::ns_string;
 use crate::fs::GuestPath;
@@ -243,6 +248,9 @@ pub fn wants(class: &str, sel: &str) -> bool {
                 // [2026-09-16] E-03 黄金岛每日任务:请求入口 + 排到运行循环的自用选择子(宿主侧构造列表)
                 | "getDailyTaskListFromServerWithSceneId:"
                 | "moleActivityIslandDailyQuest"
+                // [2026-09-24 第四轮 K6 I8-4] 黄金岛限时折扣 1073:请求入口 + 排到运行循环的自用选择子(宿主侧构造 DiscountInfo)
+                | "getDiscountObjectsListFormServerWithMapId:"
+                | "moleActivityIslandDiscount"
         ),
         // [补完 2026-09-15] F2-2 回环喂 1049 时吞掉 GameManager 的推广弹窗分发;离线进村时补发 1049
         "GameManager" => sel == "onCommandReceived:" || sel == "startGame:",
@@ -264,6 +272,9 @@ pub fn wants(class: &str, sel: &str) -> bool {
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
         // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
         "FireworkLayer" => sel == "showFireWorkFullScreen",
+        // [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励:离线时奖励表为空就不开空奖励板,改弹原版离线提示。
+        //   OnlineTimeManager 不在 mole_cheats 的 CLASSES 里,靠这里 OR 进 intercept_wants,release 下才不会静默失效。
+        "OnlineTimeManager" => sel == "showRewardLayer",
         _ => false,
     }
 }
@@ -320,6 +331,37 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
         }
+        // [2026-09-24 第四轮 K6 I8-4] 黄金岛限时折扣 1073。-[HolidayVillageLayer onEnter] 在网络门之后无条件
+        //   0x23946a `[nm getDiscountObjectsListFormServerWithMapId:10]`(r2 在 0x239460 硬编码 10;参数 1 那条分支 0x226cf0
+        //   全二进制无调用者)→ -[NetworkManager getDiscountObjectsListFormServerWithMapId:]@0x226cd0 在 0x226d30 发 1073,
+        //   岛上会话里被 mole_cheats 的 sendPacket 吞包臂吃掉,NewSceneData.discountObjDataArr_ 永远是空的,岛商店从不打折。
+        //   照 E-03 每日任务同一写法:接住参数 10,排一次运行循环回调,由宿主侧照 parseDiscountListWithSceneId:pos:len: 岛分支
+        //   (0x2272fc 起)直接构造 DiscountInfo 交给 NewSceneData(不走报文,免得漏了首字节 0x01 岛标志被 0x227184 当成主村包
+        //   写进 GameData)。不在当前调用栈同步做:onEnter 跑在切场景的 drawScene 帧栈上。
+        //   MOLE_DISCOUNT=off 时不接,放行原版(包照旧被吞,等于原离线行为:岛上无折扣)。条件不满足时只读过寄存器、没发消息。
+        if sel == "getDiscountObjectsListFormServerWithMapId:"
+            && !env.options.network_access
+            && crate::mole_cheats::island_session_active()
+            && env.cpu.regs()[2] == 10
+            && !discount_disabled()
+        {
+            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
+            let perform = sel_named(env, "performSelector:withObject:afterDelay:");
+            let tick = sel_named(env, "moleActivityIslandDiscount");
+            let _: () = msg_send(env, (nm, perform, tick, nil, 0.0f64));
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        if sel == "moleActivityIslandDiscount" {
+            // NetworkManager 并不实现它,任何状态下都必须接住。
+            if !env.options.network_access && crate::mole_cheats::island_session_active() {
+                island_discount_apply(env);
+            } else {
+                log!("[ACTIVITY] 黄金岛折扣:回调到达时已不在岛上会话,放弃构造");
+            }
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
         if sel == "changeStateTo:withMessage:" {
             if LOOPBACK_DEPTH.load(O) > 0 && env.cpu.regs()[2] == 7 {
                 // 回环解析循环末尾的 changeStateTo:7(0xec920):离线状态机不应被改成"已收包",吞掉。
@@ -328,6 +370,32 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             }
             return None;
         }
+    }
+
+    // [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励(OnlineTimeManager)离线永远是空奖励板。奖励表 reward_list_ 唯一的赋值在
+    //   setNextReward_time:NextReward_list:NextReward_level:@0x38aac8,唯一上游是 setNextOnlineRewardData@0x38aa1c,它只在 1088 回包分发
+    //   -[HolidayVillageLayer onNewSceneGameDataCommandReceived:] 0x23e946 被调;last_rew_data_ 靠 1062 的 localVipRewardData,离线同样没有。
+    //   于是 showRewardLayer@0x38b0cc 在 0x38b10a 见 [last_rew_data_ reward_array] count 为 0(last_rew_data_ 为 nil)、走 0x38b15e
+    //   以 initWithType:2 rewardsList:reward_list_(nil) 建出「连续 0 次、剩余 0 小时 0 分 0 秒」、一个格子都没有的空板,
+    //   倒计时也不走(startOrPauseCaculateLoginTime: 0x38abde 见 reward_time_==0 不调度)。
+    //   原版奖励表客户端里没有;私服 vip.rs 的表是猜的、time 字段还当成纪元时间(客户端当逐秒递减的倒计时,0x38aca6),不能移植,
+    //   也不自己编。采用退路:离线且两项都为空时不开空板,改弹原版文案 ACTION_CENTER_NETWARNING(「该功能需要联网才能使用哦!」),
+    //   写法照 mole_cheats 的 onButtonFriendSelected:/onButtonAdwallSelected: 两条离线提示臂(弹框类/文案缺失就恢复 r0-r3 放行原版,最坏空板)。
+    //   showRewardLayer 全二进制只有 -[NewSceneVillageMenuLayer onButtonOnlineRewardSelected:] 0x25a8f6 一个调用点,在
+    //   checkCanStartVipOnlineRewardFunc(0x25a8aa,VIP>3 才放行)之后:VIP<4 时原版的 NO_VIP_LEVEL_ONLINE 提示不受影响,宿主不用自己判 VIP。
+    //   菜单按钮回调栈,不在 drawScene/mainLoop 帧栈上,可以发宿主消息。getVipDailyReward:/sendOnlineLevelToServer/setLastOnLineReward
+    //   离线本来就是空过(包被岛吞包臂吃掉),不拦。在线模式零影响。
+    if class == "OnlineTimeManager" && sel == "showRewardLayer" && !env.options.network_access {
+        let saved = save_regs(env);
+        let otm: id = Ptr::from_bits(env.cpu.regs()[0]);
+        if online_reward_board_would_be_empty(env, otm) && show_offline_net_warning_box(env) {
+            log!("[ACTIVITY] 黄金岛 VIP 在线奖励:离线拿不到 1088 奖励表(reward_list_/last_rew_data_ 皆空)→ 弹「该功能需要联网」提示,不开空奖励板");
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        // 奖励表不空(不该离线出现)或弹框没发出去:恢复寄存器,放行原版。
+        restore_regs(env, saved);
+        return None;
     }
 
     // 其余全部只在离线主村生效。
@@ -2356,6 +2424,181 @@ fn encode_discount_list(env: &mut Environment) -> Vec<u8> {
     b
 }
 
+// ─────────────────────────────── [2026-09-24 第四轮 K6 I8-4] 黄金岛限时折扣 1073 ───────────────────────────────
+
+/// [2026-09-24 第四轮 K6 I8-4] NewSceneData.storeBuildingsArray_(@"NSMutableArray",编译期 +172):建设庄园 shop_type 1 的分页数组
+/// (-[NewSceneData parseObjectData:] 0x21a952..0x21a992 按 shop_sub_type 1..6 归页;-[NewStyleStoreItemsView loadObjectsDataByType:]
+/// 在 curSceneId==10 时 5..10 页直接取它,0x3b96ca)。
+const SLOT_NSD_STORE_BUILDINGS: u32 = 0xb05df4;
+/// [2026-09-24 第四轮 K6 I8-4] NewSceneData.storeDecorationsArray_(+176):shop_type 2 的分页数组(0x21a9e0;商店 11..16 页,0x3b9708)。
+const SLOT_NSD_STORE_DECORATIONS: u32 = 0xb05df8;
+/// [2026-09-24 第四轮 K6 I8-4] NewSceneData.discountObjDataArr_(+52):岛上折扣表(addOneDiscountGood:@0x21fc8c 往里加)。只用来数件数写日志。
+const SLOT_NSD_DISCOUNT_ARR: u32 = 0xb05db4;
+/// [2026-09-24 第四轮 K6 I8-4] ObjectData.rest_place_(i,+112;-[ObjectData rest_place]@0x8e130 是平凡 ivar 读)。
+const SLOT_OBJ_REST_PLACE: u32 = 0xb03cac;
+
+/// [2026-09-24 第四轮 K6 I8-4] 从 NewSceneData 的建设庄园分页数组收集可打折的贝壳商品:(物品 ID, 贝壳原价),按 ID 升序去重。
+/// 岛上折扣只被建设庄园与建造链消费,全部经 -[WrapperManager checkIsDiscountObj:]@0x2610d0 按 curSceneId 选 NewSceneData:
+/// 商店详情 -[NewStyleStoreItemsView updateObjectInfo](0x3ba2dc 判定、0x3baef4 取价)、-[NewStyleStoreMainLayer onBuyItem:](0x3b26e8/0x3b2790)、
+/// -[NewSceneVillageMenuLayer showCostGoldView:](0x25b8a4)、-[NewSceneEditMenuLayer onButtonOkSelected:](0x269296)、
+/// -[NewScenePorter finishBuild:](0x26d466/0x26d830,0x26d4b2 拿 goodsPrice 顶替 cost_vip_gold → 0x26d502 addVipGoldInNewScene: 扣贝壳)、
+/// -[NewSceneData getLockType4Object:](0x21eb30,同样顶替 cost_vip_gold 判买不买得起)。食材店不查折扣,不在候选里。
+/// 选品规则(移植者自拟,非原版数据;与主村 discount_candidates 同一口径,元素类换成岛上的,另加一条 rest_place 过滤):
+/// - 元素类是 NewSceneObjectData(岛上 parseObjectData: 0x21a23c 建的,ObjectData 子类)或 ObjectData;字段直接读 ivar,不逐个发消息;
+/// - shop_type 1/2 · 装饰类 type 14 · 纯贝壳价(cost_gold==0 且 cost_vip_gold 5..=10000,排除 0 价)· 非 VIP 专属(vip_level==0)·
+///   不限购(limit_count==0,限购已拥有的物品打折也买不了)· ID>1000(NewSceneData addOneDiscountGood: 在 getObjectDataWithId: 取不到时
+///   仍收 ID 1..7(0x21fd0c..0x21fd12),那是内购档位,离线不碰);
+/// - 岛上另排除 rest_place==2:onBuyItem: 0x3b27b0 对它走「用贝壳购买」确认框分支,避开最稳(主村同理只挑装饰类)。
+fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    if nsd == nil {
+        return out;
+    }
+    let count_sel = sel_named(env, "count");
+    let at_sel = sel_named(env, "objectAtIndex:");
+    for (slot, want_shop_type) in [
+        (SLOT_NSD_STORE_BUILDINGS, 1u8),
+        (SLOT_NSD_STORE_DECORATIONS, 2u8),
+    ] {
+        let pages: id = match read_ivar_u32(env, nsd, slot) {
+            Some(bits) => Ptr::from_bits(bits),
+            None => nil,
+        };
+        if pages == nil {
+            continue;
+        }
+        let page_count: GuestUSize = msg_send(env, (pages, count_sel));
+        for p in 0..page_count.min(16) {
+            let page: id = msg_send(env, (pages, at_sel, p));
+            if page == nil {
+                continue;
+            }
+            let n: GuestUSize = msg_send(env, (page, count_sel));
+            for i in 0..n.min(4096) {
+                let obj: id = msg_send(env, (page, at_sel, i));
+                if obj == nil {
+                    continue;
+                }
+                let isa = crate::objc::ObjC::read_isa(obj, &env.mem);
+                if !matches!(
+                    env.objc.try_get_class_name(isa),
+                    Some("NewSceneObjectData") | Some("ObjectData")
+                ) {
+                    continue;
+                }
+                let shop_type = read_ivar_u8(env, obj, SLOT_OBJ_SHOP_TYPE).unwrap_or(0);
+                let obj_type = read_ivar_u8(env, obj, SLOT_OBJ_TYPE).unwrap_or(0);
+                let limit_count = read_ivar_u8(env, obj, SLOT_OBJ_LIMIT_COUNT).unwrap_or(1);
+                let vip_level = read_ivar_u32(env, obj, SLOT_OBJ_VIP_LEVEL).unwrap_or(1);
+                let cost_gold = read_ivar_u32(env, obj, SLOT_OBJ_COST_GOLD).unwrap_or(1);
+                let price = read_ivar_u32(env, obj, SLOT_OBJ_COST_VIP_GOLD).unwrap_or(0);
+                let rest_place = read_ivar_u32(env, obj, SLOT_OBJ_REST_PLACE).unwrap_or(2);
+                let Some(item) = read_ivar_u32(env, obj, SLOT_OBJ_ID) else {
+                    continue;
+                };
+                if shop_type != want_shop_type
+                    || obj_type != DISCOUNT_OBJECT_TYPE
+                    || limit_count != 0
+                    || vip_level != 0
+                    || cost_gold != 0
+                    || !(DISCOUNT_MIN_PRICE..=DISCOUNT_MAX_PRICE).contains(&price)
+                    || rest_place == 2
+                    || item <= 1000
+                {
+                    continue;
+                }
+                out.push((item, price));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup_by_key(|e| e.0);
+    out
+}
+
+/// [2026-09-24 第四轮 K6 I8-4] 黄金岛:照 -[NetworkManager parseDiscountListWithSceneId:pos:len:]@0x2270f8 的岛分支在宿主侧构造
+/// (0x227306 [NewSceneData sharedInstance] → 0x227316 removeAllObjectFromDiscountArr → 0x2273a0 起逐条 [[DiscountInfo alloc] init]
+/// → setGoodsId:/setGoodsPrice:/setExpireTime:(0x2273e4/0x2273ee/0x2273f8,签名都是 v12@0:4L8,按 u32 传)→
+/// 0x227412 [[NewSceneData sharedInstance] addOneDiscountGood:](v12@0:4@8)→ 0x22741a release),商店划线价、买得起判定、扣款全走原版。
+/// - 选品见 island_discount_candidates;挑选、折扣率、到期时间照主村 1049 的自拟口径(pick_discounts:本地日期 yyyymmdd 做种子
+///   确定性挑 DISCOUNT_COUNT 件打 7~8 折,同一天多次进岛结果一致;选品规则为移植者自拟,非原版数据)。
+/// - expireTime 与主村一样填本地次日 0:00 的 unix 秒,只作语义与日志用:DiscountInfo expireTime 取值方法无 selref(只有 SHK 同名),
+///   -[CommonEffectController innerupdateDiscount:]@0x322f50 走的是 lefttime_ 浮点倒计时,只由 startDiscountTimer:withTarget:selecter:
+///   排程,而它唯一的调用者 -[DiscountInfoLayer startTimer]@0x1ebbe8 没人发,原版客户端在会话中途不按到期时间清表。
+///   岛上折扣表由原版在回主村时清掉(-[LoadingMainVillage updateLoading:] 0x254416 [[NewSceneData sharedInstance] removeAllObjectFromDiscountArr]),
+///   所以按「每次进岛喂一次」即可,跨天后下次进岛整表换成新一天的折扣。
+/// - 候选为空时不清表、不构造:原版 count==0 也不清(0x2272e6 在 removeAllObjectFromDiscountArr 之前返回)。
+/// - 只写 NewSceneData,不碰 GameData 的主村折扣表。
+///
+/// 只在运行循环回调里调用(会发宿主消息,调用方吞掉调用并自写 r0)。
+fn island_discount_apply(env: &mut Environment) {
+    let nsd = singleton(env, "NewSceneData", "sharedInstance");
+    if nsd == nil {
+        log!("[ACTIVITY] 黄金岛折扣:NewSceneData 未就绪,放弃构造");
+        return;
+    }
+    let di_cls = env.objc.get_known_class("DiscountInfo", &mut env.mem);
+    if di_cls == nil {
+        log!("[ACTIVITY] 黄金岛折扣:找不到 DiscountInfo 类,放弃构造");
+        return;
+    }
+    let (today, midnight_unix) = local_today_and_midnight(env);
+    let candidates = island_discount_candidates(env, nsd);
+    let picks = pick_discounts(&candidates, today.ymd());
+    if picks.is_empty() {
+        log!(
+            "[ACTIVITY] 黄金岛折扣:日期={} 候选={} 件,无可打折商品(岛上物品表可能还没加载),不清表、不构造",
+            today.ymd(),
+            candidates.len()
+        );
+        return;
+    }
+    let expire = midnight_unix.clamp(0, u32::MAX as i64) as u32;
+
+    let remove_all = sel_named(env, "removeAllObjectFromDiscountArr");
+    let _: () = msg_send(env, (nsd, remove_all));
+    let alloc_sel = sel_named(env, "alloc");
+    let init_sel = sel_named(env, "init");
+    let set_id = sel_named(env, "setGoodsId:");
+    let set_price = sel_named(env, "setGoodsPrice:");
+    let set_expire = sel_named(env, "setExpireTime:");
+    let add_sel = sel_named(env, "addOneDiscountGood:");
+    let mut desc: Vec<String> = Vec::with_capacity(picks.len());
+    for &(item, orig, price) in picks.iter() {
+        let di: id = msg_send(env, (di_cls, alloc_sel));
+        let di: id = msg_send(env, (di, init_sel));
+        if di == nil {
+            continue;
+        }
+        let _: () = msg_send(env, (di, set_id, item));
+        let _: () = msg_send(env, (di, set_price, price));
+        let _: () = msg_send(env, (di, set_expire, expire));
+        // 原版每条都重新取 [NewSceneData sharedInstance](0x22740a),单例不变,这里复用 nsd。
+        let _: () = msg_send(env, (nsd, add_sel, di));
+        // alloc/init 得到的 +1:addOneDiscountGood: 放进数组(或因 getObjectDataWithId: 取不到而不收)之后照原版 0x22741a release。
+        release(env, di);
+        desc.push(format!("{}:{}→{}", item, orig, price));
+    }
+    let arr: id = match read_ivar_u32(env, nsd, SLOT_NSD_DISCOUNT_ARR) {
+        Some(bits) => Ptr::from_bits(bits),
+        None => nil,
+    };
+    let accepted: GuestUSize = if arr == nil {
+        0
+    } else {
+        let count_sel = sel_named(env, "count");
+        msg_send(env, (arr, count_sel))
+    };
+    log!(
+        "[ACTIVITY] 黄金岛折扣:宿主侧构造 {} 件(日期={} 候选={} 选中 [{}] 到期unix={}),照 parseDiscountListWithSceneId:pos:len: 岛分支交给 NewSceneData addOneDiscountGood:(选品规则为移植者自拟,非原版数据)",
+        accepted,
+        today.ymd(),
+        candidates.len(),
+        desc.join(" "),
+        expire
+    );
+}
+
 // ─────────────────────────────── [2026-09-16] E-02 / A1-01 / E-03 进村补发 ───────────────────────────────
 
 /// 离线进村补发 -[GameManager startGame:] 在 isConnected 门内(0x19938..0x19e18)跳过的另外三条同步,按原版顺序:
@@ -2806,6 +3049,89 @@ fn island_daily_quest_prompt(env: &mut Environment, gd: id) {
         let _: () = msg_send(env, (dq, reset_sel));
     }
     log!("[ACTIVITY] 黄金岛每日任务:照原版分发臂给日常 NPC(96)挂提示图标并 resetTimer");
+}
+
+// ─────────────────────────────── [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励离线提示 ───────────────────────────────
+
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager.reward_list_(@"NSMutableArray",编译期 +240;-[OnlineTimeManager init]@0x38a7d0 置 nil,
+/// 唯一赋值在 setNextReward_time:NextReward_list:NextReward_level:@0x38aac8)。
+const SLOT_OTM_REWARD_LIST: u32 = 0xb07fc0;
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager.last_rew_data_(@"OnlineRewardData",编译期 +248;showRewardLayer 0x38b0ec 读它)。
+const SLOT_OTM_LAST_REW_DATA: u32 = 0xb07fc4;
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager 的实例大小(objc_meta 里 class_ro_t.instanceSize = 265)。
+/// 从槽里现读的偏移为 0 或读 4 字节会越过它,就当槽没按预期初始化,放行原版。
+const OTM_INSTANCE_SIZE: u32 = 265;
+
+/// [2026-09-24 第四轮 K6 N-D4-1] 读 OnlineTimeManager 的一个对象型 ivar(偏移从 _OBJC_IVAR 槽现读,不写死 +240/+248)。
+/// 偏移异常返回 None。只读内存、不发消息。
+fn otm_ivar_id(env: &Environment, otm: id, slot: u32) -> Option<id> {
+    if otm == nil {
+        return None;
+    }
+    let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(slot));
+    if off == 0 || off.saturating_add(4) > OTM_INSTANCE_SIZE {
+        return None;
+    }
+    let bits: u32 = env
+        .mem
+        .read(ConstPtr::<u32>::from_bits(otm.to_bits().wrapping_add(off)));
+    Some(Ptr::from_bits(bits))
+}
+
+/// [2026-09-24 第四轮 K6 N-D4-1] showRewardLayer 这次会不会建出空奖励板:last_rew_data_ 为 nil(原版 0x38b10a 走 0x38b15e 那一支)
+/// 且 reward_list_ 为 nil 或 count 为 0(NewRewardsLayer type 2 在 rewardsList 为空时一个格子都不建)。偏移读不出一律按「不空」,放行原版。
+/// reward_list_ 非 nil 时会发一次 count(宿主 msg_send),调用方负责恢复 r0-r3。
+fn online_reward_board_would_be_empty(env: &mut Environment, otm: id) -> bool {
+    let (Some(list), Some(last)) = (
+        otm_ivar_id(env, otm, SLOT_OTM_REWARD_LIST),
+        otm_ivar_id(env, otm, SLOT_OTM_LAST_REW_DATA),
+    ) else {
+        return false;
+    };
+    if last != nil {
+        return false;
+    }
+    if list == nil {
+        return true;
+    }
+    let count_sel = sel_named(env, "count");
+    let n: GuestUSize = msg_send(env, (list, count_sel));
+    n == 0
+}
+
+/// [2026-09-24 第四轮 K6 N-D4-1] 弹游戏自带的离线提示:文案 [[NSBundle mainBundle] localizedStringForKey:@"ACTION_CENTER_NETWARNING" value:@"" table:nil]
+/// (「该功能需要联网才能使用哦!」,原版 -[UserInfoLayer onButtonActionFunctionsSelected:] 0x5a55a 等 37 处同一文案),
+/// 框 `[[MessageBox sharedInstance] showWithTarget:nil selector:0 title:nil message:msg type:6 vipgold:0]`(type 6 只有「确定」,关框无回调)。
+/// mole_cheats 的 game_localized_string / show_game_message_box 是私有的,这里照抄同一调用序列(本文件 block_paid_action_in_time_travel 同理):
+/// 签名 v32@0:4@8:12@16@20i24i28,宿主 msg_send 只实现到「接收者+选择子+5 个参数」,type(低 32 位)与 vipgold(高 32 位,恒 0)
+/// 合成一个 u64 落到 sp+8/sp+0xc,与分开传逐字节相同。返回是否真的发出了弹框消息。只在按钮回调栈上调用,会改写 r0-r3。
+fn show_offline_net_warning_box(env: &mut Environment) -> bool {
+    let bundle_cls = env.objc.get_known_class("NSBundle", &mut env.mem);
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if bundle_cls == nil || mb_cls == nil {
+        return false;
+    }
+    let main_s = sel_named(env, "mainBundle");
+    let bundle: id = msg_send(env, (bundle_cls, main_s));
+    if bundle == nil {
+        return false;
+    }
+    let key = ns_string::get_static_str(env, "ACTION_CENTER_NETWARNING");
+    let empty = ns_string::get_static_str(env, "");
+    let loc_s = sel_named(env, "localizedStringForKey:value:table:");
+    let msg: id = msg_send(env, (bundle, loc_s, key, empty, nil));
+    if msg == nil {
+        return false;
+    }
+    let sh = sel_named(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        return false;
+    }
+    let show = sel_named(env, "showWithTarget:selector:title:message:type:vipgold:");
+    let type_and_vipgold: u64 = 6; // 低 32 位 = type 6,高 32 位 = vipgold 0
+    let _: () = msg_send(env, (mb, show, nil, SEL::null(), nil, msg, type_and_vipgold));
+    true
 }
 
 // [2026-09-16] 包3 纯函数单测:旁路档 v=2 校验、每日任务选题映射、客户端日界口径。放在文件最末(clippy items_after_test_module)。

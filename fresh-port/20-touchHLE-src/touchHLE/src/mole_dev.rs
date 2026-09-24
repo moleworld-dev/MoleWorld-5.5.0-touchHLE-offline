@@ -395,6 +395,45 @@ pub fn apply_time_minutes(env: &mut Environment, minutes: i64) -> DevResult {
     ))
 }
 
+/// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进:开发工具页「岛档快进」按钮(分钟取数值寄存器)与文本命令 `island ff <分钟>`。
+/// 根因:上面的「对象计时快进」在岛上被拒(岛上对象计时走 NewSceneTimer,updateTime 的效果未核实),岛上的售卖/升级/出海/
+///   修船/公寓/打工任务都没法无头验证;直接改岛上活对象又会被离岛回写覆盖。所以只在主村离线时,把【盘上】岛档里的绝对时间
+///   往回拨 N 分钟(等价于这段时间已经流逝),下次进岛由原版计时逻辑自己判「已完成」。具体规则、前置与快照见
+///   mole_cheats::island_ff_offline;这里只做入口校验。范围与对象计时快进同为 1..30 天。
+pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevResult {
+    if env.options.network_access {
+        return Err("在线模式下岛上进度以服务器为准,不能快进岛档".to_string());
+    }
+    if minutes <= 0 {
+        return Err("快进的分钟数必须是正数".to_string());
+    }
+    if minutes > TIME_SKIP_MAX_MINUTES {
+        return Err(format!(
+            "一次最多快进 {} 分钟(30 天)",
+            TIME_SKIP_MAX_MINUTES
+        ));
+    }
+    if crate::mole_cheats::island_session_active() {
+        return Err(
+            "黄金岛上不能快进岛档(离岛时岛上内存会覆盖改动),请回主村执行,下次进岛生效".to_string(),
+        );
+    }
+    if main_village_layer(env) == nil {
+        // 标题画面主档还没读进来,出海冷却写回主档时 saveUserInfoData 可能把空档写回去,所以要求先进主村。
+        return Err("请先进入主村再快进岛档".to_string());
+    }
+    let r = crate::mole_cheats::island_ff_offline(env, (minutes * 60) as f64);
+    match &r {
+        Ok(text) => {
+            log!("[MOLEDEV] 岛档快进 {} 分钟:{}", minutes, text);
+        }
+        Err(e) => {
+            log!("[MOLEDEV] 岛档快进 {} 分钟失败:{}", minutes, e);
+        }
+    }
+    r
+}
+
 // ───────────────────────── 任务跳转 ─────────────────────────
 
 /// [扫描修 2026-09-15] F7-4 任务跳转:四族 quickStart:。
@@ -510,7 +549,20 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
             game_data_call(env, "saveUserInfoData");
             game_data_call(env, "saveMapData");
         }
-        QuestFamily::Island => {}
+        // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转后补发激活,照原版 -[NewGameManager checkActiveStoryQuest] 在 0x246850-0x246866
+        // 发的 [[NewSceneQuest sharedInstance] activate:0]。根因:quickStart:@0x32b510 只写 questState=0(0x32b532)、
+        // setCurQuestId:0(0x32b54a)、setNextQuestId:N(0x32b564),不碰 canActivate(ivar +244);点 NPC 走
+        // -[ActorManager touchEnd:] 发 activate:1,-[NewSceneQuest activate:]@0x328190 在参数为 1 时(0x3281ea/0x3281ee)
+        // 跳过 checkCanActivate,0x32820e-0x328212 读到 canActivate==0 就整条返回——点布兰没反应,要退岛重进才恢复。
+        // activate:0 走 checkCanActivate@0x328380 → setCanActivate:1@0x32847c(刷 NPC 101 头顶感叹号)。activate: 自己的门
+        // 照原版执行:NewGameManager.gameMode 不为 0/6(0x3281d0/0x3281e6)、岛等级≥needLevel(0x32841e);等级不够置不上
+        // canActivate 是原版行为,不绕。任务是 isAutomatic 且等级够时,原版这一发会直接 nextQuest 开始任务(0x32833a-0x328376)。
+        // 签名 v12@0:4c8,BOOL 参数按仓库惯例传 false。菜单点击/文本命令回调,不在帧栈也不在 intercept 里,不需要恢复 r0-r3。
+        // quickStart: 自己已调 saveUserinfoBothInLocalAndRemote(0x32b5b0),这里不再额外存盘。
+        QuestFamily::Island => {
+            let s = sel(env, "activate:");
+            let _: () = msg_send(env, (quest, s, false));
+        }
     }
     log!(
         "[MOLEDEV] 任务跳转 {} → {}(表内共 {} 条)",
@@ -522,7 +574,8 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     // -[VipQuest activate:]@0x38722c 没有语言门;-[TimeQuest activate:] 的语言门在 zh-Hans 下放行(见上)。
     let note = match family {
         // 文案保持短:菜单还会在后面追加激活条件,toast 只有 992 宽。
-        QuestFamily::Time => ";已补发激活",
+        // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转同样补发了激活(见上)。
+        QuestFamily::Time | QuestFamily::Island => ";已补发激活",
         _ => "",
     };
     Ok(format!(
@@ -844,8 +897,11 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
     );
     // [2026-09-16] X4-02 成功文案补一句活动中心的限制,与菜单确认文案一致:旅行期间活动侧档只写内存(F2-05),
     // 付费操作的扣款却照常进主档,所以这些操作被禁用(拦截在 mole_activity.rs);旅行中拍的快照活动档仍是旅行前的。
+    // [2026-09-24 第四轮 K3 I7-01] 再补一句黄金岛:旅行期间 mole_cheats::island_flush 开头的落盘闸不写任何岛档
+    // (免得把"未来"时间戳写进 island_*.dat,重启后出海/NPC 冷却/打工任务长期卡死)。每次进岛都从磁盘读岛档,
+    // 所以离岛再进、或重启后,岛上进度都回到旅行前。
     Ok(format!(
-        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致",
+        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致。黄金岛进度在旅行期间不保存,离岛再进或重启后都回到旅行前",
         hours, total_hours
     ))
 }
@@ -861,13 +917,18 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
 /// 活动状态却停在最新,该领的奖励领不到或重复发。vip.dat 由 mole_items.rs SIDE_FILE 写,已在清单里。
 /// 刻意不收游戏自己的 3.dat(GameData.inappPurchaseInfo_ 内购交易记录)与 purchasereceipt.dat(购买凭证):
 /// 那是内购记账不是玩法进度,回滚它们只会让交易记录与贝壳数对不上。
-const SAVE_FILES: [&str; 8] = [
+const SAVE_FILES: [&str; 12] = [
     "userinfo.dat",
     "map.dat",
     "island_map.dat",
     "island_userinfo.dat",
     "island_ships.dat",
     "island_fragments.dat",
+    // [2026-09-24 第四轮骨架] 四份新岛侧档(仓库/咖啡馆/贝壳树/成就与小游戏),与另一份清单同步。
+    "island_storage.dat",
+    "island_cafe.dat",
+    "island_shelltree.dat",
+    "island_misc.dat",
     "vip.dat",
     "mole_activity.dat",
 ];
@@ -1374,6 +1435,8 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 ///   story <段号>                                       → story_play
 ///   time <分钟>                                        → apply_time_minutes
 ///   give <物品ID>                                      → mole_items::place_item(与召唤页、隐藏物品页同一入口)
+///   island ff <分钟>                                   → island_fast_forward_minutes([2026-09-24 第四轮 K4 I4-05] 岛档计时快进,
+///                                                        主村离线执行、先自动存快照,下次进岛生效)
 /// 在线模式、场景、数值范围的拒绝都由这些函数自己给出,与菜单点按钮完全一致,这里不另加门。
 /// 刻意不开放时间旅行、快照恢复、删档:菜单上它们要二次确认,脚本一行就触发太危险。
 /// `menu <页名>`:按页名打开菜单要 mole_menu 提供翻页接口(当前页是它的私有状态),那不归本包,先明确报错;
@@ -1442,12 +1505,23 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             }
             _ => Err("用法:give <物品ID>".to_string()),
         },
+        // [2026-09-24 第四轮 K4 I4-05] 岛档计时快进(主村离线执行,下次进岛生效;见 island_fast_forward_minutes)。
+        "island" => match args.as_slice() {
+            ["ff", m] => {
+                let minutes: i64 = parse_command_number(m, "分钟数")?;
+                island_fast_forward_minutes(env, minutes)
+            }
+            _ => Err(format!(
+                "用法:island ff <分钟>(1..{},在主村离线执行,下次进岛生效)",
+                TIME_SKIP_MAX_MINUTES
+            )),
+        },
         "menu" => Err(format!(
             "暂不支持按页名打开菜单(「{}」):mole_menu 还没有翻页接口,请用不带参数的 menu 开关菜单",
             args.join(" ")
         )),
         _ => Err(format!(
-            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give",
+            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give / island",
             head
         )),
     }
