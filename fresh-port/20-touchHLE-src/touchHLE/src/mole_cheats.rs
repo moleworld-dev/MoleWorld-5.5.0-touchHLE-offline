@@ -3805,6 +3805,7 @@ fn island_flush_extras(env: &mut Environment) -> Vec<String> {
 fn island_ff_extras(env: &mut Environment, secs: f64) {
     log_dbg!("[MOLECHEAT] island: 挂钩 island_ff_extras(secs={})", secs);
     // ── [K9] island_storage.dat 增强道具剩余时间 ──
+    island_storage_ff(env, secs); // [2026-09-24 第四轮 K9] savedAt 前拨 secs,下次进岛多扣这段剩余秒
     // ── [K10] island_cafe.dat 已接打工类任务开始时刻 ──
     // ── [K11] island_shelltree.dat 倒计时起点 ──
     let _ = env;
@@ -4246,6 +4247,22 @@ fn delete_island_object(env: &mut Environment, snap: id) {
 // mapData["11"],由原版 loadMapObjects 在 case3 removeAllObjects 之后回填 —— 等价于服务器下发。
 // 不拦截任何原版方法;不做 recycledHouses(一键收纳只有 type 5 已建成房屋走 recycleHouseWithId:level:andNumber:@0x474cc,
 // 且 0x4753c 在 curSceneId==10 早退,而岛 propertyHV 580 件没有 type 5,岛上不可达)。
+// [2026-09-24 第四轮 K9 I3-04] 同一套路再管两样同样「挂在 ObjectManager、靠 1062 mapData 非数组键回灌」的岛状态:
+//   · 飞鸟 14182(15 贝壳,limit_count 1):-[NewSceneVillageMenuLayer addNewObject2Map:gift:] 0x25c198 addBird →
+//     0x25c1bc [ObjectManager addUnvisbleObject:2](@0x41f4c,对 unvisbleObjects_(+288,L)按位或),不产生地图对象。
+//     下发键 "8" → 跳表 0x242a66:[ObjectManager setUnvisbleObjects:[值 unsignedLongValue]](0x242abc,签名 v12@0:4L8);
+//     -[NewGameManager endLoadMap] 0x243a42 isHaveUnvisbleObject:2 成立才 0x243a66 addBird;限购 -[NewSceneData
+//     getLockType4Object:] 0x21e8ee 同一判据返回锁 6。removeAllObjects 0x46700 清零;该 ivar 的写入点只有 init / 按位或 /
+//     setter / removeAllObjects(槽 0xb03394 全部引用),岛会话内只增不减。NewSceneData.specialFlagBits_ 回主村被
+//     resetNewSceneDataExceptObjectData 0x21e060 清零,不能当源。
+//   · 增强道具 20201-20204(propertyHV type 28,wilt_time 10800/86400 秒):0x25c42a [ObjectManager addUnvisbleSpeedUpObject:]
+//     (@0x41f60)写 speedUpObjects_(+284):键 [NSNumber numberWithInt:物品号] → 值 [NSNumber numberWithInt:wilt_time]。
+//     -[CommonEffectController innerupdateMultipleObject:]@0x322a88 每秒(0x3229ec 间隔 1.0)把值减 1(间隔 >4s 再补扣
+//     流逝秒数),≤0 移除 —— 值就是剩余秒。下发键 "21" → 跳表 0x242e5e:[[WrapperManager sharedManager] currentGameMode]==1
+//     门(0x242e8c)过了才逐条回填 speedUpObjects,再 0x24300c setMultipleBegintime:getCurrentTime + 0x243024
+//     startMultipleObjects。removeAllObjects 0x46790 清空;全二进制没有 removeUnvisbleSpeedUpObject: 的调用点,只会到期移除。
+//     NewSceneData.multiToolsDic_ 离线恒空,不能当源。
+//   原版服务器按真实时间让加速卡过期,所以侧档另存落盘时刻 savedAt,读档时把「离岛期间流逝的秒数」从剩余秒里扣掉。
 
 /// [2026-09-24 第四轮 K9] 侧档文件名(坏档保护位 ISLAND_FILE_STORAGE,规则同其它岛档)。
 const ISLAND_STORAGE_FILE: &str = "island_storage.dat";
@@ -4260,7 +4277,19 @@ thread_local! {
     static ISLAND_STORAGE_INJ_GOODS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// [2026-09-24 第四轮 K9] 上一次落盘内容摘要:变化时 log!,不变时 log_dbg!(节拍每 1.5s 可能落一次,防刷屏)。
     static ISLAND_STORAGE_LAST_SUMMARY: RefCell<String> = const { RefCell::new(String::new()) };
+    /// [2026-09-24 第四轮 K9 I3-04] 读档注入 mapData["21"] 的增强道具:(注入时刻 now_cf, [(物品号, 注入时剩余秒)])。
+    /// 键 21 的回填有 currentGameMode==1 门(0x242e8c),门没过活表就是空的。落盘时活表里没有、按真实时间推算
+    /// 也还没到期的条目,按推算剩余秒原样带过去(保留旧值、不被空活表覆盖);活表里已有的说明回填成功,从这里删掉。
+    static ISLAND_STORAGE_INJ_SPEED: RefCell<(f64, Vec<(i32, i32)>)> = const { RefCell::new((0.0, Vec::new())) };
 }
+/// [2026-09-24 第四轮 K9 I3-04] 读档注入 mapData["8"] 的飞鸟等标志位。落盘时与活表按位或(该 ivar 岛会话内只增不减,
+/// 或上去只会补上万一没回填的位,不会复活玩家去掉的东西)。
+static ISLAND_STORAGE_INJ_UNV: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 K9 I3-04] 增强道具「回填没生效、保留旧值」这句 log! 每次进岛只打一次。
+static ISLAND_STORAGE_SPEED_WARNED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K9 I3-04] 推算剩余秒低于这个数就当作已到期(innerupdateMultipleObject: 每秒一跳,
+/// 留几秒余量吸收节拍抖动,免得把刚在游戏里正常到期的卡又带回去)。
+const ISLAND_STORAGE_SPEED_MARGIN: f64 = 5.0;
 
 /// [2026-09-24 第四轮 K9] obj 是否 isKindOfClass: <cls_name>(obj 为 nil 或类不存在返回 false)。读档校验用。
 fn island_storage_is_kind(env: &mut Environment, obj: id, cls_name: &str) -> bool {
@@ -4283,7 +4312,7 @@ fn island_storage_strip_keys(env: &mut Environment, md: id) {
         return;
     }
     let rm = island_sel(env, "removeObjectForKey:");
-    for key in ["11"] {
+    for key in ["8", "11", "21"] {
         let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
         let _: () = msg_send(env, (md, rm, k));
     }
@@ -4295,10 +4324,15 @@ fn island_storage_strip_keys(env: &mut Environment, md: id) {
 /// loadNewScene(0x240efa)→ -[NewGameManager loadMapFromData:forNPC:] 逐键调 loadMapObjects: 消费 —— 刚好不会被清掉。
 /// 键必须是 NSString(与 addGoodsNumber:andCount: 的 "%d" 键同型,否则之后加减件数对不上号)、值必须是 NSNumber
 /// (取出时 [值 intValue]);不符的条目丢弃。无档/坏档(已隔离或禁止覆盖)按空仓库处理。在线模式不生效。
+/// [2026-09-24 第四轮 K9 I3-04] 同时:unvisble≠0 → mapData["8"]=NSNumber(u32)(原版读 unsignedLongValue);
+/// speedUp 每项剩余秒减去 (now_cf − savedAt),不足 1 秒的丢弃,非空 → mapData["21"](键按原版 numberWithInt:物品号重建)。
 fn island_storage_inject(env: &mut Environment) {
     ISLAND_STORAGE_ARMED.store(false, O);
     ISLAND_STORAGE_INJ_GOODS.with(|c| c.borrow_mut().clear());
     ISLAND_STORAGE_LAST_SUMMARY.with(|c| c.borrow_mut().clear());
+    ISLAND_STORAGE_INJ_UNV.store(0, O);
+    ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (0.0, Vec::new()));
+    ISLAND_STORAGE_SPEED_WARNED.store(false, O);
     if env.options.network_access {
         return;
     }
@@ -4362,11 +4396,86 @@ fn island_storage_inject(env: &mut Environment) {
     }
     let goods_kinds = goods_snap.len();
     ISLAND_STORAGE_INJ_GOODS.with(|c| *c.borrow_mut() = goods_snap);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    // ② 飞鸟等标志位 → mapData["8"](原版 0x242aa8 取 unsignedLongValue,armv7 上 unsigned long 即 u32)
+    let uk = crate::frameworks::foundation::ns_string::get_static_str(env, "unvisble");
+    let unv_num: id = msg_send(env, (root, ofk, uk));
+    let mut unv: u32 = 0;
+    if island_storage_is_kind(env, unv_num, "NSNumber") {
+        let uiv = island_sel(env, "unsignedIntValue");
+        unv = msg_send(env, (unv_num, uiv));
+    }
+    if unv != 0 && num_cls != nil {
+        let nwu = island_sel(env, "numberWithUnsignedInt:");
+        let num: id = msg_send(env, (num_cls, nwu, unv));
+        let k8 = crate::frameworks::foundation::ns_string::get_static_str(env, "8");
+        let _: () = msg_send(env, (md, sfk, num, k8));
+        ISLAND_STORAGE_INJ_UNV.store(unv, O);
+    }
+    // ③ 增强道具 → mapData["21"]:剩余秒扣掉离岛期间真实流逝的时间
+    let now = now_cf_secs();
+    let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let saved_at: f64 = {
+        let sa: id = msg_send(env, (root, ofk, sak));
+        if island_storage_is_kind(env, sa, "NSNumber") {
+            let dv = island_sel(env, "doubleValue");
+            msg_send(env, (sa, dv))
+        } else {
+            0.0
+        }
+    };
+    // savedAt 缺失/非正/比现在还晚(时钟回拨)→ 不扣,宁可少扣也不把卡误判过期。
+    let elapsed = if saved_at > 0.0 && now > saved_at { now - saved_at } else { 0.0 };
+    let mut speed_snap: Vec<(i32, i32)> = Vec::new();
+    let mut speed_expired = 0;
+    let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+    let speed: id = msg_send(env, (root, ofk, spk));
+    if island_storage_is_kind(env, speed, "NSDictionary") && num_cls != nil {
+        let out = island_alloc_init(env, "NSMutableDictionary");
+        if out != nil {
+            let nwi = island_sel(env, "numberWithInt:");
+            let keys: id = msg_send(env, (speed, ak));
+            let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+            for i in 0..n {
+                let k: id = msg_send(env, (keys, oai, i));
+                let v: id = msg_send(env, (speed, ofk, k));
+                if !island_storage_is_kind(env, k, "NSNumber") || !island_storage_is_kind(env, v, "NSNumber") {
+                    continue;
+                }
+                let oid: i32 = msg_send(env, (k, iv));
+                let rem: i32 = msg_send(env, (v, iv));
+                if oid <= 0 || rem <= 0 {
+                    continue;
+                }
+                let left = rem as f64 - elapsed;
+                if left < 1.0 {
+                    speed_expired += 1;
+                    continue;
+                }
+                let left = left.floor() as i32; // left ≤ rem ≤ i32::MAX,不会溢出
+                let kn: id = msg_send(env, (num_cls, nwi, oid));
+                let vn: id = msg_send(env, (num_cls, nwi, left));
+                let _: () = msg_send(env, (out, sfk, vn, kn));
+                speed_snap.push((oid, left));
+            }
+            if !speed_snap.is_empty() {
+                let k21 = crate::frameworks::foundation::ns_string::get_static_str(env, "21");
+                let _: () = msg_send(env, (md, sfk, out, k21));
+            }
+            release(env, out); // alloc/init 的 +1:已被 mapData retain(或没放进去,直接释放)
+        }
+    }
+    let speed_n = speed_snap.len();
+    ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (now, speed_snap));
     ISLAND_STORAGE_ARMED.store(true, O);
     log!(
-        "[MOLECHEAT] island: 读回 island_storage.dat → 仓库 {} 种 {} 件放回 mapData 键 11,交给原版 loadMapObjects 回填",
+        "[MOLECHEAT] island: 读回 island_storage.dat → 仓库 {} 种 {} 件(键 11)/ 飞鸟等标志 0x{:x}(键 8)/ 增强道具 {} 张(键 21,离岛流逝 {:.0} 秒,到期丢弃 {} 张),交给原版 loadMapObjects 回填",
         goods_kinds,
-        goods_total
+        goods_total,
+        unv,
+        speed_n,
+        elapsed,
+        speed_expired
     );
 }
 
@@ -4375,6 +4484,8 @@ fn island_storage_inject(env: &mut Environment) {
 /// 这些键,见 0x240efa → 0x245e96),再读 [[ObjectManager sharedManager] goodsInStorage] 做可变拷贝原样写 island_storage.dat
 /// (活表是唯一来源,不拿读档快照补键,原因见 ISLAND_STORAGE_INJ_GOODS)。只在「在岛上 + 本次进岛已读过侧档」时落盘;
 /// 在线模式不生效。
+/// [2026-09-24 第四轮 K9 I3-04] 另存 unvisble = [om unvisbleObjects] | 读档注入值、speedUp = [om speedUpObjects] 的拷贝
+/// (补上键 21 回填没生效、按真实时间又还没到期的读档条目)、savedAt = now_cf_secs()。
 fn island_storage_flush(env: &mut Environment) {
     if env.options.network_access || !ON_ISLAND.load(O) || !ISLAND_STORAGE_ARMED.load(O) {
         return;
@@ -4401,6 +4512,8 @@ fn island_storage_flush(env: &mut Environment) {
     let cnt = island_sel(env, "count");
     let oai = island_sel(env, "objectAtIndex:");
     let iv = island_sel(env, "intValue");
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    let nwi = island_sel(env, "numberWithInt:");
     // ① 仓库:活表的可变拷贝(+1)
     let gis = island_sel(env, "goodsInStorage");
     let live_goods: id = msg_send(env, (om, gis));
@@ -4453,10 +4566,76 @@ fn island_storage_flush(env: &mut Environment) {
         let _: () = msg_send(env, (root, sfk, goods, gk));
         release(env, goods); // mutableCopy / alloc-init 的 +1,已被 root retain
     }
+    // ② [I3-04] 飞鸟等标志位:活表 unvisbleObjects(签名 L8@0:4 → u32)| 读档注入值
+    let uo = island_sel(env, "unvisbleObjects");
+    let live_unv: u32 = msg_send(env, (om, uo));
+    let unv = live_unv | ISLAND_STORAGE_INJ_UNV.load(O);
+    if num_cls != nil {
+        let nwu = island_sel(env, "numberWithUnsignedInt:");
+        let num: id = msg_send(env, (num_cls, nwu, unv));
+        let uk = crate::frameworks::foundation::ns_string::get_static_str(env, "unvisble");
+        let _: () = msg_send(env, (root, sfk, num, uk));
+    }
+    // ③ [I3-04] 增强道具:活表 speedUpObjects 的可变拷贝(+1),值 = 剩余秒;补上「回填没生效」的读档条目
+    let now = now_cf_secs();
+    let suo = island_sel(env, "speedUpObjects");
+    let live_speed: id = msg_send(env, (om, suo));
+    let speed: id = if live_speed != nil {
+        msg_send(env, (live_speed, mc))
+    } else {
+        island_alloc_init(env, "NSMutableDictionary")
+    };
+    if speed == nil {
+        release(env, root); // 同上:拷贝失败整次不写
+        return;
+    }
+    let mut speed_n: crate::mem::GuestUSize = 0;
+    let mut speed_carried = 0;
+    if speed != nil {
+        if num_cls != nil {
+            let (inj_t, snap) = ISLAND_STORAGE_INJ_SPEED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut keep: Vec<(i32, i32)> = Vec::new();
+            for (oid, rem) in snap {
+                let kn: id = msg_send(env, (num_cls, nwi, oid));
+                let cur: id = msg_send(env, (speed, ofk, kn));
+                if cur != nil {
+                    continue; // 原版已回填(之后到期由 innerupdateMultipleObject: 自己移除),不再跟踪
+                }
+                let left = rem as f64 - (now - inj_t).max(0.0);
+                if left < ISLAND_STORAGE_SPEED_MARGIN {
+                    continue; // 按真实时间也该到期了
+                }
+                let left = left.floor() as i32;
+                let vn: id = msg_send(env, (num_cls, nwi, left));
+                let _: () = msg_send(env, (speed, sfk, vn, kn));
+                speed_carried += 1;
+                keep.push((oid, rem));
+            }
+            ISLAND_STORAGE_INJ_SPEED.with(|c| *c.borrow_mut() = (inj_t, keep));
+        }
+        if speed_carried > 0 && !ISLAND_STORAGE_SPEED_WARNED.swap(true, O) {
+            log!(
+                "[MOLECHEAT] island: ⚠️ 读档注入的增强道具有 {} 张没回填进活表(键 21 的 currentGameMode==1 门 0x242e8c 没过?)→ 保留旧值按真实时间续算,不用空活表覆盖",
+                speed_carried
+            );
+        }
+        speed_n = msg_send(env, (speed, cnt));
+        let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+        let _: () = msg_send(env, (root, sfk, speed, spk));
+        release(env, speed); // mutableCopy / alloc-init 的 +1,已被 root retain
+    }
+    if num_cls != nil {
+        let nwd = island_sel(env, "numberWithDouble:");
+        let num: id = msg_send(env, (num_cls, nwd, now));
+        let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+        let _: () = msg_send(env, (root, sfk, num, sak));
+    }
     let saved = island_sidecar_save(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE, root);
     release(env, root);
     let Some(saved) = saved else { return };
-    let summary = format!("仓库 {} 种 {} 件", goods_kinds, goods_total);
+    let mut summary = format!("仓库 {} 种 {} 件", goods_kinds, goods_total);
+    // 剩余秒每秒都在变,摘要只记张数,免得每次落盘都算「变化」刷 log!。
+    summary.push_str(&format!(" / 飞鸟等标志 0x{:x} / 增强道具 {} 张", unv, speed_n));
     let changed = ISLAND_STORAGE_LAST_SUMMARY.with(|c| {
         let mut last = c.borrow_mut();
         if *last == summary {
@@ -4471,6 +4650,63 @@ fn island_storage_flush(env: &mut Environment) {
     } else {
         log_dbg!("[MOLECHEAT] island: {}:{}", saved, summary);
     }
+}
+
+/// [2026-09-24 第四轮 K9 I3-04] 岛档计时快进(island_ff_extras 的 K9 槽位调用;K4 的 island_ff_offline 只在主村、离线、
+/// 不在岛会话时调用):把 island_storage.dat 的 savedAt 往前拨 secs 秒,下次进岛读档时增强道具剩余秒就多扣 secs,
+/// 等价于这段时间已经流逝(到期的由 island_storage_inject 丢弃,原版进岛后 HUD 加速图标随之消失)。
+/// 仓库与飞鸟没有时间字段,不动。savedAt 缺失时按「现在」起拨。无档/坏档/无增强道具时什么都不做。
+fn island_storage_ff(env: &mut Environment, secs: f64) {
+    if env.options.network_access || island_session_active() || !(secs > 0.0) {
+        return;
+    }
+    let root = island_sidecar_load(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE);
+    if !island_storage_is_kind(env, root, "NSDictionary") {
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let cnt = island_sel(env, "count");
+    let spk = crate::frameworks::foundation::ns_string::get_static_str(env, "speedUp");
+    let speed: id = msg_send(env, (root, ofk, spk));
+    let n: crate::mem::GuestUSize = if island_storage_is_kind(env, speed, "NSDictionary") {
+        msg_send(env, (speed, cnt))
+    } else {
+        0
+    };
+    if n == 0 {
+        log_dbg!("[MOLECHEAT] island: 计时快进 island_storage.dat 没有增强道具,跳过");
+        return;
+    }
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if num_cls == nil {
+        return;
+    }
+    let sak = crate::frameworks::foundation::ns_string::get_static_str(env, "savedAt");
+    let sa: id = msg_send(env, (root, ofk, sak));
+    let saved_at: f64 = if island_storage_is_kind(env, sa, "NSNumber") {
+        let dv = island_sel(env, "doubleValue");
+        msg_send(env, (sa, dv))
+    } else {
+        0.0
+    };
+    let base = if saved_at > 0.0 { saved_at } else { now_cf_secs() };
+    let mc = island_sel(env, "mutableCopy");
+    let m: id = msg_send(env, (root, mc)); // +1
+    if m == nil {
+        return;
+    }
+    let nwd = island_sel(env, "numberWithDouble:");
+    let num: id = msg_send(env, (num_cls, nwd, base - secs));
+    let sfk = island_sel(env, "setObject:forKey:");
+    let _: () = msg_send(env, (m, sfk, num, sak));
+    let r = island_sidecar_save(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE, m);
+    release(env, m);
+    log!(
+        "[MOLECHEAT] island: 计时快进 island_storage.dat 增强道具 {} 张,savedAt 前拨 {:.0} 秒 → {}",
+        n,
+        secs,
+        r.unwrap_or_else(|| "未写入(坏档保护中或归档失败)".to_string())
+    );
 }
 
 /// [扫描修 2026-09-15] F10-6 返回本次合并的新放置对象个数(由 island_flush 汇总进一行日志);F10-7 动态键串用完即释放。
