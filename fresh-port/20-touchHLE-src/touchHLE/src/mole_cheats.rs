@@ -4004,7 +4004,20 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     const ISLAND_SHOPS: [(i32, f32, f32); 5] = [
         (30101, 22.0, 42.0),
         (30102, 27.0, 42.0),
-        (30103, 32.0, 42.0),
+        // [2026-09-24 第四轮 K16 N-D3-1] 快餐店 30103 从 (32,42) 挪到基础区 (17,48)。baseTile.x=line、.y=column
+        //   (-[Object initWithMapData:type:] 0x3b4f4/0x3b524 → tileAtLine:atColumn:needDummy:)。原 line=32 落在「扩充土地 I」
+        //   (31001,1 万豆/22 级;买下才 extendMap|=0x2,-[NewSceneVillageMenuLayer addNewObject2Map:gift:] 0x25c108/0x25c280):
+        //   -[NewScenePorter isReachable]@0x26b114 在 extendMap 无 0x2 位时 0x26b39a 要求 line<=28,checkCanPut: 0x271270
+        //   判不可达 → 0x2712ae canPut=0,拖离原位后再拖回就放不下(拿起不动直接确认仍可),还白占未买的地。
+        //   新坐标依据(全部按反汇编推算,未改原版逻辑):
+        //   · 占地:isFlip=0 时 Object.size=(length_y,length_x)=(3,4)(0x3b76c);-[Object setTiles] 与 checkCanPut:
+        //     逐格 [runtimeMap tile:base offsetX:0..w-1 offsetY:0..h-1],-[NewSceneMapBase tile:offsetX:offsetY:]@0x251198
+        //     给 column=C+ox-oy、line=L-⌊(ox+oy+(C&1))/2⌋,即占地朝 line 减小方向展开:(17,48) 占 line 15..17、column 45..50;
+        //   · isReachable(extendMap=1):17<=28、17+3>=1、48-4>=18、48+4<=65 全过;HolidayVillageMap regionOfTile: 恒 0;
+        //   · -[HolidayVillageMap setBkgTilesProperty]@0x267e2c 三张静态障碍表(0x9096c8/0x9097b8/0x90a3b0)无一格命中;
+        //   · 与另外四店、布兰的家 (11,39)、公寓 (15,26) 逐格无交集;用户实测档里同为 4×3 的烧烤店 30105 就放在 (17,48)。
+        //   seqId 仍按公式 90003、currentLevel 仍 4。只影响无 island_map.dat 的新档,老档走读档路径不迁移。
+        (30103, 17.0, 48.0),
         (30104, 22.0, 47.0),
         (30105, 27.0, 47.0),
     ];
