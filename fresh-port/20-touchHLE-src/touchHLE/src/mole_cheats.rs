@@ -2683,7 +2683,7 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
 ///   做法(移植者自拟的离线等价):t = max(上次返回值 + 距上次的单调流逝, 墙钟 CF 秒 + 时间旅行偏移)。
 ///   墙钟回拨 → 按单调时钟继续走、不倒退;休眠后墙钟领先 → 向前追平(等价原版回前台对时);时间旅行偏移只增不减,
 ///   仍即时生效。进程内状态,重启后从墙钟重新起算(与原版每次登录由服务器 1065 重新对时同理)。
-///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据。
+///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据、未来时间戳收敛 island_clamp_future_timestamps。
 ///   该臂主村与岛共用(selref 0xade774 共 86 处):主村水塔 -[WaterTower innerupdate:]、-[RewardBox currentTime]、
 ///   -[DailySignLayer getServerTime]、各活动倒计时也随之单调,与原版「服务器时间不随设备时钟回拨」一致;
 ///   主村作物进度 -[CropInfoView updateObjectProgress:] 在主村分支直读 CFAbsoluteTimeGetCurrent(0xc435e),不受影响。
@@ -3242,6 +3242,119 @@ fn fix_stuck_ships(env: &mut Environment) {
     }
 }
 
+/// [2026-09-24 第四轮 K4 I4-05] 进岛读档后收敛「超前」的计时起点(由 island_after_layout_ready 调用,读档岛/默认岛两条分支都跑,
+/// 读档岛在 fix_stuck_ships 之后)。
+/// 病根:用过开发者「时间旅行」(偏移只在进程内、重启归零)或宿主系统时间回拨过的会话,会把「未来」的起点写进岛档;
+///   重启后这几个字段原版【不自愈】,要等现实时间追上才恢复:
+///   · TMMapDataShip.beginDiscoverTime/beginFixTime:-[DiscoveryShip checkIsDiscoverFinished] 0x361e4e vsub + 0x361e56 vcmpe + blt
+///     (now−begin < 时长就不完成),没有负差重置 → 船永远停在海上点不动 / 修船进度条永远不动;
+///   · NewSceneUserInfoData.curQuestResult(打工类任务 questType 7 的开始时刻):-[NewSceneQuest update:] 0x329ef0 vsub +
+///     0x329ef4 vcmpe + 0x329efc bge,负差只在显示处钳 0(0x329efe-0x329f0c),完成要等 now−begin ≥ requireCount;
+///   · NpcData.lastCoolDownTime:-[YaliNpcActor checkCooltimeOver] 0x1b9934 vsub 后有符号比较、无重置,NPC 一直在冷却。
+/// 做法(移植者自拟的离线等价,语义同 Restaurant/Apartment 原版的「负差重置成 now」自愈):比「现在 + 60 秒」还晚的一律夹到「现在」,
+///   即从这一刻重新计时;每处 log!。60 秒容差防浮点/落盘抖动。判定用含时间旅行偏移的时钟,旅行会话内进岛不会误夹。
+///   · 船与打工任务走 NewSceneTimer(0x361e2a / 0x329eb4 取 getCurrentServerTime)→ 用单调的 now_cf_secs;
+///   · NPC 冷却直读 CFAbsoluteTimeGetCurrent(0x1b992a、-[NpcActor checkGiftMode:] 0xef9de,写入点 exitGiftMode: 0x1b9a6c
+///     同样取 CFAbsoluteTimeGetCurrent)→ 用墙钟 wall_cf_secs。
+///   刻意不推广到 Restaurant/Apartment/Shop:它们原版 innerupdate 自己会把负差重置成 now(0x31c20c、0x320c9e、0x31dc30),
+///   再夹一次会和原版逻辑打架、让在建/训练进度被清两次。curQuestResult 的计数型取值远小于阈值、4294967295 哨兵单独排除。
+///   只改 mapData 快照与岛 userInfo,不影响在线与主村。
+fn island_clamp_future_timestamps(env: &mut Environment) {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return;
+    }
+    let now = now_cf_secs();
+    let limit = now + 60.0;
+    let mut fixed = 0;
+    // ① 探险船:mapData 里的 TMMapDataShip 快照(此刻 DiscoveryShip 还没实例化,initWithMapData: 读的就是它)。
+    for (obj, cname) in island_all_objects(env) {
+        if cname != "TMMapDataShip" {
+            continue;
+        }
+        // 两个 getter 都是 d8@0:4、setter 都是 v16@0:4d8(objc 元数据核对)。
+        for (getter, setter, what) in [
+            ("beginDiscoverTime", "setBeginDiscoverTime:", "出海开始"),
+            ("beginFixTime", "setBeginFixTime:", "修船开始"),
+        ] {
+            if !env.objc.object_has_method_named(&env.mem, obj, getter)
+                || !env.objc.object_has_method_named(&env.mem, obj, setter)
+            {
+                continue;
+            }
+            let g = island_sel(env, getter);
+            let v: f64 = msg_send(env, (obj, g));
+            if v > limit {
+                let s = island_sel(env, setter);
+                let _: () = msg_send(env, (obj, s, now));
+                log!(
+                    "[MOLECHEAT] island: 未来时间戳收敛 TMMapDataShip.{}({})超前 {:.0} 秒 → 夹到现在 {:.0}",
+                    getter,
+                    what,
+                    v - now,
+                    now
+                );
+                fixed += 1;
+            }
+        }
+    }
+    let ui = island_userinfo_data(env);
+    if ui != nil {
+        // ② 打工类任务开始时刻(curQuestResult d8@0:4 / setCurQuestResult: v16@0:4d8)。
+        if env.objc.object_has_method_named(&env.mem, ui, "curQuestResult") {
+            let g = island_sel(env, "curQuestResult");
+            let v: f64 = msg_send(env, (ui, g));
+            if v > limit && v < 4294967295.0 {
+                let s = island_sel(env, "setCurQuestResult:");
+                let _: () = msg_send(env, (ui, s, now));
+                log!(
+                    "[MOLECHEAT] island: 未来时间戳收敛 岛任务 curQuestResult(打工开始时刻)超前 {:.0} 秒 → 夹到现在 {:.0}",
+                    v - now,
+                    now
+                );
+                fixed += 1;
+            }
+        }
+        // ③ NPC 冷却(NpcData lastCoolDownTime d8@0:4 / setLastCoolDownTime: v16@0:4d8),按墙钟判定。
+        let wall = wall_cf_secs();
+        let wall_limit = wall + 60.0;
+        let s_npcs = island_sel(env, "npcs");
+        let npcs: id = msg_send(env, (ui, s_npcs));
+        if npcs != nil && env.objc.object_has_method_named(&env.mem, npcs, "objectAtIndex:") {
+            let s_cnt = island_sel(env, "count");
+            let s_oai = island_sel(env, "objectAtIndex:");
+            let s_lcd = island_sel(env, "lastCoolDownTime");
+            let s_slcd = island_sel(env, "setLastCoolDownTime:");
+            let n: crate::mem::GuestUSize = msg_send(env, (npcs, s_cnt));
+            for i in 0..n {
+                let npc: id = msg_send(env, (npcs, s_oai, i));
+                if npc == nil
+                    || !env.objc.object_has_method_named(&env.mem, npc, "lastCoolDownTime")
+                    || !env.objc.object_has_method_named(&env.mem, npc, "setLastCoolDownTime:")
+                {
+                    continue;
+                }
+                let v: f64 = msg_send(env, (npc, s_lcd));
+                if v > wall_limit {
+                    let _: () = msg_send(env, (npc, s_slcd, wall));
+                    log!(
+                        "[MOLECHEAT] island: 未来时间戳收敛 NPC[{}].lastCoolDownTime 超前 {:.0} 秒 → 夹到现在 {:.0}",
+                        i,
+                        v - wall,
+                        wall
+                    );
+                    fixed += 1;
+                }
+            }
+        }
+    }
+    if fixed > 0 {
+        // 直接置脏(此刻还在加载、ON_ISLAND 未置,island_mark_dirty 会忽略;写法同 build_default_island_mapdata 新岛 newGame 段):
+        //   上岛后首个节拍就把收敛后的值写回岛档。否则本会话没有别的改动时盘上仍是未来值,一旦被强杀,下次进岛又从那一刻重新计时。
+        ISLAND_DIRTY.store(true, O);
+        log!("[MOLECHEAT] island: 未来时间戳收敛共 {} 处(从进岛这一刻重新计时)", fixed);
+    }
+}
+
 /// [2026-09-16 黄金岛审查修 I5-01] 补发岛农场任务 4 的完成动作 action 13。
 ///
 /// **病根**:farmquestHV.dat 的 ID=4(「雇一只摩尔」)既没有 req_*、也没有 cli_step,于是
@@ -3382,6 +3495,7 @@ fn island_sidecar_save(env: &mut Environment, fname: &str, bit: u32, root: id) -
 fn island_after_layout_ready(env: &mut Environment) {
     log_dbg!("[MOLECHEAT] island: 挂钩 island_after_layout_ready");
     // ── [K4] 未来时间戳收敛 ──
+    island_clamp_future_timestamps(env); // [2026-09-24 第四轮 K4 I4-05] 船/打工任务/NPC 冷却的超前起点夹到现在
     // ── [K9] 仓库/飞鸟/增强道具回灌 mapData 键 8/11/21 ──
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
     // ── [K11] 超级贝壳树侧档读入缓存 ──
