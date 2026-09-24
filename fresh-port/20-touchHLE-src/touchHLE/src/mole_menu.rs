@@ -148,6 +148,8 @@ pub enum DevTool {
     BuildingStore,
     CameraCenter,
     Trace,
+    /// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进:分钟 = 寄存器值,主村离线执行、下次进岛生效(mole_dev::island_fast_forward_minutes)。
+    IslandFastForward,
 }
 
 /// [扫描修 2026-09-15] 隐藏物品页的按钮种类(F1-1 / F1-5 / F4-1)。
@@ -543,6 +545,8 @@ fn pages() -> Vec<Page> {
                 ("时间旅行+24h(不可回退)", Dev(D::TimeTravelHours(24))),
                 ("存档快照:保存", Dev(D::SnapshotSave)),
                 ("快照:下次启动恢复", Dev(D::SnapshotRestore)),
+                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 11 行首格),不挪动前面任何按钮的坐标。
+                ("岛档快进(分钟)", Dev(D::IslandFastForward)),
             ],
         },
         // 6 [扫描修 2026-09-15] F1-1/F1-5/F4-1 隐藏物品:进商店开关、节日商店模式、目录浏览(放到地图 / 入仓库)。
@@ -2251,6 +2255,10 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
         DevTool::BuildingStore => ("打开建设商店".to_string(), dev::open_building_store(env)),
         DevTool::CameraCenter => ("相机回中".to_string(), dev::camera_center(env)),
         DevTool::Trace => ("选择子跟踪".to_string(), dev::toggle_trace()),
+        DevTool::IslandFastForward => (
+            format!("岛档快进 {} 分钟", reg),
+            dev::island_fast_forward_minutes(env, reg),
+        ),
     };
     match result {
         Ok(text) => {
@@ -2294,7 +2302,7 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
             (label.to_string(), color(env, 0.42, 0.36, 0.22, 1.0))
         }
         DevTool::Spacer => (String::new(), color(env, 0.0, 0.0, 0.0, 0.0)),
-        DevTool::Quest(_) | DevTool::Story | DevTool::Weather => {
+        DevTool::Quest(_) | DevTool::Story | DevTool::Weather | DevTool::IslandFastForward => {
             (format!("{} #{}", label, reg), color(env, 0.16, 0.45, 0.7, 1.0))
         }
         DevTool::Trace => {
