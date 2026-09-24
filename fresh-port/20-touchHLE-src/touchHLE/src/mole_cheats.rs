@@ -10655,6 +10655,13 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                         // 4 条离岛路径(gobackMainVillage/菜单返回/串门/exitNewIsland:)都经过这里,且 to==1 跳过网络门,
                         // 放行后必定成功(0x24142e beq)。在岛标志在此清,curSceneId→10 强制随之停止,不会误路由主村加载。
                         ON_ISLAND.store(false, O);
+                        // [2026-09-24 第四轮 集成补漏] 本次进岛的侧档「已注入/已恢复」标志随离岛失效:落盘已在上面做完,
+                        //   回主村后 LoadingMainVillage 的 reset(0x2543fe)会清空仓库活表与咖啡馆三张表。标志若残留,
+                        //   ON_ISLAND 万一异常残留(例如在岛上关掉「可建筑黄金岛」总闸再离岛,出口臂不跑)或将来出现
+                        //   绕过 build_default_island_mapdata 的进岛路径时,节拍/关窗落盘会把清空后的空表写进
+                        //   island_storage.dat / island_cafe.dat。下次进岛由各自的注入/恢复函数重新置位。
+                        ISLAND_STORAGE_ARMED.store(false, O);
+                        CAFE_SESSION_READY.store(false, O);
                         ISLAND_ENTER_WINDOW.store(0, O);
                         ISLAND_SCENE_MGR.store(saved[0], O);
                         ISLAND_EXIT_FRAMES.store(3600, O);
