@@ -3355,6 +3355,278 @@ fn island_clamp_future_timestamps(env: &mut Environment) {
     }
 }
 
+/// [2026-09-24 第四轮 K4 I4-05] 岛档快进的取值规则:只动「像 CF 绝对时间戳」的值——≥1e6 秒(CF 纪元下任何真实时刻
+/// 都远大于它)且 <4294967295(NewSceneQuest 等处的哨兵);0(未开始/冷却已结束)、旧的小基准值、时长/计数一律不动。
+/// 回拨后不低于 1(u32 字段 0 有「未开始」语义)。返回 None = 不改。
+fn island_ff_shift(v: f64, secs: f64) -> Option<f64> {
+    if !(v >= 1.0e6 && v < 4294967295.0) {
+        return None;
+    }
+    let nv = (v - secs).max(1.0);
+    if nv < v {
+        Some(nv)
+    } else {
+        None
+    }
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 岛档快进读盘:Documents/<fname> 不存在 → Ok(nil);存在但解档为 nil 或根对象不响应 `must`
+/// → Err(什么都不写、也不改名隔离,坏档留给下次进岛的读档流程按 #7 规则处理);成功 → Ok(根对象,解档器返回的自动释放对象)。
+fn island_ff_load(env: &mut Environment, fname: &str, must: &str) -> Result<id, String> {
+    let path = island_data_path(env, fname);
+    if path == nil {
+        return Err(format!("取不到 {} 的存档路径(GameData 未就绪)", fname));
+    }
+    if !guest_file_exists(env, path) {
+        return Ok(nil);
+    }
+    let unarch_cls = env.objc.get_known_class("NSKeyedUnarchiver", &mut env.mem);
+    if unarch_cls == nil {
+        return Err("NSKeyedUnarchiver 不可用".to_string());
+    }
+    let s = island_sel(env, "unarchiveObjectWithFile:");
+    let root: id = msg_send(env, (unarch_cls, s, path));
+    if root == nil || !env.objc.object_has_method_named(&env.mem, root, must) {
+        return Err(format!(
+            "{} 存在但解档失败或格式不对(坏档/写残),为免覆盖不回拨;下次进岛时读档流程会自动隔离它",
+            fname
+        ));
+    }
+    Ok(root)
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 一份 mapData 形状的字典(key → NSArray<TMMapData>)里的全部对象,附精确类名。
+/// 与 island_all_objects 同构,区别是作用在岛档快进从盘上解出来的字典上(不碰 NewSceneData 的活表);值不是数组的条目跳过。
+fn island_ff_dict_objects(env: &mut Environment, md: id) -> Vec<(id, String)> {
+    let mut out = Vec::new();
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let ofk = island_sel(env, "objectForKey:");
+    let keys: id = msg_send(env, (md, ak));
+    if keys == nil {
+        return out;
+    }
+    let nk: crate::mem::GuestUSize = msg_send(env, (keys, cnt));
+    for ki in 0..nk {
+        let k: id = msg_send(env, (keys, oai, ki));
+        let arr: id = msg_send(env, (md, ofk, k));
+        if arr == nil || !env.objc.object_has_method_named(&env.mem, arr, "objectAtIndex:") {
+            continue;
+        }
+        let n: crate::mem::GuestUSize = msg_send(env, (arr, cnt));
+        for i in 0..n {
+            let obj: id = msg_send(env, (arr, oai, i));
+            if obj == nil {
+                continue;
+            }
+            let cls = crate::objc::ObjC::read_isa(obj, &env.mem);
+            let name = env.objc.get_class_name(cls).to_string();
+            out.push((obj, name));
+        }
+    }
+    out
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进(验证工具:开发工具页「岛档快进」按钮 / 文本命令 `island ff <分钟>`,
+/// 经 mole_dev::island_fast_forward_minutes 调用;UIKit 事件分派上下文,不在帧栈里,可以自由发宿主消息)。
+/// 背景:开发工具「对象计时快进」(-[TestLayer updateTime] 对活对象 setAccTime:)在岛上被拒,岛上的售卖/升级/出海/修船/
+///   公寓/打工任务全都没法无头验证;而直接改岛上的活对象也没用——离岛时 -[NewSceneData updateBeginTime]→setModObjectToServer:
+///   与我们的回写/节拍落盘会拿活对象把改动覆盖掉。所以反过来:在主村、离线、没有岛会话时,把【盘上】岛档里的绝对时间一律
+///   减 secs(等价于这段时间已经流逝),下次进岛读档时原版计时逻辑自己算出「已完成」。移植者自拟的调试工具,不是原版功能。
+/// 前置:离线;不在岛会话(进岛窗口/在岛/加载/离岛过渡都算);全部岛档坏档保护位为 0;两份岛档都能正常解档。
+///   任一不满足直接拒绝、什么都不写。校验通过后先调 mole_dev::snapshot_save 存一份快照(失败就不改),可用快照撤销。
+/// 回拨范围:
+///   · island_map.dat:ISLAND_TIME_FIELDS 列出的每个绝对时间字段(规则见 island_ff_shift);
+///   · island_userinfo.dat:curQuestResult(打工开始时刻,>1e6 且非哨兵才改)、npcs 各 NpcData.lastCoolDownTime;
+///   · 其余岛侧档由 island_ff_extras 各包自己回拨;
+///   · 主村主档里的出海冷却:DiscoveryShip.lastSailingTime(+448,L)由 -[DiscoveryShip initWithMapData:type:] 0x360a1c 从
+///     [[GameData sharedInstance] getLocalUserInfoDataFromGameData] 的 getLastDiscoverShipSailingTime(L8@0:4,
+///     attributeValue_[0xff000004])灌入,-[DiscoveryShip checkIsSailingAlready] 0x3610b0 用 now−lastSailingTime ≥ coolDownTime_
+///     判冷却结束 → 同样回拨,写回用 setDiscoverShipSailingTime:(v12@0:4L8),再 -[GameData saveUserInfoData](v8@0:4)落盘。
+pub fn island_ff_offline(env: &mut Environment, secs: f64) -> Result<String, String> {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return Err("在线模式下岛上进度以服务器为准,不能回拨岛档".to_string());
+    }
+    if island_session_active() {
+        return Err(
+            "黄金岛上不能快进岛档(离岛落盘会用岛上内存把改动覆盖掉),请回主村执行,下次进岛生效".to_string(),
+        );
+    }
+    if !(secs.is_finite() && secs >= 1.0) {
+        return Err("快进的秒数必须是正数".to_string());
+    }
+    let bad = ISLAND_LOAD_FAILED.load(O);
+    if bad != 0 {
+        return Err(format!(
+            "有岛档处于坏档保护中(保护位 {:#x}:本会话读档失败且未能隔离),为免覆盖不回拨",
+            bad
+        ));
+    }
+    // ① 先把两份岛档都读进来并校验,坏档直接拒绝(此时什么都还没写)。
+    let md = island_ff_load(env, "island_map.dat", "allKeys")?;
+    let ui = island_ff_load(env, "island_userinfo.dat", "objectForKey:")?;
+    if md == nil && ui == nil {
+        return Err("还没有岛档(没上过岛或删过档),没有可快进的计时".to_string());
+    }
+    // ② 改盘之前先存快照(主村时 snapshot_save 会先让游戏把主档/地图落盘),失败就不动。
+    let snap = crate::mole_dev::snapshot_save(env)
+        .map_err(|e| format!("回拨前保存快照失败:{},为安全起见没有改动岛档", e))?;
+    log!("[MOLECHEAT] island: 岛档快进 {} 秒:回拨前快照 → {}", secs, snap);
+    // island_sidecar_save 的摘要固定是「存盘 <文件>(ok=<bool>)」,归档失败返回 None。
+    let wrote = |r: &Option<String>| r.as_deref().map_or(false, |s| s.contains("ok=true"));
+    let mut failed: Vec<&str> = Vec::new();
+    // ③ island_map.dat:布局里各对象的绝对时间。
+    let mut map_n = 0;
+    if md != nil {
+        for (obj, cname) in island_ff_dict_objects(env, md) {
+            let Some((_, fields)) = ISLAND_TIME_FIELDS.iter().find(|(c, _)| *c == cname) else {
+                continue;
+            };
+            for &(getter, setter, is_double) in fields.iter() {
+                if !env.objc.object_has_method_named(&env.mem, obj, getter)
+                    || !env.objc.object_has_method_named(&env.mem, obj, setter)
+                {
+                    continue;
+                }
+                let g = island_sel(env, getter);
+                let st = island_sel(env, setter);
+                if is_double {
+                    let v: f64 = msg_send(env, (obj, g));
+                    if let Some(nv) = island_ff_shift(v, secs) {
+                        let _: () = msg_send(env, (obj, st, nv));
+                        log_dbg!("[MOLECHEAT] island: 岛档快进 {}.{} {} → {}", cname, getter, v, nv);
+                        map_n += 1;
+                    }
+                } else {
+                    let v: u32 = msg_send(env, (obj, g));
+                    if let Some(nv) = island_ff_shift(v as f64, secs) {
+                        let _: () = msg_send(env, (obj, st, nv as u32));
+                        log_dbg!("[MOLECHEAT] island: 岛档快进 {}.{} {} → {}", cname, getter, v, nv as u32);
+                        map_n += 1;
+                    }
+                }
+            }
+        }
+        if map_n > 0 {
+            let r = island_sidecar_save(env, "island_map.dat", ISLAND_FILE_MAP, md);
+            if !wrote(&r) {
+                failed.push("island_map.dat");
+            }
+        }
+    }
+    // ④ island_userinfo.dat:打工开始时刻与 NPC 冷却。根字典先 mutableCopy(+1,归档后 release),npcs 数组里的 NpcData 原地改。
+    let mut ui_n = 0;
+    if ui != nil {
+        let mc = island_sel(env, "mutableCopy");
+        let mu: id = msg_send(env, (ui, mc));
+        if mu != nil {
+            let ofk = island_sel(env, "objectForKey:");
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "curQuestResult");
+            let num: id = msg_send(env, (mu, ofk, k));
+            if num != nil && env.objc.object_has_method_named(&env.mem, num, "doubleValue") {
+                let dv = island_sel(env, "doubleValue");
+                let v: f64 = msg_send(env, (num, dv));
+                if let Some(nv) = island_ff_shift(v, secs) {
+                    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+                    let nwd = island_sel(env, "numberWithDouble:");
+                    let nn: id = msg_send(env, (num_cls, nwd, nv)); // 自动释放,放进字典后不 release
+                    let sfk = island_sel(env, "setObject:forKey:");
+                    let _: () = msg_send(env, (mu, sfk, nn, k));
+                    log_dbg!("[MOLECHEAT] island: 岛档快进 curQuestResult {} → {}", v, nv);
+                    ui_n += 1;
+                }
+            }
+            let k = crate::frameworks::foundation::ns_string::get_static_str(env, "npcs");
+            let npcs: id = msg_send(env, (mu, ofk, k));
+            if npcs != nil && env.objc.object_has_method_named(&env.mem, npcs, "objectAtIndex:") {
+                let s_cnt = island_sel(env, "count");
+                let s_oai = island_sel(env, "objectAtIndex:");
+                let s_lcd = island_sel(env, "lastCoolDownTime");
+                let s_slcd = island_sel(env, "setLastCoolDownTime:");
+                let n: crate::mem::GuestUSize = msg_send(env, (npcs, s_cnt));
+                for i in 0..n {
+                    let npc: id = msg_send(env, (npcs, s_oai, i));
+                    if npc == nil
+                        || !env.objc.object_has_method_named(&env.mem, npc, "lastCoolDownTime")
+                        || !env.objc.object_has_method_named(&env.mem, npc, "setLastCoolDownTime:")
+                    {
+                        continue;
+                    }
+                    let v: f64 = msg_send(env, (npc, s_lcd));
+                    if let Some(nv) = island_ff_shift(v, secs) {
+                        let _: () = msg_send(env, (npc, s_slcd, nv));
+                        ui_n += 1;
+                    }
+                }
+            }
+            if ui_n > 0 {
+                let r = island_sidecar_save(env, "island_userinfo.dat", ISLAND_FILE_USERINFO, mu);
+                if !wrote(&r) {
+                    failed.push("island_userinfo.dat");
+                }
+            }
+            release(env, mu);
+        }
+    }
+    // ⑤ 其余岛侧档(仓库/咖啡馆/贝壳树)各自回拨。
+    island_ff_extras(env, secs);
+    // ⑥ 主村主档里的出海冷却起点。
+    let mut sail: Option<(u32, u32)> = None;
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    if gd_cls != nil {
+        let sh = island_sel(env, "sharedInstance");
+        let gd: id = msg_send(env, (gd_cls, sh));
+        if gd != nil {
+            let gl = island_sel(env, "getLocalUserInfoDataFromGameData");
+            let uid: id = msg_send(env, (gd, gl));
+            if uid != nil
+                && env.objc.object_has_method_named(&env.mem, uid, "getLastDiscoverShipSailingTime")
+                && env.objc.object_has_method_named(&env.mem, uid, "setDiscoverShipSailingTime:")
+            {
+                let g = island_sel(env, "getLastDiscoverShipSailingTime");
+                let v: u32 = msg_send(env, (uid, g));
+                if let Some(nv) = island_ff_shift(v as f64, secs) {
+                    let s = island_sel(env, "setDiscoverShipSailingTime:");
+                    let _: () = msg_send(env, (uid, s, nv as u32));
+                    let save = island_sel(env, "saveUserInfoData");
+                    let _: () = msg_send(env, (gd, save));
+                    sail = Some((v, nv as u32));
+                }
+            }
+        }
+    }
+    let sail_text = match sail {
+        Some((a, b)) => format!("出海冷却起点 {} → {}", a, b),
+        None => "出海冷却无需回拨".to_string(),
+    };
+    log!(
+        "[MOLECHEAT] island: 岛档快进 {} 秒 → island_map.dat {} 处 / island_userinfo.dat {} 处 / {}{}",
+        secs,
+        map_n,
+        ui_n,
+        sail_text,
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(" / ⚠️ 写盘失败:{}", failed.join("、"))
+        }
+    );
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} 写盘失败(其余已回拨,可用「快照:下次启动恢复」撤销)",
+            failed.join("、")
+        ));
+    }
+    Ok(format!(
+        "已把岛档计时回拨 {} 分钟(布局 {} 处、岛任务/NPC {} 处,{}),下次进岛生效;回拨前已存快照",
+        (secs / 60.0).round() as i64,
+        map_n,
+        ui_n,
+        sail_text
+    ))
+}
+
 /// [2026-09-16 黄金岛审查修 I5-01] 补发岛农场任务 4 的完成动作 action 13。
 ///
 /// **病根**:farmquestHV.dat 的 ID=4(「雇一只摩尔」)既没有 req_*、也没有 cli_step,于是
