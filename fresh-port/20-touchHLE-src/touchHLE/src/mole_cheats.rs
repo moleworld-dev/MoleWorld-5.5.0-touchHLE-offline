@@ -2067,6 +2067,175 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
     true
 }
 
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛侧档 island_misc.dat:NSKeyedArchiver 根字典,键见下面几个常量。
+const ISLAND_MISC_FILE: &str = "island_misc.dat";
+/// 根字典键:NSMutableDictionary<NSNumber 成就号 → NSNumber 累计数/状态位>,原样照抄 NewSceneData.achievementStateRecord_。
+const ISLAND_MISC_KEY_ACH: &str = "achievementStateRecord";
+
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛成就累计计数落盘 → island_misc.dat(挂在 island_flush_extras 的 K12 槽位)。
+///
+/// **病根**:「累计做 N 次」类岛成就的进度存在 NewSceneData.achievementStateRecord_(+84,槽 0xb05d98,
+/// NSMutableDictionary,键/值都是 `numberWithUnsignedInt:` 出来的 NSNumber)。玩法侧两个计数点(checkAchieve:itemId:
+/// 按 achieveType 分派):类型 0x10/0x400/0x800 走 -[NewSceneAchievement checkReqConditionOk:itemId:]@0x335fbc——
+/// 0x336138 取表、0x33619c 首次写 1、0x33620e 写 count+1、0x33628a `cmp/bhs` 与 requireConditions 的需求数比较;
+/// 类型 0x20(建店类)走 -[NewSceneAchievement checkBuildShopOK:]@0x335af8——0x335bd2 取表、0x335c44 写 count+1。
+/// 另外 -[NewSceneAchievement saveAchieveUnlockData:] 在 0x335080 把已解锁项写成 0x10000000 状态位。
+/// 原版把这张表交给服务器存:唯一的填充来源是 1062
+/// -[NewSceneCommand parseMapDataWithPackageData:atIndex:](0x22b1c6 取选择子),NewSceneData init 只 alloc 空表,
+/// 回主村时 -[NewSceneData resetNewSceneDataExceptObjectData](LoadingMainVillage updateLoading: 0x2543fa 调)在
+/// 0x21e030 removeAllObjects。离线没有 1062 → 每次进岛从 0 数起。200_0.dat 的成就 14-18(薯条/西瓜/布丁/香草甜筒/
+/// 烤肉各卖出 100 份,触发点 -[NewSceneShop onAlarmFlagTouched] 0x31ff2a 每次收货 checkConditions:0x800 只 +1)
+/// 除非一次进岛连卖 100 份,永远解不开;其它「累计 N 次」条目同理。
+///
+/// **做法**(补全原版该由服务器保管的数据,让原版判定链自己跑):只在岛上(ON_ISLAND)把这张表原样归档写盘——
+/// 不在岛上时它已被 reset 清空,写盘等于拿空表覆盖玩家进度。值整值照抄(可能带 0x10000000 状态位):
+/// 回档后 -[NewSceneAchievement checkConditions:itemId:] 在 0x334ab4 先问 checkInAlreadyUnlockList:(读的是已随
+/// island_userinfo.dat 持久化的 achieveAlreadyUnlock),0x334abc `bne` 直接跳过已解锁项,不会重复发奖。
+/// 在线模式由私服 1062 下发,这里一律不动。归档对象是 NewSceneData 上的活表,不是 userInfoDataInNewScene
+/// (后者没有这个字段)。返回落盘摘要并入 island_flush 的汇总日志。
+fn island_misc_flush(env: &mut Environment) -> Option<String> {
+    if env.options.network_access || ONLINE_MODE.load(O) || !ON_ISLAND.load(O) {
+        return None;
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return None;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return None;
+    }
+    // -[NewSceneData achievementStateRecord]@0x223cb0(@8@0:4,纯 ivar 读)
+    let ach_s = island_sel(env, "achievementStateRecord");
+    let ach: id = msg_send(env, (nsd, ach_s));
+    if ach == nil {
+        return None;
+    }
+    let cnt_s = island_sel(env, "count");
+    let ach_n: crate::mem::GuestUSize = msg_send(env, (ach, cnt_s));
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return None;
+    }
+    let sfk = island_sel(env, "setObject:forKey:");
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
+    let _: () = msg_send(env, (root, sfk, ach, k));
+    let r = island_sidecar_save(env, ISLAND_MISC_FILE, ISLAND_FILE_MISC, root);
+    // root 是本函数 alloc-init 的 +1,归档已结束;活表 ach 是 getter 取回的,不 release。
+    release(env, root);
+    r.map(|s| format!("{}[成就累计 {} 项]", s, ach_n))
+}
+
+/// [2026-09-24 第四轮 K12 I7-03/I6-01] 进岛读回 island_misc.dat(挂在 island_after_layout_ready 的 K12 槽位)。
+/// 时序:布局就绪挂钩早于 HolidayVillageLayer onEnter 的 8 次 checkConditions: 与玩家的第一次收货,
+/// 等价于原版 1062 在进岛加载时把服务器保管的计数下发下来。
+/// · 无档 / 坏档(island_sidecar_load 已按统一口径隔离或置保护位)→ 保持 NewSceneData init/reset 后的空表;
+/// · 缺 achievementStateRecord 键 = 老档语义,跳过;
+/// · 有键:逐项校验键/值都是 NSNumber(手改坏的项丢弃并记数,避免游戏对非 NSNumber 发 unsignedIntValue),
+///   灌进一张新 alloc 的 NSMutableDictionary,发 -[NewSceneData setAchievementStateRecord:]@0x223cc0
+///   (v12@0:4@8,属性 `&,N`,0x223cdc 走 _objc_setProperty 自带 retain 并释放旧表)后放掉我们的 +1。
+///   setter 必须给可变容器:checkReqConditionOk: 会直接对它 setObject:forKey:。接收者是 NewSceneData。
+fn island_misc_restore(env: &mut Environment) {
+    if env.options.network_access || ONLINE_MODE.load(O) {
+        return;
+    }
+    fn is_kind(env: &mut Environment, obj: id, cls: id) -> bool {
+        if obj == nil || cls == nil {
+            return false;
+        }
+        let s = island_sel(env, "isKindOfClass:");
+        msg_send(env, (obj, s, cls))
+    }
+    let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
+    if nsd_cls == nil {
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let nsd: id = msg_send(env, (nsd_cls, sh));
+    if nsd == nil {
+        return;
+    }
+    // 解档器返回的是自动释放对象;下面只从中取值灌进我们自己的新容器,不长期持有它。
+    let root = island_sidecar_load(env, ISLAND_MISC_FILE, ISLAND_FILE_MISC);
+    if root == nil {
+        return;
+    }
+    let dict_cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let num_cls = env.objc.get_known_class("NSNumber", &mut env.mem);
+    if !is_kind(env, root, dict_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 根对象不是字典,忽略(下次落盘按当前进度重写)");
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let cnt_s = island_sel(env, "count");
+    let oai_s = island_sel(env, "objectAtIndex:");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let uiv = island_sel(env, "unsignedIntValue");
+    let k = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_MISC_KEY_ACH);
+    let ach_in: id = msg_send(env, (root, ofk, k));
+    if ach_in == nil {
+        return; // 老档没有这个键
+    }
+    if !is_kind(env, ach_in, dict_cls) {
+        log!("[MOLECHEAT] island: island_misc.dat 的 achievementStateRecord 不是字典,跳过");
+        return;
+    }
+    let fresh = island_alloc_init(env, "NSMutableDictionary");
+    if fresh == nil {
+        return;
+    }
+    let ak_s = island_sel(env, "allKeys");
+    let keys: id = msg_send(env, (ach_in, ak_s));
+    let n: crate::mem::GuestUSize = if keys != nil {
+        msg_send(env, (keys, cnt_s))
+    } else {
+        0
+    };
+    let mut kept: Vec<(u32, u32)> = Vec::new();
+    let mut dropped = 0u32;
+    for i in 0..n {
+        let key: id = msg_send(env, (keys, oai_s, i));
+        let val: id = if key != nil {
+            msg_send(env, (ach_in, ofk, key))
+        } else {
+            nil
+        };
+        if !is_kind(env, key, num_cls) || !is_kind(env, val, num_cls) {
+            dropped += 1;
+            continue;
+        }
+        let _: () = msg_send(env, (fresh, sfk, val, key));
+        let kv: u32 = msg_send(env, (key, uiv));
+        let vv: u32 = msg_send(env, (val, uiv));
+        kept.push((kv, vv));
+    }
+    let set_s = island_sel(env, "setAchievementStateRecord:");
+    let _: () = msg_send(env, (nsd, set_s, fresh));
+    release(env, fresh);
+    kept.sort_unstable();
+    let desc: Vec<String> = kept
+        .iter()
+        .map(|&(k, v)| {
+            if v & 0x1000_0000 != 0 {
+                format!("{}={:#x}", k, v)
+            } else {
+                format!("{}={}", k, v)
+            }
+        })
+        .collect();
+    log!(
+        "[MOLECHEAT] island: 读回 island_misc.dat 岛成就累计 {} 项 [{}]{}",
+        kept.len(),
+        desc.join(","),
+        if dropped > 0 {
+            format!("(丢弃非数字项 {} 个)", dropped)
+        } else {
+            String::new()
+        }
+    );
+}
+
 /// [P2b] 快照 TMMapData → mapData 的类型 key(只在"全表按 seqId 找不到、需要新增条目"时才用)。
 /// ★订正(2026-09 审计,objc 元数据 superclass 实读):15 个 TMMapData* 类**全部直接继承 TMMapDataBase、互为兄弟**,
 /// 并不存在"餐厅/公寓继承 TMMapDataShop"——判定顺序无所谓,"28" 也不能当父类兜底。表外的类(Building/装饰/
@@ -2856,6 +3025,7 @@ fn island_after_layout_ready(env: &mut Environment) {
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
     // ── [K11] 超级贝壳树侧档读入缓存 ──
     // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
+    island_misc_restore(env); // [2026-09-24 第四轮 K12 I7-03/I6-01] island_misc.dat 读回岛成就累计计数
     let _ = env;
 }
 
@@ -2875,6 +3045,7 @@ fn island_flush_extras(env: &mut Environment) -> Vec<String> {
     // ── [K10] 咖啡馆 island_cafe.dat ──
     // ── [K11] 超级贝壳树 island_shelltree.dat ──
     // ── [K12] 成就累计/小游戏前三 island_misc.dat ──
+    out.extend(island_misc_flush(env)); // [2026-09-24 第四轮 K12 I7-03/I6-01] 只在岛上落盘,摘要并入汇总
     let _ = &mut *env;
     out
 }
