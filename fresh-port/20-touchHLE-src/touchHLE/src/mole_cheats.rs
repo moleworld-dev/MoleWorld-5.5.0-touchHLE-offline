@@ -4066,6 +4066,29 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         .register_host_selector("setMapData:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (nsd, set_s, dict));
 
+    // [2026-09-24 第四轮 K1 I4-03] 走到默认岛 = island_map.dat 不存在或无效(解档失败/空布局),若 island_ships.dat 还在原路径,
+    //   本会话就不覆盖它。根因:船档描述的是 island_map.dat 里那批船/咖啡馆,只在读档岛分支 load_island_ships 读回;
+    //   island_note_load_failure 对「文件不存在」只清位返回,走不到「布局隔离成功 → 船档一并隔离」那段,save_island_ships
+    //   的 MAP 位门与 SHIPS 位门全放行,首个节拍就拿默认船(shipState=0、无礼物)覆盖玩家的船态/出海战利品/咖啡馆 isNew。
+    //   做法:只置 ISLAND_FILE_SHIPS 保护位(与隔离失败时「本会话禁止覆盖」同一规则,代价是本会话默认岛的船态不落盘)。
+    //   · 不在这里补调 load_island_ships:默认船 searchMapId=0、onBoardMoleNum=0,把旧礼物回填上去会命中空奖励锁死(I4-06);
+    //   · 不改名隔离船档:那是一份完好的档,改名只会让玩家更难恢复;island_save_blocked 有「原路径文件没了就解除保护」的自愈。
+    //   坏档隔离成功时船档已随布局档改名(原路径不在)→ 这里不置位;船档随之隔离失败时 SHIPS 位已置,再置一次无副作用;
+    //   布局档本身隔离失败时 MAP 位已置(save_island_ships 先被 MAP 位门挡住),这里补 SHIPS 位只是多一道保险。
+    //   保护只管本会话:本会话节拍照常把默认岛写进 island_map.dat(MAP 位没置);下次进岛(同进程重进或重启)走读档岛分支,
+    //   load_island_ships 读档成功即 island_note_load_ok 清掉 SHIPS 位,并按 (kind, objectId, ord) 把旧船态/礼物回填到默认岛
+    //   那艘 34001 上,礼物与 searchMapId/onBoardMoleNum 对不上的由 fix_stuck_ships 的礼物校验(I4-06)兜底。
+    //   所以想原样恢复旧岛,要在离岛/退出之后、下次进岛之前把原布局档放回原名(覆盖本会话写出的默认岛档);
+    //   在岛上时放回会被下一次节拍用默认岛覆盖。
+    //   只在离线岛档路径上执行(在线模式 ENABLE_NEWSCENE_ISLAND 被强制关,不经过本函数)。
+    {
+        let sp = island_data_path(env, "island_ships.dat");
+        if guest_file_exists(env, sp) {
+            ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHIPS, O);
+            log!("[MOLECHEAT] island: island_map.dat 缺失/无效,本会话不覆盖 island_ships.dat(保留原船档;要恢复旧岛请在离岛/退出后、下次进岛前把原布局档放回原名)");
+        }
+    }
+
     // ★Bug D(探险地图碎片)补偿:mapFragments 离线无回包→恒空→探险船凑不齐;原来无条件注入沙原 4 块 31005-31008。
     //   已抽成 inject_sandgarden_fragments,持久化路径也复用。
     //   [2026-09-16] A1-02+A2-02 已降级为兜底:真新岛档不送商店可买的 31006/31008,31005/31007 按任务 81/83 进度补,规则见该函数注释。
