@@ -1213,6 +1213,7 @@ fn save_island_map(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_map.dat(count={} ok={})", cnt, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_map.dat(count={} ok={})", cnt, ok);
     }
     Some(format!("存盘 island_map.dat(count={} ok={})", cnt, ok))
@@ -1394,6 +1395,7 @@ fn save_island_fragments(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok);
     }
     Some(format!("存盘 island_fragments.dat(碎片 count={} ok={})", cnt, ok))
@@ -1928,6 +1930,7 @@ fn save_island_userinfo(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_userinfo.dat(任务/剧情/成就/扩地 ok={})", ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_userinfo.dat(任务/剧情/成就/扩地 ok={})", ok);
     }
     Some(format!("存盘 island_userinfo.dat(ok={})", ok))
@@ -2985,6 +2988,7 @@ fn save_island_ships(env: &mut Environment) -> Option<String> {
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok);
     }
     Some(format!("存盘 island_ships.dat(船/咖啡馆 {} 个 ok={})", total, ok))
@@ -3299,6 +3303,7 @@ fn island_sidecar_save(env: &mut Environment, fname: &str, bit: u32, root: id) -
     if ok {
         log_dbg!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
     } else {
+        ISLAND_SAVE_FAILED.store(true, O); // [2026-09-24 第四轮 K3 I6-5] 新侧档同一口径:交给 island_flush 重新置脏并退避重试
         log!("[MOLECHEAT] island: 存盘 {}(ok={})", fname, ok);
     }
     Some(format!("存盘 {}(ok={})", fname, ok))
@@ -3357,6 +3362,9 @@ fn island_ff_extras(env: &mut Environment, secs: f64) {
 }
 
 fn island_flush(env: &mut Environment, reason: &str) {
+    // [2026-09-24 第四轮 K3 I6-5] 本轮写盘失败标志先清(四个 save_* 与 island_sidecar_save 在 writeToFile:atomically: 返回 NO 时置位);
+    //   放在时间旅行闸之前:闸内提前返回时本轮"没有失败",末次落盘的当场重试不会被上一轮的旧标志误触发。
+    ISLAND_SAVE_FAILED.store(false, O);
     // [2026-09-24 第四轮 K3 I7-01] 时间旅行落盘闸:开发者「时间旅行」偏移(只增不减、只在本进程)期间,岛上所有计时
     //   (TMMapDataShip.beginDiscoverTime/beginFixTime、TMMapDataShop.beginTime、TMMapDataRestaurant.beginUpgradeTime、
     //   各 coolingTime、curQuestResult、NpcData.lastCoolDownTime 等)都是"未来"时刻;写进岛档后重启回到现实时间,
@@ -3416,6 +3424,25 @@ fn island_flush(env: &mut Environment, reason: &str) {
     // [扫描修 2026-09-15] F10-6 汇总成一行(见函数注释)。
     let mut parts: Vec<String> = [s_ui, s_map, s_ships, s_frag].into_iter().flatten().collect();
     parts.extend(extras);
+    // [2026-09-24 第四轮 K3 I6-5] 有岛档写盘失败(writeToFile:atomically: 返回 NO;坏档保护的跳过返回 None、不算失败):
+    //   以前 DIRTY 已在开头清掉、调用方又不看返回值,失败后只剩日志,要等玩家恰好再产生一次变化才会重写 → 留下错版组合。
+    //   现在重新置脏,让节拍在 10 秒后自动重试(退避:别每 1.5 秒重跑一次含主档 AES 加密的整套落盘)。
+    //   不做"任一档失败就跳过后续档":四个文件各自 tmp+rename 原子写,userinfo 已先写成功时跳过 map/ships/fragments 只会扩大损失面;
+    //   也不做跨档代号/按最旧一代回滚(fragments 为空时按设计不写文件,代号天然落后,按最旧一代为准等于每次进岛回滚真实进度)。
+    let failed = ISLAND_SAVE_FAILED.load(O);
+    let failed_names = if failed {
+        island_failed_file_names(&parts)
+    } else {
+        String::new()
+    };
+    if failed {
+        ISLAND_DIRTY.store(true, O);
+        ISLAND_RETRY_AFTER
+            .with(|c| c.set(Some(Instant::now() + std::time::Duration::from_secs(ISLAND_RETRY_BACKOFF_SECS))));
+    } else {
+        ISLAND_RETRY_AFTER.with(|c| c.set(None));
+    }
+    ISLAND_FAILED_FILES.with(|c| *c.borrow_mut() = failed_names.clone());
     let body = if parts.is_empty() {
         "本次没有需要写入的岛档".to_string()
     } else {
@@ -3426,6 +3453,13 @@ fn island_flush(env: &mut Environment, reason: &str) {
     } else {
         log!("[MOLECHEAT] island: {} → {}", reason, body);
     }
+    if failed {
+        log!(
+            "[MOLECHEAT] island: 岛档写盘失败({})→ 已重新标记为未保存,节拍 {} 秒后自动重试",
+            failed_names,
+            ISLAND_RETRY_BACKOFF_SECS
+        );
+    }
     log_dbg!(
         "[MOLECHEAT] island: island_flush 耗时 {:.1} ms(其中合并新放置 {:.1} ms)",
         t_flush.elapsed().as_secs_f64() * 1000.0,
@@ -3435,6 +3469,68 @@ fn island_flush(env: &mut Environment, reason: &str) {
 
 /// [2026-09-24 第四轮 K3 I7-01] 「时间旅行中不保存岛档」日志是否已打过(本进程只打一次,见 island_flush 开头)。
 static ISLAND_TT_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-24 第四轮 K3 I6-5] 当前这轮 island_flush 里有岛档 writeToFile:atomically: 返回 NO。
+/// island_flush 开头清零;四个 save_island_* 与 island_sidecar_save 在 ok==false 分支置位;坏档保护的跳过(返回 None)不算。
+static ISLAND_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+/// [2026-09-24 第四轮 K3 I6-5] 写盘失败后节拍重试的退避秒数。
+const ISLAND_RETRY_BACKOFF_SECS: u64 = 10;
+thread_local! {
+    /// [2026-09-24 第四轮 K3 I6-5] 写盘失败后,节拍/即时落盘最早在这个时刻之后才重试(None = 不退避)。
+    static ISLAND_RETRY_AFTER: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// [2026-09-24 第四轮 K3 I6-5] 最近一轮 island_flush 写失败的文件名(顿号分隔,空 = 没失败),供末次落盘重试打日志。
+    static ISLAND_FAILED_FILES: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 从 island_flush 的落盘摘要里挑出 ok=false 的文件名。摘要格式统一是
+/// 「存盘 <文件名>(…ok=false)」(四个 save_island_* 与 island_sidecar_save),取「存盘 」之后、第一个括号之前。
+fn island_failed_file_names(parts: &[String]) -> String {
+    let names: Vec<&str> = parts
+        .iter()
+        .filter(|p| p.contains("ok=false"))
+        .map(|p| {
+            let s = p.strip_prefix("存盘 ").unwrap_or(p.as_str());
+            s.split(['(', '(']).next().unwrap_or(s)
+        })
+        .collect();
+    if names.is_empty() {
+        "未知文件".to_string()
+    } else {
+        names.join("、")
+    }
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 写盘失败的退避期是否已过(节拍 due 判定与关键操作即时落盘都看它)。
+fn island_retry_ready() -> bool {
+    ISLAND_RETRY_AFTER
+        .with(|c| c.get())
+        .map_or(true, |t| Instant::now() >= t)
+}
+
+/// [2026-09-24 第四轮 K3 I6-5] 末次落盘(离岛 startNewSceneFrom 10→1、应用失活/进后台/终止):这之后不会再有节拍替它重试
+/// (离岛后 ON_ISLAND 清零;进后台后线程挂起;终止后进程退出),所以有文件写失败时当场重试一次(不看退避),
+/// 仍失败就把文件名打进 log!。重试也跑整套 island_flush:各档幂等,且与节拍重试同一条路径,不另起一套写法。
+fn island_flush_final(env: &mut Environment, reason: &str) {
+    island_flush(env, reason);
+    if !ISLAND_SAVE_FAILED.load(O) {
+        return;
+    }
+    let names = ISLAND_FAILED_FILES.with(|c| c.borrow().clone());
+    log!(
+        "[MOLECHEAT] island: {} 有岛档写盘失败({})→ 末次落盘,当场重试一次",
+        reason,
+        names
+    );
+    island_flush(env, &format!("{}·重试", reason));
+    if ISLAND_SAVE_FAILED.load(O) {
+        let names = ISLAND_FAILED_FILES.with(|c| c.borrow().clone());
+        log!(
+            "[MOLECHEAT] island: {} 重试后仍写盘失败({}):这些岛档保持上一次成功写入的内容",
+            reason,
+            names
+        );
+    }
+}
 
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
 fn island_mark_dirty() {
@@ -8080,9 +8176,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //   在 onButtonCallSelected: 方法体中段把 self 拆了,后面还要读 self->itemmoney,窗口危险且可能重入。
             island_resend_quest4_action(env);
             if ON_ISLAND.load(O) && ISLAND_DIRTY.load(O) {
+                // [2026-09-24 第四轮 K3 I6-5] 上一轮有岛档写盘失败时,退避期(10 秒)过了才重试。
                 let due = ISLAND_LAST_FLUSH
                     .with(|c| c.get())
-                    .map_or(true, |t| t.elapsed().as_millis() >= 1500);
+                    .map_or(true, |t| t.elapsed().as_millis() >= 1500)
+                    && island_retry_ready();
                 if due {
                     // [扫描修 2026-09-15] F10-6 节拍落盘只打一行:原因文本并入 island_flush 的汇总行(含「节拍落盘」与各「存盘 island_xxx.dat」)。
                     island_flush(env, "节拍落盘(岛上有未保存的变化)");
@@ -8186,7 +8284,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                             env.cpu.regs()[3],
                         ];
                         log!("[MOLECHEAT] island: 离岛(startNewSceneFrom {}→{})→ 统一落盘", from, env.cpu.regs()[3] as i32);
-                        island_flush(env, "离岛统一落盘");
+                        island_flush_final(env, "离岛统一落盘"); // [2026-09-24 第四轮 K3 I6-5] 末次落盘失败当场重试一次
                         // 4 条离岛路径(gobackMainVillage/菜单返回/串门/exitNewIsland:)都经过这里,且 to==1 跳过网络门,
                         // 放行后必定成功(0x24142e beq)。在岛标志在此清,curSceneId→10 强制随之停止,不会误路由主村加载。
                         ON_ISLAND.store(false, O);
