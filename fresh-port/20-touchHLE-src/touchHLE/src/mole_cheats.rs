@@ -6435,7 +6435,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             && ISLAND_LOADING.load(O)
         {
             ISLAND_LOADING.store(false, O);
-            log!("[MOLECHEAT] island: 进岛加载被中止(LoadingHoliday 弹框 index0)→ ISLAND_LOADING=false");
+            // [2026-09-16 黄金岛审查修 I9-03] 网络窗口也要一起清。原来 ISLAND_ENTER_WINDOW 只在离岛臂
+            //   (startNewSceneFrom 10→1)清零,进岛半路被中止时它还揣着最多 1200 帧(约 20 秒)。
+            //   窗口 >0 会让岛网络门在【主村】继续生效:isConnected=1 / state=6 / isReachable=1 / 吞掉所有
+            //   sendPacket,同时 island_session_active() 为真会让整个离线活动回环停摆(mole_activity.rs:334)。
+            //   玩家表现:一次没进成的进岛之后,主村有约 20 秒「活动中心/签到/折扣点不开也不弹离线提示」的抽风期,
+            //   而且这期间接/交任务走的是在线分支。中止时清零,是这条路径上唯一安全且充分的收敛点。
+            ISLAND_ENTER_WINDOW.store(0, O);
+            log!("[MOLECHEAT] island: 进岛加载被中止(LoadingHoliday 弹框 index0)→ 清加载标志与网络窗口");
         }
         // 曾有 gobackMainVillage 前置钩子清离岛标志,因真方法 0x23d19c 读到 isChangeSceneButtonSelected 会早退、抢跑会误判离岛而删除,勿复活
         // (离岛统一走网络门块里 startNewSceneFrom:toScene: 10→1 全局出口)。
