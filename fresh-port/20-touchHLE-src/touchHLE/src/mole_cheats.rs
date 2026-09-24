@@ -4927,6 +4927,7 @@ pub fn island_gate1_hit() -> bool {
 static ISLAND_LOADING_MGR: AtomicU32 = AtomicU32::new(0);
 /// [2026-09-24 第四轮 K7] 进岛加载期的「每次进岛只打一次」日志位(enterLoading:10 臂清零)。
 const K7_LOG_STALE_LOADER: u32 = 1 << 0;
+const K7_LOG_ALERT_PAUSE: u32 = 1 << 1;
 static ISLAND_K7_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 /// [2026-09-24 第四轮 K7 I1-02] loader 是不是 LoadingManager 当前持有的加载器(baseLoading_)。
@@ -8773,7 +8774,21 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 let cur: i32 = env.mem.read(cur_ptr);
                 if cur >= 2 {
                     let pause_ptr: MutPtr<u8> = Ptr::from_bits(self_bits + 0xc);
-                    env.mem.write(pause_ptr, 0u8);
+                    // [2026-09-24 第四轮 K7 I1-04] 本加载器自己弹的系统框在场时不强清,直接放行真方法(它见 updatePause_!=0 就在
+                    //   0x252c5a 早退)。原版 showNetConnectErrorMessage@0x2520d0 在 0x25213e 故意置的暂停要等玩家点 CANCEL/RETRY;
+                    //   以前不分青红皂白下一拍就冲掉 → 框还挂着、加载已跑完切进岛,点「取消」又去中止一个已结束的加载。离线活锁
+                    //   (state1 等回包)照旧每帧解开,别处弹出的框(委托不是本加载器)不拖住它——原版里它们也不暂停 LoadingHoliday。
+                    //   判据是宿主 UIAlertView 队列里有没有委托 == self 的框(alert_pending_for_delegate),零消息,不在帧栈上发任何东西。
+                    if crate::frameworks::uikit::ui_view::ui_alert_view::alert_pending_for_delegate(
+                        env,
+                        Ptr::from_bits(self_bits),
+                    ) {
+                        if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_ALERT_PAUSE, O) & K7_LOG_ALERT_PAUSE) == 0 {
+                            log!("[MOLECHEAT] island: LoadingHoliday 自己的系统弹框在场 → 暂不强清 updatePause_(尊重原版弹框暂停,关框后由原版收尾)");
+                        }
+                    } else {
+                        env.mem.write(pause_ptr, 0u8);
+                    }
                 }
             } else if (ISLAND_K7_LOGGED.fetch_or(K7_LOG_STALE_LOADER, O) & K7_LOG_STALE_LOADER) == 0 {
                 log!(

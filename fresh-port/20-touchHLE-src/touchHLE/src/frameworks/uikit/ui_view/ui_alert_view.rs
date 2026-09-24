@@ -533,6 +533,29 @@ fn dismiss(env: &mut Environment, alert: id, index: NSInteger, clicked: bool) {
     release(env, alert);
 }
 
+/// [2026-09-24 第四轮 K7 I1-04] 有没有以 `delegate` 为委托、已 show 还没关掉的系统弹框(正显示的覆盖层或还在排队等挂的;
+/// 覆盖层总对应队列里的某一个,所以只查队列)。纯读宿主状态、不发任何消息。
+/// mole_cheats 的 (LoadingHoliday, updateLoading:) 臂在强清 updatePause_ 之前拿加载器自己查它:
+/// 原版 -[LoadingHoliday showNetConnectErrorMessage]@0x2520d0 先在 0x25213e 置 updatePause_=1、再以 self 为委托(0x252206)
+/// show 弹框,等玩家点 CANCEL/RETRY 由 alertView:didDismissWithButtonIndex: 收尾(RETRY 在 0x251e8a-0x251ea8 自己清暂停、
+/// curStep_ 归 0);这个框还在屏幕上时不能把它置的暂停冲掉。只认委托是加载器自己的框:别处弹出的框在原版里并不会暂停
+/// LoadingHoliday(它的暂停只由自己的 show* 与 state1 等回包置),若按「有任何框在场」来判,离线 state1 活锁会被一个无关的框
+/// 拖住(作弊菜单开着时框只排队不显示,更会一直拖到关菜单)。
+/// 不用 guest 的 -[LoadingHoliday doesAlertViewExistYet]@0x251cc0:它遍历 keyWindow.subviews 找 UIAlertView,而本实现刻意
+/// 不把 UIAlertView 挂进 keyWindow(见模块注释),会恒判为假,且每帧发一串消息。
+/// 无头 / MOLE_ALERT_AUTODISMISS 模式下弹框不进队列(约 1 帧后自动按索引 0 关闭),这里恒为假,沿用旧行为。
+pub fn alert_pending_for_delegate(env: &Environment, delegate: id) -> bool {
+    if delegate == nil {
+        return false;
+    }
+    env.framework_state
+        .uikit
+        .ui_alert_view
+        .queue
+        .iter()
+        .any(|&alert| env.objc.borrow::<UIAlertViewHostObject>(alert).delegate == delegate)
+}
+
 /// [扫描修 2026-09-15] 由 uikit::handle_events 每轮运行循环调用:队首弹框还没挂上就挂到 keyWindow。
 pub fn pump(env: &mut Environment) {
     let front = {
