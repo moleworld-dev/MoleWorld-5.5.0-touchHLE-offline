@@ -103,6 +103,12 @@ pub enum Action {
     /// [2026-09-24 第四轮 K14 N-D5-3] 不走 returnToMainVillage(断网专用,会 setConnectFirstInThisOpen:1);
     /// 退岛存盘在 mole_cheats 的 startNewSceneFrom 10→1 出口,不在 gobackMainVillage 上。
     ExitIsland,
+    /// [2026-09-24 第四轮 K14 I4-04] 黄金岛探险船 GM:一键修好,走原版贝壳加速修船的同一出口 -[DiscoveryShip quickFixShip]。
+    /// 仅离线且在岛上可用,见 ship_quick_fix。
+    ShipQuickFix,
+    /// [2026-09-24 第四轮 K14 I4-04] 黄金岛探险船 GM:立即返航,把 beginDiscoverTime_ 拨到出海时长之前,
+    /// 由原版 innerUpdate: 自己结算返航与礼物。仅离线且在岛上可用,见 ship_return_now。
+    ShipReturnNow,
     /// [扫描修 2026-09-15] 开发工具按钮:调用 mole_dev 的约定函数,DevResult 文案写底部 toast。
     Dev(DevTool),
     /// [扫描修 2026-09-15] 隐藏物品页按钮:调用 mole_items 的约定函数。
@@ -473,6 +479,11 @@ fn pages() -> Vec<Page> {
                 // —— 黄金岛(从黄金岛页移来)——
                 ("▶ 一键进入黄金岛", EnterIsland),
                 ("◀ 岛上一键回主村(存档)", ExitIsland),
+                // [2026-09-24 第四轮 K14 I4-04] 探险船 GM 两项(仅离线且在岛上)。插在第 11、12 项,前 11 项顺序不动;
+                // 本页按钮 19→21,每列仍 7 行,无头测试坐标 tap 178 519 / 220 517 仍落在进岛/回村上(layout_selfcheck 核对)。
+                // 本页已到 21 个上限,再加按钮会变成每列 8 行、坐标漂移。
+                ("探险船一键修好(离线GM)", ShipQuickFix),
+                ("探险船立即返航(离线GM)", ShipReturnNow),
                 ("可建筑黄金岛·热点开关", ToggleCheat("enable_newscene_island")),
                 ("修复加勒比寻宝", ToggleCheat("fix_golden_island")),
                 // [扫描修 2026-09-15] F10-9:原「直达终点(弃用)」「打开加勒比黄金岛(弃用)」移出本页——它们和「一键进入黄金岛」
@@ -1377,6 +1388,9 @@ fn run_action(env: &mut Environment, action: Action) {
         Action::OpenCaribbean => open_caribbean(env),
         Action::EnterIsland => enter_island(env),
         Action::ExitIsland => exit_island(env),
+        // [2026-09-24 第四轮 K14 I4-04] 探险船 GM,两者都自己写 toast。
+        Action::ShipQuickFix => ship_quick_fix(env),
+        Action::ShipReturnNow => ship_return_now(env),
         // [扫描修 2026-09-15] 开发工具 / 隐藏物品页。
         Action::Dev(tool) => run_dev_tool(env, tool),
         Action::Hidden(h) => run_hidden(env, h),
@@ -1954,6 +1968,153 @@ fn exit_island(env: &mut Environment) {
     teardown(env);
 }
 
+/// [2026-09-24 第四轮 K14 I4-04] 探险船 GM 的共用前置:仅离线(在线时船的进度由服务器同步,setModObjectToServer: 会真发包)、
+/// 在岛上(curSceneId==10 且岛会话活跃),然后取 [[ObjectManager sharedManager] getDiscovership](@0x46a40,@8@0:4)。
+/// getDiscovership 自己在 0x46a8e 判 curSceneId==10,遍历 ObjectManager.objects 找 objectId==34001(0x46b4e)
+/// 且 isKindOfClass:DiscoveryShip(0x46b6a)的对象,找不到返回 nil。失败时返回给玩家看的原因。
+/// 会发宿主消息,只在菜单点击事件里调用(不在 drawScene 帧栈,也不在 intercept 钩子里)。
+fn island_discovery_ship(env: &mut Environment) -> Result<id, String> {
+    if env.options.network_access {
+        return Err("在线模式下船的进度由服务器同步,不能用 GM 操作".to_string());
+    }
+    let cur = cur_scene_id(env);
+    if cur != 10 || !crate::mole_cheats::island_session_active() {
+        return Err("请在黄金岛上使用".to_string());
+    }
+    let om = game_singleton(env, "ObjectManager", "sharedManager");
+    if om == nil {
+        return Err("ObjectManager 还没初始化".to_string());
+    }
+    let s = sel(env, "getDiscovership");
+    let ship: id = msg_send(env, (om, s));
+    if ship == nil {
+        return Err("岛上没找到探险船".to_string());
+    }
+    Ok(ship)
+}
+
+/// [2026-09-24 第四轮 K14 I4-04] 探险船一键修好:shipState!=2(未修好)时发原版 -[DiscoveryShip quickFixShip]@0x362e20(v8@0:4)。
+/// 它是原版贝壳加速修船的同一出口(-[DiscoveryShipView onChooseUse] 扣完贝壳后在 0x366aee 调它,本菜单不扣贝壳):
+/// isFixing_=0、shipState=2(0x362e5c)、[[NewSceneQuest sharedInstance] checkAction:15 object:](修船任务进度)、
+/// beginFixTime_=0、unschedule innerUpdate:、播放待命动画、canSail_=1、挂出海旗 sailFlag,最后 setModObjectToServer:
+/// (离线由 mole_cheats 的回写钩子按 seqId 写回岛 mapData 并置脏落盘)。修船不占工人,不需要还工人。
+/// shipState==2 时不发:quickFixShip 会无条件新建 sailFlag 覆盖旧的,已修好再发会叠出第二面旗。
+fn ship_quick_fix(env: &mut Environment) {
+    let ship = match island_discovery_ship(env) {
+        Ok(ship) => ship,
+        Err(e) => {
+            log!("[MOLEMENU] 探险船一键修好:{}", e);
+            set_toast(format!("探险船一键修好失败:{}", e));
+            return;
+        }
+    };
+    let s = sel(env, "shipState");
+    let state: i32 = msg_send(env, (ship, s));
+    if state == 2 {
+        log!("[MOLEMENU] 探险船一键修好:shipState=2,已经修好");
+        set_toast("探险船已经修好了(待出海或出海中),不需要再修".to_string());
+        return;
+    }
+    let s = sel(env, "quickFixShip");
+    let _: () = msg_send(env, (ship, s));
+    let s = sel(env, "shipState");
+    let after: i32 = msg_send(env, (ship, s));
+    log!("[MOLEMENU] 探险船一键修好:shipState {} → {}(原版 quickFixShip)", state, after);
+    set_toast(format!("探险船已修好(shipState {} → {}),点船即可出海", state, after));
+}
+
+/// [2026-09-24 第四轮 K14 I4-04] 探险船立即返航:只在出海中(isSailing,c8@0:4)时,把 beginDiscoverTime_ 写成
+/// now − discoverTime_ − 1,由原版每秒一次的 innerUpdate:(出海时 -[DiscoveryShip onButtonDiscoverSelected] 在 0x362460
+/// 以 1.0 秒间隔排定)自己结算:0x36279a-0x3627ee 算 now−begin ≥ discoverTime_ 后,经 checkIsShipInScreen 门
+/// (船坞在屏幕内时原版会推迟)播放返航动画、清 isSailing_/beginDiscoverTime_、setModObjectToServer:、记 lastSailingTime,
+/// 之后原版挂领奖旗、发礼物。这里不伪造礼物、不发消息改状态,只拨一个时间戳。
+/// now 取 [[NewSceneTimer sharedInstance] getCurrentServerTime](L8@0:4,宿主消息同样经过 mole_cheats 对它的钩子,
+/// 与原版 innerUpdate: 取的是同一个时钟)。偏移从 guest 的 _OBJC_IVAR 槽现读(兼容 touchHLE 非脆弱 ivar 修正写回):
+/// re.py ivar DiscoveryShip 核得 discoverTime_ 槽 0xb07c24(静态 +396,L)、beginDiscoverTime_ 槽 0xb07c30(静态 +416,d)、
+/// 末尾 ivar updateCount 槽 0xb07c58(静态 +452,i),实例大小 456。三者都不小于静态值、相对位置不变,否则放弃不写。
+fn ship_return_now(env: &mut Environment) {
+    let ship = match island_discovery_ship(env) {
+        Ok(ship) => ship,
+        Err(e) => {
+            log!("[MOLEMENU] 探险船立即返航:{}", e);
+            set_toast(format!("探险船立即返航失败:{}", e));
+            return;
+        }
+    };
+    let s = sel(env, "isSailing");
+    let sailing: u8 = msg_send(env, (ship, s));
+    if sailing == 0 {
+        log!("[MOLEMENU] 探险船立即返航:船不在出海中");
+        set_toast("探险船现在没有出海,不需要返航".to_string());
+        return;
+    }
+    // 静态布局(objc_meta:instanceSize 456;discoverTime_ +396;beginDiscoverTime_ +416;最后一个 ivar updateCount +452,i)。
+    const SLOT_DISCOVER_TIME: u32 = 0xb07c24;
+    const SLOT_BEGIN_DISCOVER_TIME: u32 = 0xb07c30;
+    const SLOT_UPDATE_COUNT: u32 = 0xb07c58;
+    const STATIC_OFF_DISCOVER: u32 = 396;
+    const STATIC_OFF_BEGIN: u32 = 416;
+    const STATIC_OFF_UPDATE_COUNT: u32 = 452;
+    let read_slot = |env: &Environment, slot: u32| -> u32 {
+        env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(slot))
+    };
+    let off_discover = read_slot(env, SLOT_DISCOVER_TIME);
+    let off_begin = read_slot(env, SLOT_BEGIN_DISCOVER_TIME);
+    let off_update = read_slot(env, SLOT_UPDATE_COUNT);
+    // 非脆弱 ivar 修正只会把整个类的 ivar 统一往后挪,三者相对位置不变;beginDiscoverTime_ 后面还有本类的 updateCount,
+    // 相对位置对得上就说明 beginDiscoverTime_ 的 8 字节整个落在实例内。任何一项对不上都不写。
+    let layout_ok = off_discover >= STATIC_OFF_DISCOVER
+        && off_begin >= STATIC_OFF_BEGIN
+        && off_begin < 0x1000
+        && off_begin.checked_sub(off_discover) == Some(STATIC_OFF_BEGIN - STATIC_OFF_DISCOVER)
+        && off_update.checked_sub(off_begin) == Some(STATIC_OFF_UPDATE_COUNT - STATIC_OFF_BEGIN);
+    if !layout_ok {
+        log!(
+            "[MOLEMENU] 探险船立即返航:ivar 偏移异常(discoverTime_={} beginDiscoverTime_={} updateCount={}),放弃",
+            off_discover,
+            off_begin,
+            off_update
+        );
+        set_toast("探险船立即返航失败:船的内存布局和预期不符,没有改动".to_string());
+        return;
+    }
+    let discover: u32 = env
+        .mem
+        .read(crate::mem::ConstPtr::<u32>::from_bits(ship.to_bits() + off_discover));
+    let timer = game_singleton(env, "NewSceneTimer", "sharedInstance");
+    if timer == nil {
+        set_toast("探险船立即返航失败:NewSceneTimer 还没初始化".to_string());
+        return;
+    }
+    let s = sel(env, "getCurrentServerTime");
+    let now: u32 = msg_send(env, (timer, s));
+    let target = now as f64 - discover as f64 - 1.0;
+    // innerUpdate: 在 0x362740 见 beginDiscoverTime_<=0 就走修船分支,不结算出海;拨不出正数就不写。
+    if target < 1.0 {
+        log!(
+            "[MOLEMENU] 探险船立即返航:now={} discoverTime_={},算出的起点 {} 不是正数,放弃",
+            now,
+            discover,
+            target
+        );
+        set_toast("探险船立即返航失败:游戏时钟异常,没有改动".to_string());
+        return;
+    }
+    let begin_ptr: crate::mem::MutPtr<f64> = Ptr::from_bits(ship.to_bits() + off_begin);
+    let old: f64 = env.mem.read(begin_ptr);
+    env.mem.write(begin_ptr, target);
+    log!(
+        "[MOLEMENU] 探险船立即返航:beginDiscoverTime_ {} → {}(now={} discoverTime_={}),交给原版 innerUpdate: 结算",
+        old,
+        target,
+        now,
+        discover
+    );
+    set_toast(
+        "已把出海时间拨到期,原版每秒检查一次并结算返航(船在屏幕内时原版可能要等镜头移开),返航后点领奖旗领奖".to_string(),
+    );
+}
+
 /// 一键进入 NewScene 可建筑黄金岛(scene id 10)。arm 进岛(开功能/开窗/预注入默认岛
 /// mapData)后直接 `[SceneMannager startNewSceneFrom:1 toScene:10]`;网络门与 state2
 /// 数据门由 mole_cheats 的 intercept 在进岛窗口内放行。跳过飞机过场(热点路径仍带)。
@@ -2355,6 +2516,8 @@ fn run_hidden(env: &mut Environment, h: HiddenAct) {
 /// 而不是让测试莫名其妙地超时。只在不匹配时打日志。
 /// [2026-09-16] F2-04 Button.frame 存的是 1024 设计坐标,这里按 4:3 横屏右换算核对设计布局,宽屏下同样成立;
 /// 宽屏(--fill-screen)跑无头测试时实际要 tap 的 guest y 需加 ox(1188 宽为 +82),x 不变。
+/// [2026-09-24 第四轮 K14 I4-04] 「开发者 / 调试」页加了两项探险船 GM(第 11、12 项),按钮 19→21,每列仍 7 行,
+/// 上面三个坐标都不变,所以这里不用改;若以后超过 21 个会变成每列 8 行,下面的核对会在日志里报警。
 fn layout_selfcheck(dev_title: &str, page_idx: usize, buttons: &[Button]) {
     let hit = |gx: f32, gy: f32| -> Option<Action> {
         let (lx, ly) = (1024.0 - gy, gx);
