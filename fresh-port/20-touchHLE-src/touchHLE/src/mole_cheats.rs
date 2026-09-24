@@ -1234,6 +1234,13 @@ const ISLAND_FRAG_BY_QUEST_KEY: &str = "moleSandFragByQuest";
 ///   · 31006/31008(以及火山 31009/31011)= 岛建设商店 20 贝壳可买(shop_type=1 sub=2);
 ///   · 31005/31007 = 岛农场任务 81/83 的 rew_potato(-[NewSceneQuest rewardXP:vipGold:buildValue:]@0x32a49c ≥1000 走物品分支
 ///     → GET_ITEM_FROM_QUEST 框 → addAdventureMapFragment:@0x32a6d6);火山 31010/31012 = 咖啡任务 16/17 的 rew_object。
+///   [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 火山 31010/31012 原版与离线都来自咖啡任务 16/17(离线任务链已由
+///     island_cafe_restore_and_offer 复活):完成后 -[NewSceneData deleteAcceptedNotifyQusetFromLocalList:] 0x2209c0 以
+///     currentRewardObjectID=0 调 updateUnrewardNotifyQuest:andCurrentRewardObjectID:@0x2212f0,本地按 cafeQuestData 生成待领奖
+///     物品表(含 rewardObjectID);领奖 CafeShop recieveCafeRewards:@0x36def0 → NewRewardsLayer addObjectToMap: 0x373b14
+///     → onAddDiscoveryGiftOrCafeGiftOnMap:target:selector: → addNewObject2Map:gift: 0x25c5b4 addAdventureMapFragment:,
+///     随后由 save_island_fragments 落 island_fragments.dat。本函数不兜底火山,也不做「买齐 31009/31011 就补发」
+///     (那等于白送两条咖啡任务的奖励)。
 /// [2026-09-16] A1-02+A2-02 从「每次进岛无条件补 4 块」降级为兜底,分三种情况:
 ///   (a) 老档:island_fragments.dat 不存在、island_map.dat 存在,且 island_userinfo.dat 里没有 ISLAND_FRAG_BY_QUEST 标记
 ///       (P4-b 之前的档,或从没正常退岛落盘过)→ 照旧补齐 4 块。否则老档的 31006/31008 会凭空消失,任务又早就做完、
@@ -1407,6 +1414,8 @@ fn save_island_fragments(env: &mut Environment) -> Option<String> {
 /// 本函数只负责【恢复买到的/已得的】;[2026-09-16] A1-02+A2-02 起 inject_sandgarden_fragments 只做兜底
 /// (老档补齐 4 块,其余只补任务 81/83 已完成却缺的 31005/31007),规则见该函数注释。
 /// [扫描修 2026-09-15] F1-3/F5-10 纠错:以前这里写成"火山必需",实为沙原碎片;火山 31010/31012 来自咖啡任务 16/17。
+/// [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 原版与离线都来自咖啡任务 16/17(离线任务链已复活,见 island_cafe_restore_and_offer),
+///   领奖时经 addNewObject2Map:gift: 0x25c5b4 进 mapFragments_,本函数照常恢复。
 fn load_island_fragments(env: &mut Environment) {
     let path = island_data_path(env, "island_fragments.dat");
     if path == nil {
@@ -5920,6 +5929,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     //   [2026-09-16] A1-02+A2-02 已降级为兜底:真新岛档不送商店可买的 31006/31008,31005/31007 按任务 81/83 进度补,规则见该函数注释。
     // [扫描修 2026-09-15] F5-10 纠错:-[NewSceneData activatedAdventureMap] 判的是 12 槽 / 3 张图(0x222f12 cmp #0xb),
     //   不是"只判这 4 槽";这里只保证沙原一张图可探险,火山(31009-31012)仍靠商店购买 + 咖啡任务 16/17。
+    //   [2026-09-24 第四轮 K10 I5-03/I5-2/I4-01] 火山:31009/31011 原版与离线都在岛建设商店买,31010/31012 原版与离线都来自
+    //   咖啡任务 16/17(离线任务链已由 island_cafe_restore_and_offer 复活,领奖走原版 addNewObject2Map:gift: → addAdventureMapFragment:)。
     load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片(默认岛首进通常无,空过)
     inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片(真新岛档:31006/31008 走商店购买,31005/31007 按任务 81/83 进度补)
     restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001-90008,抬游标到 90008 防新放置撞号
