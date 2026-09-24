@@ -272,6 +272,9 @@ pub fn wants(class: &str, sel: &str) -> bool {
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
         // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
         "FireworkLayer" => sel == "showFireWorkFullScreen",
+        // [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励:离线时奖励表为空就不开空奖励板,改弹原版离线提示。
+        //   OnlineTimeManager 不在 mole_cheats 的 CLASSES 里,靠这里 OR 进 intercept_wants,release 下才不会静默失效。
+        "OnlineTimeManager" => sel == "showRewardLayer",
         _ => false,
     }
 }
@@ -367,6 +370,32 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             }
             return None;
         }
+    }
+
+    // [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励(OnlineTimeManager)离线永远是空奖励板。奖励表 reward_list_ 唯一的赋值在
+    //   setNextReward_time:NextReward_list:NextReward_level:@0x38aac8,唯一上游是 setNextOnlineRewardData@0x38aa1c,它只在 1088 回包分发
+    //   -[HolidayVillageLayer onNewSceneGameDataCommandReceived:] 0x23e946 被调;last_rew_data_ 靠 1062 的 localVipRewardData,离线同样没有。
+    //   于是 showRewardLayer@0x38b0cc 在 0x38b10a 见 [last_rew_data_ reward_array] count 为 0(last_rew_data_ 为 nil)、走 0x38b15e
+    //   以 initWithType:2 rewardsList:reward_list_(nil) 建出「连续 0 次、剩余 0 小时 0 分 0 秒」、一个格子都没有的空板,
+    //   倒计时也不走(startOrPauseCaculateLoginTime: 0x38abde 见 reward_time_==0 不调度)。
+    //   原版奖励表客户端里没有;私服 vip.rs 的表是猜的、time 字段还当成纪元时间(客户端当逐秒递减的倒计时,0x38aca6),不能移植,
+    //   也不自己编。采用退路:离线且两项都为空时不开空板,改弹原版文案 ACTION_CENTER_NETWARNING(「该功能需要联网才能使用哦!」),
+    //   写法照 mole_cheats 的 onButtonFriendSelected:/onButtonAdwallSelected: 两条离线提示臂(弹框类/文案缺失就恢复 r0-r3 放行原版,最坏空板)。
+    //   showRewardLayer 全二进制只有 -[NewSceneVillageMenuLayer onButtonOnlineRewardSelected:] 0x25a8f6 一个调用点,在
+    //   checkCanStartVipOnlineRewardFunc(0x25a8aa,VIP>3 才放行)之后:VIP<4 时原版的 NO_VIP_LEVEL_ONLINE 提示不受影响,宿主不用自己判 VIP。
+    //   菜单按钮回调栈,不在 drawScene/mainLoop 帧栈上,可以发宿主消息。getVipDailyReward:/sendOnlineLevelToServer/setLastOnLineReward
+    //   离线本来就是空过(包被岛吞包臂吃掉),不拦。在线模式零影响。
+    if class == "OnlineTimeManager" && sel == "showRewardLayer" && !env.options.network_access {
+        let saved = save_regs(env);
+        let otm: id = Ptr::from_bits(env.cpu.regs()[0]);
+        if online_reward_board_would_be_empty(env, otm) && show_offline_net_warning_box(env) {
+            log!("[ACTIVITY] 黄金岛 VIP 在线奖励:离线拿不到 1088 奖励表(reward_list_/last_rew_data_ 皆空)→ 弹「该功能需要联网」提示,不开空奖励板");
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        // 奖励表不空(不该离线出现)或弹框没发出去:恢复寄存器,放行原版。
+        restore_regs(env, saved);
+        return None;
     }
 
     // 其余全部只在离线主村生效。
@@ -3020,6 +3049,89 @@ fn island_daily_quest_prompt(env: &mut Environment, gd: id) {
         let _: () = msg_send(env, (dq, reset_sel));
     }
     log!("[ACTIVITY] 黄金岛每日任务:照原版分发臂给日常 NPC(96)挂提示图标并 resetTimer");
+}
+
+// ─────────────────────────────── [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励离线提示 ───────────────────────────────
+
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager.reward_list_(@"NSMutableArray",编译期 +240;-[OnlineTimeManager init]@0x38a7d0 置 nil,
+/// 唯一赋值在 setNextReward_time:NextReward_list:NextReward_level:@0x38aac8)。
+const SLOT_OTM_REWARD_LIST: u32 = 0xb07fc0;
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager.last_rew_data_(@"OnlineRewardData",编译期 +248;showRewardLayer 0x38b0ec 读它)。
+const SLOT_OTM_LAST_REW_DATA: u32 = 0xb07fc4;
+/// [2026-09-24 第四轮 K6 N-D4-1] OnlineTimeManager 的实例大小(objc_meta 里 class_ro_t.instanceSize = 265)。
+/// 从槽里现读的偏移为 0 或读 4 字节会越过它,就当槽没按预期初始化,放行原版。
+const OTM_INSTANCE_SIZE: u32 = 265;
+
+/// [2026-09-24 第四轮 K6 N-D4-1] 读 OnlineTimeManager 的一个对象型 ivar(偏移从 _OBJC_IVAR 槽现读,不写死 +240/+248)。
+/// 偏移异常返回 None。只读内存、不发消息。
+fn otm_ivar_id(env: &Environment, otm: id, slot: u32) -> Option<id> {
+    if otm == nil {
+        return None;
+    }
+    let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(slot));
+    if off == 0 || off.saturating_add(4) > OTM_INSTANCE_SIZE {
+        return None;
+    }
+    let bits: u32 = env
+        .mem
+        .read(ConstPtr::<u32>::from_bits(otm.to_bits().wrapping_add(off)));
+    Some(Ptr::from_bits(bits))
+}
+
+/// [2026-09-24 第四轮 K6 N-D4-1] showRewardLayer 这次会不会建出空奖励板:last_rew_data_ 为 nil(原版 0x38b10a 走 0x38b15e 那一支)
+/// 且 reward_list_ 为 nil 或 count 为 0(NewRewardsLayer type 2 在 rewardsList 为空时一个格子都不建)。偏移读不出一律按「不空」,放行原版。
+/// reward_list_ 非 nil 时会发一次 count(宿主 msg_send),调用方负责恢复 r0-r3。
+fn online_reward_board_would_be_empty(env: &mut Environment, otm: id) -> bool {
+    let (Some(list), Some(last)) = (
+        otm_ivar_id(env, otm, SLOT_OTM_REWARD_LIST),
+        otm_ivar_id(env, otm, SLOT_OTM_LAST_REW_DATA),
+    ) else {
+        return false;
+    };
+    if last != nil {
+        return false;
+    }
+    if list == nil {
+        return true;
+    }
+    let count_sel = sel_named(env, "count");
+    let n: GuestUSize = msg_send(env, (list, count_sel));
+    n == 0
+}
+
+/// [2026-09-24 第四轮 K6 N-D4-1] 弹游戏自带的离线提示:文案 [[NSBundle mainBundle] localizedStringForKey:@"ACTION_CENTER_NETWARNING" value:@"" table:nil]
+/// (「该功能需要联网才能使用哦!」,原版 -[UserInfoLayer onButtonActionFunctionsSelected:] 0x5a55a 等 37 处同一文案),
+/// 框 `[[MessageBox sharedInstance] showWithTarget:nil selector:0 title:nil message:msg type:6 vipgold:0]`(type 6 只有「确定」,关框无回调)。
+/// mole_cheats 的 game_localized_string / show_game_message_box 是私有的,这里照抄同一调用序列(本文件 block_paid_action_in_time_travel 同理):
+/// 签名 v32@0:4@8:12@16@20i24i28,宿主 msg_send 只实现到「接收者+选择子+5 个参数」,type(低 32 位)与 vipgold(高 32 位,恒 0)
+/// 合成一个 u64 落到 sp+8/sp+0xc,与分开传逐字节相同。返回是否真的发出了弹框消息。只在按钮回调栈上调用,会改写 r0-r3。
+fn show_offline_net_warning_box(env: &mut Environment) -> bool {
+    let bundle_cls = env.objc.get_known_class("NSBundle", &mut env.mem);
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if bundle_cls == nil || mb_cls == nil {
+        return false;
+    }
+    let main_s = sel_named(env, "mainBundle");
+    let bundle: id = msg_send(env, (bundle_cls, main_s));
+    if bundle == nil {
+        return false;
+    }
+    let key = ns_string::get_static_str(env, "ACTION_CENTER_NETWARNING");
+    let empty = ns_string::get_static_str(env, "");
+    let loc_s = sel_named(env, "localizedStringForKey:value:table:");
+    let msg: id = msg_send(env, (bundle, loc_s, key, empty, nil));
+    if msg == nil {
+        return false;
+    }
+    let sh = sel_named(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        return false;
+    }
+    let show = sel_named(env, "showWithTarget:selector:title:message:type:vipgold:");
+    let type_and_vipgold: u64 = 6; // 低 32 位 = type 6,高 32 位 = vipgold 0
+    let _: () = msg_send(env, (mb, show, nil, SEL::null(), nil, msg, type_and_vipgold));
+    true
 }
 
 // [2026-09-16] 包3 纯函数单测:旁路档 v=2 校验、每日任务选题映射、客户端日界口径。放在文件最末(clippy items_after_test_module)。
