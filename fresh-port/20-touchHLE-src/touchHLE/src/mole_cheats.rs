@@ -1023,6 +1023,9 @@ fn island_put(env: &mut Environment, dict: id, key: &'static str, obj: id) {
         .objc
         .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (dict, set_s, arr, key_ns));
+    // [2026-09-24 第四轮 K1 I2-4] arr 是本函数 alloc/init 的 +1,dict 的 setObject:forKey: 已 retain → 交还这份 +1。
+    //   obj 的所有权归调用方(addObject: 已 retain,调用方放完自己 release)。
+    release(env, arr);
 }
 
 /// 同 island_put,但【同 key 已有数组则追加】而非覆盖——放多个同族建筑(如 5 个商店都在 key
@@ -1045,6 +1048,9 @@ fn island_put_append(env: &mut Environment, dict: id, key: &'static str, obj: id
             .objc
             .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
         let _: () = msg_send(env, (dict, set_s, arr, key_ns));
+        // [2026-09-24 第四轮 K1 I2-4] 只在新建分支交还 alloc 的 +1(dict 已 retain,下面 addObject: 照常可用);
+        //   objectForKey: 取回的既有数组是 +0,绝不能 release,否则过释放、之后 addObject: 打野指针。
+        release(env, arr);
     }
     let add_s = env
         .objc
@@ -4018,6 +4024,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
             obj_set_int(env, shop, "setSaleItemId:", 0);
             obj_set_int(env, shop, "setProperty:", 0);
             island_put_append(env, dict, "28", shop);
+            release(env, shop); // [2026-09-24 第四轮 K1 I2-4] 数组已 retain,交还 alloc 的 +1
         }
     }
     // 物件2 餐厅 TMMapDataRestaurant 30002 @(11,39) → key "29"
@@ -4037,6 +4044,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, rest, "setConstructValue:", 0);
         obj_set_int(env, rest, "setIslandValue:", 0);
         island_put(env, dict, "29", rest);
+        release(env, rest); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
     // 物件3 公寓/训练屋 TMMapDataApartment 30001 @(15,26) → key "32"
     let apt = island_alloc_init(env, "TMMapDataApartment");
@@ -4048,6 +4056,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, apt, "setMoleNumInWaitingQueue:", 0);
         obj_set_int(env, apt, "setLastMoleFinishTrainingTime:", 0);
         island_put(env, dict, "32", apt);
+        release(env, apt); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
     // [P4-a 航海] 默认岛注入 1 艘探险船 DiscoveryShip(objectId 34001,mapData key "39")。其余字段
     //   (isFixing/isSailing/searchMapId/onBoardMoleNum/beginFixTime/beginDiscoverTime)默认 0 = 原版
@@ -4059,12 +4068,19 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         obj_set_int(env, ship, "setObjectSequenceId:", 90008); // 非0 seqId,出海状态回写命门
         island_set_point(env, ship, "setBaseTile:", 37.0, -30.0); // 原版 addDiscoveryShipOnMap 水域坐标
         island_put(env, dict, "39", ship);
+        release(env, ship); // [2026-09-24 第四轮 K1 I2-4] 同上
     }
 
     let set_s = env
         .objc
         .register_host_selector("setMapData:".to_string(), &mut env.mem);
     let _: () = msg_send(env, (nsd, set_s, dict));
+    // [2026-09-24 第四轮 K1 I2-4] -[NewSceneData setMapData:]@0x21f458 先 release 旧 ivar,再在 0x21f492 存参数的 mutableCopy
+    //   (浅拷贝,每个值数组再 retain 一次),不接管参数这份 +1 → 交还。之后的碎片/seqId/挂钩都只经 [nsd mapData] 拿 ivar 里
+    //   那份拷贝,不再引用 dict。以前默认岛这 8 个 TMMapData*、4 个数组和 dict 全都多一个 +1 永不释放。
+    //   与原版 -[LoadingHoliday createDefaultMapData](0x252508)同一所有权模式:对象 addObject: 后 release(0x2527ea),
+    //   数组 setValue:forKey: 后 release(0x252b54),dict 在 setMapData:(0x252b78)之后紧接着 release(0x252b80)。
+    release(env, dict);
 
     // [2026-09-24 第四轮 K1 I4-03] 走到默认岛 = island_map.dat 不存在或无效(解档失败/空布局),若 island_ships.dat 还在原路径,
     //   本会话就不覆盖它。根因:船档描述的是 island_map.dat 里那批船/咖啡馆,只在读档岛分支 load_island_ships 读回;
