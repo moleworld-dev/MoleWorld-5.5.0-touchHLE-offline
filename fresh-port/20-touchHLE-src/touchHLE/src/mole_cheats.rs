@@ -3769,6 +3769,7 @@ fn island_after_layout_ready(env: &mut Environment) {
     // ── [K4] 未来时间戳收敛 ──
     island_clamp_future_timestamps(env); // [2026-09-24 第四轮 K4 I4-05] 船/打工任务/NPC 冷却的超前起点夹到现在
     // ── [K9] 仓库/飞鸟/增强道具回灌 mapData 键 8/11/21 ──
+    island_storage_inject(env); // [2026-09-24 第四轮 K9] island_storage.dat → mapData,交给原版 loadMapObjects 回填
     // ── [K10] 咖啡馆许愿任务三张表恢复 + 当日任务池下发 ──
     // ── [K11] 超级贝壳树侧档读入缓存 ──
     // ── [K12] 岛成就累计计数/小游戏前三名恢复 ──
@@ -3781,6 +3782,7 @@ fn island_after_layout_ready(env: &mut Environment) {
 fn island_flush_prepare(env: &mut Environment) {
     log_dbg!("[MOLECHEAT] island: 挂钩 island_flush_prepare");
     // ── [K9] 仓库/飞鸟/增强道具落盘 + 清掉读档时注入 mapData 的 8/11/21 键 ──
+    island_storage_flush(env); // [2026-09-24 第四轮 K9] 活表 → island_storage.dat,并移除注入键
     let _ = env;
 }
 
@@ -4224,6 +4226,250 @@ fn delete_island_object(env: &mut Environment, snap: id) {
             "[MOLECHEAT] island: 删除写回 seqId={} 在 mapData 中未找到(若非本局新放置的对象,请排查)",
             seqid
         );
+    }
+}
+
+// ════════ [2026-09-24 第四轮 K9] 岛侧档 island_storage.dat:仓库(收纳箱)════════
+// 原版岛仓库挂在 ObjectManager 活对象上(goodsInStorage_,+296),持久化是【服务器权威】:
+//   · 写:收纳 -[NewSceneEditMenuLayer onChooseConfirm]@0x26a664(0x26a71e)与一键收纳 -[WrapperManager storeOnekey:]@0x392288
+//     (0x3923de)都调 -[ObjectManager addGoodsNumber:andCount:]@0x42ea0:键 [NSString stringWithFormat:@"%d",物品号]
+//     (0x42fde)→ 值 NSNumber 件数(0x42ff4 setObject:forKey:),随后 0x430f6 addStorageObjectToServerWithId:andCount: 上行
+//     (离线被 sendPacket:commandId: 吞掉)。取出 -[NewSceneEditMenuLayer onButtonOkSelected:] 0x2695de 本地 setValue:(n-1);
+//     取到只剩 0 件时改走 0x269846 removeObjectForKey: 直接删键(0x2695ca ble 分支)—— 岛会话内仓库的键会被删。
+//   · 读:1062 下发的 mapData 键 "11" → -[NewGameManager loadMapObjects:mapData:forNPC:] 跳表(tbh 表基 0x24234c,
+//     下标=键-1)→ 0x242ac4:枚举该字典 allKeys,[[NewSceneData sharedInstance] getObjectDataWithId:[键 intValue]] 非空
+//     就 [[[ObjectManager sharedManager] goodsInStorage] setObject:原值 forKey:原键](0x242be8,键值原样,无需伪造元素)。
+//   · 清:进岛 LoadingHoliday 0x252f9e unloadMap 与离岛 -[NewGameManager unloadMap] 0x2464f0 都走
+//     -[ObjectManager removeAllObjects],0x466ce 清空 goodsInStorage_。
+// 离线没有 1062 → 收纳进仓库的建筑(地图上已被 delete_island_object 删掉)退岛即连同买它的钱一起蒸发。
+// 做法(补全原版回包数据,让原版逻辑自己跑):落盘时从活表拷一份写 island_storage.dat;进岛布局就绪时把它放回
+// mapData["11"],由原版 loadMapObjects 在 case3 removeAllObjects 之后回填 —— 等价于服务器下发。
+// 不拦截任何原版方法;不做 recycledHouses(一键收纳只有 type 5 已建成房屋走 recycleHouseWithId:level:andNumber:@0x474cc,
+// 且 0x4753c 在 curSceneId==10 早退,而岛 propertyHV 580 件没有 type 5,岛上不可达)。
+
+/// [2026-09-24 第四轮 K9] 侧档文件名(坏档保护位 ISLAND_FILE_STORAGE,规则同其它岛档)。
+const ISLAND_STORAGE_FILE: &str = "island_storage.dat";
+/// [2026-09-24 第四轮 K9] 本次进岛 island_storage_inject 是否已跑完(已读过盘上侧档、把键交给了 mapData)。
+/// 没跑完就不落盘:那时 ObjectManager 活表里不是本岛会话回填出来的值,写下去会把盘上的仓库冲掉。
+static ISLAND_STORAGE_ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// [2026-09-24 第四轮 K9] 读档注入 mapData["11"] 的仓库键串。只用于本次进岛【首次落盘】时核对一次「原版回填了几种」
+    /// 并打日志,用完即清,【绝不】把活表里缺的键补回去:取出到 0 件时原版 0x269846 removeObjectForKey: 直接删键,
+    /// 「活表缺这个键」多半是玩家把它取光放回了地图,补回去就是凭空复制一份(可无限刷高价建筑)。键 11 的回填分支
+    /// 0x242ac4 没有 gameMode 之类的门,只逐条校验 getObjectDataWithId:,活表就是唯一可信来源。
+    static ISLAND_STORAGE_INJ_GOODS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// [2026-09-24 第四轮 K9] 上一次落盘内容摘要:变化时 log!,不变时 log_dbg!(节拍每 1.5s 可能落一次,防刷屏)。
+    static ISLAND_STORAGE_LAST_SUMMARY: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// [2026-09-24 第四轮 K9] obj 是否 isKindOfClass: <cls_name>(obj 为 nil 或类不存在返回 false)。读档校验用。
+fn island_storage_is_kind(env: &mut Environment, obj: id, cls_name: &str) -> bool {
+    if obj == nil {
+        return false;
+    }
+    let cls = env.objc.get_known_class(cls_name, &mut env.mem);
+    if cls == nil {
+        return false;
+    }
+    let s = island_sel(env, "isKindOfClass:");
+    msg_send(env, (obj, s, cls))
+}
+
+/// [2026-09-24 第四轮 K9] 从 mapData 移除本包读档时注入的非数组键(removeObjectForKey: 对不存在的键是空操作)。
+/// 目的:不让 save_island_map 把它们写进 island_map.dat,也不让本文件按「键 → 数组」遍历 mapData 的辅助函数
+/// (island_all_objects / island_find_by_seqid 等)长时间碰到非数组值。
+fn island_storage_strip_keys(env: &mut Environment, md: id) {
+    if md == nil {
+        return;
+    }
+    let rm = island_sel(env, "removeObjectForKey:");
+    for key in ["11"] {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+        let _: () = msg_send(env, (md, rm, k));
+    }
+}
+
+/// [2026-09-24 第四轮 K9 I3-01/I2-1] 进岛读档(island_after_layout_ready 的 K9 槽位调用):
+/// 读 island_storage.dat → goods 非空就把它的可变拷贝放进 [NewSceneData mapData]["11"]。
+/// 时序:此刻 mapData 刚 setMapData:,晚于它的是 LoadingHoliday case3 的 removeAllObjects(0x252f9e),再之后才是
+/// loadNewScene(0x240efa)→ -[NewGameManager loadMapFromData:forNPC:] 逐键调 loadMapObjects: 消费 —— 刚好不会被清掉。
+/// 键必须是 NSString(与 addGoodsNumber:andCount: 的 "%d" 键同型,否则之后加减件数对不上号)、值必须是 NSNumber
+/// (取出时 [值 intValue]);不符的条目丢弃。无档/坏档(已隔离或禁止覆盖)按空仓库处理。在线模式不生效。
+fn island_storage_inject(env: &mut Environment) {
+    ISLAND_STORAGE_ARMED.store(false, O);
+    ISLAND_STORAGE_INJ_GOODS.with(|c| c.borrow_mut().clear());
+    ISLAND_STORAGE_LAST_SUMMARY.with(|c| c.borrow_mut().clear());
+    if env.options.network_access {
+        return;
+    }
+    let md = island_mapdata(env);
+    if md == nil {
+        return;
+    }
+    // 防御:mapData 是本次进岛新建/新读的,正常不会带这些键;万一旧档里混进来了,先清掉再按侧档重放。
+    island_storage_strip_keys(env, md);
+    let root = island_sidecar_load(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE);
+    if root == nil {
+        // 无档 = 从没存过;坏档 = island_sidecar_load 已改名隔离(隔离失败则保护位保持置位,落盘会被拦下)。
+        ISLAND_STORAGE_ARMED.store(true, O);
+        return;
+    }
+    if !island_storage_is_kind(env, root, "NSDictionary") {
+        log!("[MOLECHEAT] island: ⚠️ island_storage.dat 根对象不是字典 → 按无档处理(下次落盘会用当前内容覆盖)");
+        ISLAND_STORAGE_ARMED.store(true, O);
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let iv = island_sel(env, "intValue");
+    // ① 仓库 → mapData["11"]
+    let mut goods_total: i64 = 0;
+    let mut goods_snap: Vec<String> = Vec::new();
+    let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "goods");
+    let goods: id = msg_send(env, (root, ofk, gk));
+    if island_storage_is_kind(env, goods, "NSDictionary") {
+        let out = island_alloc_init(env, "NSMutableDictionary");
+        if out != nil {
+            let keys: id = msg_send(env, (goods, ak));
+            let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+            for i in 0..n {
+                let k: id = msg_send(env, (keys, oai, i));
+                let v: id = msg_send(env, (goods, ofk, k));
+                if !island_storage_is_kind(env, k, "NSString") || !island_storage_is_kind(env, v, "NSNumber") {
+                    continue;
+                }
+                let ks = crate::frameworks::foundation::ns_string::to_rust_string(env, k).into_owned();
+                let oid_ok = ks.parse::<i32>().map_or(false, |oid| oid > 0);
+                let c: i32 = msg_send(env, (v, iv));
+                // 件数 ≤0 的丢弃:原版取到 0 件就删键(0x269846),活表里本不会有 0 件条目,放回去只会在仓库列表里显示空格。
+                if !oid_ok || c <= 0 {
+                    continue;
+                }
+                // 键值原样放回(v 归 goods 字典所有,setObject:forKey: 自己 retain,这里不 release)。
+                let _: () = msg_send(env, (out, sfk, v, k));
+                goods_total += c as i64;
+                goods_snap.push(ks);
+            }
+            if !goods_snap.is_empty() {
+                let k11 = crate::frameworks::foundation::ns_string::get_static_str(env, "11");
+                let _: () = msg_send(env, (md, sfk, out, k11));
+            }
+            release(env, out); // alloc/init 的 +1:已被 mapData retain(或没放进去,直接释放)
+        }
+    }
+    let goods_kinds = goods_snap.len();
+    ISLAND_STORAGE_INJ_GOODS.with(|c| *c.borrow_mut() = goods_snap);
+    ISLAND_STORAGE_ARMED.store(true, O);
+    log!(
+        "[MOLECHEAT] island: 读回 island_storage.dat → 仓库 {} 种 {} 件放回 mapData 键 11,交给原版 loadMapObjects 回填",
+        goods_kinds,
+        goods_total
+    );
+}
+
+/// [2026-09-24 第四轮 K9 I3-01/I2-1] 落盘(island_flush_prepare 的 K9 槽位调用;此刻 unloadMap 未跑、活表满载):
+/// 先把读档时注入 mapData 的键移除(此时 ON_ISLAND 已由 loadNewScene:10 置位,而原版在同一次 loadNewScene 里同步消费了
+/// 这些键,见 0x240efa → 0x245e96),再读 [[ObjectManager sharedManager] goodsInStorage] 做可变拷贝原样写 island_storage.dat
+/// (活表是唯一来源,不拿读档快照补键,原因见 ISLAND_STORAGE_INJ_GOODS)。只在「在岛上 + 本次进岛已读过侧档」时落盘;
+/// 在线模式不生效。
+fn island_storage_flush(env: &mut Environment) {
+    if env.options.network_access || !ON_ISLAND.load(O) || !ISLAND_STORAGE_ARMED.load(O) {
+        return;
+    }
+    let md = island_mapdata(env);
+    island_storage_strip_keys(env, md);
+    let om_cls = env.objc.get_known_class("ObjectManager", &mut env.mem);
+    if om_cls == nil {
+        return;
+    }
+    let sm = island_sel(env, "sharedManager");
+    let om: id = msg_send(env, (om_cls, sm));
+    if om == nil {
+        return;
+    }
+    let root = island_alloc_init(env, "NSMutableDictionary");
+    if root == nil {
+        return;
+    }
+    let ofk = island_sel(env, "objectForKey:");
+    let sfk = island_sel(env, "setObject:forKey:");
+    let mc = island_sel(env, "mutableCopy");
+    let ak = island_sel(env, "allKeys");
+    let cnt = island_sel(env, "count");
+    let oai = island_sel(env, "objectAtIndex:");
+    let iv = island_sel(env, "intValue");
+    // ① 仓库:活表的可变拷贝(+1)
+    let gis = island_sel(env, "goodsInStorage");
+    let live_goods: id = msg_send(env, (om, gis));
+    let goods: id = if live_goods != nil {
+        msg_send(env, (live_goods, mc))
+    } else {
+        island_alloc_init(env, "NSMutableDictionary")
+    };
+    if goods == nil {
+        release(env, root); // 拷贝失败就整次不写,绝不写出缺仓库的档
+        return;
+    }
+    let mut goods_kinds = 0;
+    let mut goods_total: i64 = 0;
+    if goods != nil {
+        // 本次进岛首次落盘:核对读档注入的键有几种在活表里,只打日志、不改数据(取走即清,之后的落盘不再核对)。
+        let snap = ISLAND_STORAGE_INJ_GOODS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if !snap.is_empty() {
+            let mut hit = 0usize;
+            for ks in &snap {
+                let k = crate::frameworks::foundation::ns_string::from_rust_string(env, ks.clone());
+                let cur: id = msg_send(env, (goods, ofk, k));
+                release(env, k); // from_rust_string 的 +1
+                if cur != nil {
+                    hit += 1;
+                }
+            }
+            if hit < snap.len() {
+                log!(
+                    "[MOLECHEAT] island: 仓库回填核对(本次进岛首次落盘):读档注入 {} 种,活表里现有其中 {} 种 —— 缺的若不是玩家已取光放回地图,就是原版 loadMapObjects 键 11 没回填(0x242ac4,请查)",
+                    snap.len(),
+                    hit
+                );
+            } else {
+                log_dbg!("[MOLECHEAT] island: 仓库回填核对:读档注入 {} 种全部在活表里", snap.len());
+            }
+        }
+        let keys: id = msg_send(env, (goods, ak));
+        let n: crate::mem::GuestUSize = if keys != nil { msg_send(env, (keys, cnt)) } else { 0 };
+        for i in 0..n {
+            let k: id = msg_send(env, (keys, oai, i));
+            let v: id = msg_send(env, (goods, ofk, k));
+            if v != nil {
+                let c: i32 = msg_send(env, (v, iv));
+                goods_total += c as i64;
+            }
+        }
+        goods_kinds = n;
+        let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "goods");
+        let _: () = msg_send(env, (root, sfk, goods, gk));
+        release(env, goods); // mutableCopy / alloc-init 的 +1,已被 root retain
+    }
+    let saved = island_sidecar_save(env, ISLAND_STORAGE_FILE, ISLAND_FILE_STORAGE, root);
+    release(env, root);
+    let Some(saved) = saved else { return };
+    let summary = format!("仓库 {} 种 {} 件", goods_kinds, goods_total);
+    let changed = ISLAND_STORAGE_LAST_SUMMARY.with(|c| {
+        let mut last = c.borrow_mut();
+        if *last == summary {
+            false
+        } else {
+            *last = summary.clone();
+            true
+        }
+    });
+    if changed {
+        log!("[MOLECHEAT] island: {}:{}", saved, summary);
+    } else {
+        log_dbg!("[MOLECHEAT] island: {}:{}", saved, summary);
     }
 }
 
