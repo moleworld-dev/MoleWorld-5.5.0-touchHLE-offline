@@ -8625,21 +8625,70 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
     }
 
-    // 工人/房间补满:三个 ivar getter 恒返回 99 → 收菜/建造永不卡人力、房间不卡容量。
+    // 工人补满:主村人力门/显示调用点上 totalWorkers/availableWorkers 返回 99 → 收菜/建造永不卡人力。
     // [2026-09-16] G-07 只管主村,菜单标签注明「仅主村」。岛上工人走 -[NewSceneUserInfoData curTotalWorkersCount]@0x3239c4,不在这里全局拦:
     //   save_island_userinfo 用宿主 msg_send 读这个 getter 写进 island_userinfo.dat,读档时再 setCurTotalWorkersCount: 写回,
-    //   恒返回 99 会把 99 永久存进岛档。另外已核实主村有同类问题(本包不改,另记):-[UserInfoData encodeWithCoder:]@0xb9f98
-    //   在 0xba0e2/0xba108/0xba17a 就是经 totalWorkers/availableWorkers/totalRooms 这三个 getter 取值编码的,开着开关时存档,
-    //   99 会写进 userinfo.dat,关掉开关后不会回退。
-    if MAX_FACILITY.load(O) {
-        match (class, sel) {
-            ("UserInfoData", "totalWorkers")
-            | ("UserInfoData", "availableWorkers")
-            | ("UserInfoData", "totalRooms") => {
-                env.cpu.regs_mut()[0] = 99;
-                return true;
-            }
-            _ => {}
+    //   恒返回 99 会把 99 永久存进岛档。
+    // [2026-09-24 第四轮 K13 I3-4] 改成按调用点 LR 的正向白名单,删掉 totalRooms 臂。
+    //   根因:以前三个 getter 对所有调用者恒返回 99,而 -[UserInfoData encodeWithCoder:]@0xb9f98 正是经这几个 getter 取值编码的
+    //   (0xba0e2 totalWorkers / 0xba108 availableWorkers / 0xba17a totalRooms);落盘入口 -[NewSceneData saveUserinfoToLocal]
+    //   归档它并加密写 userinfo.dat,岛上 island_flush 每次落盘都先调一遍(节拍 1.5 秒),99 必然被永久写进存档,关掉开关也回不去。
+    //   encodeUserInfoData(0xbc388/0xbc49c,上传)、intiWithUserInfo:(0xb9680/0xb96f8,复制)同样拿到 99。
+    //   现在只有下面 MAXFAC_GATE_LRS 里的调用点返回 99(LR = blx 地址 + 4,带 Thumb 位,逐个 re.py annot 核过),其余一律读真值。
+    //   收录的是「只做 >= 比较的人力/容量门」和「纯显示」;明确不收:encodeWithCoder:(0xba0e7/0xba10d)、ActorManager
+    //   changeAvailableMolerForTask:(0x9db2b/0x9db4d/0x9db93,读-改-写:归还分支 n>=1 在 0x9db4c「空闲 >= 总数」就跳过归还,
+    //   返回 99 会让任务完成后工人永远还不回来;扣减分支 n<0 在 0x9db92「空闲 < 1」就不扣,真值保证真没空闲时不扣)、
+    //   TaskManager sendMolesToPlayExpression(0x26039b,>=1 就 changeAvailableWorkers:-1)、
+    //   FriendVillageUnit(好友数据)、Story nextStep(新手引导)、intiWithUserInfo:/encodeUserInfoData(复制/上传)。
+    //   createIdleWorkers: 必须收:-[Object callConsumingWorker:] 过了人力门还要 [ActorManager hearWithTarget:selector:pos:]
+    //   (0x41034)叫到一只空闲摩尔才会开工,空闲摩尔数就是 createIdleWorkers: 按 availableWorkers 生成的。
+    //   已知后果(作弊语义,不另处理):门被放宽后,派工 subAvailableWorker / 任务扣减 changeAvailableWorkers:-n 都直接改 ivar,
+    //   -[UserInfoData addAvailableWorker:]@0xbb34c 只夹上限(<= totalWorkers_)不夹下限,真空闲不够时 availableWorkers 会暂时为负
+    //   并可能被存档;摩尔干完活/任务完成归还后自愈,而且读档时 -[GameData loadUserInfoData] 0x7591a → intiWithUserInfo:
+    //   (0xb96a2 取 totalWorkers → 0xb96bc 写 availableWorkers_)会把空闲数重置成总数,存档里的负值下次启动也会复位。
+    //   关掉开关后本局 HUD 可能短暂显示负数。
+    //   totalRooms 臂删掉:selref 全量只有 3 处(intiWithUserInfo:/encodeWithCoder:/encodeUserInfoData),全是复制/编码路径,
+    //   没有一个游戏门,拦它零收益、纯污染存档。已被旧逻辑写成 99 的 userinfo.dat 无法自动还原(不知道真值)。
+    //   纯改返回寄存器,不发消息;没命中白名单就往下走,最后放行真 getter。
+    if MAX_FACILITY.load(O)
+        && class == "UserInfoData"
+        && matches!(sel, "availableWorkers" | "totalWorkers")
+    {
+        // (选择子, 调用点 LR)。共享尾块(DailyQuest/CafeQuest)里同一条 blx 也会给岛上的 curIdleWorkerCount 用,
+        // 按选择子+类名一起匹配,不会误中。
+        const MAXFAC_GATE_LRS: [(&str, u32); 20] = [
+            ("availableWorkers", 0x1c1d3),  // -[GameManager createIdleWorkers:]+0x15a:生成空闲摩尔(派工要有摩尔应答)
+            ("availableWorkers", 0x40d5b),  // -[Object callConsumingWorker:]+0x76:收菜/建造派工门 >=1
+            ("availableWorkers", 0x54659),  // -[UserInfoLayer init]:HUD 工人数显示
+            ("availableWorkers", 0x58dbb),  // -[UserInfoLayer updateWorkerNumber]:HUD 工人数显示
+            ("availableWorkers", 0x64579),  // -[VillageMenuLayer canBuyMultiple:]:连续购买门 >=2
+            ("availableWorkers", 0x7cfed),  // -[GameData getLockType4Crop:]:下种人力锁 2
+            ("availableWorkers", 0x7d9af),  // -[GameData getLockType4Object:]:摆放人力锁 2
+            ("availableWorkers", 0x125f4d), // -[Quest accept]:任务人力门
+            ("availableWorkers", 0x14c501), // -[OutputHanlder onGifFlagTouched]:主村领产出人力门 >=1
+            ("availableWorkers", 0x1d967d), // -[TimeQuest accept]
+            ("availableWorkers", 0x340da7), // -[DailyQuest accept](共享尾块 blx@0x340da2)
+            ("availableWorkers", 0x38802b), // -[VipQuest accept]
+            ("availableWorkers", 0x36bb01), // -[CafeQuest checkCanAcceptCafeQuestWithQuestId:](共享尾块 blx@0x36bafc)
+            ("availableWorkers", 0x36c493), // -[CafeQuest acceptWithQuestId:](共享尾块 blx@0x36c48e)
+            ("totalWorkers", 0x5466d),      // -[UserInfoLayer init]:HUD 显示
+            ("totalWorkers", 0x58dcf),      // -[UserInfoLayer updateWorkerNumber]:HUD 显示
+            ("totalWorkers", 0x64557),      // -[VillageMenuLayer canBuyMultiple:]:连续购买门(已占 < 总数)
+            ("totalWorkers", 0x7d3bd),      // -[GameData getLockType4Object:]:type 0x13 锁 9(总数−按房间数 > 109 才锁)
+            ("totalWorkers", 0x7dac3),      // -[GameData getLockType4Object:]:锁 7(已占 >= 总数)
+            ("totalWorkers", 0xd2825),      // -[BuildingView showBuildingInfo:]:信息面板显示
+        ];
+        static LOG1_MAXFAC_GATE: AtomicBool = AtomicBool::new(false);
+        let lr = env.cpu.regs()[14];
+        if MAXFAC_GATE_LRS.iter().any(|&(s, l)| s == sel && l == lr) {
+            log_first_then_dbg!(
+                LOG1_MAXFAC_GATE,
+                "[MOLECHEAT] 工人补满:{} 在人力门/显示调用点 LR={:#x} → 99(编码/复制/读改写点照旧读真值)",
+                sel,
+                lr
+            );
+            env.cpu.regs_mut()[0] = 99;
+            return true;
         }
     }
 
