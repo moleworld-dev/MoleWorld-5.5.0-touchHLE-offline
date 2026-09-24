@@ -422,7 +422,9 @@ fn pages() -> Vec<Page> {
                 // 工人房间补满在岛上不做(全局拦岛上工人 getter 会把 99 写进岛档),只管主村。按钮位置与开关键名不变。
                 ("冷却归零(主村+黄金岛)", ToggleCheat("no_cooldown")),
                 ("建筑瞬完成(主村+黄金岛)", ToggleCheat("instant_build")),
-                ("工人房间补满(仅主村)", ToggleCheat("max_facility")),
+                // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 删掉 totalRooms 臂、工人 getter 改按调用点白名单返 99,
+                // 不再补房间,标签去掉「房间」。以前的旧逻辑已经经 encodeWithCoder: 写进 userinfo.dat 的 99 无法自动还原。开关键名不变。
+                ("工人补满(仅主村)", ToggleCheat("max_facility")),
                 ("产出×10(收菜)", ToggleCheat("harvest_mult")),
                 ("任务秒完成免费(主村+黄金岛)", ToggleCheat("free_quest")),
                 ("小游戏奖励满", ToggleCheat("minigame_reward")),
@@ -1384,6 +1386,7 @@ fn run_action(env: &mut Environment, action: Action) {
 /// 读某滑块种类的(显示名, 当前值, 上限, 是否被作弊覆盖)。当前值实时读游戏 UserInfoData。
 /// [2026-09-16] G-11 宿主 msg_send 同样经过 objc_msgSend 的作弊钩子:FORCE_LEVEL 开着时 curLevel 返回强制等级,
 /// max_facility 开着时 totalWorkers/totalRooms 恒返回 99。读法不改,只把「被覆盖」标出来,免得玩家以为存档已改。
+/// [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4)后 max_facility 不再覆盖宿主读到的工人/房间值,见下面 overridden。
 fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i64, bool) {
     let (name, max): (&'static str, i64) = match kind {
         SliderKind::Level => ("等级", 52),
@@ -1394,7 +1397,10 @@ fn slider_info(env: &mut Environment, kind: SliderKind) -> (&'static str, i64, i
     };
     let overridden = match kind {
         SliderKind::Level => crate::mole_cheats::level() > 0,
-        SliderKind::Workers | SliderKind::Rooms => crate::mole_cheats::is_on("max_facility"),
+        // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 只对 MAXFAC_GATE_LRS 里的人力门/HUD 调用点返回 99,
+        // 宿主 msg_send 的返回地址不在白名单里,这里读到的就是存档真值;totalRooms 臂整条删了。所以工人/房间不再标
+        // 「作弊覆盖」(否则开着开关时会误报)。与开关改名同一提交,K13 未合入时一起回退。
+        SliderKind::Workers | SliderKind::Rooms => false,
         SliderKind::Gold | SliderKind::VipGold => false,
     };
     // [2026-09-24 第四轮 K14 N-D2-4] 不在主村(判定同「工人数 = 20」的门)时,「工人」改读岛档
