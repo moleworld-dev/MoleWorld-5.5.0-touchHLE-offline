@@ -4975,6 +4975,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // ── [K3] ──
         // ── [K7] ──
         // ── [K8] ──
+        // [2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口吞掉打工归还的臂(ActorManager changeAvailableMolerForTask:)。按「受门控的 sel」
+        //   写法:没把 ActorManager 加进 CLASSES(那样它每帧的消息都要 to_string 两次、走完整条比较链);岛外只多一次原子读。
+        || (ON_ISLAND.load(O) && sel == "changeAvailableMolerForTask:")
         // ── [K11] ──
         // ── [K13] ──
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
@@ -7187,6 +7190,57 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 return true; // 吞掉:不跑真方法 → 不会 [0x1 isKindOfClass:] → 不崩
             }
             // target 为 nil 或有效指针:放行真方法(nil 由原版自己处理;gameMode 门已由 LR 收窄 hook 放行,布兰的家正常弹面板)。
+        }
+
+        // ★[2026-09-24 第四轮 K8 N-D2-1] 进岛加载窗口里的打工归还不再虚增工人。
+        //   原版时序:-[NewGameManager loadMapFromData:forNPC:] 在 0x245e0e 把 ActorManager.m_isLoadMap 置 1,随后 loadMapObjects
+        //   重扣加载期占用(商铺售卖中 0x31d4fc hearWithTarget:…loadData:1、出海船 blx@0x360e64 changeAvailableMolerForTask:(-onBoard)),
+        //   再进 endLoadMap@0x243a08:0x243a78 createNpcs(NewSceneQuest init 注册每帧 update:)、0x243ae0 把 createIdleWorkers:
+        //   排到 1 秒后、0x243af2 同步 checkActiveStoryQuest。createIdleWorkers:@0x241f74 要到 1 秒后才在 0x241fde 清 m_isLoadMap,
+        //   然后 0x24200e 起跑 NewSceneQuest/DailyQuest/CafeQuest 的 minusNeededWorkers(给进行中的打工任务扣人),0x242090 按空闲数
+        //   initMoleActors:。而已完成未领奖的岛任务(curQuestResult=哨兵,随 island_userinfo.dat 落盘)经 checkLastTimeState 再 finish、
+        //   离岛期间到期的打工任务经 update:@0x329efc 判到期 finish,都早于这一步;finish 在 blx@0x32a22c(-[NewSceneQuest finish])
+        //   调 [ActorManager changeAvailableMolerForTask:+n],岛日常同构在 blx@0x3414f6(-[DailyQuest finishCurrentQuest])。
+        //   该方法岛上分支只在 0x9daa0「idle>=total」时跳过,否则 0x9dba6 changeAvailableWorkers:(+n)、0x9dbb0 起 addMoleForTask:n
+        //   (blx 在 0x9dbd4,与 n<0 的 releaseMoleForTask: 共用)直接生成 n 只摩尔(不看 m_isLoadMap)。宿主 load_island_userinfo
+        //   让空闲数从总数起算(占用由加载期自行重扣),这 n 个人本会话从没扣过 → 空闲数 = 总数−k+n(k = 加载期已重扣的占用),
+        //   地图还多刷 n 只摩尔。
+        //   做法(移植者自拟的离线等价,让结果回到原版联网时服务器下发的净值):m_isLoadMap 仍为 1 = createIdleWorkers: 还没跑 =
+        //   本会话尚未给任何打工任务扣过人,此时来自这两个返回址的 +n 一律是虚增,吞掉;之后 minusNeededWorkers 见已完成
+        //   (NewSceneQuest 0x32aea2 哨兵 / DailyQuest 0x341c90 result==-1)跳过,空闲数 = 总数−k。窗口外(已清 0)照原版放行;
+        //   k=0 时原版护栏本就挡掉,吞不吞一样;窗口内玩家用贝壳秒完成往次会话接的任务走同一个 blx,吞掉同样正确
+        //   (本会话 1 秒内先接取 blx@0x3291d8 扣人再秒完成才会误吞,手动操作做不到,不另设判据)。
+        //   不改成在 load_island_userinfo 里预扣 n:k=0 时护栏会因此放行,addMoleForTask + initMoleActors:(总数) 反而多刷。
+        //   LR = blx 地址 + 4 且带 Thumb 位:0x32a22c → 0x32a231、0x3414f6 → 0x3414fb。签名 v12@0:4i8(返回 void,两处调用点
+        //   返回后都不读 r0);本臂只读内存、不发消息、不动寄存器。m_isLoadMap 偏移从 _OBJC_IVAR 槽 0xb03e54 现读(实值 +260,BOOL,
+        //   getter 0x9fb40 / setter 0x9fb50 读同一槽),槽值异常就放行。ActorManager 不在 CLASSES,粗筛走 intercept_wants 的 [K8] 槽位。
+        if ON_ISLAND.load(O)
+            && !env.options.network_access
+            && class == "ActorManager"
+            && sel == "changeAvailableMolerForTask:"
+            && (env.cpu.regs()[2] as i32) > 0
+        {
+            let lr = env.cpu.regs()[14];
+            if lr == 0x32a231 || lr == 0x3414fb {
+                let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03e54));
+                let self_bits = env.cpu.regs()[0];
+                if off != 0 && off < 0x1000 && self_bits != 0 {
+                    let loading: u8 = env.mem.read(ConstPtr::<u8>::from_bits(self_bits + off));
+                    if loading != 0 {
+                        log!(
+                            "[MOLECHEAT] island: 进岛加载窗口内吞掉打工归还 +{}(LR={:#x},{};m_isLoadMap=1,createIdleWorkers: 尚未扣人)",
+                            env.cpu.regs()[2] as i32,
+                            lr,
+                            if lr == 0x32a231 {
+                                "岛任务 NewSceneQuest finish"
+                            } else {
+                                "岛日常 DailyQuest finishCurrentQuest"
+                            }
+                        );
+                        return true;
+                    }
+                }
+            }
         }
 
         // ★Bug B 续(公寓雇用按了没真出摩尔):点雇用 NewSceneApartment 走 setCurrentProduceMoleNums:(old+1)
