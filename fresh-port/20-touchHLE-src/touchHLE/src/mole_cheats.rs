@@ -2674,7 +2674,63 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
 ///   黄金岛 getCurrentServerTime 钩子(岛上计时)、作物瞬熟算的 beginTime 目标、cf_fix_residue 的"未来"判据
 ///   都会和游戏读到的时钟差一个偏移(岛计时整体落后、残留修正误判)。偏移只增不减、在线模式由 mole_dev 拒绝设置,
 ///   所以无条件相加即可;单调时钟(Instant/mach_absolute_time)不受影响,本文件的节拍节流仍用 Instant。
+/// [2026-09-24 第四轮 K4 I4-05] 改成【单调】实现,墙钟取值挪到 wall_cf_secs。
+///   根因:原版 -[NewSceneTimer getCurrentServerTime]@0x22f60c 返回 latestServerTime_(+8)+currentTimerCount_(+12)
+///   (0x22f67e-0x22f68a),计数器由每秒调度一次的 -[NewSceneTimer timeCounterAdded]@0x22f54c(`adds r2,#1`)累加,
+///   会话内与设备时钟无关、只增不减;回前台时原版重新向服务器 getServerTime 对时。以前这里直读宿主墙钟,
+///   系统时间一往回拨,岛上的「现在」当场倒退,刚写下的 beginTime/beginDiscoverTime/beginUpgradeTime 全变成未来值
+///   (DiscoveryShip 完成判据 0x361e4e vsub + 0x361e56 vcmpe 恒判未完成),还会被节拍落盘写进 island_map.dat。
+///   做法(移植者自拟的离线等价):t = max(上次返回值 + 距上次的单调流逝, 墙钟 CF 秒 + 时间旅行偏移)。
+///   墙钟回拨 → 按单调时钟继续走、不倒退;休眠后墙钟领先 → 向前追平(等价原版回前台对时);时间旅行偏移只增不减,
+///   仍即时生效。进程内状态,重启后从墙钟重新起算(与原版每次登录由服务器 1065 重新对时同理)。
+///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据。
+///   该臂主村与岛共用(selref 0xade774 共 86 处):主村水塔 -[WaterTower innerupdate:]、-[RewardBox currentTime]、
+///   -[DailySignLayer getServerTime]、各活动倒计时也随之单调,与原版「服务器时间不随设备时钟回拨」一致;
+///   主村作物进度 -[CropInfoView updateObjectProgress:] 在主村分支直读 CFAbsoluteTimeGetCurrent(0xc435e),不受影响。
+///   ★游戏自己直读 CFAbsoluteTimeGetCurrent 的计时(作物 -[Farm innerupdate:]、NPC 冷却 -[NpcActor checkGiftMode:]
+///   0xef9de)不走 NewSceneTimer,凡是要与它们对齐的地方用 wall_cf_secs,不要用本函数。
 fn now_cf_secs() -> f64 {
+    let wall = wall_cf_secs();
+    let now = Instant::now();
+    let mut g = ISLAND_MONO_CLOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (t, lead_before) = match *g {
+        Some((last_t, last_at, last_lead)) => {
+            let mono = last_t + now.saturating_duration_since(last_at).as_secs_f64();
+            (if wall > mono { wall } else { mono }, last_lead)
+        }
+        None => (wall, 0.0),
+    };
+    let lead = t - wall;
+    *g = Some((t, now, lead));
+    drop(g);
+    // 墙钟回拨(领先量突增)/追平时各打一行,供无头测试核对;平时不打印(领先量稳定,不会刷屏)。
+    if lead - lead_before > 2.0 {
+        log!(
+            "[MOLECHEAT] island: 宿主墙钟回拨约 {:.0} 秒 → 岛时钟按单调计时继续 t={:.0}(墙钟 {:.0},领先 {:.0} 秒)",
+            lead - lead_before,
+            t,
+            wall,
+            lead
+        );
+    } else if lead_before > 2.0 && lead <= 0.0 {
+        log!(
+            "[MOLECHEAT] island: 宿主墙钟已追上岛时钟 t={:.0}(此前领先 {:.0} 秒)",
+            t,
+            lead_before
+        );
+    }
+    t
+}
+
+/// [2026-09-24 第四轮 K4 I4-05] now_cf_secs 的单调状态:(上次返回的 CF 秒, 当时的 Instant, 当时领先墙钟的秒数)。
+static ISLAND_MONO_CLOCK: Mutex<Option<(f64, Instant, f64)>> = Mutex::new(None);
+
+/// [2026-09-24 第四轮 K4 I4-05] guest 可见的墙钟 CFAbsoluteTime 秒(SystemTime::now + 时间旅行偏移,
+/// 即原 now_cf_secs 的实现,与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源)。游戏直读 CFAbsoluteTimeGetCurrent 的
+/// 计时(作物、NPC 冷却)要和它对齐,不能用单调的 now_cf_secs。
+fn wall_cf_secs() -> f64 {
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -2777,8 +2833,10 @@ pub(crate) fn farm_instant_mature_at(env: &mut Environment, recv: u32) -> bool {
     }
     let begin_ptr: MutPtr<f64> = Ptr::from_bits(recv + off_begin);
     let begin: f64 = env.mem.read(begin_ptr);
-    // now_cf_secs 与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源(SystemTime::now + 时间旅行偏移,见 F7-5),真方法紧接着取的 now 只会≥它。
-    let target = now_cf_secs() - mature as f64 - 0.5;
+    // wall_cf_secs 与 touchHLE 的 CFAbsoluteTimeGetCurrent 同源(SystemTime::now + 时间旅行偏移,见 F7-5),真方法紧接着取的 now 只会≥它。
+    // [2026-09-24 第四轮 K4 I4-05] now_cf_secs 已改成单调(墙钟回拨后会领先墙钟),这里必须用墙钟:
+    //   否则 target 可能落在 guest 的「现在」之后,innerupdate 0x485ce 见 elapsed<0 把 beginTime 重置成 now,瞬熟变成重种。
+    let target = wall_cf_secs() - mature as f64 - 0.5;
     if begin <= target {
         return true; // 本来就已过成熟点,交给原版
     }
@@ -8071,6 +8129,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   拦 getter 而不调原版 reset:reset 会取消再重新调度 timeCounterAdded(touchHLE 有"取消后重调度不复活"的前科),
     //   且后台/掉帧时计数器不走;三个 ivar 除 NewSceneTimer 自身外无人直读(xref 实证)。返回类型 L,88 个调用点均按无符号用。
     //   原 getter 在 isConnected(岛上被强制为真)时每次调用都发 1065,拦下后顺带消除。仅离线;在线走私服 1065 原版路径。
+    // [2026-09-24 第四轮 K4 I4-05] 取值来源 now_cf_secs 已改成单调实现(原版计数器只增不减,见 now_cf_secs 注释),
+    //   宿主系统时间回拨时岛上「现在」不再倒退。本臂仍是写 r0 后 return true,不发宿主消息、不碰其它寄存器。
     if class == "NewSceneTimer" && sel == "getCurrentServerTime" && !env.options.network_access {
         env.cpu.regs_mut()[0] = now_cf_secs().max(0.0) as u32;
         return true;
