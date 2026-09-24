@@ -58,9 +58,10 @@ static LOG1_AD_PROMPT: AtomicBool = AtomicBool::new(false);
 static LOG1_AD_MOREGAME: AtomicBool = AtomicBool::new(false);
 static LOG1_AD_ZHONGXIN: AtomicBool = AtomicBool::new(false);
 static LOG1_MAP_UPLOAD: AtomicBool = AtomicBool::new(false);
-/// [2026-09-16] F1-02 mapExtend 取景覆盖、F1-01 岛上 showWithTarget:selector: 非法哨兵 target 被吞掉,各自的首次 log! 标志
-/// (两处都可能每帧/每次点击命中,首次 log! 证明钩子生效,之后降为 log_dbg!)。
-static LOG1_MAPEXTEND_VIEW: AtomicBool = AtomicBool::new(false);
+/// [2026-09-16] F1-01 岛上 showWithTarget:selector: 非法哨兵 target 被吞掉的首次 log! 标志
+/// (每次点击都可能命中,首次 log! 证明钩子生效,之后降为 log_dbg!)。
+// [同步 iOS 2026-09-24] 原来同一处还有 F1-02 mapExtend 取景覆盖的 LOG1_MAPEXTEND_VIEW,取景覆盖臂已换成 iOS 的
+//   区键安全网 + 对账(见 fix_mapextend_on),它随之删除。(用普通注释,免得挂成下一行的文档注释。)
 static LOG1_ISLAND_BAD_TARGET: AtomicBool = AtomicBool::new(false);
 /// [扫描修 2026-09-15] F12-10 「左左右右」操作提示本进程是否已弹过(只弹一次)。
 static WASHROOM_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -3799,31 +3800,481 @@ pub fn restore_cracked_vipgold(env: &mut Environment) {
 /// [MoleWorld] 在线进村存档 mapExtend 写错的修复开关。mapExtend 低5位=已扩展地图区域位掩码;
 /// -[VillageLayer curVisibleArea] 取 `(unsigned __int8)mapExtend & 0x1F` 查可视区矩形。在线下发
 /// 的 userinfo.mapExtend=6(只2区)却配满图内容(到 y148)→ 查到小/空可视区 → 拖动摄像机夹值
-/// 震荡闪屏错位。强制 mapExtend getter 返回 0x1F(满图全区=不闪存档 287 的有效低字节)消除矛盾。
-/// MOLE_FIX_MAPEXTEND=1 启用(确认阶段);确认后改默认策略。
+/// 震荡闪屏错位。
+///
+/// ★现版只做「区键安全网」:只有 getter 被三个区域查表函数调用(见 [MAPEXTEND_AREA_LRS])、且低 5 位
+/// 不是 `setAreas` 建过表的合法键时,才临时补成包含它的最小合法键(见 [mapextend_area_key])。
+/// 其余所有调用者(存档、建桥/梯子的 `set(get() | bit)`、商店锁、成就、放置可达判定)一律拿真值——
+/// **绝不改玩法、绝不写存档、绝不白送扩地**(用户明令:白送会影响游戏机制)。合法存档上本修复等于不存在。
+/// 另整体接管 `-[ObjectManager checkMapExtendError]` 按存档证据对账(见 [mapextend_reconcile])。
+/// iOS 默认开,桌面由启动器 `MOLE_FIX_MAPEXTEND=1` 打开;`MOLE_FIX_MAPEXTEND=0` 可关。
+///
+/// ★血泪坑(v0.0.7 P0「更新后拖不到、缩不出下方扩展地图」):旧版让 getter 对**所有调用者**恒返回 0x1F。
+/// ①「扩展下方地图」是 **bit 0x100**(`-[UserInfoData extendBottomMap]` 直接 `mapExtend_ |= 0x100`),
+///   `-[UserInfoData isBottomMapExtended]` **直读 ivar 高字节**,getter 的返回值管不到它;
+/// ② 游戏会把 getter 的值**写回**:`encodeWithCoder:`(0xba240 `encodeInt:[self mapExtend] forKey:@"mapExtend"`)、
+///   `encodeUserInfoData`,以及建桥/梯子/摆扩地物件的 `setMapExtend:([self mapExtend] | bit)`
+///   ⇒ 每次存档或建桥都把 0x100 抹成 0x1F → 重启后 isBottomMapExtended=NO → `curVisibleArea` 不再把
+///   可视区扩到 y=0、h=mapMaxHeight(iPad 1110pt),`checkBounding` 把摄像机 y 夹在 extendHeight(315)以上,
+///   `zoom:touch2:` 的最小缩放 = winH/区高 从 768/1110≈0.69 抬到 768/795≈0.97 = 玩家看到的「拖不下去、缩不小」;
+/// ③ 同时低 5 位被永久写成 0x1F = 白送了左右桥/梯子/雪桥区并绕过它们的前置条件。
+/// 教训:拦截 getter 强改返回值前,必须查这个值会不会被写回持久化,以及同字段有没有绕过 getter 直读 ivar 的判定。
+///
 /// ★[深扫修 2026-09-11] #12 语义改成与 ui43_mode 一致的 `!= "0"`:以前 `var_os().is_some()` 让 MOLE_FIX_MAPEXTEND=0
 ///   也算开启,与启动器注释"设 0 可关"矛盾。此前不敢改,是因为启动器靠 export 它来"保住 any_enabled 为真";
 ///   现在 any_enabled 已与环境变量脱钩(见下),设 0 只会关掉 mapExtend 修复本身,不再连带关掉常驻钩子。
-/// ★[2026-09-16] F1-02 覆盖范围收窄:以前 getter 对全部 23 个调用点恒返回 0x1F,经 -[UserInfoData encodeWithCoder:] 每次存档
-///   都把 0x1F 永久写进 userinfo.dat,并直接放开未修桥/梯的扩地摆放、扩地成就与任务判定。现在只对 VillageLayer
-///   setBkg/curVisibleArea/curWalkableArea/curBornArea 这 4 个取景调用点返回 真值|0x1F(按调用者 LR 精确匹配,见
-///   MAPEXTEND_VIEW_LRS 与 intercept 里的 mapExtend 臂),其余调用点一律读真值。开关默认值未改(交用户决定);
-///   已被旧逻辑写成 0x1F 的存档无法自动还原。
+/// [同步 iOS 2026-09-24] main 09-16 F1-02 曾把覆盖收窄为「setBkg/curVisibleArea/curWalkableArea/curBornArea 4 个取景
+///   调用点返回 真值|0x1F」(MAPEXTEND_VIEW_LRS)。那版不再写进存档,但可行走区/出生区仍按满图 0x1F 算、setBkg 的雪桥位
+///   也被置上,等于继续白送扩地区;也没有收回已写进存档的 0x1F、补回被抹掉的下扩。合并时按用户明令改用 iOS 1b74a59 的
+///   区键安全网 + 对账,删掉了取景覆盖臂与 MAPEXTEND_VIEW_LRS。F1-02 查到的 23 个调用点里会写回的那些(encodeWithCoder:
+///   0xba246、encodeUserInfoData 0xbc47c、Bridge/Ladder onFinishHandler、moveBridge:/checkMapExtendError、
+///   addNewObject2Map:gift:)在区键安全网下一律读真值,不会再被写坏。
 fn fix_mapextend_on() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面启动器已把 MOLE_FIX_MAPEXTEND 默认置 1;iOS 没有启动器
-    // 和环境变量,默认开(MOLE_FIX_MAPEXTEND=0 可关)。其它平台行为不变。
+    // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面启动器已把 MOLE_FIX_MAPEXTEND 默认置 1(区键安全网防拖地图闪,
+    // 离线无服务器修不了坏存档只能客户端兜底);iOS 没有启动器和环境变量,默认开(MOLE_FIX_MAPEXTEND=0 可关)。
+    // 其它平台行为不变。
     *V.get_or_init(|| {
+        // 首次求值时抓启动存档修改时间:此刻 guest 还没来得及存档(见 mapextend_reconcile 的污染窗口判定;
+        // intercept 的一次性启动入口会先求值一次)。
+        let _ = mapextend_boot_snapshot();
         std::env::var("MOLE_FIX_MAPEXTEND")
             .map(|v| v != "0")
             .unwrap_or(cfg!(target_os = "ios"))
     })
 }
 
-/// [2026-09-16] F1-02 mapExtend 取景覆盖只认这 4 个调用者返回址(Thumb 返回址 = blx 地址 + 4 | 1,re.py annot 逐个核对):
-///   -[VillageLayer setBkg] blx@0x334b8、curVisibleArea blx@0x350a4、curWalkableArea blx@0x351d8、curBornArea blx@0x3535c。
-const MAPEXTEND_VIEW_LRS: [u32; 4] = [0x334bd, 0x350a9, 0x351dd, 0x35361];
+/// `-[VillageLayer setAreas]`(0x33bb4)给 visibleAreas/bornAreas/walkableAreas 建表用的合法区键(低 5 位):
+/// 基础 1 → 左右桥 2/4 → 梯子 8 → 雪桥 0x10 的前置链组合,与 `+[GameData isValidMapExtend:]` 位图 0xa000a0aa 一致。
+const MAPEXTEND_VALID_KEYS: [u16; 8] = [1, 3, 5, 7, 13, 15, 29, 31];
+
+/// 三个区域查表函数里 `[userInfoData mapExtend]` 调用的返回地址(Thumb 位已清):
+/// curVisibleArea 0x350a4 / curWalkableArea 0x351d8 / curBornArea 0x3535c 处 `blx _objc_msgSend` 的下一条指令。
+const MAPEXTEND_AREA_LRS: [u32; 3] = [0x350a8, 0x351dc, 0x35360];
+
+/// 低 5 位不是合法区键时,补成包含它的最小合法键(高位原样保留);合法时返回 None = 放行真值。
+fn mapextend_area_key(v: u16) -> Option<u16> {
+    let key = v & 0x1F;
+    if MAPEXTEND_VALID_KEYS.contains(&key) {
+        return None;
+    }
+    let k = MAPEXTEND_VALID_KEYS
+        .iter()
+        .copied()
+        .find(|&k| k & key == key)
+        .unwrap_or(0x1F);
+    Some((v & !0x1F) | k)
+}
+
+/// 下扩带(bit 0x100)格子判据,iPad:`-[Porter isBeyondMapBottom]`(0x3035c)= 基准点图层 y <
+/// extendHeight − halfTileHeight = 300;图层 y = 1065 − 30·line + 15·(col&1)
+/// ⇒ 偶数列 line≥26、奇数列 line≥27。网格固定 36 行 × 185 列(`-[Map init]` 0x27a30)。
+fn mapextend_in_bottom_band(line: i32, col: i32) -> bool {
+    (0..=35).contains(&line)
+        && (-36..=148).contains(&col)
+        && line >= if col & 1 == 0 { 26 } else { 27 }
+}
+
+/// 本移植的存档沙盒宿主目录:与 `Fs::new`(fs.rs 556~559)同构,
+/// `user_data_base_path()/touchHLE_sandbox/<bundle id>/Documents`。
+fn mapextend_save_dir() -> std::path::PathBuf {
+    crate::paths::user_data_base_path()
+        .join(crate::paths::SANDBOX_DIR)
+        .join("com.taomee.MoleWorld")
+        .join("Documents")
+}
+
+/// 带病 getter(对所有调用者强返 0x1F)的生效起点:启动时存档修改时间不早于此刻的存档才可能被污染。按平台分开:
+/// - iOS:带病 getter 最早进入 iOS 树(且 iOS 默认开)是 c9ad2b6(2026-09-05 17:27 +08:00);
+///   取当天 00:00 +08:00 = 2026-09-04T16:00:00Z 作界。
+#[cfg(target_os = "ios")]
+const MAPEXTEND_TAINT_EPOCH_UNIX: u64 = 1_788_537_600;
+/// - 桌面:同一个「对所有调用者恒返回 0x1F」的 getter 随 a4cca3a(2026-06-11 01:15 -0700 = 16:15 +08:00)进入 main,
+///   mac 启动器(先是账号菜单测试启动器,主启动器 dcc37f9 于 09-05 跟进)从那时起默认 MOLE_FIX_MAPEXTEND=1,
+///   直到 main 09-16 F1-02 才把覆盖收窄(之前写过盘的 0x1F 仍留在存档里)。
+///   取 a4cca3a 当天 00:00 +08:00 = 2026-06-10T16:00:00Z(unix 1_781_107_200)作界。
+#[cfg(not(target_os = "ios"))]
+const MAPEXTEND_TAINT_EPOCH_UNIX: u64 = 1_781_107_200;
+
+/// 启动时(guest 任何代码运行之前)`userinfo.dat` 的修改时间 = 上一次会话最后一次存档的时刻。
+/// 由 [fix_mapextend_on] 首次求值时抓取(intercept 的一次性启动入口会先求值一次,早于游戏第一次存档)。
+static MAPEXTEND_BOOT_MTIME: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+fn mapextend_boot_snapshot() -> Option<u64> {
+    *MAPEXTEND_BOOT_MTIME.get_or_init(|| {
+        std::fs::metadata(mapextend_save_dir().join("userinfo.dat"))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    })
+}
+
+/// 「收回白送低位」只做一次的标记,放在存档同目录,随「文件」App 导入导出一起走。
+/// 不能占 mapExtend 高位:`checkAchieve_ReqMap`(0x1f57a6)数的是全部置位。
+fn mapextend_marker_path() -> std::path::PathBuf {
+    mapextend_save_dir().join("mole_mapextend_v007_reconciled")
+}
+
+/// [MoleWorld · v0.0.7 事故善后] 整体接管 `-[ObjectManager checkMapExtendError]`(0x44b10)。
+///
+/// 挂点:全二进制唯一调用点 `-[GameManager endLoadCallBack]` 0x1a314,在 `startGame:` 同步加载完
+/// 地图物件之后执行;返回 YES 时调用方 0x1a338 会 `[villageLayer setAreas]`。
+/// 只凭存档里的证据改 mapExtend,**绝不白送**(用户明令),只动自家 `GameData.userInfoData_`:
+/// - 原版语义(每次):已完工左/右桥(getter 0x419bc/0x41abc 按 isFinished 过滤)补位 2/4。
+/// - ① 收回 v0.0.7 白送的低位(用户选「稳妥收回」),**一次性**,且只对「低 5 位 == 0x1F、
+///   启动时存档修改时间晚于 [MAPEXTEND_TAINT_EPOCH_UNIX]」的存档(之前没被带病版本写过盘的老档一律不碰)。
+///   证据 = 任意状态(含在建)的桥/梯子原始 ivar 数组,加「底座格所在区有物件」(与原版准入
+///   `-[Porter isReachable]` 0x294ac 只看 baseTile 一致):
+///   · 雪桥 0x10 = 有梯子 || 4 区有物件 || 地图上有雪桥物件本体(objectId 20002);
+///   · 梯子 8 = 有梯子 || 3 区有物件 || 保留雪桥;
+///   · 右桥 4 = 有右桥 || 2 区有物件 || 保留梯子(梯子格全在 2 区,且原版可视区要求右桥);
+///   · 左桥 2 = 有左桥 || 0 区有物件。
+///   在建的桥/梯子算证据:它们完工时 onFinishHandler 本就会无条件补位,提前保留不算白送,
+///   还避免事后补位写出 setAreas 没建表的键(9/11)。结果恒为 {1,3,5,7,13,15,29,31}。
+///   收回后立刻 `[GameData saveToLocal]` 落盘,再写标记;之后删梯子、挪桥等合法变化不会再触发收回。
+/// - ② 补回被抹掉的下扩 bit 0x100(每次,只加不减):成就 16「领主」(req_map=6,v0.0.7 下最多 5 位
+///   刷不出来)已解锁——`achieveAlreadyUnlock` 有键 16,或 `achievementStateRecord[16]` 带解锁标志
+///   0x10000000(0x1f4d88);或有非桥梯物件的 baseTile 落在下扩带。补位只用 `setMapExtend:`,
+///   不调 `extendBottomMap`(它会触发成就检查)。
+/// 已知残留(已向用户说明):买过下扩但下扩带没物件、也没领主成就的存档,数据层面无从取证;
+/// 按规则保留下来的白送位 + 补回的下扩可能凑满 6 位,原版约 0.1 秒后会解锁领主成就。
+/// [同步 iOS 2026-09-24] 在线模式(--allow-network-access)只做原版语义那一段(已完工桥补位 2/4),①收回、②补下扩、
+/// 写标记都不做:在线时私服是 mapExtend 的权威,服务端本来就给所有人发 map_extend=0x1F,本地收回会和服务器下发的值
+/// 打架(下次登录又被覆盖回去,还可能把收回结果经 updateInfoToServer 传上去)。离线单机照上面的规则对账。
+fn mapextend_reconcile(env: &mut Environment, om: id) -> bool {
+    fn sel(env: &mut Environment, name: &str) -> SEL {
+        env.objc.register_host_selector(name.to_string(), &mut env.mem)
+    }
+    fn count(env: &mut Environment, arr: id) -> u32 {
+        if arr == nil {
+            return 0;
+        }
+        let s = sel(env, "count");
+        msg_send(env, (arr, s))
+    }
+    fn at(env: &mut Environment, arr: id, i: u32) -> id {
+        let s = sel(env, "objectAtIndex:");
+        msg_send(env, (arr, s, i))
+    }
+    fn ivar_id(env: &mut Environment, obj: id, name: &str) -> id {
+        env.objc
+            .object_lookup_ivar(&env.mem, obj, &name.to_string())
+            .map(|p| -> MutPtr<u32> { p.cast() })
+            .map(|p| Ptr::from_bits(env.mem.read(p)))
+            .unwrap_or(nil)
+    }
+    fn any_finished(env: &mut Environment, arr: id) -> bool {
+        let s_fin = sel(env, "isFinished");
+        for i in 0..count(env, arr) {
+            let o = at(env, arr, i);
+            if o != nil {
+                let fin: bool = msg_send(env, (o, s_fin));
+                if fin {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    fn is_dict(env: &mut Environment, obj: id) -> bool {
+        if obj == nil {
+            return false;
+        }
+        let cls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+        let s = sel(env, "isKindOfClass:");
+        msg_send(env, (obj, s, cls))
+    }
+    /// 字典里键 intValue == want 的值;`with_flag` 非 0 时还要求该值 unsignedIntValue 含此标志。
+    fn dict_has(env: &mut Environment, dict: id, want: i32, with_flag: u32) -> bool {
+        if !is_dict(env, dict) {
+            return false;
+        }
+        let s_keys = sel(env, "allKeys");
+        let keys: id = msg_send(env, (dict, s_keys));
+        let s_int = sel(env, "intValue");
+        for i in 0..count(env, keys) {
+            let k = at(env, keys, i);
+            if k == nil {
+                continue;
+            }
+            let v: i32 = msg_send(env, (k, s_int));
+            if v != want {
+                continue;
+            }
+            if with_flag == 0 {
+                return true;
+            }
+            let s_get = sel(env, "objectForKey:");
+            let val: id = msg_send(env, (dict, s_get, k));
+            if val != nil {
+                let s_u = sel(env, "unsignedIntValue");
+                let bits: u32 = msg_send(env, (val, s_u));
+                if bits & with_flag != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    let s = sel(env, "sharedInstance");
+    let gd: id = msg_send(env, (gd_cls, s));
+    if gd == nil {
+        return false;
+    }
+    let s = sel(env, "userInfoData");
+    let ui: id = msg_send(env, (gd, s));
+    if ui == nil {
+        return false;
+    }
+    // gameMode 为 0/6 时 userInfoData 返回别人的 remoteUserInfoData_;迁移只动自家 userInfoData_@100。
+    let own = ivar_id(env, gd, "userInfoData_");
+    let slot = env
+        .objc
+        .object_lookup_ivar(&env.mem, ui, &"mapExtend_".to_string())
+        .map(|p| -> MutPtr<u16> { p.cast() });
+    let Some(slot) = slot else {
+        return false;
+    };
+    let orig: u16 = env.mem.read(slot);
+    let mut m = orig;
+
+    // 原版 checkMapExtendError(0x44bea / 0x44c96):只认已完工的桥。
+    let s = sel(env, "leftBridges");
+    let left_done: id = msg_send(env, (om, s));
+    let s = sel(env, "rightBridges");
+    let right_done: id = msg_send(env, (om, s));
+    let e2 = any_finished(env, left_done);
+    let e4 = any_finished(env, right_done);
+    if e2 {
+        m |= 2;
+    }
+    if e4 {
+        m |= 4;
+    }
+
+    // 在线模式私服权威:只做上面的原版补桥位,不收回、不补下扩、不写标记(见函数注释)。
+    let online = env.options.network_access;
+    let mine = ui == own;
+    let marker = mapextend_marker_path().exists();
+    let boot_mtime = mapextend_boot_snapshot();
+    let tainted = boot_mtime.is_some_and(|t| t >= MAPEXTEND_TAINT_EPOCH_UNIX);
+    let mut want_revert = !online && mine && !marker && tainted && (orig & 0x1F) == 0x1F;
+    let want_bottom = !online && mine && (orig & 0x100) == 0;
+
+    // 任意状态(含在建)的桥/梯子:ObjectManager 原始 ivar 数组(@244/@248/@252)。
+    let left_any = ivar_id(env, om, "leftBridges");
+    let right_any = ivar_id(env, om, "rightBridges");
+    let ladders_any = ivar_id(env, om, "ladders");
+    let has_left = count(env, left_any) > 0;
+    let has_right = count(env, right_any) > 0;
+    let has_ladder = count(env, ladders_any) > 0;
+
+    let mut occ = [false; 6];
+    let mut snow_obj = false;
+    let mut band: Option<(i32, i32, i32)> = None;
+    // 本该判收回、却因为拿不到占区证据而没判:这种情况下【不写】一次性标记,下次进村再判。
+    let mut revert_deferred = false;
+    if want_revert || want_bottom {
+        let s = sel(env, "objects");
+        let objs: id = msg_send(env, (om, s));
+        let vals: id = if objs == nil {
+            nil
+        } else {
+            let s = sel(env, "allValues");
+            msg_send(env, (objs, s))
+        };
+        let wm_cls = env.objc.get_known_class("WrapperManager", &mut env.mem);
+        let s = sel(env, "sharedManager");
+        let wm: id = msg_send(env, (wm_cls, s));
+        let map: id = if wm == nil {
+            nil
+        } else {
+            let s = sel(env, "runtimeMap");
+            msg_send(env, (wm, s))
+        };
+        if want_revert && (vals == nil || map == nil) {
+            // 拿不到占区证据就不收回,宁可留着白送也不误收。
+            log!("[MOLECHEAT] mapExtend 对账:objects/runtimeMap 为空,本次跳过收回(不写标记,下次进村再判)");
+            want_revert = false;
+            revert_deferred = true;
+        }
+        let s_type = sel(env, "type");
+        let s_base = sel(env, "baseTile");
+        let s_data = sel(env, "data");
+        let s_oid = sel(env, "objectId");
+        let s_line = sel(env, "line");
+        let s_col = sel(env, "column");
+        let s_region = sel(env, "regionOfTile:");
+        for i in 0..count(env, vals) {
+            let o = at(env, vals, i);
+            if o == nil {
+                continue;
+            }
+            let ty: i32 = msg_send(env, (o, s_type));
+            if ty == 6 || ty == 7 {
+                continue; // 桥 / 梯子本身,另作证据
+            }
+            let base: id = msg_send(env, (o, s_base));
+            if base == nil {
+                continue;
+            }
+            let data: id = msg_send(env, (o, s_data));
+            if data != nil {
+                let oid: i32 = msg_send(env, (data, s_oid));
+                if oid == 0x4e22 {
+                    snow_obj = true; // addObject: 0x4377c 路径进来的雪桥物件本体
+                }
+            }
+            if want_bottom && band.is_none() {
+                let line: i32 = msg_send(env, (base, s_line));
+                let col: i32 = msg_send(env, (base, s_col));
+                if mapextend_in_bottom_band(line, col) {
+                    band = Some((ty, line, col));
+                }
+            }
+            if want_revert {
+                let r: i32 = msg_send(env, (map, s_region, base));
+                if (0..6).contains(&r) {
+                    occ[r as usize] = true;
+                }
+            }
+        }
+    }
+
+    let mut revoked = 0u16;
+    if want_revert {
+        let keep10 = has_ladder || occ[4] || snow_obj;
+        let keep8 = has_ladder || occ[3] || keep10;
+        let keep4 = has_right || occ[2] || keep8;
+        let keep2 = has_left || occ[0];
+        let new_low = 1
+            | if keep2 { 2 } else { 0 }
+            | if keep4 { 4 } else { 0 }
+            | if keep8 { 8 } else { 0 }
+            | if keep10 { 0x10 } else { 0 };
+        let new = (m & !0x1F) | new_low;
+        revoked = m & !new & 0x1F;
+        m = new;
+    }
+    let mut ach16 = false;
+    if want_bottom {
+        let s = sel(env, "achieveAlreadyUnlock");
+        let d1: id = msg_send(env, (ui, s));
+        let s = sel(env, "achievementStateRecord");
+        let d2: id = msg_send(env, (gd, s));
+        ach16 = dict_has(env, d1, 16, 0) || dict_has(env, d2, 16, 0x1000_0000);
+        if ach16 || band.is_some() {
+            m |= 0x100;
+        }
+    }
+
+    let changed = m != orig;
+    if changed {
+        let s = sel(env, "setMapExtend:");
+        let _: () = msg_send(env, (ui, s, m));
+        if revoked & 0x10 != 0 {
+            // endLoadMap 0x20224 已按旧值塞了雪桥占位、setBkg 0x3358a 已跳过挡路石头:本局就地还原。
+            let s = sel(env, "snowBridge");
+            let snow: id = msg_send(env, (om, s));
+            if snow != nil {
+                let s = sel(env, "removeAllObjects");
+                let _: () = msg_send(env, (snow, s));
+            }
+            mapextend_restore_stone(env);
+        }
+    }
+    // [2026-09-24 融合复核修] 原来只要 !online && mine && !marker 就写标记,连「证据缺失、本次跳过收回」
+    //   也写 → 被污染的存档从此失去收回机会。改为跳过收回的那一次不写标记。
+    if !online && mine && !marker && !revert_deferred {
+        if revoked != 0 {
+            // 先让游戏把对账结果落盘,再写标记:标记在、档没落盘时下次会跳过收回。
+            let s = sel(env, "saveToLocal");
+            let _: () = msg_send(env, (gd, s));
+        }
+        if let Err(e) = std::fs::write(mapextend_marker_path(), b"v0.0.7 mapExtend reconciled\n") {
+            log!("[MOLECHEAT] mapExtend 对账标记写入失败:{e}");
+        }
+    }
+    log!(
+        "[MOLECHEAT] mapExtend 对账 {:#x} → {:#x} | 收回低位 {:#x}(已判:{}) | 证据 左桥{} 右桥{} 梯子{} 雪桥物件{} 底座占区{:?} | 下扩补回证据 成就16={} 下扩带物件={:?} | 标记{} 启动存档时间{:?} 自家{} 在线{}",
+        orig,
+        m,
+        revoked,
+        want_revert,
+        has_left,
+        has_right,
+        has_ladder,
+        snow_obj,
+        occ,
+        ach16,
+        band,
+        marker,
+        boot_mtime,
+        mine,
+        online
+    );
+    changed
+}
+
+/// 收回雪桥后本局补回挡路石头:照抄 `-[VillageLayer setBkg]` 0x334c8~0x335a6(iPad 分支)。
+fn mapextend_restore_stone(env: &mut Environment) {
+    fn sel(env: &mut Environment, name: &str) -> SEL {
+        env.objc.register_host_selector(name.to_string(), &mut env.mem)
+    }
+    let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+    let s = sel(env, "sharedManager");
+    let gm: id = msg_send(env, (gm_cls, s));
+    if gm == nil {
+        return;
+    }
+    let s = sel(env, "villageLayer");
+    let vl: id = msg_send(env, (gm, s));
+    if vl == nil {
+        return;
+    }
+    let s = sel(env, "getChildByTag:");
+    let old: id = msg_send(env, (vl, s, 0x63i32));
+    if old != nil {
+        return;
+    }
+    let dev_cls = env.objc.get_known_class("TMDevice", &mut env.mem);
+    let s = sel(env, "sharedDevice");
+    let dev: id = msg_send(env, (dev_cls, s));
+    if dev == nil {
+        return;
+    }
+    let s = sel(env, "isIpad");
+    let ipad: bool = msg_send(env, (dev, s));
+    let s = sel(env, "isRetinaDisplay");
+    let retina: bool = msg_send(env, (dev, s));
+    if !ipad && !retina {
+        // iPhone 非 retina 在 setBkg 里走另一分支(0x3385a,stone@iphone.png),本移植是 iPad,不复刻。
+        return;
+    }
+    let name = crate::frameworks::foundation::ns_string::from_rust_string(env, "stone.png".to_string());
+    let sp_cls = env.objc.get_known_class("CCSprite", &mut env.mem);
+    let s = sel(env, "spriteWithSpriteFrameName:");
+    let sp: id = msg_send(env, (sp_cls, s, name));
+    let s = sel(env, "release");
+    let _: () = msg_send(env, (name, s));
+    if sp == nil {
+        return;
+    }
+    let s = sel(env, "setAnchorPoint:");
+    let _: () = msg_send(env, (sp, s, CGPoint { x: 0.5, y: 1.0 }));
+    let pos = if retina {
+        CGPoint { x: 2000.0, y: 475.0 }
+    } else {
+        CGPoint { x: 4000.0, y: 950.0 }
+    };
+    let s = sel(env, "setPosition:");
+    let _: () = msg_send(env, (sp, s, pos));
+    let s = sel(env, "addChild:z:tag:");
+    let _: () = msg_send(env, (vl, s, sp, 8i32, 0x63i32));
+}
 
 /// objc/messages.rs 进入 intercept 的总闸。
 /// ★[深扫修 2026-09-11] #12 无条件返回 true。
@@ -5406,6 +5857,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   startup 只调一次(早于游戏读档:GameData 在 CLASSES 里,loadUserInfoData 首次进来时它已先跑)。
     //   startup 可能发宿主消息,而本条消息稍后可能被放行 → 快照并恢复 r0-r3。
     if !DEV_STARTUP_DONE.load(O) && !DEV_STARTUP_DONE.swap(true, O) {
+        // [同步 iOS 2026-09-24] mapExtend 对账要的「启动时 userinfo.dat 修改时间」在 fix_mapextend_on() 首次求值时抓取
+        //   (见 mapextend_boot_snapshot)。iOS 分支靠 any_enabled() 每条消息都调它;main 的 any_enabled 已恒真、不再调,
+        //   所以改在这个一次性入口先求值一次:存档都由 GameData 的消息发起(GameData 在 CLASSES 里),必定晚于这里。
+        //   只读环境变量和宿主文件元数据,不发消息、不碰寄存器。
+        let _ = fix_mapextend_on();
         let saved = [
             env.cpu.regs()[0],
             env.cpu.regs()[1],
@@ -6982,47 +7438,50 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
     }
 
-    // [MoleWorld] mapExtend 修复(见 fix_mapextend_on() 注释):在线进村存档 mapExtend=6 与满图
-    // 内容不一致 → curVisibleArea/curWalkableArea/curBornArea/setBkg 算出错误可视区 → 拖动闪。
-    // ★[2026-09-16] F1-02 只在这 4 个取景调用点生效,返回 真值|0x1F(保留 0x1F 以上的位,如存档 287=0x11F 的 0x100)。
-    //   根因:以前对 -[UserInfoData mapExtend]@0xbd6cc(`ldrh r0,[r0,r1]` 读 mapExtend_ +72,纯 u16 getter)的全部 23 个调用点
-    //   都返回 0x1F:encodeWithCoder: 在 0xba246 取值编码 → 每次存档把 0x1F 永久写进 userinfo.dat;encodeUserInfoData
-    //   0xbc47c 上传私服;Bridge/Ladder onFinishHandler、ObjectManager moveBridge:/checkMapExtendError、VillageMenuLayer
-    //   addNewObject2Map:gift: 读后 orr 再 setMapExtend: 把假值写回 ivar;Porter isReachable 摆放可达、GameData getLockType4Object:、
-    //   Quest 任务与 AchievementControl checkAchieve_ReqMap 成就判定全被直接满足。与深扫 #5 encryptCurLevel 显示覆盖漏进存档同类。
-    //   现在按调用者 LR 精确匹配 MAPEXTEND_VIEW_LRS(四处取值后都只用低 5 位:0x350c0/0x351f4 and #0x1f、0x35364 ands #0x1f、
-    //   setBkg 存到 [sp,#0xa0] 后全函数只在 0x3358a tst #0x10 用一次;所以 真值|0x1F 与旧的恒 0x1F 对这 4 处效果完全相同),
-    //   其余调用点一律放行真 getter。不加在线门控(离线也有早先在线同步来的 mapExtend=6 本地坏档要兜底);不额外调
-    //   checkMapExtendError(原版 -[GameManager endLoadCallBack]+0x30 已调,且它只补 0x2/0x4 两位)。
-    if fix_mapextend_on() {
-        if let ("UserInfoData", "mapExtend") = (class, sel) {
-            let lr = env.cpu.regs()[14];
-            if MAPEXTEND_VIEW_LRS.contains(&lr) {
-                let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
-                let real: Option<u16> = if recv == nil {
-                    None
-                } else {
-                    env.objc
-                        .object_lookup_ivar(&env.mem, recv, &"mapExtend_".to_string())
-                        .map(|p| {
-                            let p: MutPtr<u16> = p.cast();
-                            env.mem.read(p)
-                        })
-                };
-                // 查不到 ivar(理论上不会)时退回旧值 0x1F:只影响这 4 个取景调用点,不会进存档。
-                let ret: u32 = real.map_or(0x1F, |r| (r as u32) | 0x1F);
-                log_first_then_dbg!(
-                    LOG1_MAPEXTEND_VIEW,
-                    "[MOLECHEAT] mapExtend 取景覆盖:LR={:#x} 真值={:?} → 返回 {:#x}(只改 4 个取景调用点,存档/扩地/成就/任务读真值)",
-                    lr,
+    // [MoleWorld] mapExtend 区键安全网(见 fix_mapextend_on() 注释):在线进村存档 mapExtend=6 这类
+    // 低 5 位非法键会让 curVisibleArea/curWalkableArea/curBornArea 查到 nil → CGRectZero → 拖动闪。
+    // 只在这三个查表函数里、且键非法时临时补全;其余调用者一律放行真 getter——不改玩法、不写存档、
+    // 不白送扩地(v0.0.7 对所有调用者强返 0x1F 被写回,抹掉了下扩 bit 0x100,见 P0)。
+    // ★纯读 ivar,不发消息、不写回(见 touchhle-intercept-register-clobber)。
+    // [同步 iOS 2026-09-24] 本臂与下面的 checkMapExtendError 接管臂取代 main 09-16 F1-02 的「4 个取景调用点返回 真值|0x1F」:
+    //   那版对 curWalkableArea/curBornArea 也按满图 0x1F 算可行走区/出生区,等于白送扩地区(违反「不许白送任何扩地」);
+    //   setBkg 的 0x10 位(雪桥挡路石头)也被改写。现在只在低 5 位不是合法区键时补成包含它的最小合法键,setBkg 读真值。
+    if fix_mapextend_on()
+        && class == "UserInfoData"
+        && sel == "mapExtend"
+        && MAPEXTEND_AREA_LRS.contains(&(env.cpu.regs()[14] & !1u32))
+    {
+        let me: id = Ptr::from_bits(env.cpu.regs()[0]);
+        let real: Option<u16> = if me == nil {
+            None
+        } else {
+            env.objc
+                .object_lookup_ivar(&env.mem, me, &"mapExtend_".to_string())
+                .map(|p| -> MutPtr<u16> { p.cast() })
+                .map(|slot| env.mem.read(slot))
+        };
+        if let Some((real, fixed)) = real.and_then(|r| mapextend_area_key(r).map(|f| (r, f))) {
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, O) < 8 {
+                log!(
+                    "[MOLECHEAT] mapExtend 区键安全网 {:#x} → {:#x}(仅区域查表,不写存档)",
                     real,
-                    ret
+                    fixed
                 );
-                env.cpu.regs_mut()[0] = ret;
-                return true;
             }
-            // 其余 19 个调用点:放行真 getter。
+            env.cpu.regs_mut()[0] = fixed as u32;
+            return true;
         }
+    }
+    // [MoleWorld · v0.0.7 事故善后] 整体接管 -[ObjectManager checkMapExtendError](物件加载完之后的
+    // 唯一扩地自检点):保留原版补桥位,并按存档证据收回白送低位、补回被抹掉的下扩。见 mapextend_reconcile。
+    // 在线模式(私服权威)只做原版补桥位那一段,见 mapextend_reconcile 的在线说明。
+    // 返回 BOOL(类型编码 c8@0:4)写 r0;接管模式,msg_send 安全。
+    if fix_mapextend_on() && class == "ObjectManager" && sel == "checkMapExtendError" {
+        let om: id = Ptr::from_bits(env.cpu.regs()[0]);
+        let changed = mapextend_reconcile(env, om);
+        env.cpu.regs_mut()[0] = changed as u32;
+        return true;
     }
 
     // All shop / collection items reported as unlocked.

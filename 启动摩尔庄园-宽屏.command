@@ -31,6 +31,10 @@ echo ""
 
 APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
 cd "$TOUCHHLE_DIR" || exit 1
+# ★[2026-09-24] MOLE_FIX_MAPEXTEND(与 iOS 分支统一):只在村庄可视区/可行走区/出生区三个查表点,且存档里的扩地位
+#   不是合法组合(例如坏档 mapExtend=6)时,临时补成包含它的最小合法组合来消除拖图闪屏;合法存档上等于不存在。
+#   存档、扩地摆放、成就和任务一律按真实 mapExtend,不白送任何扩地。另外每次进自家村会按存档证据对账:
+#   2026-06-11 以后被旧版「恒返回 0x1F」写坏的存档,会一次性稳妥收回白送的扩地位,并补回被抹掉的下扩。设 0 关。
 export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"
 # ★UI 4:3 虚拟化:商店/结算/选关/弹窗等复杂布局 UI 按原设计 1024 布局并居中,世界场景仍 Hor+(见 mole_cheats.rs UI43)
 export MOLE_UI43="${MOLE_UI43:-1}"

@@ -14,8 +14,8 @@ export MOLE_MIMI="${MOLE_MIMI:-88888888}"                  # 登录米米号
 export MOLE_SERVER="${MOLE_SERVER:-159.54.175.68:7821}"     # 私服 IP:端口(或 login.moleworld.net:7821)
 export MOLE_PASSWORD="${MOLE_PASSWORD:-}"                   # 密码(空=服务器宽松接受)
 export MOLE_HUD="${MOLE_HUD:-0}"                            # 调试悬浮窗:默认关,1=开
-# ★[2026-09-16] MOLE_FIX_MAPEXTEND:只让村庄取景、可行走区和出生区按满图计算(返回真值|0x1F),用来消除本地坏档造成的拖图闪屏;
-#   存档、扩地摆放、成就和任务仍按真实 mapExtend。本地坏存档/服务端未部署时的客户端兜底;设 0 关。
+# ★[2026-09-24] MOLE_FIX_MAPEXTEND(与 iOS 分支统一):只在村庄可视区/可行走区/出生区三个查表点,且扩地位不是合法组合时
+#   临时补成最小合法组合来消除拖图闪屏;不白送扩地、不写存档。在线模式私服是权威,只做原版的已完工桥补位,不做收回。设 0 关。
 export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"
 # ===========================================================================
 
