@@ -8616,11 +8616,53 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             // 这是 all_unlock 之前的空白(它只管"已解锁显示"),与既有
             // getLockType4ShopItem:shop:→0 同构。作物/物品/家具/宠物/头像/礼物/房间/音乐厅
             // 装扮/海洋岛物品在使用层面全部解锁。
+            // [2026-09-24 第四轮 K13 I7-4] 岛上 NewSceneData getLockType4Object:(i12@0:4@8)从统一返 0 中拆出:保留原版锁 6
+            //   (已拥有/限购)与扩地顺序锁 5,其余照旧全解锁。
+            //   根因:以前恒返回 0,原版「已拥有」锁 6 被一起跳过 —— 0x21e906-0x21e93a(31001 且 extendMap&0x2)、0x21e944-0x21e978
+            //   (31002 且 &0x4)、0x21e982-0x21e9d2(31003 且 &0x8)、0x21e9dc-0x21ea2c(31004 且 &0x10),以及 isHaveUnvisbleObject:
+            //   等限购判定。-[NewStyleStoreMainLayer onBuyItem:]@0x3b2620 只认这一个锁,于是已拥有的扩充土地能重复购买:
+            //   -[NewSceneVillageMenuLayer addNewObject2Map:gift:] 在 0x25c21a 等处 showCostGoldView: 照扣 1~4 万豆,0x25c280 的
+            //   orr 对已置位掩码无变化,0x25c6f6 saveUserinfoBothInLocalAndRemote 把扣款写进主档。扩地前置锁 5(0x21e6a4-0x21e77e:
+            //   req_id 未拥有时按 extendMap 位判 31002/31003/31004 的前一块)也被跳过,先买 31003 会造出 extendMap=9 这种跳序掩码,
+            //   岛上可视/可行走/出生三区同时塌成 0(读档规整那一半在 K2)。
+            //   做法:重入标志 ALLUNLOCK_REAL_CALL 置位 → 宿主 msg_send 同一选择子拿原版真值(参数原样取 r2,当 id)→ 清标志;
+            //   标志置位期间进来的那次(就是我们自己发的)直接放行真方法。真值 6 → 返回 6(覆盖扩地/飞鸟/贝壳树等已拥有与限购);
+            //   真值 5 且物品是扩充土地 31001..=31004 → 返回 5(保住扩地顺序);其余返回 0。发过消息后 return true,只有 r0 有意义
+            //   (r1-r3 调用者不保存);标志在唯一出口前清掉(guest 里出错本进程直接 panic,不存在「半路返回没清标志」的路径)。
+            //   GameData 与其它类的 getLockType4* 照旧返回 0。
+            ("NewSceneData", "getLockType4Object:") => {
+                static ALLUNLOCK_REAL_CALL: AtomicBool = AtomicBool::new(false);
+                if ALLUNLOCK_REAL_CALL.load(O) {
+                    return false;
+                }
+                let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
+                let obj: id = Ptr::from_bits(env.cpu.regs()[2]);
+                let s_lock = island_sel(env, "getLockType4Object:");
+                ALLUNLOCK_REAL_CALL.store(true, O);
+                let real: i32 = msg_send(env, (recv, s_lock, obj));
+                ALLUNLOCK_REAL_CALL.store(false, O);
+                let mut ret: i32 = 0;
+                if (real == 6 || real == 5) && obj != nil {
+                    let s_oid = island_sel(env, "objectId");
+                    let oid: i32 = msg_send(env, (obj, s_oid));
+                    if real == 6 || (31001..=31004).contains(&oid) {
+                        ret = real;
+                        static LOG1_ALLUNLOCK_KEEP: AtomicBool = AtomicBool::new(false);
+                        log_first_then_dbg!(
+                            LOG1_ALLUNLOCK_KEEP,
+                            "[MOLECHEAT] 全解锁:岛物品 {} 保留原版锁 {}(6=已拥有/限购,5=扩地前置未满足)",
+                            oid,
+                            real
+                        );
+                    }
+                }
+                env.cpu.regs_mut()[0] = ret as u32;
+                return true;
+            }
             ("GameData", "getLockType4Crop:")
             | ("GameData", "getLockType4CropWithId:")
             | ("GameData", "getLockType4Object:")
             | ("GameData", "getLockType4Gift:")
-            | ("NewSceneData", "getLockType4Object:")
             | ("NewSceneData", "getLockType4Crop:")
             | ("DecorateRoomLayer", "getLockType4Decorate:")
             | ("MusicHallLayer", "getLockType4Decorate:") => {
