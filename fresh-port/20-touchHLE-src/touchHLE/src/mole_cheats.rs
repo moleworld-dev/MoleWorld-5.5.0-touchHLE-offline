@@ -8920,6 +8920,29 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             return true;
         }
 
+        // [2026-09-24 第四轮 K7 I1-05] 原版 LoadingHoliday 跳表 index3(0x252eb0,进入时 curStep_==4)在 [SceneMannager lastSceneId]==1
+        //   (0x252f36,进岛 from 恒为 1,故每次都跑)时于 0x252f84 执行 [[NewGameManager sharedManager] setGameMode:[[GameManager
+        //   sharedManager] gameMode]],把主村 gameMode 原样拷进岛,覆盖 state1 注入时 build_default_island_mapdata 写的 seed=1。
+        //   原版 -[VillageLayer enterNewIslands] 的前置门(0x375ee-0x37618)放行 gameMode ∈ {1,6,0},以 6 或 0 进岛时岛上
+        //   NewGameManager.gameMode 就成了 6/0,-[HolidayVillageLayer processTouch:withType:] 0x23d7e4 的 gameMode==1 门直接 bail
+        //   → 整局在岛上点建筑、点地面、点 NPC 全无反应。只夹这一次拷贝:LR==0x252f89(blx@0x252f84 的返回址 0x252f88 带 Thumb 位,
+        //   annot 实证;与 0x2497a9/0x32643b 同法推导),r2 不是 1 就改成 1;岛上合法瞬态 2/3/9/11 与主村所有 setGameMode:(另 132 个
+        //   调用点)LR 都不符,一律不碰,不会每帧钉死 gameMode。签名 v12@0:4i8,只改 r2,零消息,return false 放行真 setter。
+        //   不在 loadNewScene: 臂里补发 setGameMode:(那条臂在 endLoadingScene 调度栈上,真方法入口第一件事用 r2 写 curSceneId_,
+        //   加宿主消息要整体快照恢复 r0-r3)。build_default_island_mapdata 里的 seed 保留作兜底(lastSceneId≠1 时 index3 不拷贝)。
+        //   NewGameManager 已在 intercept_wants 的 CLASSES 里。
+        if class == "NewGameManager" && sel == "setGameMode:" && env.cpu.regs()[14] == 0x252f89 {
+            let copied = env.cpu.regs()[2] as i32;
+            if copied != 1 {
+                env.cpu.regs_mut()[2] = 1;
+                log!(
+                    "[MOLECHEAT] island: LoadingHoliday case4 拷贝 {} → 夹成 1(岛浏览态,主村 GameManager.gameMode 原样拷进岛会让岛上点击全部失效)",
+                    copied
+                );
+            }
+            return false;
+        }
+
         // ★[审计修 2026-09-11] 进岛/在岛标志改为【事件驱动】(纯原子操作 + 读寄存器,无 msg_send):
         //   · ISLAND_LOADING:[LoadingManager enterLoadingWithDelegate:nextSceneId:] 且 r3==10。唯一调用点在 startNewSceneFrom
         //     已过网络门之后(0x24155e),LoadingHoliday 也只在此、仅 nextSceneId==10 时分配;r2=SceneMannager 自身。
