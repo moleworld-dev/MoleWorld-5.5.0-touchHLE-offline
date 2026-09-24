@@ -2010,7 +2010,7 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
         ("setNextQuestId:", "nextQuestId"),
         ("setCurQuestId:", "curQuestId"),
         ("setNextStoryId:", "nextStoryId"),
-        ("setExtendMap:", "extendMap"),
+        // [2026-09-24 第四轮 K2 I7-4] ("setExtendMap:", "extendMap") 从这张表拿出去,在下面单独读回并规整。
         ("setBuildValue:", "buildValue"),
         ("setCurTotalWorkersCount:", "curTotalWorkersCount"),
     ] {
@@ -2021,6 +2021,38 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
             let v: i32 = msg_send(env, (num, iv));
             let s = env.objc.register_host_selector(setter.to_string(), &mut env.mem);
             let _: () = msg_send(env, (ui, s, v));
+        }
+    }
+    // [2026-09-24 第四轮 K2 I7-4 读档半] 岛扩地掩码 extendMap(NewSceneUserInfoData.extendMap_ +36,getter 0x3239a4)
+    //   读回时夹到「最长连续低位前缀」。合法值只有 1/3/7/15/31:-[HolidayVillageLayer setAreas]@0x23b708 只注册了
+    //   这 5 个区键(0x23b7ca/0x23bcb2/0x23c092/0x23c3f4/0x23c944 的立即数);curVisibleArea@0x23cf28 在 0x23cf86
+    //   `and r2,r0,#0x1f` 后查 visibleAreas_,查不到走 0x23cfcc 返回 CGRectZero(curWalkableArea/curBornArea 同构)
+    //   → 可视/可行走/出生三区同时塌 0,整岛拖不动、摩尔无处出生,且值已落盘、重进照样复现。
+    //   原版置位端 addNewObject2Map:gift: 的四处 orr(0x25c280 #2 / 0x25c318 #4 / 0x25c55c #8 / 0x25c62c #0x10)
+    //   靠 getLockType4Object: 的扩地顺序锁 5 保证连续;坏档或绕过顺序锁(全解锁跳序买)会造出 5/9/11/17 这类非法值。
+    //   规整规则:v=raw&0x1f,从位 0(底图,-[NewSceneUserInfoData init]@0x3232d4 默认就写 1)起只保留连续置位的
+    //   低位(9/17/0→1、11→3;超出 0x1f 的坏值含负数→1),只向下夹、不向上抹平(否则等于白送扩地)。不挂全局 setExtendMap: 钩子
+    //   (游戏自己的购买链本来就连续)。缺键时保留 init 默认值 1。
+    {
+        let k = crate::frameworks::foundation::ns_string::get_static_str(env, "extendMap");
+        let num: id = msg_send(env, (dict, ofk, k));
+        if num != nil {
+            let raw: i32 = msg_send(env, (num, iv));
+            // 超出 5 位(含负数)只可能来自坏档:按底图 1 处理,不按 raw&0x1f 取成 31(那等于白送满扩地)。
+            let v = if (raw as u32) > 0x1f { 1 } else { raw as u32 };
+            let mut m: u32 = 1;
+            while m < 0x1f && (v & (m + 1)) != 0 {
+                m = m * 2 + 1;
+            }
+            if m != raw as u32 {
+                log!(
+                    "[MOLECHEAT] island: extendMap 非法({})→规整为 {}(合法值仅 1/3/7/15/31,只保留连续低位前缀)",
+                    raw,
+                    m
+                );
+            }
+            let s = island_sel(env, "setExtendMap:");
+            let _: () = msg_send(env, (ui, s, m as i32));
         }
     }
     // [2026-09-16] A1-02+A2-02 读回沙原碎片「按任务进度兜底」标记(见 ISLAND_FRAG_BY_QUEST;函数开头已清零)。
