@@ -525,6 +525,10 @@ pub(super) fn exit(env: &mut Environment) {
         let notif_name = get_static_str(env, UIApplicationWillTerminateNotification);
         () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
 
+        // [2026-09-24 第四轮 K3 I7-02/I9-06] 黄金岛:终止回调与通知都发完后、退出前再落一次岛档(只在失活落盘之后又有变化时写,
+        // 不在岛上/非本游戏直接返回),见 mole_cheats::island_lifecycle_flush。
+        crate::mole_cheats::island_lifecycle_flush(env, "终止落盘", true);
+
         let _: () = msg![env; pool drain];
     };
 
@@ -561,6 +565,10 @@ fn send_will_resign_active(env: &mut Environment, ui_application: id) {
 
     let notif_name = get_static_str(env, UIApplicationWillResignActiveNotification);
     () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+
+    // [2026-09-24 第四轮 K3 I7-02/I9-06] 黄金岛:失活回调(0x10102 调 updateBeginTime,岛对象在 onApplicationWillResignActive 里
+    // 回写经营态)与失活通知都发完之后才落岛档;不在岛上/非本游戏直接返回。见 mole_cheats::island_lifecycle_flush。
+    crate::mole_cheats::island_lifecycle_flush(env, "失活落盘", false);
 
     let _: () = msg![env; pool drain];
 }
@@ -805,6 +813,10 @@ fn send_did_enter_background(env: &mut Environment, ui_application: id) {
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
     () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+
+    // [2026-09-24 第四轮 K3 I7-02/I9-06] 黄金岛:进后台回调与通知都发完、guest 线程挂起之前,若失活落盘之后又有变化再落一次岛档。
+    // 见 mole_cheats::island_lifecycle_flush。
+    crate::mole_cheats::island_lifecycle_flush(env, "进后台落盘", true);
 
     let _: () = msg![env; pool drain];
 }

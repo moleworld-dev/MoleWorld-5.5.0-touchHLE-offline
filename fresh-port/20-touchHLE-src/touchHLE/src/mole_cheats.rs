@@ -3532,6 +3532,30 @@ fn island_flush_final(env: &mut Environment, reason: &str) {
     }
 }
 
+/// [2026-09-24 第四轮 K3 I7-02/I9-06] 应用生命周期后置落盘:由 frameworks/uikit/ui_application.rs 在
+/// send_will_resign_active / send_did_enter_background 的 pool drain 之前、exit() 的 WillTerminate 通知之后直接调用
+/// ——此刻委托回调与对应通知都已发完:-[iMoleVillageAppDelegate applicationWillResignActive:]@0xfdb8 在 0x10102 调的
+/// [NewSceneData updateBeginTime](0x21f49c)已让各岛对象在 onApplicationWillResignActive 里 setModObjectToServer: 回写进
+/// mapData(商铺 0x32050a/0x3205de、Building 0xb2c74、DiscoveryShip 0x36103e),这时落盘才收得全。
+/// 宿主直接调用、不在 intercept 里:零重入(不经 objc_msgSend 拦截)、不涉及 r0-r3 快照。
+/// 门控:离线岛总闸开、非在线模式、在岛上(离岛过渡/进岛加载中不写,离岛那次已在 startNewSceneFrom 10→1 臂落过)。
+/// only_if_dirty:失活那次无条件落(与原来退出落盘一致,顺带收下不经置脏路径的活对象字段);进后台/终止紧跟在失活之后,
+///   只在这之间又有变化(或上一轮失败被重新置脏)时再落,免得同一时刻连写两三遍。失败时 island_flush_final 当场重试一次。
+pub fn island_lifecycle_flush(env: &mut Environment, reason: &str, only_if_dirty: bool) {
+    if !ENABLE_NEWSCENE_ISLAND.load(O)
+        || env.options.network_access
+        || ONLINE_MODE.load(O)
+        || !ON_ISLAND.load(O)
+        || ISLAND_FLUSHING.load(O)
+    {
+        return;
+    }
+    if only_if_dirty && !ISLAND_DIRTY.load(O) {
+        return;
+    }
+    island_flush_final(env, reason);
+}
+
 /// [审计修] 标记岛存档需要落盘(纯原子操作,任何 hook 里都能安全调用,不碰寄存器)。
 fn island_mark_dirty() {
     if ON_ISLAND.load(O) && !ISLAND_FLUSHING.load(O) {
@@ -8212,20 +8236,28 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // ★[审计修 2026-09-11] 在岛上直接关窗口/Cmd+Q:touchHLE 的干净退出链(uikit.rs → ui_application::exit)
         //   依次给 AppDelegate 发 applicationWillResignActive: 与 applicationWillTerminate:,然后 process::exit。
         //   以前岛存档只在离岛时写 → 关窗 = 本局岛上进度全丢,而经济(金币/贝壳)早已即时写进 userinfo.dat
-        //   (买建筑扣的钱在、建筑没了;交任务的奖励在、任务指针回滚=可无限刷)。两个回调各落一次盘,幂等。
+        //   (买建筑扣的钱在、建筑没了;交任务的奖励在、任务指针回滚=可无限刷)。
+        // [2026-09-24 第四轮 K3 I7-02/I9-06] 这里原来是【前置】落盘(先 island_flush 再放行真方法),顺序反了:
+        //   -[iMoleVillageAppDelegate applicationWillResignActive:]@0xfdb8 在 0x10102 才调 [NewSceneData updateBeginTime](0x21f49c),
+        //   后者从 0x21f504 起取 onApplicationWillResignActive 逐个发给 ObjectManager 活对象,各对象在里面 setModObjectToServer:
+        //   推"暂停那一刻"的经营态(例:-[NewSceneShop onApplicationWillResignActive]@0x3203cc 的 0x32051c-0x3205e4 分支,
+        //   在 saleItemId≥1、beginTime==0、actorId≥1 即工人还在走向商铺时补 isShopping=1/beginTime=now 再回写;
+        //   Building 0xb2c74、DiscoveryShip 0x36103e 同类),这些回写落在我们落盘之后、只留在内存 →
+        //   切后台被杀再进岛,那家店按 beginTime=0 读档(0x31d44c-0x31d472)当场判卖完。安卓切后台还会接着发
+        //   applicationDidEnterBackground:(ui_application.rs send_did_enter_background,以前注释说"永不投递"已过时)。
+        //   现在改为宿主在 ui_application 的失活/进后台/终止三处,等委托回调与通知都发完、pool drain 之前调 island_lifecycle_flush,
+        //   天然零重入、零寄存器问题。本臂只打日志放行:不在臂内转发真方法(会重入同一臂无限递归),也不手动先调 updateBeginTime
+        //   (其 NewSceneShop 分支有 setOpacity:/setTexture:/removeChildByTag:cleanup: 等 UI 副作用 0x32044e/0x320460/0x320488,幂等未证)。
         if class == "iMoleVillageAppDelegate"
-            && (sel == "applicationWillResignActive:" || sel == "applicationWillTerminate:")
+            && (sel == "applicationWillResignActive:"
+                || sel == "applicationDidEnterBackground:"
+                || sel == "applicationWillTerminate:")
             && ON_ISLAND.load(O)
         {
-            let saved = [
-                env.cpu.regs()[0],
-                env.cpu.regs()[1],
-                env.cpu.regs()[2],
-                env.cpu.regs()[3],
-            ];
-            log!("[MOLECHEAT] island: 应用即将退出({})→ 岛存档落盘", sel);
-            island_flush(env, "应用退出落盘");
-            env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+            log!(
+                "[MOLECHEAT] island: 应用生命周期回调 {} → 放行原版回调,岛存档等回调与通知都发完后由宿主统一落盘",
+                sel
+            );
             return false;
         }
 
