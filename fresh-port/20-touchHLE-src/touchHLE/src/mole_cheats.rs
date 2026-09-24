@@ -5525,6 +5525,10 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // ── [K13] ──
         // [2026-09-24 第四轮 K13 N-D2-3] 冷却归零覆盖宠物:(Animal, callAnimalSchedule:) 前置清 lastCoolDownTime(Animal 不进 CLASSES)。
         || (NO_COOLDOWN.load(O) && sel == "callAnimalSchedule:")
+        // [2026-09-24 第四轮 K13 I4-04] 探险船三段时长:(DiscoveryShip, checkIsFixShipFinished/checkIsDiscoverFinished) 前置改 ivar
+        //   (DiscoveryShip 不进 CLASSES;臂里还要求 ON_ISLAND)。
+        || ((NO_COOLDOWN.load(O) || INSTANT_BUILD.load(O))
+            && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -8900,6 +8904,65 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     {
         ret_double(env, 0.0);
         return true;
+    }
+    // [2026-09-24 第四轮 K13 I4-04] 探险船三段时长(修船 5h / 出海 3h / 冷却 12h)接入「建筑瞬完成」「冷却归零」。
+    //   根因:三段时长不是选择子,是 DiscoveryShip 自己的 ivar(u32):-[DiscoveryShip initWithTile:sprite:size:data:] 非 VIP 分支
+    //   0x3600b2 写死 discoverTime_=10800、0x3600ba coolDownTime_=43200,0x3600da fixTime_=18000(VIP 分支读 250_1.dat,
+    //   initWithMapData:type: 在 0x3606c2-0x36071c 同构再写一遍);innerUpdate:/checkIs*Finished/checkIsSailingAlready 直接读
+    //   ivar,上面两个开关的任何一条臂都管不到。
+    //   做法:以 checkIsFixShipFinished / checkIsDiscoverFinished(c8@0:4)作前置钩子,两个 init 都在写死时长之后调它们
+    //   (0x360400/0x36041a、0x360afc/0x360cba/0x360cd2),改了立刻生效:INSTANT_BUILD → fixTime_(槽 0xb07c2c)与
+    //   discoverTime_(槽 0xb07c24)写 1;NO_COOLDOWN → coolDownTime_(槽 0xb07c28)写 1。偏移一律从槽现读(DiscoveryShip
+    //   继承 Object,正是非脆弱 ivar 修正写回的形状),偏移为 0 或越过实例大小(456,objc_meta instanceSize)就不写。
+    //   置 1 不置 0:checkIsSailingAlready@0x36104c 靠 now−lastSailingTime >= coolDownTime_ 判冷却,1 秒足够且保守。
+    //   +[NewGameManager saveTMMapDataFromObject:] 船分支(0x244548-0x24462a)不拷这三项、NSCoding 也不编,改了不落盘,
+    //   关掉开关重进岛自动恢复原值;已放下的船要重进岛(重建对象)才生效。只在 ON_ISLAND(离线岛会话,在线模式下总闸关闭、
+    //   永不置位)生效。只写 ivar,不发消息、不动寄存器,放行真方法。粗筛走 intercept_wants 末尾 [K13] 槽位,DiscoveryShip
+    //   不进 CLASSES(免得它每帧 innerUpdate:/visit 都走完整条比较链)。
+    if (INSTANT_BUILD.load(O) || NO_COOLDOWN.load(O))
+        && class == "DiscoveryShip"
+        && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished")
+        && ON_ISLAND.load(O)
+    {
+        const SHIP_INSTANCE_SIZE: u32 = 456;
+        const SLOT_DISCOVER_TIME: u32 = 0xb07c24;
+        const SLOT_COOLDOWN_TIME: u32 = 0xb07c28;
+        const SLOT_FIX_TIME: u32 = 0xb07c2c;
+        let recv = env.cpu.regs()[0];
+        let instant = INSTANT_BUILD.load(O);
+        let nocool = NO_COOLDOWN.load(O);
+        let targets: [(u32, bool); 3] = [
+            (SLOT_FIX_TIME, instant),
+            (SLOT_DISCOVER_TIME, instant),
+            (SLOT_COOLDOWN_TIME, nocool),
+        ];
+        let mut changed = false;
+        for (slot, on) in targets {
+            if !on || recv == 0 {
+                continue;
+            }
+            let off: u32 = env.mem.read(ConstPtr::<u32>::from_bits(slot));
+            // 写成 off > 大小 − 4:槽值若是垃圾(接近 u32::MAX),off + 4 在 debug 构建里会溢出 panic。
+            if off == 0 || off > SHIP_INSTANCE_SIZE - 4 {
+                continue;
+            }
+            let p: MutPtr<u32> = Ptr::from_bits(recv + off);
+            if env.mem.read(p) > 1 {
+                env.mem.write(p, 1u32);
+                changed = true;
+            }
+        }
+        if changed {
+            static LOG1_SHIP_TIMES: AtomicBool = AtomicBool::new(false);
+            log_first_then_dbg!(
+                LOG1_SHIP_TIMES,
+                "[MOLECHEAT] 探险船时长:{} 前置改写(瞬完成={} → 修船/出海 1 秒,冷却归零={} → 冷却 1 秒)",
+                sel,
+                instant,
+                nocool
+            );
+        }
+        return false;
     }
     if NO_COOLDOWN.load(O) {
         match (class, sel) {
