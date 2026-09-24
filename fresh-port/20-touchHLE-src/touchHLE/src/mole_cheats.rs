@@ -3158,6 +3158,9 @@ const SHELLTREE_FULL_GROWTH: u32 = 20;
 ///   与成长值。只在应答(moleIslandShellTreeInfo)、收获/删除时的重置(resetSuperShellTreeInfo)与读档时改写。
 static SHELLTREE_BC: AtomicU32 = AtomicU32::new(0);
 static SHELLTREE_GV: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-24 第四轮 集成补漏] 本次进岛因 island_map.dat 缺失/无效回退到默认岛,而 island_shelltree.dat 还在原路径 →
+///   本会话不读也不覆盖它(与 K1 对 island_ships.dat 的做法同一规则)。每次进岛在 build_default_island_mapdata 开头清零。
+static SHELLTREE_HOLD_FOR_DEFAULT: AtomicBool = AtomicBool::new(false);
 
 /// [2026-09-24 第四轮 K11 I2-01] 取活表里的超级贝壳树,与原版 1085 回包解析同法:0x1c07d6 [ObjectManager sharedManager]
 ///   → 0x1c07ea getUniqueObjectByObjectId:32015(签名 @12@0:4i8;@0x41dbc 只返回 isFinished 的唯一物件)
@@ -3344,6 +3347,15 @@ fn island_shelltree_root(env: &mut Environment, entry: Option<(u32, u32)>) -> id
 fn island_shelltree_load(env: &mut Environment) {
     SHELLTREE_BC.store(0, O);
     SHELLTREE_GV.store(0, O);
+    // [2026-09-24 第四轮 集成补漏] 布局档缺失/无效回退默认岛时保住贝壳树侧档:默认岛布局里没有树,不拦的话首个节拍
+    //   island_shelltree_flush 按「布局里没有树 = 树已删除」写空字典,玩家事后把原布局档放回,树回来了倒计时却从头开始
+    //   (最多白等 36 小时)。这里置保护位后直接返回、不走 island_sidecar_load(它读档成功会 island_note_load_ok 清位),
+    //   保护位让 island_sidecar_save → island_save_blocked 本会话跳过它;下次走读档岛分支时本标志为假,照常读档清位。
+    if SHELLTREE_HOLD_FOR_DEFAULT.load(O) {
+        ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHELLTREE, O);
+        log!("[MOLECHEAT] island: island_map.dat 缺失/无效(当前是默认岛),本会话不读也不覆盖 island_shelltree.dat");
+        return;
+    }
     if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
         log!("[MOLECHEAT] island: island_map.dat 坏档保护中(当前是默认岛),不读 island_shelltree.dat");
         return;
@@ -5961,6 +5973,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     if nsd == nil {
         return false;
     }
+    // [2026-09-24 第四轮 集成补漏] 每次进岛重新判定是否要替贝壳树侧档挡覆盖(默认岛分支里按需置位)。
+    SHELLTREE_HOLD_FOR_DEFAULT.store(false, O);
     // [P5 地基] 先确保岛 userInfo 载体存在(NPC/任务/剧情/成就),持久化与默认两条路径都要。
     ensure_island_userinfo(env, nsd);
     start_island_tick(env);
@@ -6260,6 +6274,14 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         if guest_file_exists(env, sp) {
             ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHIPS, O);
             log!("[MOLECHEAT] island: island_map.dat 缺失/无效,本会话不覆盖 island_ships.dat(保留原船档;要恢复旧岛请在离岛/退出后、下次进岛前把原布局档放回原名)");
+        }
+    }
+    // [2026-09-24 第四轮 集成补漏] 贝壳树侧档(K11)同样描述 island_map.dat 里那棵树(键 40),同一规则:还在原路径就本会话不覆盖。
+    //   只置标志,由 island_after_layout_ready → island_shelltree_load 置保护位(见 SHELLTREE_HOLD_FOR_DEFAULT)。
+    {
+        let tp = island_data_path(env, SHELLTREE_FILE);
+        if guest_file_exists(env, tp) {
+            SHELLTREE_HOLD_FOR_DEFAULT.store(true, O);
         }
     }
 
