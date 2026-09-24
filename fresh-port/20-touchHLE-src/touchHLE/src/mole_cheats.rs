@@ -3867,14 +3867,20 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     }
     // ★[P3 gameMode seed·补全原版 LoadingHoliday case4@0x252f38(workflow A 路实证)]:进岛后
     //   NewGameManager.gameMode 的"正常浏览态=1"靠原版 case4 `[NewGameManager setGameMode:
-    //   [GameManager gameMode]]`(主村 GameManager.gameMode 在 startGame: 里=1)拷过来 seed;离线进岛
-    //   常没完整跑到 case4(case2/3 是硬网络门)→ gameMode 残留 init 的 -1 → 所有 gameMode==1 严判失效:
+    //   [GameManager gameMode]]`(主村 GameManager.gameMode 在 startGame: 里=1)拷过来 seed;若没跑到
+    //   case4 → gameMode 残留 init 的 -1 → 所有 gameMode==1 严判失效:
     //   ①布兰的家 RestaurantView(0x249769)/②公寓 ApartmentView(0x3263fc)面板入口【直读
     //   NewGameManager.gameMode==1】(curSceneId 路由对它们无效!)③食材店 ShopItemsLayer(0x24be80)
     //   读 currentGameMode==1(curSceneId=10 修复后已正确路由到 NewGameManager.gameMode)。这里在进岛
     //   数据就绪点等价补一发:读主村 GameManager.gameMode 透传(异常≤0 兜底 1=岛浏览态),一次性、
     //   非每帧(gameMode 有合法瞬态 9 临时/11 编辑放置/0 串门,绝不每帧钉死 1)。与现有 3 个 LR 门 hook
     //   叠加无害;runtime 验证 gameMode=1 已落实后,那 3 个零散 LR hook 可化简删除(A 路结论)。
+    // [2026-09-24 第四轮 K1 I1-05 注释更正] 原注释称「离线进岛常没完整跑到 case4(case2/3 是硬网络门)」,不对:本函数由
+    //   getAllObjectsListFromServerWithStartId: 臂在 updateLoading:(0x252c38)curStep 2 那档(跳表项 → 0x252da0)触发,
+    //   原版 case4(curStep 4,跳表项 → 0x252eb0)在更晚一步照常执行,lastSceneId==1(0x252f36,从主村进岛恒成立)时于
+    //   0x252f84 `[[NewGameManager sharedManager] setGameMode:[[GameManager sharedManager] gameMode]]` 再拷一次主村
+    //   gameMode,会覆盖这里的 seed。那次拷贝由 K7 的 (NewGameManager, setGameMode:) LR==0x252f89 夹取臂兜底(非 1 夹成 1);
+    //   这里的 seed 只在 case4 不跑(lastSceneId≠1)时起作用,保留作兜底。
     {
         let sm_sel = env
             .objc
