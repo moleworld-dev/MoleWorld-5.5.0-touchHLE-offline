@@ -467,6 +467,11 @@ Other options:
         ★不要打开 touchHLE::objc::messages(或 touchHLE::objc、touchHLE::
         这类覆盖它的前缀):每条消息打一行,日志暴涨、帧率骤降。
 
+    MOLE_LOG_SYNC
+        设了就开(任何值都算,包括 0):日志每写一行就 sync_data() 落盘一
+        次,用来抓断电、内核崩溃这类硬崩现场。默认关:日志写进系统页缓存
+        即可,进程崩溃也不会丢;每行都落盘会让切场景、进村时主线程卡顿。
+
     MOLE_ALERT_AUTODISMISS
         非 0 时系统弹框(UIAlertView)约 1 帧后自动按第一个按钮关闭(旧
         行为);默认等玩家点。--headless 下总是自动关。带窗口跑的自动化

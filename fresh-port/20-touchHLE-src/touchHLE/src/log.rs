@@ -70,6 +70,13 @@ macro_rules! log_once {
     }};
 }
 
+/// [MoleWorld iOS · 性能] 是否逐行 fsync 日志。默认 **否**(每行 fsync 在真机上 0.1~2ms,
+/// 日志一多就成为可观的 CPU/IO 开销)。设 `MOLE_LOG_SYNC=1` 可恢复逐行落盘,用于抓硬崩现场。
+pub fn log_sync_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MOLE_LOG_SYNC").is_some())
+}
+
 /// Print a message (with implicit newline). This should be used for all
 /// touchHLE output that isn't coming from the app itself.
 ///
@@ -95,6 +102,11 @@ macro_rules! echo {
             // [MoleWorld P0-C] 不再每行 fsync(sync_data)。write_all 已落到 OS 页缓存,进程崩溃
             // (panic/段错误)不会丢日志——内核仍会把页缓存写回磁盘;fsync 只防断电/内核崩,对调试
             // 日志没必要。而每行 fsync 在场景切换/进村时是毫秒级主线程 stall =「切场景卡一下」的真凶。
+            // [iOS⇄main 合并 2026-09-24] iOS 分支(158df05)独立做了同一件事,另留了可选开关:
+            // 需要抓硬崩(断电/内核崩)现场时设 MOLE_LOG_SYNC=1 恢复逐行 sync_data(),默认关。
+            if $crate::log::log_sync_enabled() {
+                let _ = log_file.sync_data();
+            }
         }
     };
     () => {
@@ -109,6 +121,9 @@ macro_rules! echo {
             use std::io::Write;
             let mut log_file = $crate::log::get_log_file();
             let _ = log_file.write_all(b"\n");
+            if $crate::log::log_sync_enabled() {
+                let _ = log_file.sync_data();
+            }
         }
     }
 }
