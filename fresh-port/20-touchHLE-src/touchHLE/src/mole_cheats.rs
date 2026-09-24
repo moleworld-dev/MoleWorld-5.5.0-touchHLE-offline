@@ -6502,6 +6502,15 @@ fn sync_remote_upgrade_percent(env: &mut Environment) {
 
 /// [2026-09-24 第四轮 K5] 岛会话期 (c, "isReachable") 通配臂【不】顶成 1 的调用点。
 const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
+    // [I8-04] -[UserInfoLayer checkActivityStatus] blx@0x5997a;假分支 0x59a1e 直接返回(不调度 onGetActivityStatusTimeOut、
+    //   不发 getActivityStatus)。正常到不了(下一条门已先拦住),收它是兜 onReturnToActionCenterPage 等别的入口。
+    0x5997f,
+    // [I8-04] -[UserInfoLayer onButtonActionFunctionsSelected:] 活动中心按钮 blx@0x5a42c;假分支 0x5a504 MessageBox
+    //   ACTION_CENTER_NETWARNING「该功能需要联网才能使用哦」(不走 checkActivityStatus → onGetActivityStatusTimeOut →
+    //   showActionCenterLayer:那条链会置 GameData.hasShowedNewActivities_ 内存标志并去 +[InGameScene scene] 懒建主村场景)。
+    //   ★同一方法假分支弹框之后 0x5a5ae isReachable(LR 0x5a5b3)/0x5a5ce isConnected(LR 0x5a5d3)是「可达却未连上就
+    //   disconnect + setState:2 + establishConnection 重连」,【不能收】:让它们继续被顶成在线,重连分支才保持不走。
+    0x5a431,
     // [I8-03] -[UserInfoLayer onButtonCustomServiceFunctionsSelected:] 客服入口 blx@0x5aad4;假分支 0x5ab8a
     //   MessageBox ACTION_CENTER_NETWARNING(不去建 CustomerServiceLayer)。
     0x5aad9,
@@ -6538,6 +6547,11 @@ const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
 
 /// [2026-09-24 第四轮 K5] 岛会话期 (NetworkManager, isConnected) 臂【不】顶成 1 的调用点。
 const ISLAND_OFFLINE_CONNECTED_LRS: &[u32] = &[
+    // [I8-04] -[UserInfoLayer checkActivityStatus] blx@0x59998;假分支同上 0x59a1e 直接返回。
+    0x5999d,
+    // [I8-04] -[UserInfoLayer onButtonActionFunctionsSelected:] 活动中心按钮 blx@0x5a44c;假分支同上 0x5a504
+    //   ACTION_CENTER_NETWARNING。(0x5a5d3 不收,理由见 isReachable 表同名条目。)
+    0x5a451,
     // [I9-02/I8-02] -[ExchangeCenterLayer showWithTarget:selector:] blx@0x376e64;假分支同上 GET_EXCHANGE_INFO_ERROR。
     0x376e69,
     // [I8-03] CustomerServiceLayer 四个按钮的第二道门(isReachable 为真才走到这里),假分支同上 IAP_NETWORK_ERROR:
