@@ -3026,11 +3026,15 @@ fn load_island_ships(env: &mut Environment) {
         }
         let Some(obj) = hit else { continue };
         if kind == 1 {
+            // [2026-09-24 第四轮 K2 I5-8] 读侧不再只回填 1/2,全量回填,与 save_island_ships 的无条件保存对称。
+            //   原来丢弃 0 与 ≥3:原版 shipState 不止两种取值(-[DiscoveryShip innerUpdate:]@0x362966 对 ≥3 走 unschedule 分支,
+            //   checkIsFixShipFinished@0x3620bc 把 0 或 >2 归一成 1,parseMapDataWithPackageData:atIndex: 可下发任意值),
+            //   被丢弃的值会让 mapData 里的 shipState_ 停在 NSCoding 缺省 0(encodeWithCoder:@0xcd860 不编该字段),
+            //   下一拍被归一成 1 = 船退回「需修船」。回填 0 无副作用(目标对象在读档/默认岛两条路径上本来就是 0);
+            //   不另设上界(原版 innerUpdate 只判 ≥3,没约定最大值)。
             if let Some(state) = get(env, "shipState") {
-                if state == 1 || state == 2 {
-                    let s2 = island_sel(env, "setShipState:");
-                    let _: () = msg_send(env, (obj, s2, state));
-                }
+                let s2 = island_sel(env, "setShipState:");
+                let _: () = msg_send(env, (obj, s2, state));
             }
             let gk = crate::frameworks::foundation::ns_string::get_static_str(env, "gifts"); // [扫描修 2026-09-15] F10-7
             let gifts: id = msg_send(env, (entry, ofk, gk));
