@@ -4927,6 +4927,65 @@ fn island_is_key_op(class: &str, sel: &str) -> bool {
     }
 }
 
+/// [2026-09-24 第五轮补挖 M-M3-1] 「全物品解锁」放开岛物品门槛锁时,照原版 -[NewSceneData getLockType4Object:]@0x21e560 尾段补算余额锁:
+///   0x21ec86 cost_gold≥1 且 0x21ecbc cost_gold > [[GameData sharedInstance].userInfoData gold] → 3;
+///   否则价格取 cost_vip_gold,0x21eb36 [self checkIsDiscountObj:objectId] 为真时取 0x21eb58/0x21eb68 折后 goodsPrice,
+///   0x21ed04 价格 > [[userInfoData vipGoldWithNewType] intValue] → 4;都够 → 0。签名:cost_gold/cost_vip_gold/gold i8@0:4、
+///   checkIsDiscountObj: c12@0:4i8、getDiscountObjInfoFormDiscountInfoList: @12@0:4L8、goodsPrice L8@0:4、vipGoldWithNewType @8@0:4。
+///   调用方(ALL_UNLOCK 臂)发完消息后 return true,只有 r0 有意义。
+fn allunlock_island_balance_lock(env: &mut Environment, nsd: id, obj: id, oid: i32) -> i32 {
+    let s_cg = island_sel(env, "cost_gold");
+    let cg: i32 = msg_send(env, (obj, s_cg));
+    let gd_cls = env.objc.get_known_class("GameData", &mut env.mem);
+    if gd_cls == nil {
+        return 0;
+    }
+    let s_sh = island_sel(env, "sharedInstance");
+    let gd: id = msg_send(env, (gd_cls, s_sh));
+    let ui: id = if gd != nil {
+        let s_ui = island_sel(env, "userInfoData");
+        msg_send(env, (gd, s_ui))
+    } else {
+        nil
+    };
+    if ui == nil {
+        return 0;
+    }
+    if cg >= 1 {
+        let s_gold = island_sel(env, "gold");
+        let gold: i32 = msg_send(env, (ui, s_gold));
+        if cg > gold {
+            return 3;
+        }
+    }
+    let s_cv = island_sel(env, "cost_vip_gold");
+    let mut price: i32 = msg_send(env, (obj, s_cv));
+    let s_disc = island_sel(env, "checkIsDiscountObj:");
+    let disc: bool = msg_send(env, (nsd, s_disc, oid));
+    if disc {
+        let s_info = island_sel(env, "getDiscountObjInfoFormDiscountInfoList:");
+        let info: id = msg_send(env, (nsd, s_info, oid as u32));
+        if info != nil {
+            let s_gp = island_sel(env, "goodsPrice");
+            let gp: u32 = msg_send(env, (info, s_gp));
+            price = gp as i32;
+        }
+    }
+    let s_vg = island_sel(env, "vipGoldWithNewType");
+    let vg: id = msg_send(env, (ui, s_vg));
+    let have: i32 = if vg != nil {
+        let s_iv = island_sel(env, "intValue");
+        msg_send(env, (vg, s_iv))
+    } else {
+        0
+    };
+    if price > have {
+        4
+    } else {
+        0
+    }
+}
+
 /// [2026-09-24 第四轮 集成补漏] 咖啡馆许愿任务三张本地表(island_cafe.dat,K10)的写入点也要置脏。
 /// 根因:接任务 -[NewSceneData addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:]@0x220478、
 ///   进度 modAcceptNotifyQuestData:withRequireThingsCount:@0x220d08、交任务 deleteAcceptedNotifyQusetFromLocalList:@0x220848
@@ -11212,18 +11271,36 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 let real: i32 = msg_send(env, (recv, s_lock, obj));
                 ALLUNLOCK_REAL_CALL.store(false, O);
                 let mut ret: i32 = 0;
-                if (real == 6 || real == 5) && obj != nil {
+                if real != 0 && obj != nil {
                     let s_oid = island_sel(env, "objectId");
                     let oid: i32 = msg_send(env, (obj, s_oid));
-                    if real == 6 || (31001..=31004).contains(&oid) {
+                    // [2026-09-24 第五轮补挖 M-M3-1] 余额锁 3(摩尔豆不够)/4(贝壳不够)也原样保留;其它门槛锁(1 等级、2 工人、
+                    //   15 VIP、0xe 等,以及非扩地的 5)在原版里提前返回、根本走不到余额检查,放开门槛时由宿主照原版补算一次余额。
+                    //   根因:以前除 6/扩地 5 外一律返回 0,-[NewStyleStoreMainLayer onBuyItem:]@0x3b2620 只看锁是否为 0,之后的确认回调
+                    //   与放置确认都不再验余额:豆袋(type 0x19)0 贝壳也能兑,-[UserInfoData addVipGold:] 0xbb474/0xbb49c 把负结果夹成 0,
+                    //   随后 0x25c040 照发 out_gold(25005 是 4 万豆)→ 无限刷钱;金币价物件经 -[NewScenePorter finishBuild:] 0x26d424
+                    //   addGoldInNewScene:(-cost_gold),-[UserInfoData addGold:] 0xbb20e 没有下限,0x21f7a2 立即把负数存进主档。
+                    if real == 6 || real == 3 || real == 4 || (real == 5 && (31001..=31004).contains(&oid)) {
                         ret = real;
                         static LOG1_ALLUNLOCK_KEEP: AtomicBool = AtomicBool::new(false);
                         log_first_then_dbg!(
                             LOG1_ALLUNLOCK_KEEP,
-                            "[MOLECHEAT] 全解锁:岛物品 {} 保留原版锁 {}(6=已拥有/限购,5=扩地前置未满足)",
+                            "[MOLECHEAT] 全解锁:岛物品 {} 保留原版锁 {}(6=已拥有/限购,5=扩地前置未满足,3/4=摩尔豆/贝壳不够)",
                             oid,
                             real
                         );
+                    } else {
+                        ret = allunlock_island_balance_lock(env, recv, obj, oid);
+                        if ret != 0 {
+                            static LOG1_ALLUNLOCK_BAL: AtomicBool = AtomicBool::new(false);
+                            log_first_then_dbg!(
+                                LOG1_ALLUNLOCK_BAL,
+                                "[MOLECHEAT] 全解锁:岛物品 {} 放开门槛锁 {},但余额不够 → 锁 {}(3=摩尔豆/4=贝壳)",
+                                oid,
+                                real,
+                                ret
+                            );
+                        }
                     }
                 }
                 env.cpu.regs_mut()[0] = ret as u32;
