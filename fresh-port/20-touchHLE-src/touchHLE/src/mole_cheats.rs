@@ -5523,6 +5523,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         || (ON_ISLAND.load(O) && sel == "changeAvailableMolerForTask:")
         // ── [K11] ──
         // ── [K13] ──
+        // [2026-09-24 第四轮 K13 N-D2-3] 冷却归零覆盖宠物:(Animal, callAnimalSchedule:) 前置清 lastCoolDownTime(Animal 不进 CLASSES)。
+        || (NO_COOLDOWN.load(O) && sel == "callAnimalSchedule:")
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -8936,6 +8938,41 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 }
                 env.cpu.regs_mut()[0] = 0;
                 return true;
+            }
+            // [2026-09-24 第四轮 K13 N-D2-3] 宠物送礼冷却(主村 + 黄金岛的小狗/小龟/浣熊/气球鱼等 Animal)。
+            //   根因:冷却由 -[Animal callAnimalSchedule:]@0xdd958(v16@0:4d8)自己算:0xdd9e2 [ObjectData use_cool_down]、
+            //   0xdd9f8 [m_npcData lastCoolDownTime]、0xdda28 getCurrentTime,m_remainTime = max(0, use+last−now) 后按它调度
+            //   enterGiftMode;不经过上面任何一条臂,开关对宠物无效(岛宠物 use_cool_down 28800~86400,要等 8~24 小时)。
+            //   做法:前置把 self.m_npcData(Actor ivar,槽 0xb03d78,现值 +572)的 lastCoolDownTime_(NpcData ivar,槽 0xb03fe4,
+            //   现值 +8,double)写成 0.0,再放行真方法 → 算出 m_remainTime=0 立即进送礼状态。偏移一律从槽现读(兼容非脆弱
+            //   ivar 修正写回),偏移为 0 或超出实例大小(Animal 692、NpcData 24,objc_meta instanceSize)就什么都不写。
+            //   只读写内存,不发消息、不动寄存器。TransAnimal 自带空的 callAnimalSchedule:(0x25e774),运行时类名不同,不会误中。
+            //   语义与 Building 臂一致:在宠物创建时生效(进场景/回村/购买/从收纳放出,原版只在 initAnimal 0xdcd14 调它);
+            //   0 随 npcs 落进 island_userinfo.dat / 主村 userinfo.dat(cf_fix_residue 不动 0),关掉开关后保持已冷却。
+            //   本局领完礼物原版不会重新调度(exitGiftMode: 只写 lastCoolDownTime=now),要再领得重进场景,这是原版节奏,不补调度。
+            //   粗筛走 intercept_wants 末尾 [K13] 槽位的 NO_COOLDOWN 门控,没把 Animal 加进 CLASSES。
+            ("Animal", "callAnimalSchedule:") => {
+                const ANIMAL_INSTANCE_SIZE: u32 = 692;
+                const NPCDATA_INSTANCE_SIZE: u32 = 24;
+                let recv = env.cpu.regs()[0];
+                let off_npc: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03d78));
+                // 越界护栏写成 off <= 大小 − 字段宽:槽值若是垃圾(接近 u32::MAX),off + 4 在 debug 构建里会溢出 panic。
+                if recv != 0 && off_npc != 0 && off_npc <= ANIMAL_INSTANCE_SIZE - 4 {
+                    let npc: u32 = env.mem.read(ConstPtr::<u32>::from_bits(recv + off_npc));
+                    let off_last: u32 = env.mem.read(ConstPtr::<u32>::from_bits(0xb03fe4));
+                    if npc != 0 && off_last != 0 && off_last <= NPCDATA_INSTANCE_SIZE - 8 {
+                        let last_ptr: MutPtr<f64> = Ptr::from_bits(npc + off_last);
+                        if env.mem.read(last_ptr) != 0.0 {
+                            env.mem.write(last_ptr, 0.0f64);
+                            static LOG1_ANIMAL_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                            log_first_then_dbg!(
+                                LOG1_ANIMAL_COOLDOWN,
+                                "[MOLECHEAT] 冷却归零:Animal callAnimalSchedule: 前置清 lastCoolDownTime → 0(宠物立即可送礼)"
+                            );
+                        }
+                    }
+                }
+                return false;
             }
             ("YaliNpcActor", "checkCooltimeOver") => {
                 env.cpu.regs_mut()[0] = 1; // YES — cooldown over
