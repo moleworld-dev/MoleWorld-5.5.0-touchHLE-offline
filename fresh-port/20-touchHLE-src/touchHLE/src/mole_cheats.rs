@@ -1915,6 +1915,72 @@ fn load_island_userinfo(env: &mut Environment) -> bool {
         island_note_load_failure(env, path, ISLAND_FILE_USERINFO, "island_userinfo.dat");
         return false;
     }
+    // [2026-09-24 第四轮 K2 I6-2] 解档非 nil ≠ 档有效:形状 + 已知键校验,必须在 island_note_load_ok 清保护位之前。
+    //   根因:原来只判 dict==nil。解出空字典、非字典根(字符串/数组)、或错档(比如被换成 island_map.dat,根是以
+    //   "28"/"29" 为键的布局字典)时照样清保护位、下面的 objectForKey: 全部取空跳过、最后 return true —— 岛进度
+    //   停在 -[NewSceneUserInfoData init] 默认值,1.5 秒后首个节拍把默认值写回 island_userinfo.dat,坏档没被改名成
+    //   .corrupt、原始数据不可恢复;had_userinfo=true 还让全新岛判据失效、开场剧情不播。
+    //   判据(任一成立即当坏档):根对象不是 NSDictionary(isKindOfClass:);count==0;下面这张已知键表一个都不命中。
+    //   ★非字典判据用 isKindOfClass: 而不用「响应 objectForKey:」:_touchHLE_NSMutableArray 为坏档伪字典带了
+    //   objectForKey:/setObject:forKey: 等空操作(ns_array.rs),根是数组的错档(比如被换成 island_ships.dat)会通过
+    //   响应检查,随后每次 objectForKey: 都调 note_dict_as_array_corruption 置全局 SAVE_HAS_DICT_AS_ARRAY → 本会话
+    //   checkInAlreadyUnlockList: 恒返 1、主村与岛上新成就一个都不记录不发奖。先判类就不会对数组发任何字典消息。
+    //   已知键表 = save_island_userinfo 自 a890e3b 起历来写过的全部键(git 历史逐版核对:7 个标量 + curQuestResult +
+    //   npcs + achieveAlreadyUnlock 从未变过,09-16 起多一个 ISLAND_FRAG_BY_QUEST_KEY),命中 1 个即有效,老档不会被误判。
+    //   不采纳「落盘侧全是默认值就不写」的护栏:全新岛的合法状态恰好就是那组默认值,会误伤;读档侧走
+    //   island_note_load_failure 后,save_island_userinfo 现有的保护位检查已足以挡住覆盖。
+    {
+        let is_dict: bool = {
+            let dcls = env.objc.get_known_class("NSDictionary", &mut env.mem);
+            let isk = island_sel(env, "isKindOfClass:");
+            msg_send(env, (dict, isk, dcls))
+        };
+        let why: Option<String> = if !is_dict {
+            Some("根对象不是字典".to_string())
+        } else {
+            let cnt_s = island_sel(env, "count");
+            let n: crate::mem::GuestUSize = msg_send(env, (dict, cnt_s));
+            if n == 0 {
+                Some("空字典".to_string())
+            } else {
+                let ofk0 = island_sel(env, "objectForKey:");
+                let mut hit = false;
+                for key in [
+                    "nextQuestId",
+                    "curQuestId",
+                    "nextStoryId",
+                    "extendMap",
+                    "buildValue",
+                    "curTotalWorkersCount",
+                    "curIdleWorkerCount",
+                    "curQuestResult",
+                    "npcs",
+                    "achieveAlreadyUnlock",
+                    ISLAND_FRAG_BY_QUEST_KEY,
+                ] {
+                    let k = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+                    let o: id = msg_send(env, (dict, ofk0, k));
+                    if o != nil {
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    None
+                } else {
+                    Some(format!("{} 个键里没有一个岛进度键(错档?)", n))
+                }
+            }
+        };
+        if let Some(why) = why {
+            log!(
+                "[MOLECHEAT] island: ⚠️ island_userinfo.dat 解档非 nil 但内容无效({})→ 按坏档处理(隔离/禁写),本次按无档",
+                why
+            );
+            island_note_load_failure(env, path, ISLAND_FILE_USERINFO, "island_userinfo.dat");
+            return false;
+        }
+    }
     island_note_load_ok(ISLAND_FILE_USERINFO);
     let nsd_cls = env.objc.get_known_class("NewSceneData", &mut env.mem);
     if nsd_cls == nil {
