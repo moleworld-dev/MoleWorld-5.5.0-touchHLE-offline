@@ -4912,6 +4912,26 @@ fn island_is_key_op(class: &str, sel: &str) -> bool {
     }
 }
 
+/// [2026-09-24 第四轮 集成补漏] 咖啡馆许愿任务三张本地表(island_cafe.dat,K10)的写入点也要置脏。
+/// 根因:接任务 -[NewSceneData addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:]@0x220478、
+///   进度 modAcceptNotifyQuestData:withRequireThingsCount:@0x220d08、交任务 deleteAcceptedNotifyQusetFromLocalList:@0x220848
+///   (内部转 updateUnrewardNotifyQuest:andCurrentRewardObjectID:@0x2212f0)、领奖 deleteUnrewardNotifyQuest:@0x221104 /
+///   addFinishedNotifyQuestWithQuestId:@0x22219c 都只改内存表,原版随即发包给服务器;离线包被吞,又不经过任何置脏方法,
+///   只接一条收获类任务、不做别的操作就被强杀,这次接取与进度会丢。只置脏,不排即时落盘(领奖发的经验/摩尔豆本身走
+///   add*InNewScene: 已是关键操作)。
+fn island_is_cafe_table_op(sel: &str) -> bool {
+    matches!(
+        sel,
+        "addAcceptedNotifyQusetListInLocal:wihtFinishedRequireThingsCount:"
+            | "modAcceptNotifyQuestData:withRequireThingsCount:"
+            | "deleteAcceptedNotifyQusetFromLocalList:"
+            | "updateUnrewardNotifyQuest:andCurrentRewardObjectID:"
+            | "updateUnrewardNotifyQuest:andUnrewardObjectsIds:"
+            | "deleteUnrewardNotifyQuest:"
+            | "addFinishedNotifyQuestWithQuestId:"
+    )
+}
+
 /// [2026-09-24 第四轮 K3 I5-04] 关键操作即时落盘:把 [GameManager moleIslandFlushNow] 用 performSelector:withObject:afterDelay:0
 /// 排到运行循环的 perform 相位——在当前这条游戏调用栈整个返回之后才跑,postFinish 后续的 setCurQuestId:0/setCurQuestResult:、
 /// finishBuild: 之后的 addObjectToServer: 等都已完成,一次写盘全收;窗口从 ≤2.5 秒缩到约一帧。
@@ -7774,6 +7794,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   (DiscoveryShip 不进 CLASSES;臂里还要求 ON_ISLAND)。
         || ((NO_COOLDOWN.load(O) || INSTANT_BUILD.load(O))
             && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished"))
+        // [2026-09-24 第四轮 集成补漏] 岛上厕所小游戏前三名写入点置脏(WashRoomGame 不在 CLASSES,按门控 sel 写法)。
+        || (ON_ISLAND.load(O) && sel == "updateTop3Record")
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -10524,14 +10546,19 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // ★[审计修 2026-09-11] 置脏:岛上经营/任务/剧情/成就/扩地/工人数都落在 NewSceneUserInfoData 的 set*/add*,
         //   经验/贝壳/金币/建设值/碎片走 NewSceneData 的 add*InNewScene:/addAdventureMapFragment:/setMapFragments:,
         //   新放置走 NetworkManager addObjectToServer:(这里只置脏不拦截,seqId 在它内部分配)。纯原子操作。
+        // [2026-09-24 第四轮 集成补漏] 另加咖啡馆许愿任务三张表的写入点(见 island_is_cafe_table_op)与岛上厕所小游戏
+        //   -[WashRoomGame updateTop3Record]@0x35c230(前三名只写内存、原版随即发 addTop3MiniGameRecord:/setModTop3MiniGameRecord:,
+        //   不经过任何置脏方法;island_misc.dat 由 K12 落盘)。WashRoomGame 不在 CLASSES,粗筛走 intercept_wants 的门控 sel 行。
         if ON_ISLAND.load(O)
             && ((class == "NewSceneUserInfoData" && (sel.starts_with("set") || sel.starts_with("add")))
                 || (class == "NewSceneData"
                     && (sel.ends_with("InNewScene:")
                         || sel == "addAdventureMapFragment:"
                         || sel == "setMapFragments:"
-                        || sel == "saveUserinfoToLocal"))
-                || (class == "NetworkManager" && sel == "addObjectToServer:"))
+                        || sel == "saveUserinfoToLocal"
+                        || island_is_cafe_table_op(sel)))
+                || (class == "NetworkManager" && sel == "addObjectToServer:")
+                || (class == "WashRoomGame" && sel == "updateTop3Record"))
         {
             island_mark_dirty();
             // [2026-09-24 第四轮 K3 I5-04] 关键操作(扣款/发奖/任务指针/扩地/新放置)再排一次即时落盘,见 island_request_flush_now。
