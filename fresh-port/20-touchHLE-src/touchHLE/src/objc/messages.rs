@@ -380,6 +380,20 @@ fn objc_msgSend_inner(
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
+    // [同步 iOS 91eb00f · 2026-09-24] 同理,接收者非 nil、但 isa 指向一个没有注册 host object 的「类」
+    // (取不到类名的垃圾指针):离线移植里有些类方法被伪造成返回非 nil 哨兵,游戏又拿它当真对象发消息
+    // (iOS 上在好友界面实测崩过)。下面的 get_class_name(作弊钩子粗筛、「does not respond」路径都会调)
+    // 对这种类会 expect() panic「Could not get class name!」。当作发给 nil 处理:返回 0。
+    if env.objc.try_get_class_name(orig_class).is_none() {
+        log_dbg!(
+            "[(receiver {:?} with unresolvable class {:?}) {}] -> treating as nil (no-op)",
+            receiver,
+            orig_class,
+            selector.as_str(&env.mem)
+        );
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
     // [MoleWorld] Debug-menu cheat toggles (free shop, multipliers, force VIP,
     // anti-cheat off). Gated by a cheap any_enabled() check so the hot path pays
     // nothing when all cheats are off. intercept() may fully handle the call
