@@ -9043,6 +9043,19 @@ const ISLAND_OFFLINE_REACHABLE_LRS: &[u32] = &[
     // [I8-03] -[UserInfoLayer onButtonCustomServiceFunctionsSelected:] 客服入口 blx@0x5aad4;假分支 0x5ab8a
     //   MessageBox ACTION_CENTER_NETWARNING(不去建 CustomerServiceLayer)。
     0x5aad9,
+    // [2026-09-25 第五轮遗留 E] -[SharedInterfaceLayer onSharedToWeChat]@0x1a5d2c 分享层「微信」图标 blx@0x1a5d8e
+    //   (本方法只有这一道门,没有 isConnected 门);假分支 0x1a5e3e MessageBox SINAWEIBO_NO_CONNECT type 6
+    //   「哎呀，连接不上互联网呢，真遗憾，不如以后再分享吧！」,留在分享层。
+    //   岛上入口:建造 → 商店菜单「相机」(-[NewStyleStoreMainLayer init] 岛分支 0x3aea20 的 4 项菜单 返回/相机/编辑/VIP
+    //   含相机,onButtonCameraSelected:@0x3b1c20 无场景门;-[CameraLayer showWithTarget:selector:] 0xaabfc 对场景 10 挂到
+    //   NewGameManager curScene)→ 拍照(0xac778 addImageChildWithUIImage: 弹分享层)→ 分享层 ccTouchEnded: 0x1a584e tag 5
+    //   (微信图标是 -[SharedInterfaceLayer init] 0x1a5112 另建的 share_wechat.png,0x1a5174 setTag:5,摆在 tag 4 图标正下方
+    //   y = y4 − 0.4×(两图高度和);布局表里的 share_5.png 在 0x1a5080 以 tag 4 加入,是微博入口 onSharedToSinaWeibo)。
+    //   以前被顶成可达,走 0x1a5e38 sendImageContentToWX: → +[WXApi isWXAppInstalled](宿主 canOpenURL:
+    //   对自定义 scheme 恒 NO)→ 0x12f00 UIAlertView「温馨提醒 / WE_CHAT_VERSION_TOO_LOW」,与主村离线、与同层微博入口
+    //   (F9-8 已照原版弹 SINAWEIBO_NO_CONNECT)都不一致。离线时真 getter 读 +180 isReachable_ 恒 0(init 0xe037c 写 0,
+    //   updateReachable: 的 SCNetworkReachabilityGetFlags 在 !network_access 下恒不可达),放行即走原版假分支。
+    0x1a5d93,
     // [I8-03] -[WrapperManager userSelectedAdWallFromPlatform:] 免费贝壳墙选平台 blx@0x2627ac;假分支 0x262886
     //   UIAlertView AD_NOT_AVAIL_TITLE / NETWORK_NOT_AVAIL(不去拉起广告墙平台)。
     0x2627b1,
@@ -9092,6 +9105,15 @@ const ISLAND_OFFLINE_CONNECTED_LRS: &[u32] = &[
     0x3a4d1b,
     //   onButtonLookRecallSelected blx@0x3a4e5a。
     0x3a4e5f,
+    // [2026-09-25 第五轮遗留 E] 刻意不收(已查实岛上点不到):-[UserInfoLayer onButtonBindingAccountSelected:] blx@0x5ad1e
+    //   (LR 0x5ad23)与 -[UserInfoLayer displayAccountBindingLayer] blx@0x5c89e(LR 0x5c8a3)。bindingAccountButton_(+324)
+    //   在 -[UserInfoLayer init] 0x562e0 setVisible:NO(选择子取自 0x54c30 存的 SEL,r2=0;岛 HUD NewSceneUserInfoLayer
+    //   经 0x2573e0 [super init] 同样走到);此后只有 showAccountBindingButton:@0x5c730 会改它的可见性,而它在 0x5c768 要求
+    //   curSceneId==1,岛上恒为 10;-[CCMenu itemForTouch:] 0x2ce878/0x2ce972 跳过不可见项。离线时
+    //   GameData._hasGotAccountBindingReward(+1036)不存档、init 写 0,调 showAccountBindingButton: 让它显形的全是联网回包。
+    //   原版假分支 0x5ad8c 是 MessageBox ACTION_CENTER_NETWARNING「该功能需要联网才能使用哦！」。万一将来要收,只能收 0x5ad23:
+    //   真分支 0x5ad74 已先弹 showLoadingLayer,单收 0x5c8a3 会让 displayAccountBindingLayer 在 0x5c992 直接返回、不调度
+    //   0x5c8ea 的 8 秒 onGetAccountStatusTimeOut,变成永久转圈。
 ];
 
 /// [2026-09-24 第四轮 K5] 编译期自检:LR 表严格升序且每条带 Thumb 位,不满足就编译失败。
