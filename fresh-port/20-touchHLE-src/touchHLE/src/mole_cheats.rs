@@ -195,9 +195,30 @@ static ISLAND_EXIT_FRAMES: AtomicI32 = AtomicI32::new(0);
 ///   ③ 落盘前发现原路径上的文件已不存在(玩家手动删了/挪走了)→ 清并恢复落盘。
 ///   隔离失败时一直保持到进程结束(下次进岛/下次启动会重新判定并重试隔离);不在节拍里反复重试改名,避免失败时
 ///   每秒在 Documents 里留下空的 .corrupt-* 目标文件。
+///   [2026-09-25 第五轮遗留 HOLD] 「有意保留」(原路径上的档完好或未读,只是本会话不该拿默认岛数据覆盖)也借这个掩码
+///   拦落盘,但另记在 ISLAND_HOLD_BITS,见该注释;坏档提示/提示名单/岛档快进只认「本掩码 & !ISLAND_HOLD_BITS」。
 static ISLAND_LOAD_FAILED: AtomicU32 = AtomicU32::new(0);
-/// 各岛档"跳过落盘"日志只打一次(节拍每 1.5s 一次,防刷屏)。
+/// 各岛档"跳过落盘"日志只打一次(节拍每 1.5s 一次,防刷屏)。兼坏档提示的「首次命中」闩锁(island_save_blocked 坏档分支),
+/// 只给「这份文件自己是坏档」用;有意保留与「布局档坏档保护中连带跳过」的日志走 ISLAND_HOLD_LOGGED。
 static ISLAND_BLOCK_LOGGED: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-25 第五轮遗留 HOLD] ISLAND_LOAD_FAILED 里「有意保留」的那些位(恒为它的子集):原路径上的文件完好或未读、不知好坏,
+///   只是本会话不该拿默认岛数据覆盖——布局档缺失/无效回退默认岛时的 island_ships.dat(K1 75035f3)/island_shelltree.dat
+///   (8602bea),以及布局档隔离成功后船档随之改名失败(D3)。
+///   根因:以前这三处直接把位写进坏档掩码,f1bcd59(K3 I7-07)的坏档提示又按「掩码里全是坏档」设计 → island_save_blocked 首次
+///   跳过就挂提示、island_show_block_prompt 按整个掩码列名,完好的船档/贝壳树档被报成「损坏且无法隔离…删掉对应 .dat」,
+///   诱导玩家删掉唯一一份好档;岛档快进(island_ff_offline)也被误拒。
+///   做法:保留位仍留在 ISLAND_LOAD_FAILED 里(所有既有落盘门按位照旧拦截,失效时只会「多拦」不会「错写」),
+///   只在坏档提示、提示名单、岛档快进三个出口过滤掉。
+///   读写规则:置位只经 island_hold_file;清位经 island_protect_clear,或在 island_note_load_failure 置坏档位前先摘除
+///   (原路径上确是坏档 → 按坏档处理、要提示);其它地方只读。
+static ISLAND_HOLD_BITS: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-25 第五轮遗留 HOLD] 「本会话保留、跳过落盘」与「布局档坏档保护中连带跳过」两类日志的一次性闩锁,每次进岛
+///   (build_default_island_mapdata 开头)清零。低 8 位(ISLAND_FILE_*)给 island_save_blocked 的保留分支,
+///   左移 ISLAND_HOLD_LOGGED_MAPGATE 位后给 island_shelltree_flush / save_island_ships 的「布局档坏档保护中连带跳过」,两类各打各的。
+///   与 ISLAND_BLOCK_LOGGED 分开:后者同时是坏档提示的「首次命中」闩锁且按进程生效,以前那两行连带跳过日志占掉它的
+///   SHIPS/SHELLTREE 位后,同进程里这两份档之后真坏且隔离失败就再也不挂提示。
+static ISLAND_HOLD_LOGGED: AtomicU32 = AtomicU32::new(0);
+const ISLAND_HOLD_LOGGED_MAPGATE: u32 = 8;
 const ISLAND_FILE_MAP: u32 = 1 << 0;
 const ISLAND_FILE_USERINFO: u32 = 1 << 1;
 const ISLAND_FILE_SHIPS: u32 = 1 << 2;
@@ -2159,16 +2180,19 @@ fn quarantine_corrupt_file(env: &mut Environment, path: id) -> bool {
 ///   · 文件存在 = 坏档/写残:置位 → 尝试改名隔离;隔离成功立即清位(数据已保住),失败则保持置位、本会话不覆盖它。
 fn island_note_load_failure(env: &mut Environment, path: id, bit: u32, fname: &str) {
     if !guest_file_exists(env, path) {
-        ISLAND_LOAD_FAILED.fetch_and(!bit, O);
+        island_protect_clear(bit);
         return;
     }
     log!(
         "[MOLECHEAT] island: ⚠️ {} 存在但解档失败(坏档/写残)→ 不当作无档直接覆盖,先隔离保留",
         fname
     );
+    // [2026-09-25 第五轮遗留 HOLD] 原路径上确是坏档:先摘掉可能残留的「有意保留」位,按坏档处理(隔离失败要提示)。
+    //   这是 ISLAND_LOAD_FAILED 唯一的坏档置位点。
+    ISLAND_HOLD_BITS.fetch_and(!bit, O);
     ISLAND_LOAD_FAILED.fetch_or(bit, O);
     if quarantine_corrupt_file(env, path) {
-        ISLAND_LOAD_FAILED.fetch_and(!bit, O);
+        island_protect_clear(bit);
         log!(
             "[MOLECHEAT] island: {} 已改名保留为 .corrupt,本次按无档处理(可手动改回原名恢复)",
             fname
@@ -2178,17 +2202,18 @@ fn island_note_load_failure(env: &mut Environment, path: id, bit: u32, fname: &s
         //   布局隔离成功清掉 MAP 位后,save_island_ships 的 MAP 位保护与 SHIPS 保护位都放行,默认岛自带的 1 艘默认船
         //   (34001)在首个节拍/离岛/关窗落盘时就覆盖原船档 → 玩家把 .corrupt 改回原名后 shipState/待领奖品/咖啡馆 isNew 全丢。
         //   取舍:不改成"布局读档失败的会话一律不写船档"(否则默认岛的船每次重进都退回坏船);
-        //   隔离失败时置 SHIPS 保护位(与其它岛档"隔离不了就本会话禁止覆盖"同一规则),代价仅是本会话默认岛船状态不落盘。
+        //   船档随之改名失败时置 SHIPS 保留位(island_hold_file:本会话不覆盖、落盘拦截同坏档,但船档本身没坏,不弹坏档提示),
+        //   代价仅是本会话默认岛船状态不落盘。
         //   island_fragments.dat 不动:默认岛路径同样 load_island_fragments 读回并去重并入,不会被默认数据覆盖。
         if bit == ISLAND_FILE_MAP {
             let sp = island_data_path(env, "island_ships.dat");
             if guest_file_exists(env, sp) {
                 if quarantine_corrupt_file(env, sp) {
-                    ISLAND_LOAD_FAILED.fetch_and(!ISLAND_FILE_SHIPS, O);
+                    island_protect_clear(ISLAND_FILE_SHIPS);
                     log!("[MOLECHEAT] island: island_ships.dat 已随布局档一并改名保留 → 恢复时 island_map.dat 与 island_ships.dat 两份隔离件需一起改回原名(船/咖啡馆状态存在船档里)");
                 } else {
-                    ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHIPS, O);
-                    log!("[MOLECHEAT] island: island_ships.dat 随布局档隔离失败 → 本会话暂停覆盖船档(默认岛的船状态本会话不落盘)");
+                    island_hold_file(ISLAND_FILE_SHIPS);
+                    log!("[MOLECHEAT] island: island_ships.dat 随布局档改名失败 → 本会话保留原船档不覆盖(船档本身未见损坏,不按坏档提示;默认岛的船状态本会话不落盘)");
                 }
             }
         }
@@ -2200,24 +2225,59 @@ fn island_note_load_failure(env: &mut Environment, path: id, bit: u32, fname: &s
     }
 }
 
-/// [深扫修 2026-09-11] #7 岛档解档成功:解除该文件的坏档保护。
+/// [2026-09-25 第五轮遗留 HOLD] 解除某(几)份岛档的保护:坏档保护与有意保留一起清(保持 ISLAND_HOLD_BITS ⊆ ISLAND_LOAD_FAILED)。
+fn island_protect_clear(bits: u32) {
+    ISLAND_LOAD_FAILED.fetch_and(!bits, O);
+    ISLAND_HOLD_BITS.fetch_and(!bits, O);
+}
+
+/// [2026-09-25 第五轮遗留 HOLD] 有意保留:本会话不覆盖原路径上的这份档(落盘拦截与坏档相同),但它不是坏档——
+///   不挂坏档提示、不进提示名单、不挡岛档快进。已在坏档保护中的位不降级(那份文件确是坏档,照旧要提示)。
+fn island_hold_file(bit: u32) {
+    let prev = ISLAND_LOAD_FAILED.fetch_or(bit, O);
+    if (prev & bit) == 0 {
+        ISLAND_HOLD_BITS.fetch_or(bit, O);
+    }
+}
+
+/// [深扫修 2026-09-11] #7 岛档解档成功:解除该文件的坏档保护(连同有意保留位)。
 fn island_note_load_ok(bit: u32) {
-    ISLAND_LOAD_FAILED.fetch_and(!bit, O);
+    island_protect_clear(bit);
 }
 
 /// [深扫修 2026-09-11] #7 落盘前检查:该岛档是否处于坏档保护中(是 → 调用方跳过写这份文件)。
 /// 原路径上的文件已经不在了(玩家手动处理)就解除保护、恢复落盘。
+/// [2026-09-25 第五轮遗留 HOLD] 有意保留位(ISLAND_HOLD_BITS)同样跳过落盘,但只打一行「本会话保留」日志,不挂坏档提示。
 fn island_save_blocked(env: &mut Environment, path: id, bit: u32, fname: &str) -> bool {
     if (ISLAND_LOAD_FAILED.load(O) & bit) == 0 {
         return false;
     }
+    let hold = (ISLAND_HOLD_BITS.load(O) & bit) != 0;
     if !guest_file_exists(env, path) {
-        ISLAND_LOAD_FAILED.fetch_and(!bit, O);
-        log!(
-            "[MOLECHEAT] island: {} 原路径上的坏档已不在(被手动处理)→ 解除保护、恢复落盘",
-            fname
-        );
+        island_protect_clear(bit);
+        if hold {
+            log!(
+                "[MOLECHEAT] island: {} 本会话保留的旧档已不在原路径(被手动删除/挪走)→ 解除保留、恢复落盘",
+                fname
+            );
+        } else {
+            log!(
+                "[MOLECHEAT] island: {} 原路径上的坏档已不在(被手动处理)→ 解除保护、恢复落盘",
+                fname
+            );
+        }
         return false;
+    }
+    if hold {
+        // [2026-09-25 第五轮遗留 HOLD] 完好/未读的旧档,只是本会话不拿默认岛数据覆盖:不挂坏档提示(以前误弹「损坏且无法隔离
+        //   …删掉对应 .dat」,诱导玩家删掉唯一一份好档),也不占 ISLAND_BLOCK_LOGGED(坏档提示的首次闩锁)。
+        if (ISLAND_HOLD_LOGGED.fetch_or(bit, O) & bit) == 0 {
+            log!(
+                "[MOLECHEAT] island: 跳过落盘 {}(本会话保留原路径上的旧档、不覆盖:island_map.dat 缺失/无效,当前是默认岛;不是坏档,不提示)",
+                fname
+            );
+        }
+        return true;
     }
     if (ISLAND_BLOCK_LOGGED.fetch_or(bit, O) & bit) == 0 {
         log!(
@@ -3321,10 +3381,12 @@ fn island_shelltree_load(env: &mut Environment) {
     SHELLTREE_GV.store(0, O);
     // [2026-09-24 第四轮 集成补漏] 布局档缺失/无效回退默认岛时保住贝壳树侧档:默认岛布局里没有树,不拦的话首个节拍
     //   island_shelltree_flush 按「布局里没有树 = 树已删除」写空字典,玩家事后把原布局档放回,树回来了倒计时却从头开始
-    //   (最多白等 36 小时)。这里置保护位后直接返回、不走 island_sidecar_load(它读档成功会 island_note_load_ok 清位),
-    //   保护位让 island_sidecar_save → island_save_blocked 本会话跳过它;下次走读档岛分支时本标志为假,照常读档清位。
+    //   (最多白等 36 小时)。这里置保留位(island_hold_file)后直接返回、不走 island_sidecar_load(它读档成功会
+    //   island_note_load_ok 清位),保留位让 island_sidecar_save → island_save_blocked 本会话跳过它(只打「本会话保留」日志,
+    //   不弹坏档提示——[2026-09-25 第五轮遗留 HOLD] 以前直接写坏档掩码,完好的贝壳树档被报成「损坏且无法隔离」);
+    //   下次走读档岛分支时本标志为假,照常读档清位。
     if SHELLTREE_HOLD_FOR_DEFAULT.load(O) {
-        ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHELLTREE, O);
+        island_hold_file(ISLAND_FILE_SHELLTREE);
         log!("[MOLECHEAT] island: island_map.dat 缺失/无效(当前是默认岛),本会话不读也不覆盖 island_shelltree.dat");
         return;
     }
@@ -3371,7 +3433,9 @@ fn island_shelltree_flush(env: &mut Environment) -> Option<String> {
         return None;
     }
     if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
-        if (ISLAND_BLOCK_LOGGED.fetch_or(ISLAND_FILE_SHELLTREE, O) & ISLAND_FILE_SHELLTREE) == 0 {
+        // [2026-09-25 第五轮遗留 HOLD] 闩锁用 ISLAND_HOLD_LOGGED(每次进岛清零),不占坏档提示的首次闩锁 ISLAND_BLOCK_LOGGED。
+        let lb = ISLAND_FILE_SHELLTREE << ISLAND_HOLD_LOGGED_MAPGATE;
+        if (ISLAND_HOLD_LOGGED.fetch_or(lb, O) & lb) == 0 {
             log!("[MOLECHEAT] island: 跳过落盘 island_shelltree.dat(island_map.dat 坏档保护中,当前是默认岛)");
         }
         return None;
@@ -3810,7 +3874,9 @@ fn save_island_ships(env: &mut Environment) -> Option<String> {
     // [深扫修 2026-09-11] #7 船档描述的是 island_map.dat 里那批船/咖啡馆:布局坏档仍在保护中(当前内存是默认岛)时,
     //   船档也不能用默认岛的船状态覆盖;自身坏档保护中同理。
     if (ISLAND_LOAD_FAILED.load(O) & ISLAND_FILE_MAP) != 0 {
-        if (ISLAND_BLOCK_LOGGED.fetch_or(ISLAND_FILE_SHIPS, O) & ISLAND_FILE_SHIPS) == 0 {
+        // [2026-09-25 第五轮遗留 HOLD] 闩锁用 ISLAND_HOLD_LOGGED(每次进岛清零),不占坏档提示的首次闩锁 ISLAND_BLOCK_LOGGED。
+        let lb = ISLAND_FILE_SHIPS << ISLAND_HOLD_LOGGED_MAPGATE;
+        if (ISLAND_HOLD_LOGGED.fetch_or(lb, O) & lb) == 0 {
             log!("[MOLECHEAT] island: 跳过落盘 island_ships.dat(island_map.dat 坏档保护中,当前是默认岛)");
         }
         return None;
@@ -4289,7 +4355,7 @@ fn island_ff_dict_objects(env: &mut Environment, md: id) -> Vec<(id, String)> {
 ///   公寓/打工任务全都没法无头验证;而直接改岛上的活对象也没用——离岛时 -[NewSceneData updateBeginTime]→setModObjectToServer:
 ///   与我们的回写/节拍落盘会拿活对象把改动覆盖掉。所以反过来:在主村、离线、没有岛会话时,把【盘上】岛档里的绝对时间一律
 ///   减 secs(等价于这段时间已经流逝),下次进岛读档时原版计时逻辑自己算出「已完成」。移植者自拟的调试工具,不是原版功能。
-/// 前置:离线;不在岛会话(进岛窗口/在岛/加载/离岛过渡都算);全部岛档坏档保护位为 0;两份岛档都能正常解档。
+/// 前置:离线;不在岛会话(进岛窗口/在岛/加载/离岛过渡都算);全部岛档坏档保护位为 0(有意保留位 ISLAND_HOLD_BITS 不算);两份岛档都能正常解档。
 ///   任一不满足直接拒绝、什么都不写。校验通过后先调 mole_dev::snapshot_save 存一份快照(失败就不改),可用快照撤销。
 /// 回拨范围:
 ///   · island_map.dat:ISLAND_TIME_FIELDS 列出的每个绝对时间字段(规则见 island_ff_shift);
@@ -4311,7 +4377,9 @@ pub fn island_ff_offline(env: &mut Environment, secs: f64) -> Result<String, Str
     if !(secs.is_finite() && secs >= 1.0) {
         return Err("快进的秒数必须是正数".to_string());
     }
-    let bad = ISLAND_LOAD_FAILED.load(O);
+    // [2026-09-25 第五轮遗留 HOLD] 有意保留位不拦:它只管那次(默认岛)岛会话的落盘;快进在主村进行,只把盘上的旧侧档计时
+    //   回拨,与「这段时间流逝了」一致(island_shelltree_ff 经 island_sidecar_load 读档成功会清掉该位,下次进岛重新判定)。
+    let bad = ISLAND_LOAD_FAILED.load(O) & !ISLAND_HOLD_BITS.load(O);
     if bad != 0 {
         return Err(format!(
             "有岛档处于坏档保护中(保护位 {:#x}:本会话读档失败且未能隔离),为免覆盖不回拨",
@@ -4571,7 +4639,8 @@ fn island_sidecar_load(env: &mut Environment, fname: &str, bit: u32) -> id {
     loaded
 }
 
-/// [2026-09-24 第四轮骨架] 通用岛侧档落盘:保护位置位时先问 island_save_blocked(原路径仍是未隔离的坏档就跳过),
+/// [2026-09-24 第四轮骨架] 通用岛侧档落盘:保护位置位时先问 island_save_blocked(原路径仍是未隔离的坏档就跳过;
+///   [2026-09-25 第五轮遗留 HOLD] 本会话有意保留的旧侧档同样跳过,只是不挂坏档提示),
 ///   再 archivedDataWithRootObject: + writeToFile:atomically:YES。返回落盘摘要「存盘 xxx.dat(ok=..)」供 island_flush 汇总;
 ///   root 为 nil 或归档失败返回 None。成功只打 log_dbg!,ok=false 用 log!(与四份老档一致)。root 的所有权不变(不 release)。
 #[allow(dead_code)]
@@ -5117,7 +5186,8 @@ fn island_request_flush_now(env: &mut Environment) {
 }
 
 /// [2026-09-24 第四轮 K3 I7-07] 岛档因坏档保护被禁写(原路径是解档失败、又没能改名隔离的坏档)时给玩家的一次性提示:
-/// island_save_blocked 首次跳过某文件时置位,由 moleIslandTick 在岛上弹原版 MessageBox 后清零。
+/// island_save_blocked 首次因坏档跳过某文件时置位,由 moleIslandTick 在岛上弹原版 MessageBox 后清零。
+/// [2026-09-25 第五轮遗留 HOLD] 有意保留位(ISLAND_HOLD_BITS)跳过落盘时不置位,见 island_save_blocked 的 hold 分支。
 /// 以前只有一行日志,玩家整局照常玩、退出后岛上进度全没,而交任务的经验/贝壳已进主档,下次还能再领。
 static ISLAND_BLOCK_PROMPT_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -5144,8 +5214,10 @@ const ISLAND_FILE_NAMES: [(u32, &str); 8] = [
 ///     「原路径坏档没了就解除保护」在玩家下一次真实操作置脏时自愈。
 ///   · 文案区分两种恢复方式:删掉文件 → 本会话下一次落盘时 island_save_blocked 发现原路径已空即解除保护(当场恢复);
 ///     修好文件(原路径仍有文件)→ 本会话仍按保护跳过,要等下次进岛解档成功(island_note_load_ok)才解除。
+///   · [2026-09-25 第五轮遗留 HOLD] 有意保留位(ISLAND_HOLD_BITS)不提示也不列名(见 island_save_blocked 的 hold 分支):
+///     只剩保留位时不弹;布局档真坏又隔离失败时名单里只有真坏的那几份,不再把完好的船档/贝壳树档一起列成「损坏」。
 fn island_show_block_prompt(env: &mut Environment) {
-    let bits = ISLAND_LOAD_FAILED.load(O);
+    let bits = ISLAND_LOAD_FAILED.load(O) & !ISLAND_HOLD_BITS.load(O);
     if bits == 0 {
         ISLAND_BLOCK_PROMPT_PENDING.store(false, O);
         return;
@@ -6109,6 +6181,8 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     }
     // [2026-09-24 第四轮 集成补漏] 每次进岛重新判定是否要替贝壳树侧档挡覆盖(默认岛分支里按需置位)。
     SHELLTREE_HOLD_FOR_DEFAULT.store(false, O);
+    // [2026-09-25 第五轮遗留 HOLD] 「本会话保留/连带跳过」日志每次进岛各打一次。state2 补注入重跑本函数时还没到任何落盘,重复清零无副作用。
+    ISLAND_HOLD_LOGGED.store(0, O);
     // [P5 地基] 先确保岛 userInfo 载体存在(NPC/任务/剧情/成就),持久化与默认两条路径都要。
     ensure_island_userinfo(env, nsd);
     start_island_tick(env);
@@ -6395,10 +6469,11 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     //   本会话就不覆盖它。根因:船档描述的是 island_map.dat 里那批船/咖啡馆,只在读档岛分支 load_island_ships 读回;
     //   island_note_load_failure 对「文件不存在」只清位返回,走不到「布局隔离成功 → 船档一并隔离」那段,save_island_ships
     //   的 MAP 位门与 SHIPS 位门全放行,首个节拍就拿默认船(shipState=0、无礼物)覆盖玩家的船态/出海战利品/咖啡馆 isNew。
-    //   做法:只置 ISLAND_FILE_SHIPS 保护位(与隔离失败时「本会话禁止覆盖」同一规则,代价是本会话默认岛的船态不落盘)。
+    //   做法:置 SHIPS 保留位(island_hold_file:落盘拦截同坏档、代价是本会话默认岛的船态不落盘;但船档本身完好,
+    //   不弹坏档提示、不进提示名单——[2026-09-25 第五轮遗留 HOLD] 以前直接写坏档掩码,被 f1bcd59 的提示报成「损坏且无法隔离」)。
     //   · 不在这里补调 load_island_ships:默认船 searchMapId=0、onBoardMoleNum=0,把旧礼物回填上去会命中空奖励锁死(I4-06);
     //   · 不改名隔离船档:那是一份完好的档,改名只会让玩家更难恢复;island_save_blocked 有「原路径文件没了就解除保护」的自愈。
-    //   坏档隔离成功时船档已随布局档改名(原路径不在)→ 这里不置位;船档随之隔离失败时 SHIPS 位已置,再置一次无副作用;
+    //   坏档隔离成功时船档已随布局档改名(原路径不在)→ 这里不置位;船档随之改名失败时 SHIPS 保留位已置,再置一次无副作用;
     //   布局档本身隔离失败时 MAP 位已置(save_island_ships 先被 MAP 位门挡住),这里补 SHIPS 位只是多一道保险。
     //   保护只管本会话:本会话节拍照常把默认岛写进 island_map.dat(MAP 位没置);下次进岛(同进程重进或重启)走读档岛分支,
     //   load_island_ships 读档成功即 island_note_load_ok 清掉 SHIPS 位,并按 (kind, objectId, ord) 把旧船态/礼物回填到默认岛
@@ -6409,12 +6484,12 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     {
         let sp = island_data_path(env, "island_ships.dat");
         if guest_file_exists(env, sp) {
-            ISLAND_LOAD_FAILED.fetch_or(ISLAND_FILE_SHIPS, O);
+            island_hold_file(ISLAND_FILE_SHIPS);
             log!("[MOLECHEAT] island: island_map.dat 缺失/无效,本会话不覆盖 island_ships.dat(保留原船档;要恢复旧岛请在离岛/退出后、下次进岛前把原布局档放回原名)");
         }
     }
     // [2026-09-24 第四轮 集成补漏] 贝壳树侧档(K11)同样描述 island_map.dat 里那棵树(键 40),同一规则:还在原路径就本会话不覆盖。
-    //   只置标志,由 island_after_layout_ready → island_shelltree_load 置保护位(见 SHELLTREE_HOLD_FOR_DEFAULT)。
+    //   只置标志,由 island_after_layout_ready → island_shelltree_load 置保留位(island_hold_file,见 SHELLTREE_HOLD_FOR_DEFAULT)。
     {
         let tp = island_data_path(env, SHELLTREE_FILE);
         if guest_file_exists(env, tp) {
@@ -6561,12 +6636,13 @@ fn island_loading_alert_swallow_log(env: &mut Environment, sel: &str) {
     let map_exists = guest_file_exists(env, path);
     let failed = ISLAND_LOAD_FAILED.load(O);
     log!(
-        "[MOLECHEAT] island: 吞掉 LoadingHoliday {}(离线进岛不弹「网络连接中断」,也不走 reconnectUsingNewHD)诊断:mapData.count={:?} island_map.dat 存在={} 布局坏档保护={} ISLAND_LOAD_FAILED={:#x} ISLAND_INJECTED={} state2 补注入已判={}",
+        "[MOLECHEAT] island: 吞掉 LoadingHoliday {}(离线进岛不弹「网络连接中断」,也不走 reconnectUsingNewHD)诊断:mapData.count={:?} island_map.dat 存在={} 布局坏档保护={} ISLAND_LOAD_FAILED={:#x} ISLAND_HOLD_BITS={:#x} ISLAND_INJECTED={} state2 补注入已判={}",
         sel,
         cnt,
         map_exists,
         (failed & ISLAND_FILE_MAP) != 0,
         failed,
+        ISLAND_HOLD_BITS.load(O),
         ISLAND_INJECTED.with(|c| c.get()),
         ISLAND_REINJECT_TRIED.load(O)
     );
