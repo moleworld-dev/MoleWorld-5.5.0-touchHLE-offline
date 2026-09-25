@@ -2828,7 +2828,9 @@ const ISLAND_MISC_KEY_TOP3: &str = "top3RecordOfMiniGame";
 /// [2026-09-24 第四轮 K12 I7-03/I6-01] 岛成就累计计数落盘 → island_misc.dat(挂在 island_flush_extras 的 K12 槽位)。
 ///
 /// **病根**:「累计做 N 次」类岛成就的进度存在 NewSceneData.achievementStateRecord_(+84,槽 0xb05d98,
-/// NSMutableDictionary,键/值都是 `numberWithUnsignedInt:` 出来的 NSNumber)。玩法侧两个计数点(checkAchieve:itemId:
+/// NSMutableDictionary<NSNumber 成就号 → NSNumber>;[2026-09-25 第五轮遗留 ACH 更正] 键由 saveAchieveUnlockData: 用
+/// `numberWithInt:` 构造(0x33503e),由 checkReqConditionOk:/checkBuildShopOK: 用 `numberWithUnsignedInt:` 构造
+/// (0x336120/0x335b9c 发送);宿主 NSNumber 跨类型相等,是同一个键。值是 `numberWithUnsignedInt:`)。玩法侧两个计数点(checkAchieve:itemId:
 /// 按 achieveType 分派):类型 0x10/0x400/0x800 走 -[NewSceneAchievement checkReqConditionOk:itemId:]@0x335fbc——
 /// 0x336138 取表、0x33619c 首次写 1、0x33620e 写 count+1、0x33628a `cmp/bhs` 与 requireConditions 的需求数比较;
 /// 类型 0x20(建店类)走 -[NewSceneAchievement checkBuildShopOK:]@0x335af8——0x335bd2 取表、0x335c44 写 count+1。
@@ -2843,7 +2845,8 @@ const ISLAND_MISC_KEY_TOP3: &str = "top3RecordOfMiniGame";
 /// **做法**(补全原版该由服务器保管的数据,让原版判定链自己跑):只在岛上(ON_ISLAND)把这张表原样归档写盘——
 /// 不在岛上时它已被 reset 清空,写盘等于拿空表覆盖玩家进度。值整值照抄(可能带 0x10000000 状态位):
 /// 回档后 -[NewSceneAchievement checkConditions:itemId:] 在 0x334ab4 先问 checkInAlreadyUnlockList:(读的是已随
-/// island_userinfo.dat 持久化的 achieveAlreadyUnlock),0x334abc `bne` 直接跳过已解锁项,不会重复发奖。
+/// island_userinfo.dat 持久化的 achieveAlreadyUnlock),0x334abc `bne` 直接跳过已解锁项——两份档一致时不会重复发奖;
+/// island_userinfo.dat 丢失或落后时,由 island_misc_restore 丢弃孤立的已解锁位(第五轮遗留 ACH)。
 /// 在线模式由私服 1062 下发,这里一律不动。归档对象是 NewSceneData 上的活表,不是 userInfoDataInNewScene
 /// (后者没有这个字段)。返回落盘摘要并入 island_flush 的汇总日志。
 /// [2026-09-24 第四轮 K12 I7-05] 同一份档再存 top3RecordOfMiniGame 键(小游戏前三名,病根与读回见 island_misc_restore_top3)。
@@ -2911,6 +2914,20 @@ fn island_misc_flush(env: &mut Environment) -> Option<String> {
 ///   (v12@0:4@8,属性 `&,N`,0x223cdc 走 _objc_setProperty 自带 retain 并释放旧表)后放掉我们的 +1。
 ///   setter 必须给可变容器:checkReqConditionOk: 会直接对它 setObject:forKey:。接收者是 NewSceneData。
 /// · [2026-09-24 第四轮 K12 I7-05] 小游戏前三名由 island_misc_restore_top3 读回,与成就计数互不依赖。
+/// · [2026-09-25 第五轮遗留 ACH] 带 0x10000000 位的项先核对已解锁表。原版两张表都在服务器:1062
+///   -[NewSceneCommand parseMapDataWithPackageData:atIndex:] 在 0x22b1c6/0x22b1d4 取选择子、0x22c538/0x22c362 分别取
+///   achievementStateRecord / achieveAlreadyUnlock 灌数;-[NewSceneAchievement saveAchieveUnlockData:]@0x334fc4 在 0x3350a4
+///   写状态位、0x3350f8 写解锁时刻,两边同时写——原版不变量「计数带 0x10000000 位 ⇔ 已解锁表里有这个成就」。
+///   离线两份分存(计数在 island_misc.dat、已解锁表在 island_userinfo.dat):后者被隔离、删掉,或合法但落后于本档
+///   (island_flush 先写 userinfo 后写 misc,前者写失败后者写成功再崩)时,checkInAlreadyUnlockList:@0x33538c 返回假,
+///   checkConditions:itemId: 不再在 0x334abc 跳过;checkReqConditionOk: 在 0x3361f8 把 0x10000000 加 1,0x33628a `cmp/bhs`
+///   对任何需求数都成立(checkBuildShopOK: 在 0x335c20/0x335ca0 同理)→ saveAchieveUnlockData: 重新解锁,0x335188
+///   showRewards: 再发一次经验/摩尔豆/贝壳(进主档)与建设值。
+///   规则:位在、表里没有 → 整项丢弃(计数回到 0,要真做满需求数才会再解锁;saveAchieveUnlockData: 在 0x335080 写的是
+///   `mov.w #0x10000000` 整值,原计数本就没保留,丢弃与剥位对正常值等价,但丢弃不会留下 0x10000000|n 残值);表里有的项和
+///   不带位的进行中计数照原样恢复,两份一致时一项不改。只读已解锁表、不写(不伪造解锁时刻,也不改「进度档丢了按新岛
+///   重来」的既定口径)。本函数在 load_island_userinfo 之后跑(build_default_island_mapdata 先读进度档再调布局就绪挂钩),
+///   取到的就是本次读档结果;读档失败时那张表停在 NewSceneUserInfoData init / reset(0x32397c removeAllObjects)后的空表。
 fn island_misc_restore(env: &mut Environment) {
     if env.options.network_access || ONLINE_MODE.load(O) {
         return;
@@ -2951,6 +2968,30 @@ fn island_misc_restore(env: &mut Environment) {
         log!("[MOLECHEAT] island: island_misc.dat 的 achievementStateRecord 不是字典,跳过");
         return;
     }
+    // [2026-09-25 第五轮遗留 ACH] 已解锁位与已解锁表的跨档一致性(规则见函数头)。判据照抄
+    //   -[NewSceneAchievement checkInAlreadyUnlockList:]@0x33538c 那三条消息:NewSceneData sharedInstance →
+    //   userInfoDataInNewScene → achieveAlreadyUnlock(selref 0xadd840),再 objectForKey:[NSNumber numberWithInt:id](0x3353ea)
+    //   非 nil 即已解锁。不经宿主调原方法:要先 +shareInstance 造 NewSceneAchievement 单例,且 SAVE_HAS_DICT_AS_ARRAY
+    //   止血臂置位时它恒返回 1,会把孤立项误判成已解锁而留下。
+    let unlocked: id = {
+        let ui_s = island_sel(env, "userInfoDataInNewScene"); // @8@0:4,getter 0x223cf4(纯 ivar 读)
+        let ui: id = msg_send(env, (nsd, ui_s));
+        if ui == nil {
+            nil
+        } else {
+            let s = island_sel(env, "achieveAlreadyUnlock"); // @8@0:4,getter 0x323ad0(纯 ivar 读)
+            let d: id = msg_send(env, (ui, s));
+            // 只对真字典发 objectForKey:(对坏档伪字典数组发会置 SAVE_HAS_DICT_AS_ARRAY,见 load_island_userinfo 的 K2 注释);
+            // nil / 伪字典一律按「不在表里」处理,与游戏自身判「未解锁」一致。
+            if island_misc_is_kind(env, d, dict_cls) {
+                d
+            } else {
+                nil
+            }
+        }
+    };
+    let nwi = island_sel(env, "numberWithInt:");
+    let mut orphan: Vec<u32> = Vec::new();
     let fresh = island_alloc_init(env, "NSMutableDictionary");
     if fresh == nil {
         return;
@@ -2975,15 +3016,30 @@ fn island_misc_restore(env: &mut Environment) {
             dropped += 1;
             continue;
         }
-        let _: () = msg_send(env, (fresh, sfk, val, key));
         let kv: u32 = msg_send(env, (key, uiv));
         let vv: u32 = msg_send(env, (val, uiv));
+        // [2026-09-25 第五轮遗留 ACH] 带已解锁位但已解锁表里查不到 → 孤立位,整项丢弃(见函数头)。
+        if vv & 0x1000_0000 != 0 {
+            let listed = unlocked != nil && {
+                // 与 0x3353ea 同一构键法(numberWithInt:,i32);宿主 NSNumber 的 hash/compare 跨 Int/LongLong 一致,
+                // 能命中解档出来的 LongLong 键——游戏自己的 checkInAlreadyUnlockList: 本来就依赖这一点。
+                let k2: id = msg_send(env, (num_cls, nwi, kv as i32));
+                let o: id = msg_send(env, (unlocked, ofk, k2));
+                o != nil
+            };
+            if !listed {
+                orphan.push(kv);
+                continue;
+            }
+        }
+        let _: () = msg_send(env, (fresh, sfk, val, key));
         kept.push((kv, vv));
     }
     let set_s = island_sel(env, "setAchievementStateRecord:");
     let _: () = msg_send(env, (nsd, set_s, fresh));
     release(env, fresh);
     kept.sort_unstable();
+    orphan.sort_unstable();
     let desc: Vec<String> = kept
         .iter()
         .map(|&(k, v)| {
@@ -2995,13 +3051,22 @@ fn island_misc_restore(env: &mut Environment) {
         })
         .collect();
     log!(
-        "[MOLECHEAT] island: 读回 island_misc.dat 岛成就累计 {} 项 [{}]{}",
+        "[MOLECHEAT] island: 读回 island_misc.dat 岛成就累计 {} 项 [{}]{}{}",
         kept.len(),
         desc.join(","),
         if dropped > 0 {
             format!("(丢弃非数字项 {} 个)", dropped)
         } else {
             String::new()
+        },
+        if orphan.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "(丢弃孤立已解锁位 {} 项 {:?}:已解锁表里没有这些成就(island_userinfo.dat 无档/坏档/落后于本档)→ 计数回到 0,免得下一次 +1 就重新解锁重发奖)",
+                orphan.len(),
+                orphan
+            )
         }
     );
 }
