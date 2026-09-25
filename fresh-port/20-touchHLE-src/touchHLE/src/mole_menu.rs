@@ -2135,6 +2135,15 @@ fn ship_return_now(env: &mut Environment) {
 /// mapData)后直接 `[SceneMannager startNewSceneFrom:1 toScene:10]`;网络门与 state2
 /// 数据门由 mole_cheats 的 intercept 在进岛窗口内放行。跳过飞机过场(热点路径仍带)。
 fn enter_island(env: &mut Environment) {
+    // [2026-09-25 第五轮遗留 C] 时间旅行中不进岛,规则与 mole_cheats 的 enterNewIslands 臂相同(旅行期间岛档不落盘、进岛从盘上重读,
+    //   交任务的奖励却当场进主档 → 同一条岛任务能反复领)。放在 island_arm_entry 与发 enterNewIslands 之前,什么岛状态都不动。
+    //   修改器是盖在游戏画面上的 UIKit 层,游戏的 MessageBox 会被它挡住,所以这里用底部提示说明原因,菜单保持打开。
+    let tt_offset = crate::libc::time::time_offset_secs();
+    if tt_offset != 0 {
+        log!("[MOLEMENU] enter island refused: 时间旅行中(偏移 {} 秒)", tt_offset);
+        set_toast(crate::mole_cheats::ISLAND_TT_ENTER_BLOCKED_MSG.to_string());
+        return;
+    }
     let wm = game_singleton(env, "WrapperManager", "sharedManager");
     let village: id = if wm != nil {
         let s = sel(env, "currentVillageLayer");
@@ -2358,11 +2367,14 @@ fn dev_confirm(action: Action) -> Option<(u32, String)> {
         // [2026-09-16] X4-02 确认文案补上活动中心的限制:旅行期间 mole_activity 侧档只写内存(F2-05),付费操作的扣款和发奖
         // 却照常写进主档,所以这些操作在旅行中被禁用(拦截在 mole_activity.rs);旅行中拍快照时,主档是旅行后的,
         // 活动档还是旅行前的。文案超过一行,底部 toast 会自动折行(add_toast)。
-        // [2026-09-24 第四轮 K3 I7-01] 补黄金岛:旅行期间岛档一律不落盘(mole_cheats::island_flush 开头的落盘闸);每次进岛都从磁盘读岛档,离岛再进或重启后都回到旅行前。
-        Action::Dev(DevTool::TimeTravelHours(h)) => Some((
+        // [2026-09-24 第四轮 K3 I7-01] 补黄金岛:旅行期间岛档一律不落盘(mole_cheats::island_flush 开头的落盘闸)。
+        // [2026-09-25 第五轮遗留 C] 只挡落盘会让岛上进度回滚而奖励留在主档,现在旅行期间不能进岛,落盘闸只作兜底;
+        //   文案同步。岛会话中(island_session_active)不再先要确认:第一下就执行,由 time_travel_hours 直接给出拒绝原因,
+        //   免得点两下才知道不行。
+        Action::Dev(DevTool::TimeTravelHours(h)) if !crate::mole_cheats::island_session_active() => Some((
             1000 + h.clamp(0, 1_000_000) as u32,
             format!(
-                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。黄金岛进度在旅行期间不保存,离岛再进或重启后都回到旅行前。再点一次确认",
+                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。旅行期间不能进入黄金岛(岛上进度这段时间无法保存),重启回到现实时间后恢复;要测岛上计时请在不旅行时用「岛档快进」。再点一次确认",
                 h
             ),
         )),

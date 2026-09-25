@@ -4685,8 +4685,12 @@ fn island_flush(env: &mut Environment, reason: &str) {
     //   各 coolingTime、curQuestResult、NpcData.lastCoolDownTime 等)都是"未来"时刻;写进岛档后重启回到现实时间,
     //   -[DiscoveryShip checkIsDiscoverFinished] 0x361e56 vcmpe + 0x361e5e blt.w 对未来起点恒判未完成(不像餐厅/公寓会把起点重置成 now),
     //   cf_fix_residue 只修超前 15.5 年以上的残留 → 出海/NPC 冷却/打工任务长期卡死且不可逆。照 mole_items.rs on_enter_village
-    //   与 mole_activity 侧档的既有做法:旅行期间岛档只留在内存、不落盘。每次进岛 build_default_island_mapdata 都从磁盘读岛档,
-    //   所以离岛再进、或重启后,岛上进度都回到旅行前(离岛那次 startNewSceneFrom 10→1 的落盘同样被本闸跳过)。
+    //   与 mole_activity 侧档的既有做法:旅行期间岛档只留在内存、不落盘。
+    //   [2026-09-25 第五轮遗留 C] 只挡落盘不够:每次进岛 build_default_island_mapdata 都从磁盘读岛档,离岛再进或重启后岛上进度
+    //   回到旅行前,交任务的奖励却已经 add*InNewScene: 当场进了主档 → 同一条岛任务能反复领奖。现在旅行期间进不了岛
+    //   (enterNewIslands 臂拦下并延迟弹原版风格提示,修改器「一键进入黄金岛」也先拒),岛会话中也开始不了旅行
+    //   (mole_dev::time_travel_hours 用 island_session_active() 拒绝);本函数所有调用点都要求 ON_ISLAND,正常流程走不到本闸。
+    //   闸保留作兜底:将来若出现绕过 enterNewIslands 的进岛路径,至少不把未来时间戳写进岛档;命中时日志直接点明有漏网路径。
     //   · 放在置 FLUSHING / 清 DIRTY 之前:不清 DIRTY、不更新 ISLAND_LAST_FLUSH(旅行只在重启时结束,留给那之后);
     //   · 节拍因此每拍都会走到这里(due 恒真),日志只在第一次打(偏移只增不减,一次就够),本分支零消息;
     //   · 有意连开头那次 [NewSceneData saveUserinfoToLocal](主档)也一起跳过:游戏自己的存档路径(add*InNewScene: 等)照常写主档,
@@ -4695,7 +4699,7 @@ fn island_flush(env: &mut Environment, reason: &str) {
     if tt_offset != 0 {
         if !ISLAND_TT_SKIP_LOGGED.swap(true, O) {
             log!(
-                "[MOLECHEAT] island: 时间旅行中不保存岛档(偏移 {} 秒,{}):岛上进度只留在内存,离岛再进或重启后都回到旅行前",
+                "[MOLECHEAT] island: 时间旅行中不保存岛档(偏移 {} 秒,{}):兜底命中——旅行期间本不应在岛上,说明存在绕过 enterNewIslands 拦截的进岛路径;岛上进度只留在内存",
                 tt_offset,
                 reason
             );
@@ -4790,6 +4794,84 @@ fn island_flush(env: &mut Environment, reason: &str) {
 
 /// [2026-09-24 第四轮 K3 I7-01] 「时间旅行中不保存岛档」日志是否已打过(本进程只打一次,见 island_flush 开头)。
 static ISLAND_TT_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// [2026-09-25 第五轮遗留 C] 时间旅行中进岛被拦时给玩家看的提示(enterNewIslands 臂的延迟弹框与修改器「一键进入黄金岛」的
+/// 底部提示共用同一段正文;get_static_str 静态串,不释放)。标点照 mole_activity 的 TIME_TRAVEL_PAID_BLOCKED_MSG 用全角。
+pub const ISLAND_TT_ENTER_BLOCKED_MSG: &str = "时间旅行中不能进入黄金岛（这段时间岛上进度无法保存）。重新启动游戏回到现实时间后即可进岛；要测岛上计时，请重启后在主村用开发工具「岛档快进」。";
+/// [2026-09-25 第五轮遗留 C] 时间旅行拦岛提示已排队(moleIslandTimeTravelNotice 还没弹出或还在等别的框关掉)。
+/// 仿 ISLAND_FLUSH_NOW_PENDING:置位期间再拦进岛不重复排队(只把重试计数清零、延长那条链),免得先后弹出两个相同的框;
+/// 由 island_show_tt_notice 在弹出/放弃/排不上时清零。
+static ISLAND_TT_NOTICE_PENDING: AtomicBool = AtomicBool::new(false);
+/// [2026-09-25 第五轮遗留 C] 延迟提示的重试次数:每拦一次进岛清零;别的提示框占着屏时 0.5 秒后再试。
+static ISLAND_TT_NOTICE_TRIES: AtomicU32 = AtomicU32::new(0);
+/// [2026-09-25 第五轮遗留 C] 重试上限:40 次 × 0.5 秒 ≈ 20 秒。旅行 +1h/+24h 之后主村可能先冒出计时类提示框,
+/// 玩家手动关掉它往往要好几秒;每次重试只发 sharedInstance/parent 两条轻量消息,开销可以忽略。
+const ISLAND_TT_NOTICE_MAX_TRIES: u32 = 40;
+
+/// [2026-09-25 第五轮遗留 C] 把 [GameManager moleIslandTimeTravelNotice] 用 performSelector:withObject:afterDelay: 排到运行循环的
+/// perform 相位(宿主实现只登记请求、不同步跑游戏逻辑;参数 (SEL, id, f64) 与 island_request_flush_now 相同)。
+/// GameManager 不实现该选择子,由 intercept 里开关块外的同名臂接住。会打乱 r0-r3,调用方都是吞掉调用的臂。返回是否排上了。
+fn island_schedule_tt_notice(env: &mut Environment, gm: id, delay: f64) -> bool {
+    if gm == nil {
+        log!("[MOLECHEAT] island: 时间旅行拦岛提示排不上(GameManager 为 nil)");
+        return false;
+    }
+    let s = island_sel(env, "moleIslandTimeTravelNotice");
+    let perform = island_sel(env, "performSelector:withObject:afterDelay:");
+    let _: () = msg_send(env, (gm, perform, s, nil, delay));
+    true
+}
+
+/// [2026-09-25 第五轮遗留 C] 弹「时间旅行中不能进入黄金岛」(只在 moleIslandTimeTravelNotice 臂里调用:宿主自排的选择子、
+/// perform 相位,栈上没有游戏方法体,不在 drawScene/mainLoop 帧栈上,可以发消息)。
+/// 为什么必须延迟弹、不能在 enterNewIslands 臂里当场弹:飞机热区(-[VillageLayer checkSpecailZone:] 0x374f4)与活动公告
+///   (-[ActivityBulletinLayer onJoinInActivity] 0x3aac42)都是先弹原版「去黄金岛」确认框,玩家点「是」后
+///   -[MessageBox onButtonYes:]@0xcb6e4 先在 0xcb742 [target performSelector:enterNewIslands],之后才在 0xcb754 detech
+///   (0xcbb8e removeFromParentAndCleanup: + 0xcbbaa purgeMessageBox 释放单例)。当场弹时确认框还挂在场景上,
+///   -[MessageBox showWithTarget:…object:]@0xca650 在 0xca66e 取 [self parent]、0xca674 非 nil 就 bne.w 0xcaa4e 直接返回
+///   → 提示被静默吞掉,随即连框一起被 detech 关掉,玩家什么也看不到。排到运行循环后确认框已被 purge,sharedInstance 新建的框
+///   parent 为 nil,能正常显示。仍有别的框占着屏(parent 非 nil)时 0.5 秒后再试,最多 ISLAND_TT_NOTICE_MAX_TRIES 次。
+/// 调用序列照原版本方法自己的拒绝分支 0x3773c-0x377ae:[[MessageBox sharedInstance] showWithTarget:nil selector:0 title:nil
+///   message:msg type:6 vipgold:0](type 6 只有「确定」、关框无回调),见 show_game_message_box。
+fn island_show_tt_notice(env: &mut Environment) {
+    let mb_cls = env.objc.get_known_class("MessageBox", &mut env.mem);
+    if mb_cls == nil {
+        ISLAND_TT_NOTICE_PENDING.store(false, O);
+        return;
+    }
+    let sh = island_sel(env, "sharedInstance");
+    let mb: id = msg_send(env, (mb_cls, sh));
+    if mb == nil {
+        ISLAND_TT_NOTICE_PENDING.store(false, O);
+        return;
+    }
+    let parent_s = island_sel(env, "parent");
+    let parent: id = msg_send(env, (mb, parent_s));
+    if parent != nil {
+        // 别的提示框还开着(show 会在 0xca674 直接返回):留着排队标志,0.5 秒后再试。
+        if ISLAND_TT_NOTICE_TRIES.fetch_add(1, O) < ISLAND_TT_NOTICE_MAX_TRIES {
+            let gm_cls = env.objc.get_known_class("GameManager", &mut env.mem);
+            let gm: id = if gm_cls != nil {
+                let smgr = island_sel(env, "sharedManager");
+                msg_send(env, (gm_cls, smgr))
+            } else {
+                nil
+            };
+            if island_schedule_tt_notice(env, gm, 0.5) {
+                return;
+            }
+        } else {
+            log!("[MOLECHEAT] island: 时间旅行拦岛提示放弃(别的提示框一直开着);进岛照样已拦下");
+        }
+        ISLAND_TT_NOTICE_PENDING.store(false, O);
+        return;
+    }
+    ISLAND_TT_NOTICE_PENDING.store(false, O);
+    let msg = crate::frameworks::foundation::ns_string::get_static_str(env, ISLAND_TT_ENTER_BLOCKED_MSG);
+    if show_game_message_box(env, msg, 6, nil, SEL::null()) {
+        log!("[MOLECHEAT] island: 已弹「时间旅行中不能进入黄金岛」提示");
+    }
+}
 
 /// [2026-09-24 第四轮 K3 I6-5] 当前这轮 island_flush 里有岛档 writeToFile:atomically: 返回 NO。
 /// island_flush 开头清零;四个 save_island_* 与 island_sidecar_save 在 ok==false 分支置位;坏档保护的跳过(返回 None)不算。
@@ -7875,6 +7957,10 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             && matches!(sel, "checkIsFixShipFinished" | "checkIsDiscoverFinished"))
         // [2026-09-24 第四轮 集成补漏] 岛上厕所小游戏前三名写入点置脏(WashRoomGame 不在 CLASSES,按门控 sel 写法)。
         || (ON_ISLAND.load(O) && sel == "updateTop3Record")
+        // ── [第五轮 C] ──
+        // [2026-09-25 第五轮遗留 C] 时间旅行拦岛的延迟提示:宿主自排的裸 sel(接收者 GameManager 已在 CLASSES,
+        //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
+        || sel == "moleIslandTimeTravelNotice"
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -10092,6 +10178,14 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         return true;
     }
 
+    // [2026-09-25 第五轮遗留 C] 时间旅行拦岛的延迟提示(enterNewIslands 臂用 performSelector:withObject:afterDelay: 排进来;
+    //   运行循环 perform 相位,栈上没有游戏方法体,不在帧栈上,可以发消息)。放在总闸块外:不管开关怎样,排进来的这一拍都要
+    //   接住并清排队标志。GameManager 不实现该选择子,必须 return true,否则落到真派发 = 未实现的选择子。
+    if sel == "moleIslandTimeTravelNotice" {
+        island_show_tt_notice(env);
+        return true;
+    }
+
     // ★[审计修 2026-09-11·取证纠错] 离线时钟:拦 -[NewSceneTimer getCurrentServerTime](0x22f60c)直接返回宿主真实时间,
     //   且**必须是 CFAbsoluteTime(2001 纪元)而非 unix 秒**:原版 -[NetworkManager parseServerTime:pos:len:] 收到 1065 的
     //   u32 unix 秒后先减 kCFAbsoluteTimeIntervalSince1970(978307200)再存(0x226fea vsub.f64)。离线从没人调
@@ -11078,6 +11172,28 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     busy
                 );
                 return false;
+            }
+            // [2026-09-25 第五轮遗留 C] 开发者「时间旅行」期间不让上岛。旅行期间 island_flush 开头的落盘闸不写任何岛档,
+            //   每次进岛 build_default_island_mapdata 又从盘上重读岛档;而交任务/经营的收支经 add*InNewScene: 当场写进主档
+            //   (如 -[NewSceneData addXpInNewScene:]@0x21f6a4 在 0x21f6ec addXp: 后于 0x21f6fe saveUserinfoToLocal)
+            //   → 离岛再进或重启后同一条岛任务能反复领奖,岛上花的钱留在主档而买到的东西回滚。
+            //   这里是所有离线进岛路径的必经点(selref enterNewIslands 0xadd028 只有飞机确认框 0x374f4、活动公告 0x3aac42 两处引用,
+            //   外加修改器 enter_island 的宿主调用;1→10 的 startNewSceneFrom 只在本方法 gate#1 之后的 SUCC 里),且在真方法
+            //   第一处状态改动 0x37692 setIsChangeSceneButtonSelected:1 之前;照原版自己在本方法 0x3773c 用 type 6 MessageBox
+            //   拒绝进岛(NEW_SCENE_NO_NETCONNECT)的做法。放在上面两道前置门之后:门不过原版本来也静默返回,不弹框。
+            //   吞掉后 ISLAND_INJECTED/GATE1/ENTER_WINDOW 都不动,island_session_active() 仍为假。提示必须延迟弹(见 island_show_tt_notice)。
+            let tt_offset = crate::libc::time::time_offset_secs();
+            if tt_offset != 0 {
+                log!(
+                    "[MOLECHEAT] island: 时间旅行中(偏移 {} 秒)拦下进岛 enterNewIslands:不开网络窗口、不置场景切换标志",
+                    tt_offset
+                );
+                ISLAND_TT_NOTICE_TRIES.store(0, O);
+                if !ISLAND_TT_NOTICE_PENDING.swap(true, O) && !island_schedule_tt_notice(env, gm, 0.0) {
+                    ISLAND_TT_NOTICE_PENDING.store(false, O);
+                }
+                env.cpu.regs_mut()[0] = 0;
+                return true; // 吞掉真 enterNewIslands(v8@0:4)
             }
             ISLAND_INJECTED.with(|c| c.set(false));
             ISLAND_GATE1_HIT.store(false, O);
