@@ -485,6 +485,14 @@ pub fn run_run_loop(
             }
         }
 
+        // [2026-09-25 第五轮遗留 FLUSH] 黄金岛「关键操作即时落盘」受理点:本轮触摸(handle_events)、定时器(CADisplayLink →
+        // CCDirector mainLoop → CCScheduler)、perform 队列都已返回,栈上没有游戏方法体,等价于原 afterDelay:0 的时机,
+        // 但置脏钩子不再在帧栈上发任何消息。只在主线程;没排队时只有一次原子读。自动释放池在 poll 里只包住 island_flush
+        // (与 deliver_significant_time_change、ns_timer 定时器回调、生命周期落盘同一写法),见 mole_cheats::island_flush_now_poll。
+        if is_main_run_loop && crate::mole_cheats::island_flush_now_pending() {
+            crate::mole_cheats::island_flush_now_poll(env);
+        }
+
         if is_main_run_loop {
             media_player::handle_players(env);
         }
