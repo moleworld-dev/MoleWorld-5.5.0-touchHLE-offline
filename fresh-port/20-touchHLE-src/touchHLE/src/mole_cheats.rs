@@ -1028,36 +1028,6 @@ fn island_put(env: &mut Environment, dict: id, key: &'static str, obj: id) {
     release(env, arr);
 }
 
-/// 同 island_put,但【同 key 已有数组则追加】而非覆盖——放多个同族建筑(如 5 个商店都在 key
-/// "28")必须用它,否则 island_put 每次 setObject:forKey: 覆盖,5 个只剩最后 1 个。
-fn island_put_append(env: &mut Environment, dict: id, key: &'static str, obj: id) {
-    if obj == nil {
-        return;
-    }
-    let key_ns = crate::frameworks::foundation::ns_string::get_static_str(env, key);
-    let get_s = env
-        .objc
-        .register_host_selector("objectForKey:".to_string(), &mut env.mem);
-    let mut arr: id = msg_send(env, (dict, get_s, key_ns));
-    if arr == nil {
-        arr = island_alloc_init(env, "NSMutableArray");
-        if arr == nil {
-            return;
-        }
-        let set_s = env
-            .objc
-            .register_host_selector("setObject:forKey:".to_string(), &mut env.mem);
-        let _: () = msg_send(env, (dict, set_s, arr, key_ns));
-        // [2026-09-24 第四轮 K1 I2-4] 只在新建分支交还 alloc 的 +1(dict 已 retain,下面 addObject: 照常可用);
-        //   objectForKey: 取回的既有数组是 +0,绝不能 release,否则过释放、之后 addObject: 打野指针。
-        release(env, arr);
-    }
-    let add_s = env
-        .objc
-        .register_host_selector("addObject:".to_string(), &mut env.mem);
-    let _: () = msg_send(env, (arr, add_s, obj));
-}
-
 /// Build the offline **default Golden Island** `mapData` (3 buildings) and inject
 /// it into `[NewSceneData sharedInstance]` via `setMapData:`, so LoadingHoliday's
 /// state-2 gate (which requires `mapData.count > 0`, normally filled by the dead
@@ -1065,6 +1035,8 @@ fn island_put_append(env: &mut Environment, dict: id, key: &'static str, obj: id
 /// byte-level disassembly of the game's own `-[LoadingHoliday createDefaultMapData]`
 /// (0x252508); we hand-construct the dict instead of calling that method because
 /// it also fires ~8 NetworkManager pushes that are pointless/risky offline.
+/// [2026-09-25 第五轮遗留 A] 商铺按原版只放 1 家水果店 30101;另预置 1 艘探险船 34001(原版进岛加载时由
+/// -[NewGameManager addDiscoveryShipOnMap]@0x245f54 补建,初态字段全 0,这里预置等价),咖啡馆仍交给原版 addCoffeeBarOnMap。
 // ★【已回滚 load_island_shop_atlases】:进岛 loadNewScene 补加载那 4 个建筑商店图集会把黄金岛
 // 渲染搞坏成全绿场地(疑这 4 图集的贴图在 CCTextureCache/帧缓存里覆盖/冲突了岛背景贴图)。补图集
 // 要换更安全的时机/方式(只在进建设庄园那刻、且不覆盖岛贴图),留后续。
@@ -5874,7 +5846,7 @@ fn merge_new_island_objects_into_mapdata(env: &mut Environment) -> i32 {
 /// 而经营回写(writeback_island_object)与退岛合并(merge_new_island_objects_into_mapdata)都以
 /// seqId 为键、且 `seqId==0 → 跳过`,于是**第二次进岛起,餐厅升级/公寓雇佣/出海状态全部不再落盘**
 /// (2026-09-06 无头实测:雇佣 +1 后退岛,存档里 moleNumInWaitingQueue_ 仍为 0)。
-/// 首进用默认岛时种子给的是 90001-90008,这里对读档对象做同样的事:把所有 seqId==0 的对象
+/// 首进用默认岛时种子给的是 90001/90006/90007/90008(水果店/餐厅/公寓/船),这里对读档对象做同样的事:把所有 seqId==0 的对象
 /// 从 max(90000, 已有最大) 起顺序补发。seqId 本就是会话内主键(原版由服务器 1062 下发、不入本地档),
 /// 读档时重发与原版语义一致;之后 restore_seqid_cursor 会把游标抬到新最大值防新放置撞号。
 fn assign_island_seqids(env: &mut Environment) {
@@ -6234,50 +6206,48 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         return false;
     }
 
-    // ★Bug C(商店空格子)治本:商店目录 propertyHV 主村启动期已加载(5 桶×4 食材 30201-30220,
-    // workflow 解密实证),但默认岛原来【只放 1 个商店 30101】→ 只它可逛、且 getShopItemsIds: 只
-    // 服务 shopId∈[30101,30105]、点别的建筑返 0 格 = 全空。这里放全 5 个商店 30101-30105(各对应
-    // 一个食材桶),同 key "28" 用 island_put_append 追加(原 island_put 会覆盖只剩1个)。
-    // currentLevel 一律用已知安全值 4(商品锁已由 getLockType4ShopItem:shop:→0 全放开,level 不
-    // 影响商品列表;避免高 level/99 的进岛卡死险)。baseTile 5 格错开不叠图。
-    const ISLAND_SHOPS: [(i32, f32, f32); 5] = [
-        (30101, 22.0, 42.0),
-        (30102, 27.0, 42.0),
-        // [2026-09-24 第四轮 K16 N-D3-1] 快餐店 30103 从 (32,42) 挪到基础区 (17,48)。baseTile.x=line、.y=column
-        //   (-[Object initWithMapData:type:] 0x3b4f4/0x3b524 → tileAtLine:atColumn:needDummy:)。原 line=32 落在「扩充土地 I」
-        //   (31001,1 万豆/22 级;买下才 extendMap|=0x2,-[NewSceneVillageMenuLayer addNewObject2Map:gift:] 0x25c108/0x25c280):
-        //   -[NewScenePorter isReachable]@0x26b114 在 extendMap 无 0x2 位时 0x26b39a 要求 line<=28,checkCanPut: 0x271270
-        //   判不可达 → 0x2712ae canPut=0,拖离原位后再拖回就放不下(拿起不动直接确认仍可),还白占未买的地。
-        //   新坐标依据(全部按反汇编推算,未改原版逻辑):
-        //   · 占地:isFlip=0 时 Object.size=(length_y,length_x)=(3,4)(0x3b76c);-[Object setTiles] 与 checkCanPut:
-        //     逐格 [runtimeMap tile:base offsetX:0..w-1 offsetY:0..h-1],-[NewSceneMapBase tile:offsetX:offsetY:]@0x251198
-        //     给 column=C+ox-oy、line=L-⌊(ox+oy+(C&1))/2⌋,即占地朝 line 减小方向展开:(17,48) 占 line 15..17、column 45..50;
-        //   · isReachable(extendMap=1):17<=28、17+3>=1、48-4>=18、48+4<=65 全过;HolidayVillageMap regionOfTile: 恒 0;
-        //   · -[HolidayVillageMap setBkgTilesProperty]@0x267e2c 三张静态障碍表(0x9096c8/0x9097b8/0x90a3b0)无一格命中;
-        //   · 与另外四店、布兰的家 (11,39)、公寓 (15,26) 逐格无交集;用户实测档里同为 4×3 的烧烤店 30105 就放在 (17,48)。
-        //   seqId 仍按公式 90003、currentLevel 仍 4。只影响无 island_map.dat 的新档,老档走读档路径不迁移。
-        (30103, 17.0, 48.0),
-        (30104, 22.0, 47.0),
-        (30105, 27.0, 47.0),
-    ];
-    for &(oid, tx, ty) in ISLAND_SHOPS.iter() {
-        let shop = island_alloc_init(env, "TMMapDataShop");
-        if shop != nil {
-            obj_set_int(env, shop, "setObjectId:", oid);
-            // [P2b 持久化命门] 非0 seqId:升级/操作回写靠 objectSequenceId 匹配;种子建筑 seqId=0 会被
-            // 回写的 seqId==0 守卫跳过=升级丢。用 90001+ 高位(新建筑 seqId 从小自增,几乎不撞)。
-            obj_set_int(env, shop, "setObjectSequenceId:", 90000 + (oid - 30100));
-            island_set_point(env, shop, "setBaseTile:", tx, ty);
-            obj_set_int(env, shop, "setIsFlip:", 0);
-            island_set_double(env, shop, "setBeginTime:", 0.0);
-            obj_set_int(env, shop, "setIsShopping:", 0);
-            obj_set_int(env, shop, "setIsUpgrading:", 0);
-            obj_set_int(env, shop, "setCurrentLevel:", 4); // 已知安全(非99/非0)
-            obj_set_int(env, shop, "setSaleItemId:", 0);
-            obj_set_int(env, shop, "setProperty:", 0);
-            island_put_append(env, dict, "28", shop);
-            release(env, shop); // [2026-09-24 第四轮 K1 I2-4] 数组已 retain,交还 alloc 的 +1
-        }
+    // 物件1 水果店 TMMapDataShop 30101 @(22,42) → key "28"。[2026-09-25 第五轮遗留 A] 按原版只放这一家(用户拍板「尊重原版默认岛商铺」)。
+    //   原版 -[LoadingHoliday createDefaultMapData]@0x252508 只 alloc 一个 TMMapDataShop(0x25259c):0x2525b0 setObjectId:0x7595、
+    //   0x2525d6 isFlip 0、0x2525e8/0x2525ec baseTile=(0x41b00000,0x42280000)=(22,42)、0x252610 beginTime 0.0(常量 0x2529f0 实读 8 字节全 0)、
+    //   isShopping/isUpgrading/saleItemId/property 全 0、0x252640 currentLevel 4(=建成的 1 星店:-[NewSceneShop onQuickBuild:] 0x31e594
+    //   建成即 4,进货门 getLockType4ShopItem:shop: 0x21ef5a 按 currentUpgradeLevel−3 算星级),装进键 "28"(0x2527f2 "%d" 格式化 0x1c)。
+    //   该方法 5.5.0 没人调用(selref 0xaddd5c 只在 GameData 两处用),联网新岛布局由服务器 1062(0x426)回包下发;淘米服务器实际下发什么
+    //   已无从核实,私服 island.rs default_island_objects 就是照本方法写的,不算独立证据。独立旁证是岛任务文案(zh-Hans farmquest_descriptionHV):
+    //   任务 5/6 让玩家「去水果店」加速/售卖,任务 7「供不应求」开场白就是「岛上只有一家水果店忙不过来了」,21「雪糕店!」/32「快餐店!」/
+    //   39「西点店!」都是「来开家/建一家」——默认只有水果店才对得上。
+    //   雪糕/快餐/西点/烧烤店 30102-30105 由玩家在建设庄园买(propertyHV 不设 limit_count):getLockType4Object: 主村等级门 20/21/24/25
+    //   (0x21ebd2)、空闲工人门(need_farmer_to_build=1,0x21ec74 锁 2;新岛 -[NewSceneUserInfoData init] 0x32328c curIdleWorkerCount=1)、
+    //   摩尔豆门(0x21ecbe),烧烤店另要布兰的家 5 级(0x21e604-0x21e69e 锁 14)。以前白送这 4 家,这些门全被跳过,玩家一进岛就能经营
+    //   四种食材店;成就 10「企业家」(拥有 3 种以上商铺)的条件也一开始就满足,首家新店建成(-[NewSceneShop onFinishHandler] 0x31f4c2
+    //   checkConditions:0x80 → checkExistShopOK:)就发奖。
+    //   岛上商铺类任务(7/21/23/32/34/39/45,req_own)与成就 8「新事业」都按购买/建造事件计数,预置店不会让它们白完成:
+    //   -[NewSceneQuest checkAction:object:] 在动作 1(addNewObject2Map:gift: 0x25c35a 发)× questType 3 时 0x32aad0 curQuestResult+1;
+    //   读图补判 checkWetherHasAlreadyFinishedQuestWithId:(0x328888-0x3288a8,只在 endLoadMap 0x243d18 调)与 accept(0x3290a0-0x3290ba)
+    //   只数 limit_count==1 或 type 0x10/0x14 的对象,商铺 type 0x20 不计;成就 8 由 checkBuildShopOK:(0x335af8,0x335c44 写回 count+1)累计。
+    //   所以 5 店默认下任务 21「来开家雪糕店」时图上早摆着一家,还得再买一家,与任务链逐家引导的设计相悖。
+    //   食材店面板只按被点那家店的 shopId 取桶(ShopItemsLayer showWithTarget: 0x24bf46 → getShopItemsIds: 0x21e4a4,全二进制唯一调用点
+    //   0x24bf62),单店时水果店照常 4 件货。当年「商店空格子」另有真因,都已另修、与店数无关:showWithTarget: 开头的 currentGameMode==1 门
+    //   (本文件 LR 0x24bec3 臂与上面的 gameMode seed)、reset 清空食材桶(本函数前段 loadPropertyWithType 重填)、非脆弱 ivar 偏移写回。
+    //   seqId:原版由 getPackageDataForAddObjectWithMapData:(0x22a16a getCurrentSequenceId → 0x22a184 setObjectSequenceId:)按游标现分配;
+    //   离线没有服务器,仍用种子 90001,与餐厅 90006/公寓 90007/船 90008 同一套,中间空号无害(restore_seqid_cursor 只抬不降)。
+    //   建设值:原版 0x25273e-0x25276e 对默认对象调 addBuildValueInNewScene:,但 30101/30002/30001 在 propertyHV 里没有 build_value,
+    //   0x21f7da 小于 1 直接返回,这里不加,等价。
+    //   只影响没有有效 island_map.dat 的岛(新号,或布局档坏档隔离后回退)。已有岛档走上面的读档分支;玩家已有的店是他的资产,不迁移、不删除。
+    let shop = island_alloc_init(env, "TMMapDataShop");
+    if shop != nil {
+        obj_set_int(env, shop, "setObjectId:", 30101);
+        // [P2b 持久化命门] 非0 seqId:升级/操作回写靠 objectSequenceId 匹配;种子建筑 seqId=0 会被回写的 seqId==0 守卫跳过=升级丢。
+        obj_set_int(env, shop, "setObjectSequenceId:", 90001);
+        island_set_point(env, shop, "setBaseTile:", 22.0, 42.0);
+        obj_set_int(env, shop, "setIsFlip:", 0);
+        island_set_double(env, shop, "setBeginTime:", 0.0);
+        obj_set_int(env, shop, "setIsShopping:", 0);
+        obj_set_int(env, shop, "setIsUpgrading:", 0);
+        obj_set_int(env, shop, "setCurrentLevel:", 4);
+        obj_set_int(env, shop, "setSaleItemId:", 0);
+        obj_set_int(env, shop, "setProperty:", 0);
+        island_put(env, dict, "28", shop);
+        release(env, shop); // [2026-09-24 第四轮 K1 I2-4] 数组已 retain,交还 alloc 的 +1(同原版 0x2527ea)
     }
     // 物件2 餐厅 TMMapDataRestaurant 30002 @(11,39) → key "29"
     let rest = island_alloc_init(env, "TMMapDataRestaurant");
@@ -6287,7 +6257,12 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         island_set_point(env, rest, "setBaseTile:", 11.0, 39.0);
         obj_set_int(env, rest, "setIsFlip:", 0);
         obj_set_int(env, rest, "setBeginUpgradeTime:", 0);
-        obj_set_int(env, rest, "setProperty:", 1);
+        // [2026-09-25 第五轮遗留 A] property 改回原版 0:原版 0x252898 ldr r1,[sp,#0x8](0x252676 存入的 setProperty:)、0x25289c r2=0,
+        //   私服也是 0。以前写 1,是早期《默认岛数据提取.md》把 0x25288e 取 [sp,#0xc](0x25264c 存入的 setCurrentLevel:)r2=1 和
+        //   setProperty:0 两个 setter 对调抄错;Bug B 改回了 currentLevel,property 漏改。TMMapDataRestaurant.property_(ivar 槽 0xb041ec)
+        //   与 NewSceneRestaurant.property_(槽 0xb076cc)只被 init/编解码/getter/setter 与 initWithTile/initWithMapData(0x31b536 拷入)、
+        //   saveTMMapDataFromObject:(0x243fe6 拷回)引用,没有玩法读者;改 0 只为忠于原版,老档保持 1 无害,不迁移。
+        obj_set_int(env, rest, "setProperty:", 0);
         // ★Bug B(摩尔公寓雇用恒弹"升级布兰的家")治本:餐厅 level 决定 moleUpperLimit。
         // levelupHV.dat 餐厅 30002 最低 level=1(→上限16),【没有 level 0】→ 注入 0 时
         // getUpgradeDataWithId:30002 andLevel:0 查无行 → moleUpperLimit=0 → 公寓雇用门
@@ -6329,7 +6304,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     let _: () = msg_send(env, (nsd, set_s, dict));
     // [2026-09-24 第四轮 K1 I2-4] -[NewSceneData setMapData:]@0x21f458 先 release 旧 ivar,再在 0x21f492 存参数的 mutableCopy
     //   (浅拷贝,每个值数组再 retain 一次),不接管参数这份 +1 → 交还。之后的碎片/seqId/挂钩都只经 [nsd mapData] 拿 ivar 里
-    //   那份拷贝,不再引用 dict。以前默认岛这 8 个 TMMapData*、4 个数组和 dict 全都多一个 +1 永不释放。
+    //   那份拷贝,不再引用 dict。以前(5 店时期)默认岛这 8 个 TMMapData*、4 个数组和 dict 全都多一个 +1 永不释放(现为 4 个 TMMapData*)。
     //   与原版 -[LoadingHoliday createDefaultMapData](0x252508)同一所有权模式:对象 addObject: 后 release(0x2527ea),
     //   数组 setValue:forKey: 后 release(0x252b54),dict 在 setMapData:(0x252b78)之后紧接着 release(0x252b80)。
     release(env, dict);
@@ -6374,10 +6349,10 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     //   咖啡任务 16/17(离线任务链已由 island_cafe_restore_and_offer 复活,领奖走原版 addNewObject2Map:gift: → addAdventureMapFragment:)。
     load_island_fragments(env); // [P4-b] 先恢复玩家买到的碎片(默认岛首进通常无,空过)
     inject_sandgarden_fragments(env, nsd); // [2026-09-16] 再兜底沙原碎片(真新岛档:31006/31008 走商店购买,31005/31007 按任务 81/83 进度补)
-    restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001-90008,抬游标到 90008 防新放置撞号
+    restore_seqid_cursor(env); // [P3-a] 默认岛种子 seqId 90001/90006-90008,抬游标到 90008 防新放置撞号
     island_after_layout_ready(env); // [2026-09-24 第四轮骨架] 布局就绪挂钩(默认岛)
 
-    log!("[MOLECHEAT] island: injected default mapData (5 shops 30101-30105 / restaurant 30002 / apartment 30001 / ship 34001)");
+    log!("[MOLECHEAT] island: injected default mapData (shop 30101 / restaurant 30002 / apartment 30001 / ship 34001)");
     true
 }
 
