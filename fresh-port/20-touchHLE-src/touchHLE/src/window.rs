@@ -1490,6 +1490,9 @@ impl Window {
                     // (0x8badf00d); handled by gating GL + delivering the message.
                     log!("Received app-did-enter-background event.");
                     // background 优先级高于 resign:直接覆盖(消费侧 pop_event 取最新状态即可)。不再 assert。
+                    // [2026-09-25 第五轮遗留 IOS] 被覆盖的失活由消费侧 ui_application::did_enter_background 补发(它发现本次
+                    // 激活以来失活未送达就先发 applicationWillResignActive:),生产侧不改:P0 宿主 GL 闸门
+                    // background_or_terminate_pending 只看这个槽,改成排队会让长帧中途进后台时闸门晚关。
                     self.high_priority_event = Some(Event::AppDidEnterBackground);
                     break;
                 }

@@ -311,6 +311,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 // pauses CCDirector in its own handler. Do NOT exit and do NOT gate
                 // GL (still foreground → GL legal). A true background, if it
                 // follows, arrives as AppDidEnterBackground.
+                // [2026-09-25 第五轮遗留 IOS] resign_active 复用 send_will_resign_active,岛档随后由它的「失活落盘」写;
+                // 失活若被进后台覆盖没送到,did_enter_background 会先补发。
                 log!("Handling app-will-resign-active: pausing (game saves + pauses).");
                 ui_application::resign_active(env);
             }
@@ -366,6 +368,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 // iOS `applicationDidEnterBackground:` — TRUE background. After this,
                 // any GL call kills us; gate GL first, then deliver the message (the
                 // game calls `stopAnimation`).
+                // [2026-09-25 第五轮遗留 IOS] 之后复用 send_did_enter_background(含「进后台落盘」,只写脏的)。
                 log!("Handling app-did-enter-background: gating GL, suspending render.");
                 ui_application::did_enter_background(env);
             }

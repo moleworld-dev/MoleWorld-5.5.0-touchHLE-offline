@@ -568,42 +568,56 @@ pub(super) fn exit(env: &mut Environment) {
     std::process::exit(0);
 }
 
+/// [2026-09-25 第五轮遗留 IOS] 本次激活以来是否已给游戏发过失活:[resign_active] 置位,[did_become_active] 清零;
+/// [did_enter_background] 见未置位就先补发失活。根因:window.rs 的 iOS 臂里「进后台」直接覆盖高优先级槽中还没被
+/// pop_event 取走的「失活」(锁屏时两个事件几乎同时到,或长帧期间多次 poll),于是原版失活回调 @0xfdb8 整个不跑:
+/// 岛上缺 0x10102 [NewSceneData updateBeginTime](各岛对象在这里回写暂停那一刻的经营态),主村缺 0x1009e
+/// [GameData saveToLocal:](两者按 runningScene 是 GameNewScene 还是 InGameScene 互斥),另有 saveSettings 0xfe26、
+/// [CCDirector pause] 0xffc0、pauseMiniGame 0xffec 等;而进后台回调 @0x11270 只 stopAnimation、记下贝壳与金币,不存档。
+/// 真 iOS 保证失活先于进后台,补发是还原系统语义。
+#[cfg(target_os = "ios")]
+static IOS_RESIGN_DELIVERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// [MoleWorld iOS] iOS `applicationWillResignActive:` — the app lost focus
 /// (Control Center, home-indicator, notification, or about to background). Tell
 /// the guest to pause + save, WITHOUT exiting and WITHOUT gating GL (we're still
 /// foreground; GL is legal). If this becomes a true background,
 /// [did_enter_background] follows.
+///
+/// [2026-09-25 第五轮遗留 IOS] 复用 [send_will_resign_active](含第四轮 K3 ace7d96 的黄金岛「失活落盘」);
+/// 进后台前若还没失活,由 [did_enter_background] 先补发本函数。
+/// 不变量:SDL 在 iOS 失活时还会给每个窗口发 SDL_WINDOWEVENT_FOCUS_LOST 与 MINIMIZED(SDL_video.c
+/// SDL_OnApplicationWillResignActive),只因 window.rs 的 desktop_window 带 `!cfg!(target_os = "ios")`,它们才不会
+/// 转成 WindowMinimized → handle_window_minimized → send_will_resign_active。所以本函数是 iOS 失活的唯一入口;
+/// 若以后让 iOS 也走 desktop_window,会双发失活、双跑整轮岛档落盘。
 #[cfg(target_os = "ios")]
 pub(super) fn resign_active(env: &mut Environment) {
     // Don't message the fake app-picker bundle: its game singletons don't exist.
     if env.is_app_picker {
         return;
     }
+    IOS_RESIGN_DELIVERED.store(true, std::sync::atomic::Ordering::Relaxed);
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
-    let pool: id = msg_class![env; NSAutoreleasePool new];
-
-    // Flush NSUserDefaults now (the game also saves in its own handler; this
-    // matches the old exit() behavior so a later OS kill can't lose data).
-    let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
-    let _: bool = msg![env; user_defaults synchronize];
-
-    let delegate: id = msg![env; ui_application delegate];
-    if env
-        .objc
-        .object_has_method_named(&env.mem, delegate, "applicationWillResignActive:")
-    {
-        () = msg![env; delegate applicationWillResignActive:ui_application];
-    }
-    let notif_name = get_static_str(env, UIApplicationWillResignActiveNotification);
-    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
-    let _: () = msg![env; pool drain];
+    // [2026-09-25 第五轮遗留 IOS] 复用 send_will_resign_active:NSUserDefaults synchronize → 委托
+    //   applicationWillResignActive: → 失活通知 → 黄金岛「失活落盘」(island_lifecycle_flush(...,false),无条件写)
+    //   → pool drain。以前这里是它的平行副本(synchronize/委托/通知/pool 逐项相同),第四轮 K3 ace7d96 把岛档落盘
+    //   从委托前置钩子挪进 send_* 时没带上这份副本,568df7f 合进 iOS 后切后台时岛档完全不落盘。
+    send_will_resign_active(env, ui_application);
 }
 
 /// [MoleWorld iOS] iOS `applicationDidEnterBackground:` — the TRUE background.
 /// Gate GL FIRST (so neither this delivery nor anything after touches the GPU),
 /// then deliver the message (the game calls `stopAnimation`). iOS kills any app
 /// that issues GL after this returns.
+///
+/// [2026-09-25 第五轮遗留 IOS] 复用 [send_did_enter_background](含第四轮 K3 的黄金岛「进后台落盘」,只写脏的);
+/// 游戏还没收到失活(失活事件被进后台覆盖)时先补发 [resign_active]。补发发生在 GL 闸门关闭之后:闸门只拦 present
+/// (eagl presentRenderbuffer: 与 composition 合成),原版失活链不 present,闸门不会挡掉它要做的暂停/存档。
+/// 但它并非完全不碰 GL:岛上商铺 currentUpgradeLevel_==1 且有 sprite 时,-[NewSceneShop onApplicationWillResignActive]
+/// @0x3203cc 在 0x320464 setTexture:2 → @0x31eb7c → -[BuildingFrame displayNewSceneShopFrame:buildingId:level:]@0x67750,
+/// 可能走 0x678e4 [CCTextureCache addImage:] / 0x67926 removeUnusedTextures 发纹理上传/删除(闸门不拦)。补发时已在真后台,
+/// 这与 P0「长帧中途进后台、剩余 GL 照发」同类,概率低(纹理多半已缓存),留真机验证。
 #[cfg(target_os = "ios")]
 pub(super) fn did_enter_background(env: &mut Environment) {
     if let Some(window) = env.window.as_mut() {
@@ -612,19 +626,14 @@ pub(super) fn did_enter_background(env: &mut Environment) {
     if env.is_app_picker {
         return;
     }
-    let ui_application: id = msg_class![env; UIApplication sharedApplication];
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
-    let pool: id = msg_class![env; NSAutoreleasePool new];
-    let delegate: id = msg![env; ui_application delegate];
-    if env
-        .objc
-        .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
-    {
-        () = msg![env; delegate applicationDidEnterBackground:ui_application];
+    if !IOS_RESIGN_DELIVERED.load(std::sync::atomic::Ordering::Relaxed) {
+        log!("[生命周期] iOS 进后台前游戏还没收到失活(失活事件被进后台事件覆盖)→ 先补发 applicationWillResignActive:");
+        resign_active(env);
     }
-    let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
-    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
-    let _: () = msg![env; pool drain];
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    // [2026-09-25 第五轮遗留 IOS] 复用 send_did_enter_background:委托 applicationDidEnterBackground: → 进后台通知
+    //   → 黄金岛「进后台落盘」(island_lifecycle_flush(...,true),失活落盘之后又变脏才写)→ pool drain。
+    send_did_enter_background(env, ui_application);
 }
 
 /// [MoleWorld iOS] iOS `applicationWillEnterForeground:` — leaving the
@@ -661,6 +670,9 @@ pub(super) fn did_become_active(env: &mut Environment) {
     if let Some(window) = env.window.as_mut() {
         window.set_backgrounded(false);
     }
+    // [2026-09-25 第五轮遗留 IOS] 重新激活:下一次进后台前必须重新收到失活,否则由 did_enter_background 补发。
+    // 进前台/激活走普通先进先出队列,不会被覆盖,所以只在这里清零。
+    IOS_RESIGN_DELIVERED.store(false, std::sync::atomic::Ordering::Relaxed);
     if env.is_app_picker {
         return;
     }
