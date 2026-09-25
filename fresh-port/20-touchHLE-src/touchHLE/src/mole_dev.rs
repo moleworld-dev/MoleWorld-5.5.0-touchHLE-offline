@@ -404,6 +404,15 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
     if env.options.network_access {
         return Err("在线模式下岛上进度以服务器为准,不能快进岛档".to_string());
     }
+    // [2026-09-25 第五轮遗留 C] 时间旅行中不快进岛档:旅行期间进不了岛(mole_cheats 的 enterNewIslands 臂拦下),快进的效果要重启、
+    //   偏移归零后才看得到;而且 island_storage_ff 在仓库档缺 savedAt 时回退用 now_cf_secs(),它含旅行偏移(wall_cf_secs 加了
+    //   time_offset_secs),会把未来的 savedAt 写进 island_storage.dat。重启后再快进效果相同,所以直接拒绝。
+    //   (回拨前自动拍的快照在旅行中同样是「旅行后的主档 + 旅行前的侧档」,与手动快照一样,不是拒绝的主因。)
+    if crate::libc::time::time_offset_secs() != 0 {
+        return Err(
+            "时间旅行中不能快进岛档(旅行期间进不了岛,快进效果要重启后才看得到),请重启游戏回到现实时间后再快进".to_string(),
+        );
+    }
     if minutes <= 0 {
         return Err("快进的分钟数必须是正数".to_string());
     }
@@ -911,10 +920,10 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
     // [2026-09-24 第四轮 K3 I7-01] 再补一句黄金岛:旅行期间 mole_cheats::island_flush 开头的落盘闸不写任何岛档
     // (免得把"未来"时间戳写进 island_*.dat,重启后出海/NPC 冷却/打工任务长期卡死)。
     // [2026-09-25 第五轮遗留 C] 只挡落盘会让岛上进度回滚而奖励留在主档(同一条岛任务能反复领),所以现在旅行期间进不了岛
-    // (mole_cheats 的 enterNewIslands 臂拦下并弹提示)、岛会话中开始不了旅行(上面);
+    // (mole_cheats 的 enterNewIslands 臂拦下并弹提示)、岛会话中开始不了旅行(上面)、岛档快进也停用(island_fast_forward_minutes);
     // 落盘闸只作兜底。文案同步成「不能进岛,重启后恢复」,与菜单确认文案一致。
     Ok(format!(
-        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致。旅行期间不能进入黄金岛(岛上进度这段时间无法保存),重启回到现实时间后恢复;要测岛上计时请在不旅行时用「岛档快进」",
+        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致。旅行期间不能进入黄金岛,岛档快进也停用(岛上进度这段时间无法保存),重启回到现实时间后恢复;要测岛上计时请在不旅行时用「岛档快进」",
         hours, total_hours
     ))
 }
