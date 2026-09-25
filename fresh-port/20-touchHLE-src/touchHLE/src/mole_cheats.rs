@@ -1121,7 +1121,8 @@ fn load_island_map(env: &mut Environment) -> bool {
         //   MAP 位、默认岛分支又不读船档 → 首个节拍 save_island_map 把默认岛写进 island_map.dat、save_island_ships 把默认岛那艘
         //   「需修船」写进 island_ships.dat,玩家真实船态/待领奖品/咖啡馆 isNew 一起被覆盖,两份档都没留 .corrupt。
         //   save_island_map 自己「空不写」,正常流程不会产出空档,出现即写残/外部改坏。现走与解档失败同一条路:文件仍在原路径
-        //   → 改名 .corrupt 并连带隔离 island_ships.dat(island_note_load_failure 里 bit==MAP 那段);隔离失败 → 保持 MAP 位,
+        //   → 改名 .corrupt 并连带隔离 island_ships.dat / island_shelltree.dat(island_note_load_failure 里 bit==MAP 那段,
+        //   贝壳树侧档自第五轮遗留 HOLD 起一并改名);隔离失败 → 保持 MAP 位,
         //   save_island_map 与 save_island_ships 双双拒写。上面的 island_note_load_ok 不挪(先清后置,结果一样)。
         log!("[MOLECHEAT] island: ⚠️ island_map.dat 解档出空布局(count=0)→ 按坏档处理");
         island_note_load_failure(env, path, ISLAND_FILE_MAP, "island_map.dat");
@@ -2197,7 +2198,7 @@ fn island_note_load_failure(env: &mut Environment, path: id, bit: u32, fname: &s
             "[MOLECHEAT] island: {} 已改名保留为 .corrupt,本次按无档处理(可手动改回原名恢复)",
             fname
         );
-        // [审查修 2026-09-13] D3 布局档隔离成功 → 船档一并隔离,两份同进退。
+        // [审查修 2026-09-13] D3 布局档隔离成功 → 船档一并隔离,两份同进退(第五轮 HOLD 起贝壳树侧档也一并,三份同进退)。
         //   根因:island_ships.dat 描述的是 island_map.dat 里那批船/咖啡馆,只在布局读档成功分支(load_island_ships)读回;
         //   布局隔离成功清掉 MAP 位后,save_island_ships 的 MAP 位保护与 SHIPS 保护位都放行,默认岛自带的 1 艘默认船
         //   (34001)在首个节拍/离岛/关窗落盘时就覆盖原船档 → 玩家把 .corrupt 改回原名后 shipState/待领奖品/咖啡馆 isNew 全丢。
@@ -2205,15 +2206,33 @@ fn island_note_load_failure(env: &mut Environment, path: id, bit: u32, fname: &s
         //   船档随之改名失败时置 SHIPS 保留位(island_hold_file:本会话不覆盖、落盘拦截同坏档,但船档本身没坏,不弹坏档提示),
         //   代价仅是本会话默认岛船状态不落盘。
         //   island_fragments.dat 不动:默认岛路径同样 load_island_fragments 读回并去重并入,不会被默认数据覆盖。
+        //   [2026-09-25 第五轮遗留 HOLD] island_shelltree.dat 同样依赖布局,一并改名(见下);island_storage/cafe/misc.dat 不动:
+        //   默认岛分支同样经 island_after_layout_ready 读回、落盘取的是活表(goodsInStorage / NewSceneData 三张许愿任务表 /
+        //   成就与前三名)原样写回,内容不按布局推导,不会被默认岛覆盖成「删除」状态;改名反而让玩家在默认岛上丢掉仓库与任务进度。
         if bit == ISLAND_FILE_MAP {
             let sp = island_data_path(env, "island_ships.dat");
             if guest_file_exists(env, sp) {
                 if quarantine_corrupt_file(env, sp) {
                     island_protect_clear(ISLAND_FILE_SHIPS);
-                    log!("[MOLECHEAT] island: island_ships.dat 已随布局档一并改名保留 → 恢复时 island_map.dat 与 island_ships.dat 两份隔离件需一起改回原名(船/咖啡馆状态存在船档里)");
+                    log!("[MOLECHEAT] island: island_ships.dat 已随布局档一并改名保留 → 恢复时 island_map.dat、island_ships.dat(与 island_shelltree.dat,若也已改名)的隔离件需一起改回原名(船/咖啡馆状态存在船档里)");
                 } else {
                     island_hold_file(ISLAND_FILE_SHIPS);
                     log!("[MOLECHEAT] island: island_ships.dat 随布局档改名失败 → 本会话保留原船档不覆盖(船档本身未见损坏,不按坏档提示;默认岛的船状态本会话不落盘)");
+                }
+            }
+            // [2026-09-25 第五轮遗留 HOLD] 贝壳树侧档同理,三份同进退。根因:它描述布局键 40 那棵树(K11/8602bea),
+            //   -[TMMapDataSuperShellTree encodeWithCoder:]@0xce3a8 只编 purchaseTime_/harvestTimes_,成长值与 36 小时倒计时
+            //   起点只存在侧档里;island_shelltree_flush 按 island_all_objects 推导「布局里没有树 = 写空字典」。以前只靠默认岛分支的
+            //   SHELLTREE_HOLD_FOR_DEFAULT 保住本会话,下次进岛读的是本会话写出的默认岛布局(没有树)→ island_shelltree_load
+            //   读档清位、落盘写空字典 → 玩家把 .corrupt 改回原名后树回来了,成长值(最多 20)与倒计时却归零。与 D3 给船档补
+            //   同进退的理由相同。改名失败 → 文件仍在原路径,默认岛分支照旧置 SHELLTREE_HOLD_FOR_DEFAULT(有意保留、不提示)。
+            let tp = island_data_path(env, SHELLTREE_FILE);
+            if guest_file_exists(env, tp) {
+                if quarantine_corrupt_file(env, tp) {
+                    island_protect_clear(ISLAND_FILE_SHELLTREE);
+                    log!("[MOLECHEAT] island: island_shelltree.dat 已随布局档一并改名保留 → 恢复旧岛时 island_map.dat / island_ships.dat / island_shelltree.dat 三份隔离件需一起改回原名(贝壳树成长值与倒计时存在贝壳树侧档里)");
+                } else {
+                    log!("[MOLECHEAT] island: island_shelltree.dat 随布局档改名失败 → 本会话保留原贝壳树侧档不覆盖(默认岛分支置保留位,不按坏档提示)");
                 }
             }
         }
@@ -6489,6 +6508,7 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
         }
     }
     // [2026-09-24 第四轮 集成补漏] 贝壳树侧档(K11)同样描述 island_map.dat 里那棵树(键 40),同一规则:还在原路径就本会话不覆盖。
+    //   [2026-09-25 第五轮遗留 HOLD] 布局档坏档改名隔离成功时它已随之改名(原路径不在)→ 这里不置标志;随之改名失败时文件还在,照旧置。
     //   只置标志,由 island_after_layout_ready → island_shelltree_load 置保留位(island_hold_file,见 SHELLTREE_HOLD_FOR_DEFAULT)。
     {
         let tp = island_data_path(env, SHELLTREE_FILE);
