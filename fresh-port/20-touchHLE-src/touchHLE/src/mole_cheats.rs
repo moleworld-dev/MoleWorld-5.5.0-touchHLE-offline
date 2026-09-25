@@ -11199,6 +11199,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     return true;
                 }
                 // (a2) 缓冲回放包装也一并吞(belt-and-suspenders;其三调用方全空过)。
+                //   iOS 上这两个选择子另由 intercept 前段 #[cfg(target_os = "ios")] 的全程离线吞包臂先吞(那条不看岛会话,离线一律吞)。
                 (_, "sendAllBufferDatas") | (_, "sendAllBuffDataInNewSceneLoading") => {
                     return true; // 离线无服务器,缓冲回放无意义且必卡 → 吞掉
                 }
@@ -11213,7 +11214,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 //   重新归档+加密+写盘一次 → 卡顿随本档累计动作数线性增长、跨会话不复位,沙盒里那个 md5 名的
                 //   文件也无限变大,进岛一次比一次慢。离线岛的全部状态已由我们自己的四个 island_*.dat 持久化,
                 //   这条重发队列没有任何消费者。方法返回 void、所有调用方都丢弃返回值,吞掉零副作用。
-                //   在线模式下整块被 ENABLE_NEWSCENE_ISLAND 关掉(见 5191 起),私服的断线重发凭据不受影响。
+                //   在线模式下整块被 ENABLE_NEWSCENE_ISLAND 关掉(见 intercept 开头 network_access 分支),私服的断线重发凭据不受影响。
+                // [2026-09-25 第五轮遗留 BUF] 历史积压不会被回放进在线岛,不必清理:缓冲文件名 = md5("%lu%@"(userId,taomeeUDID)
+                //   + getEncrypKey 串)(getBuffFileNameForCurrentUser@0x22e4cc,放在 Library/)。离线进程只在启动时
+                //   applicationDidFinishLaunching 0xf2b0 [NetworkManager sharedInstance] → -[NetworkManager init] →
+                //   -[NewSceneNetworkBuffer init]@0x22d580(0x22d686 算名)算一次,那时 userinfo.dat 还没读
+                //   (userInfoData_ 是 GameData init 0x6b6b0 新建的,userId_=0),离线积压全落在 uid 0 那份文件里;
+                //   在线 cmd 1234 登录成功时 parseLoginSuccessfullyData 0xe5992 setUserId: → 0xe59b0
+                //   resetBuffDataFileNameAndBuffData 按登录号重绑,loadFromFile@0x22de18 先清空内存队列再读,uid 0 文件
+                //   不会被任何账号加载。前提:只有 1234 的登录回包会重绑(cmd 1000 的 parseUserIdData 只 setUserId、
+                //   不重绑),别让在线流程绕过 1234。也别在删档时按当前 userId 现算文件名去删——那时主档已读入,
+                //   算出的是在线账号自己的待重发队列,真正的 uid 0 残留反而删不到。
                 (_, "pushOneObjectIn:withCommandId:andSendFlag:") => {
                     env.cpu.regs_mut()[0] = 0;
                     return true;
