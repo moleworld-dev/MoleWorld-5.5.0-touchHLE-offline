@@ -11710,26 +11710,54 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 ret_double(env, 0.0);
                 return true;
             }
-            // [2026-09-24 第四轮 K13 I2-06] 布兰的家(岛餐厅)冷却时长:两个初始化调用点放行真值,其余照旧返回 0。
-            //   根因:-[NewSceneRestaurant initWithMapData:type:] 在 lastCoolTime_(槽 0xb076e8,+368)为 0 时,0x31b61c 取
-            //   getCurrentServerTime、0x31b630 blx getOutCoolTime、0x31b636 `subs r0,r5,r0` → lastCoolTime_ = now − 冷却时长
-            //   (原版 43200 = levelupHV 30002 saleFinishCostTime)= 一进岛立刻可收;-[... initWithTile:sprite:size:data:] 在
-            //   0x31b372/0x31b386/0x31b38a 有同构的一段。这里返回 0 会让 lastCoolTime_ = now = 刚开始冷却:开着开关时无感
-            //   (其余调用点仍返回 0),关掉开关后反而要等满 12 小时;若本局餐厅发过 setModObjectToServer:(升级/领收益),这个坏值
-            //   还会经 getLastCooldownTime → saveTMMapDataFromObject: 落进 island_map.dat。
-            //   做法:LR 为这两次 blx 的返回址(0x31b630+4 → 0x31b635、0x31b386+4 → 0x31b38b,带 Thumb 位)时放行真方法;
-            //   OutputHanlder innerupdate:(0x14b826)/ccTouchBegan:(0x14ca60)/processTouched(0x14cbea)与 onUpgradeFinishHandler
-            //   (0x31c374)照旧返回 0,作弊效果不变。不用「lastCoolTime==now 就回补」:与刚领完收益的正常状态无法区分。
-            //   签名 I8@0:4(返回 unsigned int),以前按 double 写 r0:r1 也等价于 r0=0,这里改成只写 r0。纯改寄存器,不发消息。
+            // [2026-09-24 第四轮 K13 I2-06 / 2026-09-25 第五轮遗留 F] 布兰的家(岛餐厅)冷却时长:按调用点区分,判定点返回 1,其余放行真值。
+            //   背景:getOutCoolTime(I8@0:4,@0x31cc2c)= levelupHV 30002 saleFinishCostTime(1~6 级都是 43200),查无数据时为 0;
+            //   6 处选择子引用、7 个 blx 调用点(selref 0xadfc70;innerupdate: 在 0x14b826 取一次,供 0x14b82e/0x14b838 两次 blx 复用)。
+            //   判定点(返回最小正值 1 → 距上次领取 >=1 秒即算可领,与原版「可领 ⇔ 挂旗 ⇔ 认领点击 ⇔ 点击领取」口径一致):
+            //     · -[OutputHanlder innerupdate:] blx@0x14b838(LR 0x14b83d):0x14b84c bge → 0x14b946 挂领取旗(NpcPrompt tag1 → onGifFlagTouched)
+            //     · -[OutputHanlder ccTouchBegan:withEvent:] blx@0x14ca6c(LR 0x14ca71):0x14ca8a bmi 不认领,否则吞下整栋建筑的点击
+            //     · -[OutputHanlder processTouched] blx@0x14cbf8(LR 0x14cbfd):0x14cbfe bhs → onGifFlagTouched 领取
+            //   放行真值:
+            //     · innerupdate: blx@0x14b82e(LR 0x14b833):后接 0x14b832 cbz,0 是原版「本级无售卖数据」哨兵,不是「冷却已到」。
+            //       以前这里返回 0 → 恒跳 0x14b850 升级图标分支,开关开着时布兰的家永远不冒领取旗,只能盲点本体收取
+            //       (K13 复核疑虑,第五轮主控实测查实)。
+            //     · initWithMapData:type: blx@0x31b630(LR 0x31b635)/ initWithTile:sprite:size:data: blx@0x31b386(LR 0x31b38b):
+            //       lastCoolTime_(槽 0xb076e8,+368)= now − 冷却时长 = 一进岛立刻可收;返回 0 会写成「刚开始冷却」并经
+            //       saveTMMapDataFromObject: 落档。
+            //     · -[NewSceneRestaurant onUpgradeFinishHandler] blx@0x31c37a(LR 0x31c37f;调用来源 createBuildingForMapData: blx@0x31bd62
+            //       读档完工 / -[NewSceneRestaurant innerupdate:] blx@0x31c2e0(帧栈)/ onQuickUpgrade: blx@0x31c046 VIP 加速完工):
+            //       0x31c344 仅 last<begin 时换算,0x31c382~0x31c39a 算 lastCoolTime_ = 2·begin + 升级时长 − 冷却 − last,0x31c5e4 当场落档;
+            //       返回 0 会算成「完工时刻 + (begin − last)」这个未来值写进 island_map.dat,放行即原版公式。原版公式在开始升级前
+            //       已超过冷却时长没领(begin − last > 冷却)时同样会得出晚于完工的值,由 -[OutputHanlder innerupdate:] 0x14b80a 起的
+            //       负差重置成 now 在内存里自愈(island_clamp_future_timestamps 刻意不管餐厅),这是原版行为,照样保留。
+            //     · 其它(未知)调用点一律放行。
+            //   取舍(相对修前是退化,不是纯改善):开着开关时餐厅恒为可领态。原版可领时 innerupdate: 在 0x14b946 挂领取旗后就
+            //   unschedule(0x14ba4a),走不到 0x14b850 起的升级图标段(0x14ba96~0x14bac4 NpcPrompt tag1 type6 → onUpgradeIconTouched),
+            //   本体点击也被 OutputHanlder 认领去领取,信息/升级面板只在领完后不到 1 秒的窗口里点得开;所以 1~5 级想升级布兰的家
+            //   要先关开关(旗若还挂着先点掉,那次残留领取是 onGifFlagTouched 0x14c770 起不复核冷却的原版行为)。修前 cbz 恒跳
+            //   0x14b850,1~5 级、没在升级、人气值够时升级图标还会出,经图标 0x31bb6c → showInfoView 能升级,但永远不冒领取旗。
+            //   这与同一开关下 Building/SpacialObject/YellowDuck(下面 OutputHanlder innerupdate: 前置臂)点本体即领取的口径一致。
+            //   备选(未采用,待用户拍板):只让 LR 0x14b83d 返回 1、另两处放行真值 → 照样冒旗、点旗领取,点本体按「未满 12 小时」
+            //   路由弹面板可升级;代价是挂旗时点本体开面板而不是领取,原版不存在这种状态组合。
+            //   不改 OutputHanlder.lastCoolDownTime_(槽 0xb04ba4,+240):落盘值只来自它(getLastCooldownTime@0x31c6cc → 0x244382/0x244396
+            //   setLastCoolTime:),所以本臂任何返回都不会进存档,关开关即恢复原版计时。innerupdate: 跑在 CCScheduler 帧栈上,
+            //   本臂只写 r0,不发消息;放行前不动寄存器。
             ("NewSceneRestaurant", "getOutCoolTime") => {
-                const LR_INIT_WITH_MAPDATA: u32 = 0x31b635;
-                const LR_INIT_WITH_TILE: u32 = 0x31b38b;
+                const LR_OH_INNERUPDATE_CMP: u32 = 0x14b83d;
+                const LR_OH_TOUCH_BEGAN: u32 = 0x14ca71;
+                const LR_OH_PROCESS_TOUCHED: u32 = 0x14cbfd;
                 let lr = env.cpu.regs()[14];
-                if lr == LR_INIT_WITH_MAPDATA || lr == LR_INIT_WITH_TILE {
-                    return false;
+                if matches!(lr, LR_OH_INNERUPDATE_CMP | LR_OH_TOUCH_BEGAN | LR_OH_PROCESS_TOUCHED) {
+                    env.cpu.regs_mut()[0] = 1;
+                    static LOG1_RESTAURANT_COOLDOWN: AtomicBool = AtomicBool::new(false);
+                    log_first_then_dbg!(
+                        LOG1_RESTAURANT_COOLDOWN,
+                        "[MOLECHEAT] 冷却归零:布兰的家 getOutCoolTime 在 OutputHanlder 判定处返回 1(LR {:#x}),领取旗按 1 秒冷却挂出",
+                        lr
+                    );
+                    return true;
                 }
-                env.cpu.regs_mut()[0] = 0;
-                return true;
+                return false;
             }
             // [2026-09-24 第四轮 K13 N-D2-3] 宠物送礼冷却(主村 + 黄金岛的小狗/小龟/浣熊/气球鱼等 Animal)。
             //   根因:冷却由 -[Animal callAnimalSchedule:]@0xdd958(v16@0:4d8)自己算:0xdd9e2 [ObjectData use_cool_down]、
@@ -11801,7 +11829,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //   判冷却,上面 Building/SpacialObject/YellowDuck getLastCooldownTime 臂只经快照写进存档,本局不生效(退岛重进或在编辑
             //   模式里挪一下才能领,而且每挪一次领一次)。
             //   做法:只处理 objectTarget_(槽 0xb04b9c,+236)的运行时类恰好是 Building / SpacialObject / YellowDuck 的处理器,
-            //   与上面 getter 臂同一口径;不碰 NewSceneRestaurant(走 0x14b790 分支按 getOutCoolTime 判,K13 已刻意不把 0 写进餐厅档)。
+            //   与上面 getter 臂同一口径;不碰 NewSceneRestaurant(走 0x14b790 分支按 getOutCoolTime 判,由上面
+            //   getOutCoolTime 臂在 LR 0x14b83d/0x14ca71/0x14cbfd 返回 1 处理;不改它的 lastCoolDownTime_,免得经 getLastCooldownTime 把怪值写进餐厅档)。
             //   前置把 lastCoolDownTime_ 写成 0.0;领奖后 -[OutputHanlder onGifFlagTouched] 在 0x14c750 重新调度 innerupdate:,
             //   下一拍再次清零。类名经 isa 在宿主侧读,不发 guest 消息;偏移从槽现读,越界(实例大小 260)就不写。只读写内存。
             ("OutputHanlder", "innerupdate:") => {
