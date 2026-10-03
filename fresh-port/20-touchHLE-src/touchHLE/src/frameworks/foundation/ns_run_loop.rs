@@ -496,6 +496,10 @@ pub fn run_run_loop(
         if is_main_run_loop && crate::mole_activity::run_loop_pending() {
             crate::mole_activity::run_loop_poll(env);
         }
+        // [2026-10-03] 道具模块的受理点(进村后检查存档里的负数摩尔豆等,见 mole_items::run_loop_poll),调用方只置标志。
+        if is_main_run_loop && crate::mole_items::run_loop_pending() {
+            crate::mole_items::run_loop_poll(env);
+        }
 
         // [2026-09-25 第五轮遗留 FLUSH] 黄金岛「关键操作即时落盘」受理点:本轮触摸(handle_events)、定时器(CADisplayLink →
         // CCDirector mainLoop → CCScheduler)、perform 队列都已返回,栈上没有游戏方法体,等价于原 afterDelay:0 的时机,

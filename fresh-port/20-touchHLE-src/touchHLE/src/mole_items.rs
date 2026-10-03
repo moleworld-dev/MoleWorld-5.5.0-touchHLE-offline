@@ -1817,6 +1817,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             if !env.options.network_access {
                 on_enter_village(env);
             }
+            // [2026-10-03] 负数摩尔豆检查:在线离线都排,只写一个原子(见 NEG_GOLD_CHECK_PENDING)。
+            NEG_GOLD_CHECK_PENDING.store(true, Ordering::Relaxed);
             None
         }
         "UserVIPInfoData" => vip_hook(env, sel),
@@ -1825,6 +1827,67 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
     }
 }
 
+
+// ============================================================================
+// [2026-10-03] 负数摩尔豆夹回 0(用户拍板)
+// ============================================================================
+
+/// 旧版「全物品解锁」(getLockType4Object: 恒返回 0,连余额锁 3/4 一起放开)开着时,摩尔豆不够也能买下去:
+/// -[UserInfoData addGold:]@0xbb1d8 只做 gold_ += delta(0xbb20c..0xbb210),不设下限,存档里就留下了负数摩尔豆。
+/// 原版里摩尔豆不会为负(各扣款入口都先判余额);贝壳不受影响:-[UserInfoData addVipGold:]@0xbb418 自带下限
+/// (0xbb474 相加结果 ≤ -1 就写 encryptInt:0)。岛上花的也是主档 UserInfoData.gold_(NewSceneUserInfoData 没有自己的余额)。
+/// 每次进村(-[GameManager startGame:],在线离线都算;从岛回村那一路跑在 CCScheduler 帧栈上)只置这个标志,
+/// 由运行循环受理点 neg_gold_check_poll 读 [[GameData sharedInstance] userInfoData] 的 gold,是负数就用原版 setGold:0
+/// (纯赋值 0xbd590)写回,再照 addGold: 收尾(0xbb28a..0xbb29c)发 [[WrapperManager sharedManager] updateUserInfoView:2] 刷新 HUD;
+/// 下一次存档自然落盘。正数一概不动;夹过一次之后存档里就是 0,以后不会再触发(解除购买门槛现在照原版判余额)。
+static NEG_GOLD_CHECK_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// ns_run_loop::run_run_loop 主线程每轮都调,只有一次原子读。
+pub fn run_loop_pending() -> bool {
+    NEG_GOLD_CHECK_PENDING.load(Ordering::Relaxed)
+}
+
+/// 运行循环受理点(ns_run_loop,perform 相位之后):栈上没有游戏方法体,可以自由发宿主消息;不在 intercept 里,不碰寄存器。
+/// HUD 刷新(updateGold 里要格式化数字串)会产生自动释放对象,包一层池当场 drain(perform 相位本身没有池)。
+pub fn run_loop_poll(env: &mut Environment) {
+    if !NEG_GOLD_CHECK_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
+    let new_s = sel_of(env, "new");
+    let pool: id = msg_send(env, (pool_cls, new_s));
+    neg_gold_check(env);
+    let drain_s = sel_of(env, "drain");
+    let _: () = msg_send(env, (pool, drain_s));
+}
+
+fn neg_gold_check(env: &mut Environment) {
+    let gd = shared(env, "GameData", "sharedInstance");
+    if gd == nil {
+        return;
+    }
+    let ui_s = sel_of(env, "userInfoData");
+    let ui: id = msg_send(env, (gd, ui_s));
+    if ui == nil {
+        return;
+    }
+    let gold_s = sel_of(env, "gold");
+    let gold: i32 = msg_send(env, (ui, gold_s));
+    if gold >= 0 {
+        return;
+    }
+    let set_s = sel_of(env, "setGold:");
+    let _: () = msg_send(env, (ui, set_s, 0i32));
+    let wm = shared(env, "WrapperManager", "sharedManager");
+    if wm != nil {
+        let upd_s = sel_of(env, "updateUserInfoView:");
+        let _: () = msg_send(env, (wm, upd_s, 2i32));
+    }
+    log!(
+        "[MOLEITEMS] 存档里的摩尔豆是负数({}),多半是旧版「全物品解锁」在钱不够时买下的;已按原版不会出现负数的规则夹回 0(下次存档落盘)",
+        gold
+    );
+}
 
 // ===== 以下静态表由离线脚本从解密数据表与 iPad 图集生成(勿手改;改规则请重新生成)=====
 // 数据源:解密 property.dat / propertyHV.dat / zh-Hans 描述表 / 240_0 / 250_2 / 340_0;
