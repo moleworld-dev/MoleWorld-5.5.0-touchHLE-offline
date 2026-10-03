@@ -28,7 +28,7 @@ use crate::frameworks::foundation::ns_string;
 use crate::fs::GuestPathBuf;
 use crate::objc::{id, msg_send, nil, release, SEL};
 use crate::Environment;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
@@ -1093,6 +1093,12 @@ fn vip_apply(env: &mut Environment, obj: id, v: VipVals) {
 /// 这里把 next 也按「强制 = 满级」返回 0,和强制 vipValue 配套,等价于累计升级之前离线恒为 0 时的满级显示。
 /// 全二进制读 vipValueOfNextLevel 的只有 3 处(initWithVIPInfoData:@0x6ac7e、在线的 parseVipInfo、VIPLayer),
 /// 离线没有「读 next → 调 setter 写回」的路径,返回强制值 0 不会经 setter 写进侧档;真实值仍在对象和 vip.dat 里,关掉强制 VIP 就恢复。
+/// [2026-10-03] 用户拍板「替服务器补发 VIP 信息」:没充过值(侧档没有 VIP 记录)的号以前三值恒 0,
+/// -[VIPLayer showWithTarget:selector:] 在 0x37f0a6 `orrs r0, next, value` / 0x37f0aa beq 见两者都是 0 就走 0x37f26c:reset 后弹
+/// GET_VIP_INFO_FAILED「获取 VIP 信息失败!请先检查网络状况」。原版进村每次都发 getVipInfo(startGame: 0x19ca0),服务器给没充值的玩家
+/// 回 VIP0、累计 0、下一级门槛 = VIP1 所需累计额,面板显示「达到 VIP 1 您还需充值 N 元」与首充大礼包提示(0x37f39e)。
+/// 这里照同一口径注入 VipVals{0, 0, VIP1 门槛}(vip_default_vals,门槛与假充值累计同一张 vip_thresholds 表,移植者自拟、非原版数据);
+/// 注入时 VIP_BUSY 置位,setter 钩子不记账,不写侧档——侧档只记真实充值/修改器改过的值。不走 parseVipInfo,不涉及它的作弊警告(0x1c0c96)。
 fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
     if env.options.network_access || VIP_BUSY.load(O) {
         return None;
@@ -1119,10 +1125,8 @@ fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
                 return None;
             }
             side_ensure_loaded(env);
-            let vals = side().vip;
-            if vals.is_none() && !force_next {
-                return None;
-            }
+            let recorded = side().vip;
+            let vals = Some(recorded.unwrap_or_else(vip_default_vals));
             VIP_BUSY.store(true, O);
             let local = local_vip_object(env);
             let is_local = local != nil && local.to_bits() == recv;
@@ -1131,13 +1135,21 @@ fn vip_hook(env: &mut Environment, sel: &str) -> Option<bool> {
                 if let Some(v) = vals {
                     vip_apply(env, local, v);
                     VIP_INJECTED.store(true, O);
-                    log!(
-                        "[MOLEITEMS] VIP 读档:从 {} 写回 vipLevel={} vipValue={} vipValueOfNextLevel={}",
-                        SIDE_FILE,
-                        v.level,
-                        v.value,
-                        v.next
-                    );
+                    if recorded.is_some() {
+                        log!(
+                            "[MOLEITEMS] VIP 读档:从 {} 写回 vipLevel={} vipValue={} vipValueOfNextLevel={}",
+                            SIDE_FILE,
+                            v.level,
+                            v.value,
+                            v.next
+                        );
+                    } else {
+                        log!(
+                            "[MOLEITEMS] VIP 读档:没有充值记录,照原版服务器口径下发 vipLevel=0 vipValue=0 vipValueOfNextLevel={}(VIP1 门槛,移植者自拟、非原版数据;不写 {})",
+                            v.next,
+                            SIDE_FILE
+                        );
+                    }
                 }
             }
             VIP_BUSY.store(false, O);
@@ -1333,6 +1345,16 @@ fn vip_thresholds() -> &'static [i32] {
     })
 }
 
+/// [2026-10-03] 没充过值的玩家「服务器」该下发的三值:VIP0、累计 0、下一级门槛 = VIP1 门槛(见 vip_hook 注释)。
+fn vip_default_vals() -> VipVals {
+    let (level, next) = vip_progress(0, 0, vip_thresholds());
+    VipVals {
+        level,
+        value: 0,
+        next,
+    }
+}
+
 /// [补完 2026-09-15] 纯函数:累计 VIP 值 → (等级, 下一级门槛)。thresholds 单位同 VIP 值、严格递增。
 /// - 等级只升不降:取 old_level 与门槛推导值的较大者。原版 parseVipInfo 发现下发等级低于本地会
 ///   showCheatWarningMessage 并拒收(0x1c0c96),等级在客户端眼里本就单调不降。
@@ -1366,21 +1388,17 @@ fn vip_progress(old_level: i32, value: i32, thresholds: &[i32]) -> (i32, i32) {
 ///    让 vip_hook 自然记账并原子落盘;万一没记上(比如本地 VIP 对象还没建),直接写侧档,下次读 VIP 时由 vip_hook 注入。
 /// [2026-09-25 第五轮遗留 V] 1084 回包还有「分发」那一半(主村 0x239f6 / 岛 0x23e7c4:HUD VIP 徽章、VIP 成就、贝壳树重排),
 ///    由 on_shells_purchased 末尾照原版入口补发 getVipInfo(mole_activity::request_vip_info)、运行循环受理点执行。
-/// [补完 2026-09-15] 待补项(有意省略,不是原版不弹):parseVipInfo 的首充大礼包。
+/// [2026-10-03] 首充大礼包(用户拍板补上;以前有意省略)。
 /// 原版进村 -[GameManager startGame:]+0xb38(0x19ca0)每次都发 getVipInfo,没充过值的玩家也会先收到一次 VIP 信息,
 /// 本地旧 next 不为 0;第一次真充值后 parseVipInfo 在 0x1c0e34-0x1c0e48 判定「旧等级 [sp+4]=0、旧 VIP 值 [sp+8]=0、
 /// 旧 next [sp+0x18]≠0、新 VIP 值 [sp+0x20]≠0」成立,调 [[WrapperManager sharedManager] initFirstChargeGifts],
-/// 再 [FirstChargeGiftsLayer layerWithRewards:[wm firstChargeGiftsArray]] showWithTarget:NetworkManager selector:nil。
-/// 所以原版每个玩家第一次充值都会弹首充礼包(-[WrapperManager initFirstChargeGifts]@0x262d58:702×2000、704×10、22022、22023);
-/// 移植版第一次假购买只发贝壳、升 VIP1,没有礼包。
-/// [2026-09-25 第五轮遗留 V] 离线现在也会在进村时补发 getVipInfo,但只补回包的分发臂、不写三值(不走 parseVipInfo),
-/// 旧 next 仍为 0,首充礼包判定照旧不成立。
-/// 暂不复刻的原因(都没法无头验证):① -[FirstChargeGiftsLayer showWithTarget:selector:]@0x3803cc 会取 currentUiLayer 的
-/// tag 6、tag 5 子层(0x380444/0x38048e getChildByTag:)调 performSelector:detach;这里还在商店购买按钮回调的调用栈上,
-/// 若商店正挂在这两个 tag 上,当场拆掉可能留下悬空对象(原版是异步回包触发,不在按钮栈上);
-/// ② 领礼物走 releaseFirstChargeGift:@0x2630a4 → onAddFirstChargeGiftToMap:@0x262f2c 把物品摆到地图上,
-/// 黄金岛会话里、商店开着时能否正常摆放不清楚;③ 关闭按钮 onButtonCloseSelected@0x3806e4 还要弹「放弃礼包」确认框。
-/// 以后要补:锁存「应弹首充」标志,等商店关闭、回到主村安全点再按上面的顺序调用,先用开关门控、无头验证弹层能关再默认打开。
+/// 再 [FirstChargeGiftsLayer layerWithRewards:[wm firstChargeGiftsArray]] showWithTarget:NetworkManager selector:nil(0x1c0e64..0x1c0ec0)。
+/// 所以原版每个玩家第一次充值都会弹首充礼包(-[WrapperManager initFirstChargeGifts]@0x262d58:702×2000、704×10、22022、22023)。
+/// 现在没充值的号由 vip_hook 按服务器口径注入了 VIP1 门槛,「旧 next ≠ 0」与原版一样成立;这里只要旧等级、旧累计都是 0 而新累计 > 0,
+/// 就置 FIRST_CHARGE_PENDING,不在购买按钮的调用栈上弹(原版是异步回包触发)。由运行循环受理点 first_charge_gift_poll 在主村
+/// (curSceneId 1)、currentGameMode == 1 时照上面的顺序调用:-[FirstChargeGiftsLayer showWithTarget:selector:]@0x3803cc 自己在
+/// 0x38040a 要求 currentGameMode == 1,否则直接返回不弹,所以等商店等面板关掉再弹与原版判据一致;岛上不弹,回主村后再弹
+/// (领取 onAddFirstChargeGiftToMap:@0x262f2c 往主村地图摆物品,岛上能否摆没有把握)。
 /// 调用方已判离线;本函数发宿主 msg_send 但不保存/恢复 r0-r3(由 on_shells_purchased 统一做)。
 fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option<ShellPack>) {
     let Some(pack) = pack else {
@@ -1402,6 +1420,14 @@ fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option
     let value = (old.value.max(0) as i64 + add).min(i32::MAX as i64) as i32;
     let (level, next) = vip_progress(old.level, value, thresholds);
     let new = VipVals { level, value, next };
+    // [2026-10-03] 首充大礼包:与 parseVipInfo 0x1c0e34..0x1c0e48 同判据(旧 next ≠ 0 由 vip_default_vals 的服务器口径保证)。
+    if old.level == 0 && old.value <= 0 && new.value > 0 {
+        FIRST_CHARGE_PENDING.store(true, O);
+        log!(
+            "[MOLEITEMS] 首充:旧 VIP0 / 累计 0 → 累计 {}(0.1 元),照原版 parseVipInfo 判据应弹首充大礼包;等回到主村、没有面板打开时弹出",
+            new.value
+        );
+    }
 
     let obj = local_vip_object(env);
     if obj != nil {
@@ -1842,23 +1868,108 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
 /// 下一次存档自然落盘。正数一概不动;夹过一次之后存档里就是 0,以后不会再触发(解除购买门槛现在照原版判余额)。
 static NEG_GOLD_CHECK_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// ns_run_loop::run_run_loop 主线程每轮都调,只有一次原子读。
+/// [2026-10-03] 首充大礼包待弹(见 vip_accumulate 注释);FIRST_CHARGE_NEXT_TRY_MS = 下次检查时刻(进程内毫秒),
+/// 场景或面板不满足时约 0.5 秒再看一次,不必每帧发消息。
+static FIRST_CHARGE_PENDING: AtomicBool = AtomicBool::new(false);
+static FIRST_CHARGE_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
+
+fn process_ms() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// ns_run_loop::run_run_loop 主线程每轮都调,平时只有两次原子读。
 pub fn run_loop_pending() -> bool {
     NEG_GOLD_CHECK_PENDING.load(Ordering::Relaxed)
+        || (FIRST_CHARGE_PENDING.load(Ordering::Relaxed)
+            && process_ms() >= FIRST_CHARGE_NEXT_TRY_MS.load(Ordering::Relaxed))
 }
 
 /// 运行循环受理点(ns_run_loop,perform 相位之后):栈上没有游戏方法体,可以自由发宿主消息;不在 intercept 里,不碰寄存器。
 /// HUD 刷新(updateGold 里要格式化数字串)会产生自动释放对象,包一层池当场 drain(perform 相位本身没有池)。
 pub fn run_loop_poll(env: &mut Environment) {
-    if !NEG_GOLD_CHECK_PENDING.swap(false, Ordering::Relaxed) {
+    let neg_gold = NEG_GOLD_CHECK_PENDING.swap(false, Ordering::Relaxed);
+    let gift = FIRST_CHARGE_PENDING.load(Ordering::Relaxed)
+        && process_ms() >= FIRST_CHARGE_NEXT_TRY_MS.load(Ordering::Relaxed);
+    if !neg_gold && !gift {
         return;
     }
     let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
     let new_s = sel_of(env, "new");
     let pool: id = msg_send(env, (pool_cls, new_s));
-    neg_gold_check(env);
+    if neg_gold {
+        neg_gold_check(env);
+    }
+    if gift {
+        first_charge_gift_poll(env);
+    }
     let drain_s = sel_of(env, "drain");
     let _: () = msg_send(env, (pool, drain_s));
+}
+
+/// [2026-10-03] 弹首充大礼包(照 parseVipInfo 0x1c0e4a..0x1c0ec0 的调用顺序)。只在离线、主村、currentGameMode == 1 时弹;
+/// 条件不满足就约 0.5 秒后再看(标志保留)。
+fn first_charge_gift_poll(env: &mut Environment) {
+    if env.options.network_access {
+        // 在线时 VIP 三值与首充礼包都由服务器回包(parseVipInfo)负责。
+        FIRST_CHARGE_PENDING.store(false, O);
+        return;
+    }
+    FIRST_CHARGE_NEXT_TRY_MS.store(process_ms() + 500, O);
+    if crate::mole_cheats::island_session_active() {
+        return;
+    }
+    let sm = shared(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return;
+    }
+    let s = sel_of(env, "curSceneId");
+    let scene: i32 = msg_send(env, (sm, s));
+    if scene != 1 {
+        return;
+    }
+    let wm = shared(env, "WrapperManager", "sharedManager");
+    if wm == nil {
+        return;
+    }
+    let s = sel_of(env, "currentGameMode");
+    let mode: i32 = msg_send(env, (wm, s));
+    if mode != 1 {
+        return;
+    }
+    let layer_cls = env
+        .objc
+        .get_known_class("FirstChargeGiftsLayer", &mut env.mem);
+    let nm = shared(env, "NetworkManager", "sharedInstance");
+    if layer_cls == nil {
+        FIRST_CHARGE_PENDING.store(false, O);
+        log!("[MOLEITEMS] ⚠️ 首充大礼包:找不到 FirstChargeGiftsLayer 类,放弃");
+        return;
+    }
+    FIRST_CHARGE_PENDING.store(false, O);
+    let s = sel_of(env, "initFirstChargeGifts");
+    let _: () = msg_send(env, (wm, s));
+    let s = sel_of(env, "firstChargeGiftsArray");
+    let gifts: id = msg_send(env, (wm, s));
+    let s = sel_of(env, "layerWithRewards:");
+    let layer: id = msg_send(env, (layer_cls, s, gifts));
+    if layer == nil {
+        log!("[MOLEITEMS] ⚠️ 首充大礼包:layerWithRewards: 返回 nil,没有弹出");
+        return;
+    }
+    let s = sel_of(env, "showWithTarget:selector:");
+    let null_sel: SEL = SEL::null();
+    let _: () = msg_send(env, (layer, s, nm, null_sel));
+    let count: u32 = if gifts == nil {
+        0
+    } else {
+        let s = sel_of(env, "count");
+        msg_send(env, (gifts, s))
+    };
+    log!(
+        "[MOLEITEMS] 首充大礼包:照原版 parseVipInfo 顺序 initFirstChargeGifts → layerWithRewards:({} 件) → showWithTarget:NetworkManager selector:nil 已弹出",
+        count
+    );
 }
 
 fn neg_gold_check(env: &mut Environment) {
