@@ -681,6 +681,8 @@ fn objc_msgSend_inner(
                     // 之前调用;onBuyVIPGold: 返回 void,下面统一把 r0/r1 清零,寄存器最终状态与原来一致。
                     // [补完 2026-09-15] 同时把本次购买的 itemid / 实发贝壳数 / 档位(含标价)交给 mole_items,
                     // 替原版服务器做「累计充值 → VIP 等级」(原版 1083 上报 + 1084 回包 parseVipInfo 写三值)。
+                    // [2026-09-25 第五轮遗留 V] 1084 回包的分发臂(HUD VIP 徽章、VIP 成就、贝壳树重排)由 on_shells_purchased 末尾
+                    // 照原版 0x117dcc 补发 getVipInfo、交给 mole_activity 在运行循环受理点执行。
                     crate::mole_items::on_shells_purchased(env, item_id, amount, pack);
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
