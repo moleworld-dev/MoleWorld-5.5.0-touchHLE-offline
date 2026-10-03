@@ -3764,13 +3764,16 @@ fn writeback_island_object(env: &mut Environment, snap: id) {
 ///   做法(移植者自拟的离线等价):t = max(上次返回值 + 距上次的单调流逝, 墙钟 CF 秒 + 时间旅行偏移)。
 ///   墙钟回拨 → 按单调时钟继续走、不倒退;休眠后墙钟领先 → 向前追平(等价原版回前台对时);时间旅行偏移只增不减,
 ///   仍即时生效。进程内状态,重启后从墙钟重新起算(与原版每次登录由服务器 1065 重新对时同理)。
-///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据、未来时间戳收敛 island_clamp_future_timestamps。
+///   用它的:getCurrentServerTime 离线臂、纪元迁移 migrate_island_timestamps、cf_fix_residue 的判据、未来时间戳收敛 island_clamp_future_timestamps;
+///   [2026-09-25 第五轮遗留 MISC-4] 另有宿主侧「服务器」逻辑:mole_activity 的 now_cf_u32 / local_date / local_today_and_midnight
+///   (签到、海底寻宝、每日任务 1074、折扣 1049/1073、节日与烟花的日界与时间戳)和 mole_items 的 local_wall_secs(节日商店、
+///   进村连续登录日界),让宿主「服务器」与游戏经 getCurrentServerTime 看到的「现在」同源,宿主时间回拨时两边日界不再差一天。
 ///   该臂主村与岛共用(selref 0xade774 共 86 处):主村水塔 -[WaterTower innerupdate:]、-[RewardBox currentTime]、
 ///   -[DailySignLayer getServerTime]、各活动倒计时也随之单调,与原版「服务器时间不随设备时钟回拨」一致;
 ///   主村作物进度 -[CropInfoView updateObjectProgress:] 在主村分支直读 CFAbsoluteTimeGetCurrent(0xc435e),不受影响。
 ///   ★游戏自己直读 CFAbsoluteTimeGetCurrent 的计时(作物 -[Farm innerupdate:]、NPC 冷却 -[NpcActor checkGiftMode:]
 ///   0xef9de)不走 NewSceneTimer,凡是要与它们对齐的地方用 wall_cf_secs,不要用本函数。
-fn now_cf_secs() -> f64 {
+pub(crate) fn now_cf_secs() -> f64 {
     let wall = wall_cf_secs();
     let now = Instant::now();
     let mut g = ISLAND_MONO_CLOCK

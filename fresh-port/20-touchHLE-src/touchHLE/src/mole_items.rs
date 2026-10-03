@@ -95,10 +95,21 @@ fn restore_regs(env: &mut Environment, saved: [u32; 4]) {
 // 本地日期(游戏时区 + 开发者时间旅行偏移)
 // ============================================================================
 
-/// 当前"本地墙钟秒"(unix 秒 + 本地时区偏移)。时区规则与引擎一致(默认 Asia/Shanghai,MOLE_TZ=host 跟随宿主),
-/// 并加上 mole_dev 时间旅行偏移,保证节日窗口/登录日界与游戏内看到的时间一致。
+/// 当前"本地钟面秒"(unix 秒 + 本地时区偏移)。时区规则与引擎一致(默认 Asia/Shanghai,MOLE_TZ=host 跟随宿主),
+/// 并含 mole_dev 时间旅行偏移,保证节日窗口/登录日界与游戏内看到的时间一致。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时由墙钟(host_now_unix_secs + time_offset_secs)改为 crate::mole_cheats::now_cf_secs():
+/// 与离线 -[NewSceneTimer getCurrentServerTime] 臂、mole_activity 的 local_date/now_cf_u32 同一单调时钟(正常运行时等于墙钟,
+/// 进程内宿主时间回拨时不倒退)。根因:F2-07 统一节日日历后,mole_activity 的 festival_today(废品站高价回收、春节烟花)与这里的
+/// festival_active_mask(节日商店)查的是同一张表,两边必须同一天;只改那边会在回拨跨节日边界时错开一天。
+/// now_cf_secs 已含时间旅行偏移,不能再加 time_offset_secs。进村连续登录 on_enter_village 在进程内回拨时不再走「回拨保持原记录」
+/// 那一支(日界不倒退);跨重启单调时钟从墙钟重新起算,那一支照旧兜底。
 fn local_wall_secs() -> i64 {
-    let unix = crate::libc::time::host_now_unix_secs() + crate::libc::time::time_offset_secs();
+    let cf = crate::mole_cheats::now_cf_secs();
+    let unix = if cf.is_finite() {
+        cf.floor() as i64 + 978_307_200
+    } else {
+        crate::libc::time::host_now_unix_secs() + crate::libc::time::time_offset_secs()
+    };
     unix + crate::libc::time::local_utc_offset_at(unix) as i64
 }
 

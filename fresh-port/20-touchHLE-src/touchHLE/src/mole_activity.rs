@@ -1023,9 +1023,16 @@ fn firework_scene_ready(env: &mut Environment) -> bool {
 
 // ─────────────────────────────── 时间与节日 ───────────────────────────────
 
-/// 当前 CFAbsoluteTime 整秒(与离线 getCurrentServerTime、NSDate 同一口径,含时间旅行偏移)。
+/// 当前 CFAbsoluteTime 整秒(含时间旅行偏移)。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时改用 crate::mole_cheats::now_cf_secs(),与离线 -[NewSceneTimer getCurrentServerTime] 臂同一单调时钟
+/// (那里返回 now_cf_secs().max(0.0) as u32,这里同样截断取整)。根因:游戏侧拿来与本模块对账的都是 getCurrentServerTime——签到
+/// -[DailySignLayer getServerTime] 0x39a6c8/0x39a6d8 → 0x39a704 拆日期,海底寻宝 -[SeabedSeekingTreasureMainLayer displayUI] 0x2c0b4a
+/// 算 5 分钟冷却,每日任务回包时间经 updateDailyQuestListWithCurrentServerData: 在 0x82fe6 算截止时间;以前这里直读墙钟
+/// cf_absolute_time_now,第四轮 K4 把 getCurrentServerTime 改成单调后,进程内宿主时间往回拨时两边日界、冷却差出回拨量(最多一天)。
+/// 正常运行时单调时钟等于墙钟;只有进程内回拨时它不倒退,这时与 NSDate/CFAbsoluteTimeGetCurrent(墙钟)不再相同。
+/// 时间旅行偏移仍即时生效(now_cf_secs 里的墙钟项含 time_offset_secs,偏移只增不减,max 之后立即体现)。
 fn now_cf_u32() -> u32 {
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     if cf.is_finite() && cf > 0.0 {
         cf.min(u32::MAX as f64) as u32
     } else {
@@ -1051,8 +1058,10 @@ impl LocalDate {
 
 /// 本地日期。时区取 [NSTimeZone systemTimeZone](默认北京时间,MOLE_TZ=host 跟随宿主),
 /// 与 -[DailySignLayer getServerTime] 用 CFTimeZoneCopySystem 拆日期的口径一致。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时也与 -[DailySignLayer getServerTime] 同源(0x39a6c8/0x39a6d8 → getCurrentServerTime):
+/// 改用单调时钟 crate::mole_cheats::now_cf_secs(),见 now_cf_u32。
 fn local_date(env: &mut Environment) -> LocalDate {
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     let cf = if cf.is_finite() { cf } else { 0.0 };
     let unix = cf.floor() as i64 + 978_307_200;
     let tz_cls = env.objc.get_known_class("NSTimeZone", &mut env.mem);
@@ -1123,6 +1132,9 @@ enum Festival {
 /// 春节烟花从初一前 15 天起生效(以前分别是 12/20 与除夕)。
 /// MOLE_FESTIVAL:christmas/xmas → 强制圣诞;newyear/spring → 强制春节;off 或强制成其它节日 → 都不开;
 /// all/date/未设置 → 按日期(两个窗口不重叠,判定先后不影响结果)。菜单「节日商店」轮换只管商店,不影响这里。
+/// [2026-09-25 第五轮遗留 MISC-4] 日期来自 local_date(单调时钟);mole_items 的节日商店(festival_active_mask)与进村登录日界
+/// (local_day_index → local_wall_secs)同改为 now_cf_secs,两边同一天,F2-07 统一日历不会因宿主时间回拨而错开一天。
+/// 烟花额度记账(local_date)与检查(festival_today 的日期)也同源。
 fn festival_today(env: &mut Environment) -> (Festival, LocalDate) {
     let today = local_date(env);
     let by_date = || {
@@ -2251,9 +2263,10 @@ fn discount_disabled() -> bool {
 
 /// 本地"今天"的日期与次日 0:00 的 unix 秒。时区口径同 local_date([NSTimeZone systemTimeZone],默认北京时间,
 /// 含开发工具时间旅行偏移);次日 0:00 用那一刻的 UTC 偏移换算,MOLE_TZ=host 跨夏令时也准。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时同 local_date,用单调时钟 crate::mole_cheats::now_cf_secs()。
 fn local_today_and_midnight(env: &mut Environment) -> (LocalDate, i64) {
     use crate::frameworks::foundation::ns_time_zone::seconds_from_gmt_at_unix;
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     let cf = if cf.is_finite() { cf } else { 0.0 };
     let unix = cf.floor() as i64 + 978_307_200;
     let tz_cls = env.objc.get_known_class("NSTimeZone", &mut env.mem);
@@ -2889,8 +2902,13 @@ fn daily_values_for_today(env: &mut Environment, island: bool, ymd: u32) -> Vec<
 
 /// 主村 1074 回包(parseDailyTaskListWithSceneId:pos:len:@0x1c0398 逐字节核实):
 /// [u8 场景标志 0=主村(1=岛,0x1c0420)][u32 unix 秒(0x1c046c 转 double、减 kCFAbsoluteTimeIntervalSince1970 → setCurrentServerTime:)]
-/// [u32 个数][u32 原始值 × 个数]。时间取 now_cf_u32,与 CFAbsoluteTimeGetCurrent/NewSceneTimer 同一虚拟时钟(含时间旅行偏移),
+/// [u32 个数][u32 原始值 × 个数]。时间取 now_cf_u32,与离线 NewSceneTimer getCurrentServerTime 同一单调时钟(含时间旅行偏移),
 /// 否则 isDailyQuestListForTodayRecieved 拿截止时间比较时会每次都判成跨天并清进度。
+/// [2026-09-25 第五轮遗留 MISC-4] 截止时间由 updateDailyQuestListWithCurrentServerData: 在 0x82fe6 用回包时间 +0x7080 算出,跨天判定
+/// -[GameData isDailyQuestListForTodayRecieved]@0x830c0 在 0x831d4 比的也是回包 currentServerTime,两边都是本函数给的时间。
+/// 主村倒计时 -[DailyQuest leftTime] 经 -[DailyQuest currentTime]@0x342870 → -[WrapperManager getCurrentTime]@0x2615ec,在 curSceneId≠10 时
+/// 0x261656 直读 CFAbsoluteTimeGetCurrent(墙钟);进程内宿主时间回拨时主村倒计时会多出回拨量——这与原版「截止按服务器时间、主村
+/// 倒计时按设备时钟」一致,不另处理。岛上倒计时走 getCurrentServerTime,与回包对齐。
 /// GameData.dailyQuestData 不足 34 条时不回包:hashDailyQuestIdInMainVillage: 在表条数小于原始值时做 v % 条数(0x82a50),
 /// 表没加载好(0 条)会除以 0。
 fn encode_daily_task_list_main(env: &mut Environment) -> Option<Vec<u8>> {
