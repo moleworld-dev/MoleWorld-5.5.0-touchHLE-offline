@@ -97,6 +97,22 @@ static VIP_LEVEL: AtomicI32 = AtomicI32::new(VIP_LEVEL_MAX);
 /// Forced player level (0 = off; cycled 0/10/.../100 by the menu). Overrides the
 /// curLevel getter, mirroring how FORCE_VIP overrides vipLevel.
 static FORCE_LEVEL: AtomicI32 = AtomicI32::new(0);
+/// [2026-10-03 第六波] 强制 VIP 时 vipLevelWithNewType 返回的等级串(调用方取 intValue),下标 = VIP 等级 − 1。
+/// get_static_str 按内容入池,预热(forcevip_prewarm)与取用必须是同一组字面量,所以集中在这里。
+const FORCE_VIP_STRS: [&str; 4] = ["1", "2", "3", "4"];
+
+/// [2026-10-03 第六波] 强制 VIP 等级串预热:get_static_str 首次会在宿主侧 alloc 一个 _touchHLE_NSString_Static,
+/// 而 vipLevelWithNewType 可能在 CCScheduler 帧栈上被调到(例如商店列表惯性滚动时刷新格子的 VIP 锁、HUD 刷新),
+/// 那里不能发宿主消息。由菜单在打开「强制VIP」或切换 VIP 等级的触摸上下文里调一次,之后 intercept 里只查池子。
+/// 四个等级一起预热,切换等级时不必再分配。开关关着时不做事。
+pub fn forcevip_prewarm(env: &mut Environment) {
+    if FORCE_VIP.load(O) {
+        for s in FORCE_VIP_STRS {
+            let _ = crate::frameworks::foundation::ns_string::get_static_str(env, s);
+        }
+    }
+}
+
 /// All shop / collection items reported as unlocked.
 static ALL_UNLOCK: AtomicBool = AtomicBool::new(false);
 /// [2026-09-25 第五轮遗留 B] 全解锁放开主村 VIP 锁 15 时 vipLevelWithNewType 在 LR 0x7d95d 返回的伪值串(调用方取 intValue,
@@ -11690,12 +11706,9 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             // (一开强制VIP、一进 VIP 相关 UI/商店就崩的根因)。改成返回一个永驻 NSString
             // (VIP_LEVEL 的字符串):[intValue] 得到正确等级、VIP 判定通过、且绝不崩。
             ("UserVIPInfoData", "vipLevelWithNewType") => {
-                let s = match VIP_LEVEL.load(O).clamp(1, VIP_LEVEL_MAX) {
-                    1 => "1",
-                    2 => "2",
-                    3 => "3",
-                    _ => "4",
-                };
+                // [2026-10-03 第六波] 等级串取自 FORCE_VIP_STRS,已由菜单预热(forcevip_prewarm),这里只查池子、不在宿主侧分配。
+                let lv = VIP_LEVEL.load(O).clamp(1, VIP_LEVEL_MAX) as usize;
+                let s = FORCE_VIP_STRS[(lv - 1).min(FORCE_VIP_STRS.len() - 1)];
                 let ns = crate::frameworks::foundation::ns_string::get_static_str(env, s);
                 env.cpu.regs_mut()[0] = ns.to_bits();
                 return true;
