@@ -1364,6 +1364,10 @@ fn run_action(env: &mut Environment, action: Action) {
             if key == "all_unlock" {
                 crate::mole_cheats::allunlock_prewarm(env);
             }
+            // [2026-10-03 第六波] 强制 VIP 的等级串同样在这里预热(见 mole_cheats::forcevip_prewarm)。
+            if key == "force_vip" {
+                crate::mole_cheats::forcevip_prewarm(env);
+            }
             // Rebuild so the on/off label refreshes immediately.
             rebuild(env);
         }
@@ -1371,6 +1375,8 @@ fn run_action(env: &mut Environment, action: Action) {
             // [2026-09-16] G-11 bump_vip_level 在 1..=4 间循环并顺带打开 force_vip;原来悄悄打开,这里在 toast 说清楚。
             let was_forced = crate::mole_cheats::is_on("force_vip");
             crate::mole_cheats::bump_vip_level();
+            // [2026-10-03 第六波] bump_vip_level 会顺带打开强制 VIP,同样在菜单触摸上下文里预热等级串。
+            crate::mole_cheats::forcevip_prewarm(env);
             let lv = crate::mole_cheats::vip_level();
             set_toast(if was_forced {
                 format!("强制VIP 等级 → VIP {}", lv)
