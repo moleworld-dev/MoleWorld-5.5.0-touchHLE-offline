@@ -98,6 +98,18 @@ static VIP_LEVEL: AtomicI32 = AtomicI32::new(VIP_LEVEL_MAX);
 static FORCE_LEVEL: AtomicI32 = AtomicI32::new(0);
 /// All shop / collection items reported as unlocked.
 static ALL_UNLOCK: AtomicBool = AtomicBool::new(false);
+/// [2026-09-25 第五轮遗留 B] 全解锁放开主村 VIP 锁 15 时 vipLevelWithNewType 在 LR 0x7d95d 返回的伪值串(调用方取 intValue,
+/// 大于任何物品的 vip_level)。get_static_str 按内容入池,预热与取用必须是同一个字面量,所以集中在这里。
+const ALLUNLOCK_VIP_STR: &str = "99";
+
+/// [2026-09-25 第五轮遗留 B] 全解锁 VIP 门槛伪值串预热:get_static_str 首次会在宿主侧 alloc 一个 _touchHLE_NSString_Static
+/// (ns_string.rs get_static_str),而锁函数可能在列表惯性滚动的 CCScheduler 帧栈上被调到,那里不能发宿主消息。
+/// 由菜单在打开开关的触摸上下文里调一次(本开关目前只能从菜单打开),之后 intercept 里同一字面量只查池子。
+pub fn allunlock_prewarm(env: &mut Environment) {
+    if ALL_UNLOCK.load(O) {
+        let _ = crate::frameworks::foundation::ns_string::get_static_str(env, ALLUNLOCK_VIP_STR);
+    }
+}
 /// 成就面板全亮:只让 -[AchievementItems unlocked:] 返回 YES(纯显示)。
 /// [2026-09-16] G-05 不再拦 checkInAlreadyUnlockList:,真实成就判定、记录与发奖照常进行。
 static ALL_ACHIEVE: AtomicBool = AtomicBool::new(false);
@@ -11548,6 +11560,97 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
     }
 
+    // [2026-09-25 第五轮遗留 B] 主村「全物品解锁」只放开锁函数里的门槛,余额锁 3/4、已拥有/限购锁 6 等交还原版自己算。
+    //   修了啥:以前下面 ALL_UNLOCK 块把 -[GameData getLockType4Object:/getLockType4Crop:/getLockType4Gift:] 与
+    //   -[DecorateRoomLayer getLockType4Decorate:] 整个短路成 0,门槛放开的同时,余额锁和限购锁也一并没了。
+    //   根因:-[NewStyleStoreMainLayer onBuyItem:]@0x3b24f0 在主村 0x3b2620 对 GameData 取锁,0x3b269e 只看锁是否非 0;之后
+    //   -[VillageMenuLayer showCostGoldView:]@0x64798 在 0x6483e addGold:(−cost_gold)、0x64ad6 addVipGold:(−价格)之前都不比较余额。
+    //   -[UserInfoData addGold:]@0xbb1d8 在 0xbb20e 直接相加、没有下限 → 摩尔豆被扣成负数并存盘;addVipGold: 在 0xbb474/0xbb49c
+    //   把负结果夹成 0 → 贝壳价物件白拿;豆袋 25005(250 贝壳换 4 万豆)走 0x65076 type==0x19 → 0x65092 扣贝壳 → 0x65168
+    //   addGold:(+out_gold),0 贝壳也能反复兑。种子 -[Farm showCostGold:] 0x4a694、房间装扮 -[DecorateRoomLayer showCostGold:isVip:]
+    //   同样不验余额。限购锁被顶掉的后果:20001 扩充面积能重复买(每次白扣 50 贝壳),20002 清理障碍能在台阶 16001 完工
+    //   (mapExtend|=8)之前买、造出非法区键,同类加速卡能重复买。(印章兑换 -[SealExchangeLayer addAndUpdateExchangeMenu] 只在
+    //   0x39bfd4 curSceneId==10 且物品是 NewSceneObjectData 时向 0x39c00a [NewSceneData sharedInstance] 取锁 6,走的是岛上那一臂,
+    //   主村不经这几个 GameData 锁函数,不受本段影响。)
+    //   不能只把真值 3/4 原样返回:原版余额检查排在门槛锁之后,门槛锁提前返回时根本不算余额。顺序是
+    //   Object:5@0x7d336 → 9 → 11/12 → 6 → 13 → 1@0x7d920 → 15@0x7d970 → 2@0x7d9b0 → 3@0x7d9f2 → 4@0x7da18 → 7@0x7dac4 → 8@0x7dbd6;
+    //   Crop:5 → 1 → 2 → 3@0x7d02c → 4@0x7d072;Gift:1 → 2 → 库存 3;Decorate:先算 3/4,摩尔豆价再在 0x1d127a 用等级锁 1 覆盖。
+    //   前置锁 5 提前返回时,排在后面的已拥有锁 6 也没算。
+    //   做法(移植者自拟的作弊收窄,不是离线补数据,所以不按在线模式门控,与岛上 K13/81bf9ae 臂一致):不再拦锁函数,原版照常执行;
+    //   只在函数里读门槛数值的那几条 blx 上,按 (类, 选择子, 调用点 LR = blx 地址 + 4 | Thumb 位) 精确匹配,返回一个必然满足门槛的
+    //   伪值。其余全由原版自己算:余额 3/4(含折扣价)、已拥有/限购 6、同类卡 11/12、摩尔上限 9(故意不收 totalWorkers@0x7d3bd)、
+    //   20002 台阶顺序锁 5(前置计数伪值为 1 后,0x7d372 的 mapExtend&8 检查照跑)、礼物库存锁 3。
+    //   为什么按 LR、不像岛上那样宿主重发取真值:列表惯性滚动时 CCScrollView deaccelerateScrolling:@0x8f320(0x900c2 schedule: 驱动)
+    //   → scrollViewDidScroll: → table:cellAtIndex: → updateUnlockInfo:data: → 锁函数,整条都在 CCScheduler 帧栈上,不能发宿主消息;
+    //   按 LR 只写 r0,不发消息,也不需要重入标志。各 blx 都是 full.asm 核过的 4 字节 blx 0x885150(_objc_msgSend),伪值只参与紧随其后
+    //   的那一次 cmp/tst。返回类型:curLevel/availableWorkers/totalWorkers i8@0:4,objectCount:type: i16@0:4i8i12,
+    //   findOwnPresentReqItem: B12@0:4i8,gamedataFlag L8@0:4,vipLevelWithNewType @8@0:4(NSString,调用方随即取 intValue)。
+    //   必须排在下面 FORCE_VIP / FORCE_LEVEL / MAXFAC 三块之前:它们对 vipLevelWithNewType/curLevel/availableWorkers/totalWorkers
+    //   另有返回,排在后面就轮不到这里。GameData getLockType4CropWithId:(全二进制无 selref)与 NewSceneData getLockType4Crop:
+    //   (7 处 selref 接收者全是 GameData)是死代码,不拦。
+    if ALL_UNLOCK.load(O) {
+        const BIG: u32 = i32::MAX as u32;
+        // (类, 选择子, 调用点 LR, 伪返回值)
+        const ALLUNLOCK_GATE_LRS: [(&str, &str, u32, u32); 13] = [
+            ("ObjectManager", "objectCount:type:", 0x7d335, 1), // Object 前置锁 5:blx@0x7d330,0x7d338 cmp #1/blt;20002 的 mapExtend&8(0x7d372)照跑
+            ("WrapperManager", "gamedataFlag", 0x7d793, 0x30), // Object 锁 13:14987 在 0x7d796 tst #0x20
+            ("WrapperManager", "gamedataFlag", 0x7d7d1, 0x30), // Object 锁 13:14956 在 0x7d7d4 tst #0x10
+            ("UserInfoData", "curLevel", 0x7d91f, BIG), // Object 等级锁 1:0x7d922 cmp/bgt
+            ("UserInfoData", "availableWorkers", 0x7d9af, BIG), // Object 人力锁 2:0x7d9b2 cmp/bgt
+            ("UserInfoData", "totalWorkers", 0x7dac3, BIG), // Object 锁 7(田地/牧场数 ≥ 摩尔总数),排在余额之后
+            ("UserInfoData", "curLevel", 0x7dbd3, BIG), // Object 锁 8(居民房数 ≥ 等级;选择子取自 0x7d914 存进 [sp,#4] 的 curLevel),排在余额之后
+            ("ObjectManager", "objectCount:type:", 0x7cf81, 1), // Crop 前置锁 5:0x7cf84 cmp #1/blt
+            ("UserInfoData", "curLevel", 0x7cfbd, BIG), // Crop 等级锁 1:0x7cfc0 cmp/bgt
+            ("UserInfoData", "availableWorkers", 0x7cfed, BIG), // Crop 人力锁 2:0x7cff0 cmp/bgt
+            ("GameData", "findOwnPresentReqItem:", 0x7d191, 1), // Gift 前置礼物锁 1:0x7d194 cmp #1/bne,0x7d198 eor 得 r6=0
+            ("UserInfoData", "curLevel", 0x7d1d5, BIG), // Gift 等级锁 2:0x7d1d8 cmp/bgt
+            ("UserInfoData", "curLevel", 0x1d1277, BIG), // DecorateRoomLayer 摩尔豆价装扮的等级锁 1:0x1d1276 cmp/movgt
+        ];
+        static ALLUNLOCK_GATE_LOGGED: AtomicU32 = AtomicU32::new(0);
+        let lr = env.cpu.regs()[14];
+        if let Some(i) = ALLUNLOCK_GATE_LRS
+            .iter()
+            .position(|&(c, s, l, _)| l == lr && s == sel && c == class)
+        {
+            let v = ALLUNLOCK_GATE_LRS[i].3;
+            let bit = 1u32 << i;
+            if ALLUNLOCK_GATE_LOGGED.fetch_or(bit, O) & bit == 0 {
+                log!(
+                    "[MOLECHEAT] 全解锁:主村锁函数门槛 {}.{} @LR {:#x} → {:#x}(只放开门槛;余额 3/4、已拥有/限购 6、同类卡 11/12、摩尔上限 9、清理障碍台阶顺序 5 由原版照算)",
+                    class,
+                    sel,
+                    lr,
+                    v
+                );
+            } else {
+                log_dbg!(
+                    "[MOLECHEAT] 全解锁:主村锁函数门槛 {}.{} @LR {:#x}",
+                    class,
+                    sel,
+                    lr
+                );
+            }
+            env.cpu.regs_mut()[0] = v;
+            return true;
+        }
+        // Object VIP 锁 15:blx@0x7d958,调用方在 0x7d96a 取 intValue、0x7d972 与物品 vip_level 比较。返回永驻静态串
+        //   (与 FORCE_VIP 臂同法)。get_static_str 只有首次会在宿主侧 alloc,已在菜单打开本开关时预热(allunlock_prewarm),
+        //   这里落在帧栈上时只查池子、不发消息。
+        if lr == 0x7d95d && class == "UserVIPInfoData" && sel == "vipLevelWithNewType" {
+            let ns = crate::frameworks::foundation::ns_string::get_static_str(env, ALLUNLOCK_VIP_STR);
+            if ALLUNLOCK_GATE_LOGGED.fetch_or(1 << 13, O) & (1 << 13) == 0 {
+                log!(
+                    "[MOLECHEAT] 全解锁:主村锁函数门槛 UserVIPInfoData.vipLevelWithNewType @LR 0x7d95d → \"{}\"",
+                    ALLUNLOCK_VIP_STR
+                );
+            } else {
+                log_dbg!("[MOLECHEAT] 全解锁:主村锁函数门槛 UserVIPInfoData.vipLevelWithNewType @LR 0x7d95d");
+            }
+            env.cpu.regs_mut()[0] = ns.to_bits();
+            return true;
+        }
+    }
+
     // VIP: force "is VIP user" + a high VIP level/value. Only the methods that
     // actually exist on this build are hooked (verified against the method table):
     //   - WrapperManager checkIsVipUser     (the real "is this a VIP" check)
@@ -11674,10 +11777,13 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 env.cpu.regs_mut()[0] = 1;
                 return true;
             }
-            // 实际下种/摆放/购买/装扮走的锁链路:getLockType4* 全族 → 0(=完全解锁)。
-            // 这是 all_unlock 之前的空白(它只管"已解锁显示"),与既有
-            // getLockType4ShopItem:shop:→0 同构。作物/物品/家具/宠物/头像/礼物/房间/音乐厅
-            // 装扮/海洋岛物品在使用层面全部解锁。
+            // [2026-09-25 第五轮遗留 B] 锁函数的分工(以前这里是「getLockType4* 全族 → 0」,把余额锁与限购锁一起抹掉了,见上方
+            //   ALLUNLOCK_GATE_LRS 段的根因):
+            //   · 主村 -[GameData getLockType4Object:/getLockType4Crop:/getLockType4Gift:] 与 -[DecorateRoomLayer getLockType4Decorate:]
+            //     不再拦,原版照常执行,只由上方 ALLUNLOCK_GATE_LRS 在门槛调用点返回伪值;
+            //   · -[MusicHallLayer getLockType4Decorate:]@0x210ef4 只有余额锁 3/4、没有门槛,不拦;
+            //   · GameData getLockType4CropWithId:、NewSceneData getLockType4Crop: 是死代码,不拦;
+            //   · 岛上 NewSceneData getLockType4Object: 仍由下面这一臂取原版真值(K13 + 81bf9ae)。
             // [2026-09-24 第四轮 K13 I7-4] 岛上 NewSceneData getLockType4Object:(i12@0:4@8)从统一返 0 中拆出:保留原版锁 6
             //   (已拥有/限购)与扩地顺序锁 5,其余照旧全解锁。
             //   根因:以前恒返回 0,原版「已拥有」锁 6 被一起跳过 —— 0x21e906-0x21e93a(31001 且 extendMap&0x2)、0x21e944-0x21e978
@@ -11691,7 +11797,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //   标志置位期间进来的那次(就是我们自己发的)直接放行真方法。真值 6 → 返回 6(覆盖扩地/飞鸟/贝壳树等已拥有与限购);
             //   真值 5 且物品是扩充土地 31001..=31004 → 返回 5(保住扩地顺序);其余返回 0。发过消息后 return true,只有 r0 有意义
             //   (r1-r3 调用者不保存);标志在唯一出口前清掉(guest 里出错本进程直接 panic,不存在「半路返回没清标志」的路径)。
-            //   GameData 与其它类的 getLockType4* 照旧返回 0。
+            //   [2026-09-25 第五轮遗留 B] 原来这里写「GameData 与其它类的 getLockType4* 照旧返回 0」,已不成立:主村锁函数改由上方
+            //   ALLUNLOCK_GATE_LRS 只放开门槛,余额与限购锁由原版照算(本臂行为不变)。
             ("NewSceneData", "getLockType4Object:") => {
                 static ALLUNLOCK_REAL_CALL: AtomicBool = AtomicBool::new(false);
                 if ALLUNLOCK_REAL_CALL.load(O) {
@@ -11737,16 +11844,6 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     }
                 }
                 env.cpu.regs_mut()[0] = ret as u32;
-                return true;
-            }
-            ("GameData", "getLockType4Crop:")
-            | ("GameData", "getLockType4CropWithId:")
-            | ("GameData", "getLockType4Object:")
-            | ("GameData", "getLockType4Gift:")
-            | ("NewSceneData", "getLockType4Crop:")
-            | ("DecorateRoomLayer", "getLockType4Decorate:")
-            | ("MusicHallLayer", "getLockType4Decorate:") => {
-                env.cpu.regs_mut()[0] = 0; // 0 == unlocked
                 return true;
             }
             _ => {}

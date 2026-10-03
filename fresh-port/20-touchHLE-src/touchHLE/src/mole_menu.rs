@@ -1351,6 +1351,11 @@ fn run_action(env: &mut Environment, action: Action) {
                 return;
             }
             crate::mole_cheats::toggle(key);
+            // [2026-09-25 第五轮遗留 B] 全物品解锁的 VIP 门槛伪值串在这里(菜单触摸上下文,可发宿主消息)预热,
+            //   免得 get_static_str 首次的宿主 alloc 落在列表惯性滚动的 CCScheduler 帧栈上。开关关着时不做事。
+            if key == "all_unlock" {
+                crate::mole_cheats::allunlock_prewarm(env);
+            }
             // Rebuild so the on/off label refreshes immediately.
             rebuild(env);
         }
