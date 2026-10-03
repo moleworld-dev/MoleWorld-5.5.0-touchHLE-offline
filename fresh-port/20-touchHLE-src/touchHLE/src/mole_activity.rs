@@ -2436,6 +2436,9 @@ const SLOT_NSD_STORE_DECORATIONS: u32 = 0xb05df8;
 const SLOT_NSD_DISCOUNT_ARR: u32 = 0xb05db4;
 /// [2026-09-24 第四轮 K6 I8-4] ObjectData.rest_place_(i,+112;-[ObjectData rest_place]@0x8e130 是平凡 ivar 读)。
 const SLOT_OBJ_REST_PLACE: u32 = 0xb03cac;
+/// [2026-09-25 第五轮遗留 MISC-2] ObjectData.level_(C,+12;-[ObjectData level]@0x8dd60 是平凡 ivar 读:0x8dd68 取槽、0x8dd6c ldrb)。
+/// 岛物品由 -[NewSceneData parseObjectData:] 在 0x21a2b0 setLevel:,NewSceneObjectData 只新增 +136/+140 两个 ivar,level_ 继承自 ObjectData。
+const SLOT_OBJ_LEVEL: u32 = 0xb03c30;
 
 /// [2026-09-24 第四轮 K6 I8-4] 从 NewSceneData 的建设庄园分页数组收集可打折的贝壳商品:(物品 ID, 贝壳原价),按 ID 升序去重。
 /// 岛上折扣只被建设庄园与建造链消费,全部经 -[WrapperManager checkIsDiscountObj:]@0x2610d0 按 curSceneId 选 NewSceneData:
@@ -2443,12 +2446,19 @@ const SLOT_OBJ_REST_PLACE: u32 = 0xb03cac;
 /// -[NewSceneVillageMenuLayer showCostGoldView:](0x25b8a4)、-[NewSceneEditMenuLayer onButtonOkSelected:](0x269296)、
 /// -[NewScenePorter finishBuild:](0x26d466/0x26d830,0x26d4b2 拿 goodsPrice 顶替 cost_vip_gold → 0x26d502 addVipGoldInNewScene: 扣贝壳)、
 /// -[NewSceneData getLockType4Object:](0x21eb30,同样顶替 cost_vip_gold 判买不买得起)。食材店不查折扣,不在候选里。
-/// 选品规则(移植者自拟,非原版数据;与主村 discount_candidates 同一口径,元素类换成岛上的,另加一条 rest_place 过滤):
+/// 选品规则(移植者自拟,非原版数据;沿用主村 discount_candidates 的口径,元素类换成岛上的,另加 rest_place 与 level 两条过滤):
 /// - 元素类是 NewSceneObjectData(岛上 parseObjectData: 0x21a23c 建的,ObjectData 子类)或 ObjectData;字段直接读 ivar,不逐个发消息;
 /// - shop_type 1/2 · 装饰类 type 14 · 纯贝壳价(cost_gold==0 且 cost_vip_gold 5..=10000,排除 0 价)· 非 VIP 专属(vip_level==0)·
 ///   不限购(limit_count==0,限购已拥有的物品打折也买不了)· ID>1000(NewSceneData addOneDiscountGood: 在 getObjectDataWithId: 取不到时
 ///   仍收 ID 1..7(0x21fd0c..0x21fd12),那是内购档位,离线不碰);
 /// - 岛上另排除 rest_place==2:onBuyItem: 0x3b27b0 对它走「用贝壳购买」确认框分支,避开最稳(主村同理只挑装饰类)。
+/// - [2026-09-25 第五轮遗留 MISC-2] 岛上另排除 level>1(静态口径,不按玩家当前等级动态筛,免得同一天升级就换品):
+///   -[NewSceneData getLockType4Object:] 先在 0x21eb36 checkIsDiscountObj: 换成折扣价,再 0x21eb82 取 [obj level]、0x21ebc8 取主村
+///   [[GameData sharedInstance] userInfoData] curLevel,0x21ebd0 cmp + 0x21ebd2 bgt 等级不够返回 1(等级锁)。propertyHV 按其余规则
+///   筛出的 200 件候选里只有 32036(80 贝壳)是 level 18,其余都是 1 级;主村 property.dat 的候选全是 1 级,这条让岛候选与主村
+///   「全是 1 级」的口径一致。正常进岛要主村 curLevel>17(-[VillageLayer checkSpecailZone:] 0x373b4、-[ActivityBulletinLayer
+///   onJoinInActivity] 0x3aab1e,否则弹 NEED_LEVEL_UNLOCK_ISLAND),对他们 32036 永远不锁;只有修改器一键进岛绕过等级门的低等级
+///   玩家才会看到它「打了折却锁着」。候选从 200 变 199,改动当天岛折扣整表会换一次;岛折扣表每次进岛重建、回主村清空,不落盘。
 fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     if nsd == nil {
@@ -2493,6 +2503,8 @@ fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)>
                 let cost_gold = read_ivar_u32(env, obj, SLOT_OBJ_COST_GOLD).unwrap_or(1);
                 let price = read_ivar_u32(env, obj, SLOT_OBJ_COST_VIP_GOLD).unwrap_or(0);
                 let rest_place = read_ivar_u32(env, obj, SLOT_OBJ_REST_PLACE).unwrap_or(2);
+                // 读不到按最高等级处理,保守排除(与 limit_count 读不到给 1 同理)。
+                let level = read_ivar_u8(env, obj, SLOT_OBJ_LEVEL).unwrap_or(u8::MAX);
                 let Some(item) = read_ivar_u32(env, obj, SLOT_OBJ_ID) else {
                     continue;
                 };
@@ -2503,6 +2515,7 @@ fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)>
                     || cost_gold != 0
                     || !(DISCOUNT_MIN_PRICE..=DISCOUNT_MAX_PRICE).contains(&price)
                     || rest_place == 2
+                    || level > 1
                     || item <= 1000
                 {
                     continue;
