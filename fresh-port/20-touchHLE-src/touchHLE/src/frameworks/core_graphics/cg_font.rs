@@ -10,10 +10,12 @@ use super::cg_data_provider::CGDataProviderRef;
 use super::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::font::Font;
+use crate::frameworks::core_foundation::cf_data::CFDataRef;
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
+use crate::frameworks::core_graphics::cg_geometry::CGRectZero;
 use crate::frameworks::foundation::unichar;
 use crate::mem::{ConstPtr, GuestUSize, MutPtr};
-use crate::objc::{objc_classes, ClassExports, HostObject};
+use crate::objc::{id, msg, msg_class, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 // Note: on iOS SDK side this type is defined as a pointer to an opaque struct
@@ -96,6 +98,7 @@ fn CGFontGetLeading(env: &mut Environment, font: CGFontRef) -> i32 {
 fn CGFontGetFontBBox(env: &mut Environment, font: CGFontRef) -> CGRect {
     let font = &env.objc.borrow::<CGFontHostObject>(font).font;
     let (x_min, y_min, x_max, y_max) = font.global_bounding_box();
+    assert!(x_min <= x_max && y_min <= y_max);
     CGRect {
         origin: CGPoint {
             x: x_min as CGFloat,
@@ -124,9 +127,61 @@ fn CGFontGetGlyphAdvances(
     true
 }
 
+fn CGFontGetGlyphBBoxes(
+    env: &mut Environment,
+    font: CGFontRef,
+    glyphs: ConstPtr<CGGlyph>,
+    count: GuestUSize,
+    boxes: MutPtr<CGRect>,
+) -> bool {
+    let mut res = true;
+    let font = &env.objc.borrow::<CGFontHostObject>(font).font;
+    for i in 0..count {
+        let glyph_id = env.mem.read(glyphs + i);
+        let Some((x_min, y_min, x_max, y_max)) = font.glyph_bounding_box(glyph_id) else {
+            res = false;
+            // TODO: not sure what real device does here?
+            env.mem.write(boxes + i, CGRectZero);
+            continue;
+        };
+        assert!(x_min <= x_max && y_min <= y_max);
+        // TODO: extract to a helper
+        let rect = CGRect {
+            origin: CGPoint {
+                x: x_min as CGFloat,
+                y: y_min as CGFloat,
+            },
+            size: CGSize {
+                width: (x_max - x_min) as CGFloat,
+                height: (y_max - y_min) as CGFloat,
+            },
+        };
+        env.mem.write(boxes + i, rect);
+    }
+    res
+}
+
 fn CGFontGetItalicAngle(env: &mut Environment, font: CGFontRef) -> CGFloat {
     let font = &env.objc.borrow::<CGFontHostObject>(font).font;
     font.italic_angle().unwrap_or(0.0)
+}
+
+fn CGFontCopyTableForTag(env: &mut Environment, font: CGFontRef, tag: u32) -> CFDataRef {
+    let font = &env.objc.borrow::<CGFontHostObject>(font).font;
+    let table_data = font.table_data(tag).unwrap();
+
+    let len = table_data.len() as GuestUSize;
+    let guest_bytes = env.mem.alloc(len);
+    env.mem
+        .bytes_at_mut(guest_bytes.cast(), len)
+        .copy_from_slice(table_data);
+    let new: id = msg_class![env; NSData alloc];
+    msg![env; new initWithBytesNoCopy:guest_bytes length:len]
+}
+
+fn CGFontGetNumberOfGlyphs(env: &mut Environment, font: CGFontRef) -> GuestUSize {
+    let font = &env.objc.borrow::<CGFontHostObject>(font).font;
+    font.number_of_glyphs().into()
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -140,5 +195,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGFontGetLeading(_)),
     export_c_func!(CGFontGetFontBBox(_)),
     export_c_func!(CGFontGetGlyphAdvances(_, _, _, _)),
+    export_c_func!(CGFontGetGlyphBBoxes(_, _, _, _)),
     export_c_func!(CGFontGetItalicAngle(_)),
+    export_c_func!(CGFontCopyTableForTag(_, _)),
+    export_c_func!(CGFontGetNumberOfGlyphs(_)),
 ];

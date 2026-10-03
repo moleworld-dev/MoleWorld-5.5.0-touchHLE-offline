@@ -266,6 +266,13 @@ fn getc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     fgetc(env, file_ptr)
 }
 
+/// `Handle getc() when the buffer ran out`
+/// Ref <https://github.com/openbsd/src/blob/3b5bd91ebfd321ca2ed72ebf0b0debf1f4192118/lib/libc/stdio/rget.c#L43>
+fn __srget(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
+    // OpenBSD implementation refills the internal buffer, but we don't
+    getc(env, file_ptr)
+}
+
 fn ungetc(env: &mut Environment, c: i32, file_ptr: MutPtr<FILE>) -> i32 {
     assert!(c != EOF); // TODO
     _touchHLE_check_file_object_lock(env, file_ptr);
@@ -709,6 +716,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fread(_, _, _, _)),
     export_c_func!(fgetc(_)),
     export_c_func!(getc(_)),
+    export_c_func!(__srget(_)),
     export_c_func!(ungetc(_, _)),
     export_c_func!(fgets(_, _, _)),
     export_c_func!(fputs(_, _)),

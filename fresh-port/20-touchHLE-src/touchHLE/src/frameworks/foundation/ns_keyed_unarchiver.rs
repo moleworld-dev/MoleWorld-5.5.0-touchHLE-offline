@@ -470,8 +470,7 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
             from_rust_string(env, s)
         }
         Value::Integer(int) => {
-            #[allow(clippy::clone_on_copy)]
-            let int = int.clone();
+            let int = *int;
             // Similar logic to deserialize_plist()
             let number: id = msg_class![env; NSNumber alloc];
             // TODO: is this the correct order of preference? does it matter?

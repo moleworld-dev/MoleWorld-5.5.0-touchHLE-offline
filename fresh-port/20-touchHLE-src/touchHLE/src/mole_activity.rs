@@ -54,6 +54,13 @@
 //! 进岛 -[HolidayVillageLayer onEnter] 发 getDiscountObjectsListFormServerWithMapId:10。岛上会话吞掉全部 sendPacket,与每日任务同一写法:
 //! 接住请求、排一次运行循环回调,在宿主侧照 parseDiscountListWithSceneId:pos:len: 岛分支构造 DiscountInfo 交给 NewSceneData,
 //! 建设庄园的划线价/买得起判定/扣款全走原版。选品规则为移植者自拟,非原版数据(见 island_discount_candidates);MOLE_DISCOUNT=off 同样关闭。
+//!
+//! # VIP 信息 1084([2026-09-25] 第五轮遗留 V)
+//! 离线接住 -[NetworkManager getVipInfo] 只置一个排队标志,由主线程运行循环受理点(ns_run_loop,perform 相位之后)照原版回包的
+//! 两条分发臂执行:主村 -[GameManager onCommandReceived:] 0x239f6(HUD VIP 按钮/徽章、AchievementControl checkConditions:0x800),
+//! 岛上 -[HolidayVillageLayer onNewSceneGameDataCommandReceived:] 0x23e7c4(HUD、NewSceneAchievement checkConditions:0x1000、贝壳树 rescheduleTree)。
+//! 不伪造报文、不走 parseVipInfo(本地 VIP 三值由 mole_items 的 vip.dat 侧档负责);进村(0x19ca0)与假充值(0x117dcc)照原版入口补发;
+//! 修改器「强制 VIP」开着时跳过成就判定那一步(只刷新 HUD 与贝壳树)。见 vip_info_poll。
 
 use crate::frameworks::foundation::ns_string;
 use crate::fs::GuestPath;
@@ -251,6 +258,8 @@ pub fn wants(class: &str, sel: &str) -> bool {
                 // [2026-09-24 第四轮 K6 I8-4] 黄金岛限时折扣 1073:请求入口 + 排到运行循环的自用选择子(宿主侧构造 DiscountInfo)
                 | "getDiscountObjectsListFormServerWithMapId:"
                 | "moleActivityIslandDiscount"
+                // [2026-09-25 第五轮遗留 V] VIP 信息 1084 的请求入口(离线只置排队标志,由运行循环受理点补回包分发)
+                | "getVipInfo"
         ),
         // [补完 2026-09-15] F2-2 回环喂 1049 时吞掉 GameManager 的推广弹窗分发;离线进村时补发 1049
         "GameManager" => sel == "onCommandReceived:" || sel == "startGame:",
@@ -359,6 +368,31 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             } else {
                 log!("[ACTIVITY] 黄金岛折扣:回调到达时已不在岛上会话,放弃构造");
             }
+            env.cpu.regs_mut()[0] = 0;
+            return Some(true);
+        }
+        // [2026-09-25 第五轮遗留 V] VIP 信息 1084。-[NetworkManager getVipInfo]@0xeac2c(v8@0:4)本体只有 sendPacket:nil commandId:0x43c
+        //   (0xeac38),没有任何前置门或副作用。在线时回包经 parseData 进 parseVipInfo:pos:len:@0x1c0b9c 写本地三值,再在公共尾
+        //   0xe6d9e..0xe6de4 先给 delegateGameData 发 onCommandReceived:(主村 1084 臂 0x239f6)、再给 delegateNewSceneGameData 发
+        //   onNewSceneGameDataCommandReceived:(岛 1084 臂 0x23e7c4)。离线时主村这一包被真 sendPacket 在 isReachable_=0 处空过,
+        //   岛上被 mole_cheats 的 sendPacket 吞包臂吃掉,两条分发臂从不执行:VIP 成就(主村 AchievementControl 0x800、岛 NewSceneAchievement 0x1000,各是唯一入口)永远解锁不了,
+        //   HUD 的 VIP 徽章(updateUI4VIP)不刷新,贝壳树(rescheduleTree 唯一调用点)不重排。
+        //   这里只补「分发」那一半,不走 parseVipInfo:它在 0x1c0c96 见包里等级低于本地 vipLevelWithNewType 就弹作弊警告,
+        //   0x1c0cea/0x1c0d1c/0x1c0d5a 用包里的值覆盖本地三值,0x1c0e34 起还会判首充礼包;本地三值由 mole_items 的 vip.dat 侧档负责。
+        //   离线一律接住(主村、岛上都会发),只置排队标志(纯原子操作,不发任何宿主消息),由 ns_run_loop 主线程
+        //   perform 相位之后的 vip_info_poll 执行两条臂:调用点里 -[HolidayVillageLayer onEnter] 0x23949c 跑在切场景的 drawScene 帧栈上,
+        //   不能就地发一串宿主消息(规则③)。在线模式不接:只读过 options,落到下面照常处理。getVipInfo 返回 void,吞掉后写 r0=0。
+        //   原版调用点(selref 0xadc680 共 14 处,下列为 blx 地址,日志里的 LR = blx+4 带 Thumb 位):进岛 -[HolidayVillageLayer onEnter]
+        //   0x23949c(LR 0x2394a1)、岛建设按钮 -[NewSceneVillageMenuLayer onButtonBuildSelected:] 0x25ab6e(LR 0x25ab73)、主村建设按钮
+        //   -[VillageMenuLayer onButtonBuildSelected:] 0x61d78(LR 0x61d7d)、关 VIP 面板 -[VIPLayer detach] 0x37f730(LR 0x37f735;
+        //   来自关闭按钮,或 -[VIPLayer showWithTarget:selector:] 0x37f526 注册的 NSNotificationCenter 观察者 onHideView 0x37f648 → detach)、
+        //   活动公告 -[ActivityBulletinLayer onJoinInActivity] 0x3aa7fa、TestLayer/NewSceneTestLayer 调试层(init 与 VIP 值加减按钮);离线走不到的:
+        //   进村 -[GameManager startGame:] 0x19ca0(isConnected 门内,由 startgame_resend_offline 补)、内购成功 0x117dcc 与
+        //   -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:] 0x7f284(SHELLHOOK 整段绕开,由 mole_items::on_shells_purchased 补)、
+        //   好友村回家 -[FriendsVillageLayer reduceMemoryCallBack_goToHomeVillage] 0x109172(离线没有好友村)。
+        if sel == "getVipInfo" && !env.options.network_access {
+            let lr = env.cpu.regs()[14];
+            request_vip_info(env, &format!("离线接住 getVipInfo(调用方 LR={lr:#x})"));
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
         }
@@ -1023,9 +1057,16 @@ fn firework_scene_ready(env: &mut Environment) -> bool {
 
 // ─────────────────────────────── 时间与节日 ───────────────────────────────
 
-/// 当前 CFAbsoluteTime 整秒(与离线 getCurrentServerTime、NSDate 同一口径,含时间旅行偏移)。
+/// 当前 CFAbsoluteTime 整秒(含时间旅行偏移)。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时改用 crate::mole_cheats::now_cf_secs(),与离线 -[NewSceneTimer getCurrentServerTime] 臂同一单调时钟
+/// (那里返回 now_cf_secs().max(0.0) as u32,这里同样截断取整)。根因:游戏侧拿来与本模块对账的都是 getCurrentServerTime——签到
+/// -[DailySignLayer getServerTime] 0x39a6c8/0x39a6d8 → 0x39a704 拆日期,海底寻宝 -[SeabedSeekingTreasureMainLayer displayUI] 0x2c0b4a
+/// 算 5 分钟冷却,每日任务回包时间经 updateDailyQuestListWithCurrentServerData: 在 0x82fe6 算截止时间;以前这里直读墙钟
+/// cf_absolute_time_now,第四轮 K4 把 getCurrentServerTime 改成单调后,进程内宿主时间往回拨时两边日界、冷却差出回拨量(最多一天)。
+/// 正常运行时单调时钟等于墙钟;只有进程内回拨时它不倒退,这时与 NSDate/CFAbsoluteTimeGetCurrent(墙钟)不再相同。
+/// 时间旅行偏移仍即时生效(now_cf_secs 里的墙钟项含 time_offset_secs,偏移只增不减,max 之后立即体现)。
 fn now_cf_u32() -> u32 {
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     if cf.is_finite() && cf > 0.0 {
         cf.min(u32::MAX as f64) as u32
     } else {
@@ -1051,8 +1092,10 @@ impl LocalDate {
 
 /// 本地日期。时区取 [NSTimeZone systemTimeZone](默认北京时间,MOLE_TZ=host 跟随宿主),
 /// 与 -[DailySignLayer getServerTime] 用 CFTimeZoneCopySystem 拆日期的口径一致。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时也与 -[DailySignLayer getServerTime] 同源(0x39a6c8/0x39a6d8 → getCurrentServerTime):
+/// 改用单调时钟 crate::mole_cheats::now_cf_secs(),见 now_cf_u32。
 fn local_date(env: &mut Environment) -> LocalDate {
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     let cf = if cf.is_finite() { cf } else { 0.0 };
     let unix = cf.floor() as i64 + 978_307_200;
     let tz_cls = env.objc.get_known_class("NSTimeZone", &mut env.mem);
@@ -1123,6 +1166,9 @@ enum Festival {
 /// 春节烟花从初一前 15 天起生效(以前分别是 12/20 与除夕)。
 /// MOLE_FESTIVAL:christmas/xmas → 强制圣诞;newyear/spring → 强制春节;off 或强制成其它节日 → 都不开;
 /// all/date/未设置 → 按日期(两个窗口不重叠,判定先后不影响结果)。菜单「节日商店」轮换只管商店,不影响这里。
+/// [2026-09-25 第五轮遗留 MISC-4] 日期来自 local_date(单调时钟);mole_items 的节日商店(festival_active_mask)与进村登录日界
+/// (local_day_index → local_wall_secs)同改为 now_cf_secs,两边同一天,F2-07 统一日历不会因宿主时间回拨而错开一天。
+/// 烟花额度记账(local_date)与检查(festival_today 的日期)也同源。
 fn festival_today(env: &mut Environment) -> (Festival, LocalDate) {
     let today = local_date(env);
     let by_date = || {
@@ -2251,9 +2297,10 @@ fn discount_disabled() -> bool {
 
 /// 本地"今天"的日期与次日 0:00 的 unix 秒。时区口径同 local_date([NSTimeZone systemTimeZone],默认北京时间,
 /// 含开发工具时间旅行偏移);次日 0:00 用那一刻的 UTC 偏移换算,MOLE_TZ=host 跨夏令时也准。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时同 local_date,用单调时钟 crate::mole_cheats::now_cf_secs()。
 fn local_today_and_midnight(env: &mut Environment) -> (LocalDate, i64) {
     use crate::frameworks::foundation::ns_time_zone::seconds_from_gmt_at_unix;
-    let cf = crate::frameworks::core_foundation::time::cf_absolute_time_now();
+    let cf = crate::mole_cheats::now_cf_secs();
     let cf = if cf.is_finite() { cf } else { 0.0 };
     let unix = cf.floor() as i64 + 978_307_200;
     let tz_cls = env.objc.get_known_class("NSTimeZone", &mut env.mem);
@@ -2436,6 +2483,9 @@ const SLOT_NSD_STORE_DECORATIONS: u32 = 0xb05df8;
 const SLOT_NSD_DISCOUNT_ARR: u32 = 0xb05db4;
 /// [2026-09-24 第四轮 K6 I8-4] ObjectData.rest_place_(i,+112;-[ObjectData rest_place]@0x8e130 是平凡 ivar 读)。
 const SLOT_OBJ_REST_PLACE: u32 = 0xb03cac;
+/// [2026-09-25 第五轮遗留 MISC-2] ObjectData.level_(C,+12;-[ObjectData level]@0x8dd60 是平凡 ivar 读:0x8dd68 取槽、0x8dd6c ldrb)。
+/// 岛物品由 -[NewSceneData parseObjectData:] 在 0x21a2b0 setLevel:,NewSceneObjectData 只新增 +136/+140 两个 ivar,level_ 继承自 ObjectData。
+const SLOT_OBJ_LEVEL: u32 = 0xb03c30;
 
 /// [2026-09-24 第四轮 K6 I8-4] 从 NewSceneData 的建设庄园分页数组收集可打折的贝壳商品:(物品 ID, 贝壳原价),按 ID 升序去重。
 /// 岛上折扣只被建设庄园与建造链消费,全部经 -[WrapperManager checkIsDiscountObj:]@0x2610d0 按 curSceneId 选 NewSceneData:
@@ -2443,12 +2493,19 @@ const SLOT_OBJ_REST_PLACE: u32 = 0xb03cac;
 /// -[NewSceneVillageMenuLayer showCostGoldView:](0x25b8a4)、-[NewSceneEditMenuLayer onButtonOkSelected:](0x269296)、
 /// -[NewScenePorter finishBuild:](0x26d466/0x26d830,0x26d4b2 拿 goodsPrice 顶替 cost_vip_gold → 0x26d502 addVipGoldInNewScene: 扣贝壳)、
 /// -[NewSceneData getLockType4Object:](0x21eb30,同样顶替 cost_vip_gold 判买不买得起)。食材店不查折扣,不在候选里。
-/// 选品规则(移植者自拟,非原版数据;与主村 discount_candidates 同一口径,元素类换成岛上的,另加一条 rest_place 过滤):
+/// 选品规则(移植者自拟,非原版数据;沿用主村 discount_candidates 的口径,元素类换成岛上的,另加 rest_place 与 level 两条过滤):
 /// - 元素类是 NewSceneObjectData(岛上 parseObjectData: 0x21a23c 建的,ObjectData 子类)或 ObjectData;字段直接读 ivar,不逐个发消息;
 /// - shop_type 1/2 · 装饰类 type 14 · 纯贝壳价(cost_gold==0 且 cost_vip_gold 5..=10000,排除 0 价)· 非 VIP 专属(vip_level==0)·
 ///   不限购(limit_count==0,限购已拥有的物品打折也买不了)· ID>1000(NewSceneData addOneDiscountGood: 在 getObjectDataWithId: 取不到时
 ///   仍收 ID 1..7(0x21fd0c..0x21fd12),那是内购档位,离线不碰);
 /// - 岛上另排除 rest_place==2:onBuyItem: 0x3b27b0 对它走「用贝壳购买」确认框分支,避开最稳(主村同理只挑装饰类)。
+/// - [2026-09-25 第五轮遗留 MISC-2] 岛上另排除 level>1(静态口径,不按玩家当前等级动态筛,免得同一天升级就换品):
+///   -[NewSceneData getLockType4Object:] 先在 0x21eb36 checkIsDiscountObj: 换成折扣价,再 0x21eb82 取 [obj level]、0x21ebc8 取主村
+///   [[GameData sharedInstance] userInfoData] curLevel,0x21ebd0 cmp + 0x21ebd2 bgt 等级不够返回 1(等级锁)。propertyHV 按其余规则
+///   筛出的 200 件候选里只有 32036(80 贝壳)是 level 18,其余都是 1 级;主村 property.dat 的候选全是 1 级,这条让岛候选与主村
+///   「全是 1 级」的口径一致。正常进岛要主村 curLevel>17(-[VillageLayer checkSpecailZone:] 0x373b4、-[ActivityBulletinLayer
+///   onJoinInActivity] 0x3aab1e,否则弹 NEED_LEVEL_UNLOCK_ISLAND),对他们 32036 永远不锁;只有修改器一键进岛绕过等级门的低等级
+///   玩家才会看到它「打了折却锁着」。候选从 200 变 199,改动当天岛折扣整表会换一次;岛折扣表每次进岛重建、回主村清空,不落盘。
 fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)> {
     let mut out: Vec<(u32, u32)> = Vec::new();
     if nsd == nil {
@@ -2493,6 +2550,8 @@ fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)>
                 let cost_gold = read_ivar_u32(env, obj, SLOT_OBJ_COST_GOLD).unwrap_or(1);
                 let price = read_ivar_u32(env, obj, SLOT_OBJ_COST_VIP_GOLD).unwrap_or(0);
                 let rest_place = read_ivar_u32(env, obj, SLOT_OBJ_REST_PLACE).unwrap_or(2);
+                // 读不到按最高等级处理,保守排除(与 limit_count 读不到给 1 同理)。
+                let level = read_ivar_u8(env, obj, SLOT_OBJ_LEVEL).unwrap_or(u8::MAX);
                 let Some(item) = read_ivar_u32(env, obj, SLOT_OBJ_ID) else {
                     continue;
                 };
@@ -2503,6 +2562,7 @@ fn island_discount_candidates(env: &mut Environment, nsd: id) -> Vec<(u32, u32)>
                     || cost_gold != 0
                     || !(DISCOUNT_MIN_PRICE..=DISCOUNT_MAX_PRICE).contains(&price)
                     || rest_place == 2
+                    || level > 1
                     || item <= 1000
                 {
                     continue;
@@ -2601,15 +2661,18 @@ fn island_discount_apply(env: &mut Environment) {
 
 // ─────────────────────────────── [2026-09-16] E-02 / A1-01 / E-03 进村补发 ───────────────────────────────
 
-/// 离线进村补发 -[GameManager startGame:] 在 isConnected 门内(0x19938..0x19e18)跳过的另外三条同步,按原版顺序:
+/// 离线进村补发 -[GameManager startGame:] 在 isConnected 门内(0x19938..0x19e18)跳过的另外四条同步,按原版顺序:
 /// - 0x19ae6 `[[GameData sharedInstance] setIsUserSelectedNoticeBoardMenu:NO]`(re.py 追寄存器:接收者 r11 = r5 = 0x197ae 的
 ///   GameData 类引用、r8 = sharedInstance;全二进制也只有 GameData 实现这个选择子)→ 0x19b00 `[nm getNoticeMessages]`(1058;
 ///   回包后 onCommandReceived: 0x237a4 在玩家没点过公告栏时只给公告按钮加小星星,不强弹);
 /// - 0x19b68 `[nm getFireworkFlagFromServer]`(1112):只在春节窗口、今天还没放过、也没有烟花包在途时补发;
 /// - 0x19c6c `[nm getDailyTaskListFromServerWithSceneId:1]`(1074):进村就备好当天列表。-[ActorManager touchEnd:] 在列表为空时
 ///   先弹「没有连接网络」再重发(0x9eba4/0x9ebb4 → 0x9ec40),不提前备好的话第一次点日常 NPC 仍会弹框。
-/// 三个发包方法都不查 state,直接 sendPacket:commandId:(0x1cb33a / 0x1cbc68 / 0x1cb618),由 handle_send_packet 回环应答。
-/// 调用方负责 save_regs/restore_regs。
+/// - [2026-09-25 第五轮遗留 V] 0x19ca0 `[nm getVipInfo]`(1084):只补 GameManager 的 1084 分发臂(0x239f6),由运行循环受理点
+///   vip_info_poll 执行,不走回环(见 request_vip_info)。
+/// 前三个发包方法都不查 state,直接 sendPacket:commandId:(0x1cb33a / 0x1cbc68 / 0x1cb618),由 handle_send_packet 回环应答。
+/// 从岛回村时第四轮 K7 N-D5-2 的 (SceneMannager, loadMainVillageScene) 臂已在 startGame: 之前清掉离岛标志,所以冷启动进村与
+/// 从岛回村都会走到这里。调用方负责 save_regs/restore_regs。
 fn startgame_resend_offline(env: &mut Environment, nm: id) {
     let gd = singleton(env, "GameData", "sharedInstance");
     if gd != nil {
@@ -2633,6 +2696,15 @@ fn startgame_resend_offline(env: &mut Environment, nm: id) {
 
     let get_daily = sel_named(env, "getDailyTaskListFromServerWithSceneId:");
     let _: () = msg_send(env, (nm, get_daily, 1i32));
+
+    // [2026-09-25 第五轮遗留 V] 0x19ca0 `[nm getVipInfo]`(1084):isConnected 门内紧跟 1074(0x19c6c)、圣诞活动标志(0x19c86,不补)之后。
+    //   getVipInfo@0xeac2c 本体只有 sendPacket:nil commandId:0x43c、没有别的副作用,这里直接置排队标志,与经原版入口再被
+    //   getVipInfo 臂接住等价,不再多发宿主消息:从岛回村时本函数跑在调度器帧栈上(-[NewBaseLoading endLoading] → … →
+    //   -[SceneMannager endLoadingScene] 0x241668 loadMainVillageScene → startGame → startGame:,同一次 CCScheduler tick);
+    //   冷启动则是 -[LoadingLayer update:] 0x12f30c performSelectorOnMainThread:loadTarget waitUntilDone:NO → perform 相位 →
+    //   loadTarget 0x12f0ea startGame:。受理时 startGame: 早已返回:curSceneId 在 0x12efbc(回村 0x241660)已置 1、
+    //   userInfoLayer 在 0x193f0 已赋值、initGameData(0x19e26)以 gameMode==1 为前提,原版 currentGameMode 门放行。
+    request_vip_info(env, "进村补发 getVipInfo(0x19ca0)");
 }
 
 // ─────────────────────────────── [2026-09-16] E-03 每日任务 1074 ───────────────────────────────
@@ -2876,8 +2948,13 @@ fn daily_values_for_today(env: &mut Environment, island: bool, ymd: u32) -> Vec<
 
 /// 主村 1074 回包(parseDailyTaskListWithSceneId:pos:len:@0x1c0398 逐字节核实):
 /// [u8 场景标志 0=主村(1=岛,0x1c0420)][u32 unix 秒(0x1c046c 转 double、减 kCFAbsoluteTimeIntervalSince1970 → setCurrentServerTime:)]
-/// [u32 个数][u32 原始值 × 个数]。时间取 now_cf_u32,与 CFAbsoluteTimeGetCurrent/NewSceneTimer 同一虚拟时钟(含时间旅行偏移),
+/// [u32 个数][u32 原始值 × 个数]。时间取 now_cf_u32,与离线 NewSceneTimer getCurrentServerTime 同一单调时钟(含时间旅行偏移),
 /// 否则 isDailyQuestListForTodayRecieved 拿截止时间比较时会每次都判成跨天并清进度。
+/// [2026-09-25 第五轮遗留 MISC-4] 截止时间由 updateDailyQuestListWithCurrentServerData: 在 0x82fe6 用回包时间 +0x7080 算出,跨天判定
+/// -[GameData isDailyQuestListForTodayRecieved]@0x830c0 在 0x831d4 比的也是回包 currentServerTime,两边都是本函数给的时间。
+/// 主村倒计时 -[DailyQuest leftTime] 经 -[DailyQuest currentTime]@0x342870 → -[WrapperManager getCurrentTime]@0x2615ec,在 curSceneId≠10 时
+/// 0x261656 直读 CFAbsoluteTimeGetCurrent(墙钟);进程内宿主时间回拨时主村倒计时会多出回拨量——这与原版「截止按服务器时间、主村
+/// 倒计时按设备时钟」一致,不另处理。岛上倒计时走 getCurrentServerTime,与回包对齐。
 /// GameData.dailyQuestData 不足 34 条时不回包:hashDailyQuestIdInMainVillage: 在表条数小于原始值时做 v % 条数(0x82a50),
 /// 表没加载好(0 条)会除以 0。
 fn encode_daily_task_list_main(env: &mut Environment) -> Option<Vec<u8>> {
@@ -3049,6 +3126,235 @@ fn island_daily_quest_prompt(env: &mut Environment, gd: id) {
         let _: () = msg_send(env, (dq, reset_sel));
     }
     log!("[ACTIVITY] 黄金岛每日任务:照原版分发臂给日常 NPC(96)挂提示图标并 resetTimer");
+}
+
+// ─────────────────────────────── [2026-09-25 第五轮遗留 V] VIP 信息 1084 回包分发 ───────────────────────────────
+
+/// [2026-09-25 第五轮遗留 V] 「VIP 信息 1084 回包分发」是否在排队。只由 request_vip_info 置位、vip_info_poll 清零;
+/// 同一轮运行循环里的多次请求天然合并成一次分发(分发幂等:已解锁的成就会被原版 checkInAlreadyUnlockList: 跳过)。
+static VIP_INFO_PENDING: AtomicBool = AtomicBool::new(false);
+/// +[GameNewScene scene]@0x23ed08 的单例槽(0x23ed14 `add r4, pc` 得 0xb40bd8)。只读不建:槽空时 +scene 会在 0x23ed36
+/// alloc/init 一个新场景;+purgeSharedInstance@0x23ed50 先 release 再清零,所以读到的非 0 值一定是活对象。
+const SLOT_GAME_NEW_SCENE: u32 = 0xb40bd8;
+/// 岛 1084 臂 0x23e896 `movw r2, #0x7d0f`:贝壳树(SuperShellTree)的唯一对象 ID。
+const VIP_INFO_SHELLTREE_ID: i32 = 32015;
+/// 岛 HUD(NewSceneUserInfoLayer,UserInfoLayer 的子类)的 tag:-[GameNewScene addMainVillageLayer:] 0x23ee5a 以 tag 3 挂上,
+/// 1084 臂 0x23e818 `movs r2, #0x3` 取它。
+const ISLAND_HUD_TAG: i32 = 3;
+/// 岛 1084 臂 0x23e870 `mov.w r2, #0x1000`(全二进制唯一传 0x1000 的调用点):checkConditions:itemId: 0x334c16 → checkAchieveVIP:。
+const ACH_TYPE_VIP_ISLAND: i32 = 0x1000;
+/// 主村 1084 臂 0x23a82 `mov.w r2, #0x800`(AchievementControl 唯一传 0x800 的调用点):checkConditions:itemId: 0x1f6d44 → checkAchieve_ReqVIP。
+/// 岛上 -[NewSceneShop onAlarmFlagTouched] 0x31ff3a(r2 在 0x31ff2a 置 0x800)给 NewSceneAchievement checkConditions:itemId: 传的 0x800
+/// 是岛成就的另一类型,与 VIP 无关(岛 VIP 是 0x1000)。
+const ACH_TYPE_VIP_MAIN: i32 = 0x800;
+
+/// [2026-09-25 第五轮遗留 V] 请一次「VIP 信息 1084 回包分发」:离线等价于原版发出 getVipInfo、等服务器回包。
+/// 纯原子操作,不发消息、不碰寄存器,可以在任何栈上调用(含 drawScene / CCScheduler 帧栈与 SHELLHOOK)。
+/// 调用方:getVipInfo 臂(原版所有入口)、进村补发(startgame_resend_offline,对应 0x19ca0)、假充值(mole_items::on_shells_purchased,
+/// 对应 0x117dcc)。在线模式直接返回。
+pub fn request_vip_info(env: &Environment, why: &str) {
+    if env.options.network_access {
+        return;
+    }
+    let first = !VIP_INFO_PENDING.swap(true, O);
+    log!(
+        "[ACTIVITY] VIP 信息 1084:{},{}(本轮运行循环末尾补回包分发,不走 parseVipInfo,不改本地 VIP 值)",
+        why,
+        if first { "已排队" } else { "本轮已排过,合并" }
+    );
+}
+
+/// [2026-09-25 第五轮遗留 V] 是否有待分发的 1084。ns_run_loop::run_run_loop 主线程每轮都调,只有一次原子读。
+pub fn vip_info_pending() -> bool {
+    VIP_INFO_PENDING.load(O)
+}
+
+/// [2026-09-25 第五轮遗留 V] 「VIP 信息 1084 回包分发」受理点。只由 ns_run_loop::run_run_loop 在主线程、本轮 perform 相位之后、
+/// 「关键操作即时落盘」受理点(mole_cheats::island_flush_now_poll)之前调用:这时本轮触摸、定时器(CADisplayLink → CCDirector
+/// mainLoop → drawScene → CCScheduler)、perform 队列都已返回,栈上没有任何游戏方法体,可以自由发宿主消息;不在 intercept 里,
+/// 不涉及 r0-r3 快照。照第五轮 FLUSH(置脏只排标志、运行循环统一受理)的写法,原因是规则「帧栈上不发宿主消息」:
+/// 调用点里 -[HolidayVillageLayer onEnter] 0x23949c 跑在切场景的 drawScene 帧栈上,从岛回村时的进村补发跑在 CCScheduler tick 里。
+/// 时机上是同一轮运行循环末尾,原版是一次网络往返之后;分发臂开头都按 curSceneId 自己判场景,与当时谁是代理无关。
+/// perform 相位不建自动释放池,这里自建一个包住整次分发(updateUI4VIP 里的 stringWithFormat:/spriteFrameByName:、
+/// 成就解锁发奖链都会产生自动释放对象),当场 drain;原版 iOS 每轮运行循环都会 drain,两者等价。
+pub fn vip_info_poll(env: &mut Environment) {
+    if !VIP_INFO_PENDING.swap(false, O) {
+        return;
+    }
+    if env.options.network_access {
+        log!("[ACTIVITY] VIP 信息 1084:受理时已是在线模式,放弃分发");
+        return;
+    }
+    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
+    let new_s = sel_named(env, "new");
+    let pool: id = msg_send(env, (pool_cls, new_s));
+    vip_info_dispatch(env);
+    let drain_s = sel_named(env, "drain");
+    let _: () = msg_send(env, (pool, drain_s));
+}
+
+/// [2026-09-25 第五轮遗留 V] 照 parseData 公共尾 0xe6d9e..0xe6de4 的两次分发:原版先给 delegateGameData(GameManager)发
+/// onCommandReceived:,再给 delegateNewSceneGameData(HolidayVillageLayer,全二进制唯一实现者)发 onNewSceneGameDataCommandReceived:;
+/// 两条 1084 臂开头都判 [[SceneMannager sharedManager] curSceneId](主村臂 0x23a24 要 1,岛臂 0x23e7f2 要 10),
+/// 所以这里按 curSceneId 分派与原版等价。岛上会话里真实值不是 1/10 时 mole_cheats 的 curSceneId 臂返回 10,与其它岛功能口径一致。
+/// 修改器「强制 VIP」开着时跳过成就判定那一步(两边判定都读 [[GameData userVIPInfoData] vipLevelWithNewType],会读到强制等级、
+/// 永久记下解锁并发奖),只刷新 HUD 与贝壳树。
+fn vip_info_dispatch(env: &mut Environment) {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        log!("[ACTIVITY] VIP 信息 1084 分发:SceneMannager 单例还没建,原版两条分发臂都不做事");
+        return;
+    }
+    let cur_sel = sel_named(env, "curSceneId");
+    let cur: i32 = msg_send(env, (sm, cur_sel));
+    let force_vip = crate::mole_cheats::is_on("force_vip");
+    match cur {
+        1 => vip_info_main_arm(env, force_vip),
+        10 => vip_info_island_arm(env, force_vip),
+        _ => {
+            log!(
+                "[ACTIVITY] VIP 信息 1084 分发:受理时 curSceneId={},原版两条分发臂(主村要 1、岛要 10)都不做事",
+                cur
+            );
+        }
+    }
+}
+
+/// [2026-09-25 第五轮遗留 V] 主村 1084 臂,照 -[GameManager onCommandReceived:] 0x239f6..0x23aaa 逐条执行:
+/// [[GameManager sharedManager] userInfoLayer] 非 nil 时 isShowVIPFunctionsButton:YES(0x23a5e,v12@0:4c8)→
+/// [[AchievementControl shareInstance] checkConditions:0x800](0x23a8e,v12@0:4i8)→ 重新取一次 userInfoLayer(0x23a92)发
+/// updateUI4VIP(0x23aaa → 0x2265a,v8@0:4)。主村 updateUI4VIP 只有这条臂和好友村会调,以前离线主村 HUD 的 VIP 徽章从没刷新过。
+/// 原版门照旧由原版自己判:checkConditions: 在 0x1f6c60/0x1f6c70 见 [[WrapperManager sharedManager] currentGameMode] 为 0/6 时
+/// 静默返回,isShowVIPFunctionsButton:@0x592a0 在 currentGameMode!=1 时直接返回;日志里的 currentGameMode 只是诊断读数。
+/// HUD 先用 object_has_method_named 判一下再发(原版直接发)。只在 vip_info_poll 里调用。
+fn vip_info_main_arm(env: &mut Environment, force_vip: bool) {
+    let wm = singleton(env, "WrapperManager", "sharedManager");
+    let mode: i32 = if wm == nil {
+        -1
+    } else {
+        let s = sel_named(env, "currentGameMode");
+        msg_send(env, (wm, s))
+    };
+    let gm = singleton(env, "GameManager", "sharedManager");
+    let uil_sel = sel_named(env, "userInfoLayer");
+    let uil: id = if gm == nil {
+        nil
+    } else {
+        msg_send(env, (gm, uil_sel))
+    };
+    if uil != nil
+        && env
+            .objc
+            .object_has_method_named(&env.mem, uil, "isShowVIPFunctionsButton:")
+    {
+        let s = sel_named(env, "isShowVIPFunctionsButton:");
+        let _: () = msg_send(env, (uil, s, true));
+    }
+    let ach_note = if force_vip {
+        "强制 VIP 开着,已跳过(VIP 成就判定会读到强制等级并永久记下解锁、发奖;关掉强制 VIP 后下次触发再按真实等级判)"
+    } else {
+        let ac = singleton(env, "AchievementControl", "shareInstance");
+        if ac == nil {
+            "AchievementControl 单例不在,未判定"
+        } else {
+            let s = sel_named(env, "checkConditions:");
+            let _: () = msg_send(env, (ac, s, ACH_TYPE_VIP_MAIN));
+            "已交原版判定(原版在 currentGameMode 为 0/6 时静默跳过,0x1f6c60/0x1f6c70)"
+        }
+    };
+    let uil2: id = if gm == nil {
+        nil
+    } else {
+        msg_send(env, (gm, uil_sel))
+    };
+    let hud_done = uil2 != nil
+        && env
+            .objc
+            .object_has_method_named(&env.mem, uil2, "updateUI4VIP");
+    if hud_done {
+        let s = sel_named(env, "updateUI4VIP");
+        let _: () = msg_send(env, (uil2, s));
+    }
+    log!(
+        "[ACTIVITY] VIP 信息 1084 分发(主村 curSceneId=1,currentGameMode={}):HUD {};AchievementControl checkConditions:0x800 {}",
+        mode,
+        if hud_done { "已刷新" } else { "没有 userInfoLayer" },
+        ach_note
+    );
+}
+
+/// [2026-09-25 第五轮遗留 V] 岛 1084 臂,照 -[HolidayVillageLayer onNewSceneGameDataCommandReceived:] 0x23e7f8..0x23e8f4 逐条执行:
+/// [[GameNewScene scene] getChildByTag:3](0x23e822,@12@0:4i8)非 nil 时 isShowVIPFunctionsButton:YES(0x23e83a)与 updateUI4VIP
+/// (0x23e84c)→ [[NewSceneAchievement shareInstance] checkConditions:0x1000](0x23e87c)→ [[ObjectManager sharedManager]
+/// getUniqueObjectByObjectId:32015](0x23e8a2)非 nil 且 isKindOfClass:SuperShellTree(0x23e8da)时 rescheduleTree(0x23e8f4 →
+/// 0x23df1c;全二进制唯一调用点:stopScheduler、removeFlag,再以 1.0 秒间隔重排 innerupdate:,旗子由约 1 秒后的 updateView 重建)。
+/// 场景取单例槽 SLOT_GAME_NEW_SCENE,不发 +scene(槽空时它会新建场景);HUD 先用 object_has_method_named 判一下再发。
+/// 原版门照旧由原版自己判:checkConditions:itemId: 在 0x3349c4/0x3349da 见 [[NewGameManager sharedManager] gameMode] 为 0/6 时早退;
+/// 日志里的 gameMode 只是诊断读数。只在 vip_info_poll 里调用。
+fn vip_info_island_arm(env: &mut Environment, force_vip: bool) {
+    let ngm = singleton(env, "NewGameManager", "sharedManager");
+    let mode: i32 = if ngm == nil {
+        -1
+    } else {
+        let s = sel_named(env, "gameMode");
+        msg_send(env, (ngm, s))
+    };
+    let slot: ConstPtr<u32> = Ptr::from_bits(SLOT_GAME_NEW_SCENE);
+    let scene: id = Ptr::from_bits(env.mem.read(slot));
+    let mut hud_done = false;
+    if scene != nil {
+        let tag_sel = sel_named(env, "getChildByTag:");
+        let hud: id = msg_send(env, (scene, tag_sel, ISLAND_HUD_TAG));
+        if hud != nil
+            && env
+                .objc
+                .object_has_method_named(&env.mem, hud, "isShowVIPFunctionsButton:")
+            && env
+                .objc
+                .object_has_method_named(&env.mem, hud, "updateUI4VIP")
+        {
+            let show_sel = sel_named(env, "isShowVIPFunctionsButton:");
+            let _: () = msg_send(env, (hud, show_sel, true));
+            let upd_sel = sel_named(env, "updateUI4VIP");
+            let _: () = msg_send(env, (hud, upd_sel));
+            hud_done = true;
+        }
+    }
+    let ach_note = if force_vip {
+        "强制 VIP 开着,已跳过(VIP 成就判定会读到强制等级并永久记下解锁、发奖;关掉强制 VIP 后下次触发再按真实等级判)"
+    } else {
+        let ach = singleton(env, "NewSceneAchievement", "shareInstance");
+        if ach == nil {
+            "NewSceneAchievement 单例不在,未判定"
+        } else {
+            let s = sel_named(env, "checkConditions:");
+            let _: () = msg_send(env, (ach, s, ACH_TYPE_VIP_ISLAND));
+            "已交原版判定(原版在 gameMode 为 0/6 时早退,0x3349c4/0x3349da)"
+        }
+    };
+    let mut tree_done = false;
+    let om = singleton(env, "ObjectManager", "sharedManager");
+    let tree_cls = env.objc.get_known_class("SuperShellTree", &mut env.mem);
+    if om != nil && tree_cls != nil {
+        let g = sel_named(env, "getUniqueObjectByObjectId:");
+        let obj: id = msg_send(env, (om, g, VIP_INFO_SHELLTREE_ID));
+        if obj != nil {
+            let isk = sel_named(env, "isKindOfClass:");
+            let is_tree: bool = msg_send(env, (obj, isk, tree_cls));
+            if is_tree {
+                let r = sel_named(env, "rescheduleTree");
+                let _: () = msg_send(env, (obj, r));
+                tree_done = true;
+            }
+        }
+    }
+    log!(
+        "[ACTIVITY] VIP 信息 1084 分发(黄金岛 curSceneId=10,gameMode={}):HUD {};NewSceneAchievement checkConditions:0x1000 {};贝壳树 32015 {}",
+        mode,
+        if hud_done { "已刷新" } else { "不在" },
+        ach_note,
+        if tree_done { "rescheduleTree" } else { "无活树" }
+    );
 }
 
 // ─────────────────────────────── [2026-09-24 第四轮 K6 N-D4-1] 岛上 VIP 在线奖励离线提示 ───────────────────────────────

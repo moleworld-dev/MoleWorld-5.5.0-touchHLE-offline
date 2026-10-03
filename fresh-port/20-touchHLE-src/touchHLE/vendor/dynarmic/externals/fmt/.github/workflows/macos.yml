@@ -9,23 +9,26 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-11, macos-13]
+        os: [macos-13, macos-14]
         build_type: [Debug, Release]
         std: [11, 17, 20]
+        shared: [""]
         exclude:
-          - { os: macos-11, std: 20 }
           - { os: macos-13, std: 11 }
           - { os: macos-13, std: 17 }
         include:
-          - shared: -DBUILD_SHARED_LIBS=ON
+          - os: macos-14
+            std: 23
+            build_type: Release
+            shared: -DBUILD_SHARED_LIBS=ON
 
     runs-on: '${{ matrix.os }}'
 
     steps:
-    - uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
     - name: Set timezone
-      run: sudo systemsetup -settimezone 'Asia/Yekaterinburg'
+      run: sudo systemsetup -settimezone 'Europe/Minsk'
 
     - name: Select Xcode 14.3 (macOS 13)
       run: sudo xcode-select -s "/Applications/Xcode_14.3.app"

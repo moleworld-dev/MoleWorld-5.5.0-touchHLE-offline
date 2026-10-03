@@ -5,19 +5,20 @@
  */
 //! `CGContext.h`
 
-use super::cg_affine_transform::CGAffineTransform;
-use super::cg_image::CGImageRef;
-use super::{cg_bitmap_context, cg_color, CGFloat, CGPoint, CGRect};
-use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
-use crate::frameworks::core_graphics::cg_bitmap_context::{
+use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
+use super::cg_bitmap_context::{
     CGBitmapContextDrawer, CGBitmapContextGetHeight, CGBitmapContextGetWidth,
 };
-use crate::frameworks::core_graphics::cg_color::CGColorRef;
-use crate::frameworks::core_graphics::cg_font::{
-    CGFontHostObject, CGFontRef, CGFontRelease, CGFontRetain, CGGlyph,
+use super::cg_color::CGColorRef;
+use super::cg_color_space::{
+    kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB, CGColorSpaceGetModel, CGColorSpaceRef,
 };
-use crate::frameworks::core_graphics::cg_geometry::CGPointZero;
+use super::cg_font::{CGFontHostObject, CGFontRef, CGFontRelease, CGFontRetain, CGGlyph};
+use super::cg_geometry::CGPointZero;
+use super::cg_image::CGImageRef;
+use super::{cg_bitmap_context, cg_color, CGFloat, CGPoint, CGRect, CGSize};
+use crate::dyld::{export_c_func, FunctionExports};
+use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::uikit;
 use crate::mem::{ConstPtr, GuestUSize};
 use crate::objc::{objc_classes, ClassExports, HostObject};
@@ -30,6 +31,17 @@ type CGInterpolationQuality = i32;
 
 type CGTextDrawingMode = i32;
 const kCGTextFill: CGTextDrawingMode = 0;
+const kCGTextFillStroke: CGTextDrawingMode = 2;
+
+pub type CGBlendMode = i32;
+pub const kCGBlendModeNormal: CGBlendMode = 0;
+pub const kCGBlendModeMultiply: CGBlendMode = 1;
+pub const kCGBlendModeScreen: CGBlendMode = 2;
+#[allow(unused)]
+pub const kCGBlendModeOverlay: CGBlendMode = 3;
+pub const kCGBlendModeDarken: CGBlendMode = 4;
+pub const kCGBlendModeLighten: CGBlendMode = 5;
+pub const kCGBlendModeCopy: CGBlendMode = 17;
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -63,10 +75,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: keep more states saved once they are implemented
 type ContextState = (
-    (CGFloat, CGFloat, CGFloat, CGFloat),
-    CGAffineTransform,
-    CGFontRef,
-    CGFloat,
+    (CGFloat, CGFloat, CGFloat, CGFloat), // RGB fill color
+    CGAffineTransform,                    // transform
+    CGFontRef,                            // font
+    CGFloat,                              // font size
+    CGBlendMode,                          // blend mode
 );
 
 pub(super) struct CGContextHostObject {
@@ -76,6 +89,9 @@ pub(super) struct CGContextHostObject {
     pub(super) font_size: CGFloat,
     /// Current transform.
     pub(super) transform: CGAffineTransform,
+    pub(super) blend_mode: CGBlendMode,
+    /// Text transform.
+    pub(super) text_transform: Option<CGAffineTransform>,
     pub(super) state_stack: Vec<ContextState>,
 }
 impl HostObject for CGContextHostObject {}
@@ -97,6 +113,22 @@ pub fn CGContextRetain(env: &mut Environment, c: CGContextRef) -> CGContextRef {
     } else {
         c
     }
+}
+
+fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, blend_mode: CGBlendMode) {
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
+        .blend_mode = blend_mode;
+}
+
+fn CGContextSetFillColorSpace(
+    env: &mut Environment,
+    _context: CGContextRef,
+    space: CGColorSpaceRef,
+) {
+    let color_model = CGColorSpaceGetModel(env, space);
+    assert!(color_model == kCGColorSpaceModelMonochrome || color_model == kCGColorSpaceModelRGB);
+    // TODO
 }
 
 fn CGContextSetFillColorWithColor(env: &mut Environment, context: CGContextRef, color: CGColorRef) {
@@ -128,6 +160,27 @@ fn CGContextSetGrayFillColor(
     env.objc
         .borrow_mut::<CGContextHostObject>(context)
         .rgb_fill_color = color;
+}
+
+// [合并上游 v0.3.0 2026-10-02] 上游 6d20964e / e05daa62 在这里加了
+// CGContextSetGrayStrokeColor / CGContextSetRGBStrokeColor 两个只打 TODO 日志的空桩;
+// 我方在下方路径 API 段(#23(b)、E22)已有真实现(写入描边侧表、随 SaveGState 入栈,
+// RGB 版为 pub 供 -[UIColor set]/-[UIColor setStroke] 调用),故删掉上游空桩保留我方实现。
+
+fn CGContextSetShadowWithColor(
+    _env: &mut Environment,
+    context: CGContextRef,
+    offset: CGSize,
+    blur: CGFloat,
+    color: CGColorRef,
+) {
+    log!(
+        "TODO: CGContextSetShadowWithColor({:?}, {}, {}, {:?})",
+        context,
+        offset,
+        blur,
+        color
+    );
 }
 
 pub fn CGContextFillRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
@@ -206,6 +259,7 @@ pub fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
         host_obj.transform,
         host_obj.font,
         host_obj.font_size,
+        host_obj.blend_mode,
     ));
     CGFontRetain(env, env.objc.borrow::<CGContextHostObject>(context).font);
     // [深扫修 2026-09-11] #23(b):描边颜色/线宽属于图形状态,一并入栈
@@ -237,6 +291,7 @@ pub fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
     host_obj.transform = state.1;
     host_obj.font = state.2;
     host_obj.font_size = state.3;
+    host_obj.blend_mode = state.4;
 }
 
 fn CGContextSetInterpolationQuality(
@@ -258,6 +313,14 @@ fn CGContextSetAllowsAntialiasing(_env: &mut Environment, context: CGContextRef,
     );
 }
 
+fn CGContextSetShouldSmoothFonts(_env: &mut Environment, context: CGContextRef, should: bool) {
+    log!(
+        "TODO: CGContextSetShouldSmoothFonts({:?}, {})",
+        context,
+        should
+    );
+}
+
 fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {
     CGFontRetain(env, font);
     let old_font = env.objc.borrow_mut::<CGContextHostObject>(context).font;
@@ -276,7 +339,18 @@ fn CGContextSetTextDrawingMode(
     _context: CGContextRef,
     mode: CGTextDrawingMode,
 ) {
-    assert_eq!(mode, kCGTextFill); // TODO: support other modes
+    assert!(mode == kCGTextFill || mode == kCGTextFillStroke); // TODO: support other modes
+}
+
+fn CGContextSetTextMatrix(
+    env: &mut Environment,
+    context: CGContextRef,
+    transform: CGAffineTransform,
+) {
+    log_dbg!("CGContextSetTextMatrix({:?})", transform);
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
+        .text_transform = Some(transform);
 }
 
 fn CGContextShowGlyphsAtPoint(
@@ -295,21 +369,61 @@ fn CGContextShowGlyphsAtPoint(
 
     let font = env.objc.borrow::<CGContextHostObject>(context).font;
     let font_size = env.objc.borrow::<CGContextHostObject>(context).font_size;
+    let text_transform = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .text_transform
+        .unwrap_or(CGAffineTransformIdentity);
 
     let font = &env.objc.borrow::<CGFontHostObject>(font).font;
 
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
 
-    font.draw_glyphs(font_size, glyph_ids, (x, y), |raster_glyph| {
-        uikit::ui_font::draw_font_glyph(
-            &mut drawer,
-            raster_glyph,
-            fill_color,
-            /* clip_x: */ None,
-            /* clip_y: */ None,
-        )
-    });
+    font.draw_glyphs(
+        font_size,
+        glyph_ids,
+        (x, y),
+        text_transform,
+        |raster_glyph| {
+            uikit::ui_font::draw_font_glyph(
+                &mut drawer,
+                raster_glyph,
+                fill_color,
+                /* clip_x: */ None,
+                /* clip_y: */ None,
+            )
+        },
+    );
+}
+
+fn CGContextShowGlyphsAtPositions(
+    env: &mut Environment,
+    context: CGContextRef,
+    glyphs: ConstPtr<CGGlyph>,
+    positions: ConstPtr<CGPoint>,
+    count: GuestUSize,
+) {
+    let text_transform = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .text_transform
+        .unwrap_or(CGAffineTransformIdentity);
+    assert!(text_transform.tx == 0.0 && text_transform.ty == 0.0); // TODO
+
+    for i in 0..count {
+        let glyph_ptr = glyphs + i;
+        let point = env.mem.read(positions + i);
+        let transformed_point = text_transform.apply_to_point(point);
+        CGContextShowGlyphsAtPoint(
+            env,
+            context,
+            transformed_point.x,
+            transformed_point.y,
+            glyph_ptr,
+            1,
+        );
+    }
 }
 
 // ============================================================================
@@ -983,9 +1097,14 @@ fn CGContextStrokeEllipseInRect(env: &mut Environment, context: CGContextRef, re
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRetain(_)),
     export_c_func!(CGContextRelease(_)),
+    export_c_func!(CGContextSetBlendMode(_, _)),
+    export_c_func!(CGContextSetFillColorSpace(_, _)),
     export_c_func!(CGContextSetFillColorWithColor(_, _)),
     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
+    export_c_func!(CGContextSetGrayStrokeColor(_, _, _)),
+    export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
+    export_c_func!(CGContextSetShadowWithColor(_, _, _, _)),
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
     export_c_func!(CGContextClipToRect(_, _)),
@@ -999,11 +1118,16 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRestoreGState(_)),
     export_c_func!(CGContextSetInterpolationQuality(_, _)),
     export_c_func!(CGContextSetAllowsAntialiasing(_, _)),
+    export_c_func!(CGContextSetShouldSmoothFonts(_, _)),
     export_c_func!(CGContextSetFont(_, _)),
     export_c_func!(CGContextSetFontSize(_, _)),
     export_c_func!(CGContextSetTextDrawingMode(_, _)),
+    export_c_func!(CGContextSetTextMatrix(_, _)),
     export_c_func!(CGContextShowGlyphsAtPoint(_, _, _, _, _)),
+    export_c_func!(CGContextShowGlyphsAtPositions(_, _, _, _)),
     // [深扫修 2026-09-11] #23(b):路径 API
+    // ([合并上游 v0.3.0 2026-10-02] SetRGBStrokeColor / SetGrayStrokeColor 的导出项
+    // 上游已加在 SetGrayFillColor 之后,指向的就是本文件我方真实现,此处不再重复导出。)
     export_c_func!(CGContextBeginPath(_)),
     // [审查修 2026-09-13] E21:裁剪(最小版:只清当前路径,不做真正裁剪)
     export_c_func!(CGContextClip(_)),
@@ -1019,8 +1143,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextStrokePath(_)),
     export_c_func!(CGContextDrawPath(_, _)),
     export_c_func!(CGContextSetLineWidth(_, _)),
-    export_c_func!(CGContextSetRGBStrokeColor(_, _, _, _, _)),
-    export_c_func!(CGContextSetGrayStrokeColor(_, _, _)),
     export_c_func!(CGContextSetStrokeColorWithColor(_, _)),
     export_c_func!(CGContextStrokeRect(_, _)),
     export_c_func!(CGContextFillEllipseInRect(_, _)),

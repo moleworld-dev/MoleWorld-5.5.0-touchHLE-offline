@@ -381,8 +381,16 @@ pub fn with_format(env: &mut Environment, format: id, args: VaList) -> String {
         },
         args,
     );
-    // TODO: what if it's not valid UTF-8?
-    String::from_utf8(res).unwrap()
+    match String::from_utf8_lossy(&res) {
+        Cow::Borrowed(str) => str.to_owned(),
+        Cow::Owned(string) => {
+            // TODO: Support UTF-16 printf directly
+            log!(
+                "Warning: invalid UTF-8 sequence replaced with U+FFFD in UTF-16 string formatting"
+            );
+            string
+        }
+    }
 }
 
 pub fn from_rust_ordering(ordering: std::cmp::Ordering) -> NSComparisonResult {
@@ -914,6 +922,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
++ (id)stringWithContentsOfURL:(id)url // NSURL*
+                     encoding:(NSStringEncoding)encoding
+                         error:(MutPtr<id>)error { // NSError**
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithContentsOfURL:url
+                                             encoding:encoding
+                                                error:error];
+    autorelease(env, new)
+}
+
 + (id)stringWithFormat:(id)format, // NSString*
                        ...args {
     let res = with_format(env, format, args.start());
@@ -1123,6 +1141,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     range_of_string_common(env, this, search_string, options, range)
 }
 
+- (NSRange)rangeOfCharacterFromSet:(id)set { // NSCharacterSet *
+    let length: NSUInteger = msg![env; this length];
+    let mut idx: NSUInteger = 0;
+    while idx < length {
+        let c: u16 = msg![env; this characterAtIndex:idx];
+        if msg![env; set characterIsMember:c] {
+            return NSRange { location: idx, length: 1 };
+        }
+        idx += 1;
+    }
+    NSRange { location: NSNotFound as NSUInteger, length: 0 }
+}
+
 - (id)description {
     this
 }
@@ -1298,10 +1329,34 @@ pub const CLASSES: ClassExports = objc_classes! {
     // -[NetworkManager onServerListResult:] got a3=0 → "Error connecting to server" → entermainmenu,
     // which in this port stops the render run loop (village builds but never paints). Both concrete
     // subclasses implement initWithBytes:length:encoding:, so this dispatches correctly for each.
+    // [合并上游 v0.3.0 2026-10-02] 上游 266c4f47 在 _touchHLE_NSString 版里加了「data 为 nil 时释放自身
+    // 返回 nil」,用来躲开它那边 initWithBytes:NULL length:0 的 panic。我方 initWithBytes:length:encoding:
+    // 长度 0 时不碰内存(F8-4),不会崩;这里保持原行为(nil → bytes NULL/length 0 → 空串),
+    // 与 Apple「[data bytes]/[data length] 转 initWithBytes:」的写法一致,不改游戏已验证过的流程。
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let bytes: ConstPtr<u8> = bytes.cast();
     let length: NSUInteger = msg![env; data length];
     msg![env; this initWithBytes:bytes length:length encoding:encoding]
+}
+
+// [合并上游 v0.3.0 2026-10-02] 上游 f02bc1bf 新增,原放在 _touchHLE_NSString 上;按我方「字符串方法
+// 放抽象 NSString」的做法上移到这里,只经 NSData 与 initWithData:encoding: 消息分派,
+// _touchHLE_NSMutableString(+[NSMutableString stringWithContentsOfURL:encoding:error:])也能继承。
+// 读不到数据时不再 assert!(error.is_null())(调用方传了 error 指针就 panic),
+// 与 initWithContentsOfFile:encoding:error: 的修法一致:error 写 nil,释放自身返回 nil。
+// 编码无法解码时由 initWithBytes:length:encoding: 释放自身并返回 nil。
+- (id)initWithContentsOfURL:(id)url // NSURL*
+                    encoding:(NSStringEncoding)encoding
+                       error:(MutPtr<id>)error { // NSError**
+    let data: id = msg_class![env; NSData dataWithContentsOfURL:url];
+    if data == nil {
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
+        release(env, this);
+        return nil;
+    }
+    msg![env; this initWithData:data encoding:encoding]
 }
 
 - (())getCharacters:(MutPtr<unichar>)buffer
@@ -1621,9 +1676,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     //       "/var/automount”, or "/private” from the path
     assert!(!path.starts_with("/private"));
     assert!(!path.starts_with("/var/automount"));
-    // TODO: Reducing empty components and references to the current directory
-    assert!(!path.contains("//"));
-    assert!(!path.contains("/./"));
+    // Reducing empty components and references to the current directory
+    let path = path.replace("//", "/").replace("/./", "/");
     // Removing a trailing slash from the last component.
     let path = path_algorithms::trim_trailing_slashes(&path);
     // For absolute paths only, resolve references to the parent directory
@@ -2036,7 +2090,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     *env.objc.borrow_mut(this) = host_object;
-
     this
 }
 
@@ -2875,7 +2928,7 @@ mod ns_string_tests {
 /// In case of small buffer no data is written.
 ///
 /// Right now this helper is used for `NSString getCString:maxLength:encoding:`
-/// method and `CFStringGetPascalString` function.
+/// method, `CFStringGetPascalString` and `CFStringGetBytes` functions.
 pub fn get_bytes_buffer_inner(
     env: &mut Environment,
     str: id, // NSString *

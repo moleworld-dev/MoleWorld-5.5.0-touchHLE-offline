@@ -404,6 +404,15 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
     if env.options.network_access {
         return Err("在线模式下岛上进度以服务器为准,不能快进岛档".to_string());
     }
+    // [2026-09-25 第五轮遗留 C] 时间旅行中不快进岛档:旅行期间进不了岛(mole_cheats 的 enterNewIslands 臂拦下),快进的效果要重启、
+    //   偏移归零后才看得到;而且 island_storage_ff 在仓库档缺 savedAt 时回退用 now_cf_secs(),它含旅行偏移(wall_cf_secs 加了
+    //   time_offset_secs),会把未来的 savedAt 写进 island_storage.dat。重启后再快进效果相同,所以直接拒绝。
+    //   (回拨前自动拍的快照在旅行中同样是「旅行后的主档 + 旅行前的侧档」,与手动快照一样,不是拒绝的主因。)
+    if crate::libc::time::time_offset_secs() != 0 {
+        return Err(
+            "时间旅行中不能快进岛档(旅行期间进不了岛,快进效果要重启后才看得到),请重启游戏回到现实时间后再快进".to_string(),
+        );
+    }
     if minutes <= 0 {
         return Err("快进的分钟数必须是正数".to_string());
     }
@@ -434,7 +443,702 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
     r
 }
 
+// ───────────────────────── 主村工人/房间重算 ─────────────────────────
+//
+// [2026-09-25 第五轮遗留 WK99] 旧版「工人房间补满」写进 userinfo.dat 的 totalWorkers/totalRooms = 99 一键还原。
+// 原版主村两个数的来源(full.asm 逐条核过):
+//   · 新号:-[UserInfoData init]@0xb9050 在 0xb91da 把 3 写进 totalWorkers_(+36)/availableWorkers_(+40),0xb9150 把 1 写进
+//     totalRooms_(+48);默认地图 createDefaultMapData@0x79418 放一座 5001 红色尖顶房(state 6 = 人口 3)。
+//   · totalWorkers 唯一增长口 -[UserInfoData addWorker:]@0xbb2a4(总数、空闲同加 n,0xbb316 刷抬头,0xbb344 initMoleActors:n 生成
+//     空闲摩尔),主村调用点:房屋建成 -[Building onFinishHandler] 0xb11d0(type 5、非仓库摆放模式 7、objectId≠60004 银行)、
+//     房屋升级 -[Building upgrade] 0xb0baa(非模式 7、type≠6)、买「摩尔」19001 -[VillageMenuLayer addNewObject2Map:gift:] 0x65728。
+//     仓库存取(gameMode 7)两头都不动它,所以仓库里房子的人口一直算在总数里;全程没有减少路径。
+//   · 原版自带居民房人口 -[GameData getWorkerCountByRoom]@0x7dc00:地图上 [ObjectManager rooms](只收 type 5)按 buildingState
+//     4/5/6 计 1/2/3(0x7dcc2/0x7dcd2/0x7dce2),再加仓库 recycledHouses 每个「id_等级」键的 等级 × 个数(0x7de06 mla)。
+//   ⇒ 原版恒等式:totalWorkers = getWorkerCountByRoom − 已建成银行数 + 额外摩尔(买来的;锁 9 拿含银行的原始
+//     getWorkerCountByRoom 比,额外摩尔封顶 110 + 已建成银行数)。额外摩尔除了总数本身存档里没有任何记录,只能由玩家自己报(寄存器)。
+//     [复核补] 原版唯一会让总摩尔少于居民房人口的是竞态:onFinishHandler 在 0xb1060 取的是完工那一刻的 currentGameMode,
+//     0xb118a 见 7 就跳过 addWorker:,所以仓库摆放(gameMode 7,0x62bb2/0x660f2)期间恰好有别的房屋完工(Building innerupdate:
+//     0xaf60a 按帧触发,不看模式)会少给 1 人;正常流程不会出现。本工具按恒等式把它补回,预览里照实说明。
+//   · totalRooms 唯一增长口 -[UserInfoData addRoom:]@0xbb548,只在 Porter 新摆一座房屋(含从仓库取出)时由
+//     -[Building initWithTile:sprite:size:data:] blx 0xad860 调(另一处 initWithTile:sprite:size:data:isWay: 的 blx 0xada9c
+//     所在方法没有任何 selref 引用,不会被调用);读它的 selref 只有 intiWithUserInfo:/encodeWithCoder:/
+//     encodeUserInfoData 三处复制/编码,没有玩法读它。原值 = 1 + 历次摆放次数,推不出,只能还原到下界。
+// 所以只在存档确实不符合原版时才改:三项同写 99 的旧作弊指纹(总摩尔与房间都 ≥ 99),或总摩尔少于居民房人口;
+// 正常档(包括合法 ≥ 99 的重度玩家档,只要房间 < 99)不动,寄存器残留值也不碰。写回走原版路径:增加用原版 addWorker:,
+// 减少(原版没有减少路径)用 setter,最后 saveUserInfoData 让游戏自己存主档,改前先自动存快照。
+// 调用上下文:菜单 handle_touch / 文本命令台(frameworks/uikit.rs handle_events 运行循环顶部),可以发宿主消息;不在帧栈上。
+
+/// 原版买「摩尔」(19001,type 0x13)的上限:-[GameData getLockType4Object:] 在 0x7d398..0x7d3d6 对 type 0x13 算
+/// totalWorkers − getWorkerCountByRoom,> 0x6d 给锁 9 → 最多 110 个。只用于提示文案。
+/// [复核补] 锁 9 用的是原始 getWorkerCountByRoom(含已建成银行,0x7d3cc),而本工具的额外摩尔按扣掉银行的居民房人口算,
+/// 所以按本工具口径原版上限是 110 + 已建成银行数(见 WorkerRecalcPlan::orig_extra_max)。
+const EXTRA_MOLES_ORIG_MAX: i32 = 110;
+/// 寄存器里「额外摩尔数」允许的上限。开着「全物品解锁」(mole_cheats 让 getLockType4Object: 恒返回 0)或「工人补满」
+/// (锁 9 那条 blx 的返回地址 0x7d3bd 在 K13 白名单里读到 99,99 − 居民房人口 永远不大于 109)时买的摩尔可以超过 110,
+/// 要能原样保住,所以放宽到 999。
+const EXTRA_MOLES_INPUT_MAX: i64 = 999;
+/// 旧版「工人房间补满」(c01007a 之前)三个 getter 对所有调用者恒返回 99,经 -[UserInfoData encodeWithCoder:]
+/// 0xba0e2/0xba108/0xba17a 把 99 同时写进总摩尔、空闲、房间;读档后两数只增不减,所以被污染的档一定两项都 ≥ 99。
+const OLD_MAXFAC_VALUE: i32 = 99;
+/// 中信虚拟银行(60004,type 5,store_able 1):-[Building onFinishHandler] 在 0xb11a2 `movw r1,#0xea64` 比 objectId,
+/// 相等时跳过 0xb11d0 的 addWorker:1(建成不给工人),但 getWorkerCountByRoom 照样把它算进居民房人口。
+const BANK_OBJECT_ID: i32 = 60004;
+/// 开地上限锁 7 的地块:-[GameData getLockType4Object:] 在 0x7da5c..0x7daa4 对 1001/2001/1010 各发 objectCount:type:2 求和,
+/// 0x7dac6 与 totalWorkers 比,地块数 ≥ 总摩尔数就锁(-[VillageMenuLayer canBuyMultiple:] 0x64500.. 同口径)。
+const PLOT_OBJECT_IDS: [i32; 3] = [1001, 2001, 1010];
+
+/// [SceneMannager curSceneId](i8@0:4):1 = 主村,10 = 黄金岛,2 = 切场景过场;单例拿不到时 -1。
+fn scene_id(env: &mut Environment) -> i32 {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return -1;
+    }
+    let s = sel(env, "curSceneId");
+    msg_send(env, (sm, s))
+}
+
+/// [WrapperManager currentGameMode](i8@0:4);单例拿不到时 -1。
+fn wrapper_game_mode(env: &mut Environment) -> i32 {
+    let wm = singleton(env, "WrapperManager", "sharedManager");
+    if wm == nil {
+        return -1;
+    }
+    let s = sel(env, "currentGameMode");
+    msg_send(env, (wm, s))
+}
+
+/// 主村地图是否还在加载:[[ActorManager Instance] m_isLoadMap](B8@0:4,ivar +260 槽 0xb03e54)。
+/// 原版 -[GameManager loadMapFromData:forNPC:] 0x206e6 / loadMapFromData:selector:mapData:forNPC: 0x20b6c 置 1,
+/// endLoadMap 以 1 秒间隔调度的 -[GameManager createIdleWorkers:] 先对各任务 minusNeededWorkers 扣预留,再在 0x1c0de 清 0。
+/// 这段时间 rooms 和仓库只加载了一部分(getWorkerCountByRoom 偏小),空闲数也还没扣任务预留;而且
+/// -[FriendsVillageLayer goToHomeVillage] 先在 0x108d10 setGameMode:1 才回家加载,gameMode 门挡不住。
+/// 原版 -[GameData saveMapData:] 0x768f4/0x768fa、-[VillageMenuLayer onButtonFriendSelected:] 0x61624 都拿它当「加载中」门。
+/// 单例为 nil 按「加载中」算。
+fn main_map_loading(env: &mut Environment) -> bool {
+    let am = singleton(env, "ActorManager", "Instance");
+    if am == nil {
+        return true;
+    }
+    let s = sel(env, "m_isLoadMap");
+    let loading: bool = msg_send(env, (am, s));
+    loading
+}
+
+/// 只改主村主档的开发工具共用的门:离线、不在岛会话、主村层已挂上、curSceneId==1、地图加载完、currentGameMode==1。
+/// gameMode 门同时挡住串门(-[FriendsVillageLayer init] 0x100392 等处 setGameMode:0)、移动/编辑(-[MoveLayer showWithTarget:selector:] 0xad09c 模式 2)、
+/// 仓库摆放(模式 7,rooms_ 可能暂时少一座房)、好友礼物(模式 9)等。
+fn main_village_offline_gate(env: &mut Environment, what: &str) -> Result<(), String> {
+    if env.options.network_access {
+        return Err(format!("在线模式下工人/房间以服务器为准,不能{}", what));
+    }
+    if crate::mole_cheats::island_session_active() {
+        return Err(format!("黄金岛上不能{}(只改主村),请回主村再用", what));
+    }
+    if main_village_layer(env) == nil {
+        return Err(format!(
+            "请先进入主村再{}(标题画面、过场或串门时主村房屋没加载全)",
+            what
+        ));
+    }
+    let scene = scene_id(env);
+    if scene != 1 {
+        return Err(format!(
+            "当前不在主村(curSceneId={}),请等进村完成再{}",
+            scene, what
+        ));
+    }
+    if main_map_loading(env) {
+        return Err(format!(
+            "主村地图还在加载(原版此时也不存地图,空闲摩尔要加载完 1 秒后才生成),稍等几秒再{}",
+            what
+        ));
+    }
+    let mode = wrapper_game_mode(env);
+    if mode != 1 {
+        return Err(format!(
+            "请先关闭其它面板、退出编辑/摆放模式再{}(currentGameMode={})",
+            what, mode
+        ));
+    }
+    Ok(())
+}
+
+/// 重算计划(只读,不写)。菜单二次确认的预览、文本命令的预览和真正执行都从这里来,口径一致。
+pub struct WorkerRecalcPlan {
+    pub total_old: i32,
+    pub avail_old: i32,
+    pub rooms_old: i32,
+    /// 原版 [GameData getWorkerCountByRoom] 的返回值(含银行)。
+    pub by_room_raw: i32,
+    /// 已建成的中信银行座数(地图 buildingState 4..=6 + 仓库「60004_等级」键);原版建成不给工人,每座比居民房人口少 1。
+    pub bank_pop: i32,
+    /// 居民房人口 = by_room_raw − bank_pop(不小于 0)。
+    pub by_room: i32,
+    pub houses_map: i32,
+    pub houses_store: i32,
+    /// 开地上限锁 7 计数的地块数(1001/2001/1010 的 objectCount:type:2 之和)。
+    pub plots: i32,
+    /// 额外摩尔数:要改工人时 = 寄存器输入;不改时 = 现状 total_old − by_room,只用于显示。
+    pub extra: i64,
+    /// 旧版 99 指纹:总摩尔、房间都 ≥ 99。
+    pub polluted: bool,
+    /// 总摩尔少于居民房人口(原版正常流程不会出现,只有仓库摆放期间恰好有房屋完工的竞态会少给,见本节开头)。
+    pub below_resident: bool,
+    /// 文本命令 force:跳过判定强制按 居民房人口 + 额外摩尔 重算。
+    pub forced: bool,
+    pub total_new: i32,
+    pub avail_new: i32,
+    pub rooms_new: i32,
+}
+
+impl WorkerRecalcPlan {
+    pub fn changes(&self) -> bool {
+        self.total_new != self.total_old
+            || self.avail_new != self.avail_old
+            || self.rooms_new != self.rooms_old
+    }
+
+    fn workers_fix(&self) -> bool {
+        self.forced || self.polluted || self.below_resident
+    }
+
+    /// [复核补] 按本工具口径(居民房人口已扣银行)的原版额外摩尔上限:锁 9 拿含银行的原始 getWorkerCountByRoom 比(0x7d3cc),
+    /// 所以是 110 + 已建成银行数。
+    fn orig_extra_max(&self) -> i64 {
+        EXTRA_MOLES_ORIG_MAX as i64 + self.bank_pop.max(0) as i64
+    }
+
+    fn resident_text(&self) -> String {
+        if self.bank_pop > 0 {
+            format!(
+                "居民房人口 {}(原版 getWorkerCountByRoom {} 已扣除中信银行 {} 座:原版建成银行不给工人)",
+                self.by_room, self.by_room_raw, self.bank_pop
+            )
+        } else {
+            format!("居民房人口 {}", self.by_room)
+        }
+    }
+
+    fn houses_text(&self) -> String {
+        format!(
+            "现有房屋 {}:地图 {} + 仓库 {}",
+            self.houses_map + self.houses_store,
+            self.houses_map,
+            self.houses_store
+        )
+    }
+
+    pub fn describe(&self) -> String {
+        if !self.changes() {
+            let extra_now = self.total_old - self.by_room;
+            let mut notes: Vec<String> = Vec::new();
+            if extra_now as i64 > self.orig_extra_max() {
+                notes.push(format!(
+                    "额外摩尔超过原版购买上限 {},多半是开着「工人补满」或「全物品解锁」时买的",
+                    self.orig_extra_max()
+                ));
+            }
+            if self.total_old >= OLD_MAXFAC_VALUE && self.rooms_old < OLD_MAXFAC_VALUE {
+                notes.push("总摩尔 ≥99 但房间 <99,不像旧版「工人房间补满」三项同写 99 的残留(确是旧版残留又按过「房间数 = 20」的,可用文本命令 workers recalc apply force [额外摩尔数])".to_string());
+            }
+            let why = if notes.is_empty() {
+                "都在原版范围内".to_string()
+            } else {
+                format!("{},不改", notes.join(";"))
+            };
+            return format!(
+                "总摩尔 {} = {} + 额外摩尔(买来的,不占住房){},空闲 {},房间 {}({}),{}",
+                self.total_old,
+                self.resident_text(),
+                extra_now,
+                self.avail_old,
+                self.rooms_old,
+                self.houses_text(),
+                why
+            );
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.workers_fix() {
+            let why = if self.forced {
+                "文本命令强制重算"
+            } else if self.polluted {
+                "总摩尔与房间都 ≥99,是旧版「工人房间补满」写进存档的 99 残留"
+            } else {
+                "总摩尔少于居民房人口,原版正常流程不会出现(仓库摆放时恰好有房屋完工会少给,或改过数值)"
+            };
+            parts.push(format!("判定:{}", why));
+        }
+        if self.total_new != self.total_old {
+            let mut s = format!(
+                "总摩尔 {}→{}({} + 额外摩尔 {};额外摩尔(买来的,不占住房)存档里没有记录,按寄存器算",
+                self.total_old,
+                self.total_new,
+                self.resident_text(),
+                self.extra
+            );
+            if self.extra > self.orig_extra_max() {
+                s.push_str(&format!(
+                    ";超过原版购买上限 {},只有开着「工人补满」或「全物品解锁」时买才可能",
+                    self.orig_extra_max()
+                ));
+            }
+            let keep = (self.total_old - self.by_room) as i64;
+            if self.total_old >= self.by_room && keep <= EXTRA_MOLES_INPUT_MAX && keep != self.extra
+            {
+                s.push_str(&format!(
+                    ";若 {} 本来就对,把寄存器设为 {} 即保持不变",
+                    self.total_old, keep
+                ));
+            }
+            s.push(')');
+            parts.push(s);
+        }
+        if self.avail_new != self.avail_old {
+            parts.push(format!("空闲 {}→{}", self.avail_old, self.avail_new));
+        }
+        if self.rooms_new != self.rooms_old {
+            parts.push(format!(
+                "房间 {}→{}({};原版房间数 = 1 + 历次摆放房屋次数,推不出原值,只还原到下界,没有玩法读它)",
+                self.rooms_old,
+                self.rooms_new,
+                self.houses_text()
+            ));
+        }
+        if self.total_new < self.total_old && self.plots >= self.total_new {
+            parts.push(format!(
+                "现有田地/池塘等地块 {} 块 ≥ 新总摩尔数(原版开地上限 = 总摩尔数):已开的不拆,但要等总摩尔数超过 {} 才能再开新地",
+                self.plots, self.plots
+            ));
+        }
+        parts.join(",")
+    }
+
+    /// 二次确认码用的摘要:两次点击之间数值一变(房子刚好建成、做了仓库操作、改了寄存器),确认码就不同,会重新提示。
+    pub fn digest(&self) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for v in [
+            self.total_old,
+            self.avail_old,
+            self.rooms_old,
+            self.total_new,
+            self.avail_new,
+            self.rooms_new,
+        ] {
+            h = (h ^ (v as u32)).wrapping_mul(0x0100_0193);
+        }
+        h % 100_000_000
+    }
+}
+
+/// 算重算计划(只读)。extra_in = 额外摩尔数(菜单取寄存器);只有存档确实要改工人时才校验和使用它,
+/// 正常档完全忽略寄存器(寄存器是整页共享的,任务跳转、快进留下的数不能影响这里)。force 只给文本命令用。
+pub fn plan_worker_recalc(
+    env: &mut Environment,
+    extra_in: i64,
+    force: bool,
+) -> Result<WorkerRecalcPlan, String> {
+    main_village_offline_gate(env, "重算工人/房间")?;
+    let ui = user_info_data(env);
+    let gd = singleton(env, "GameData", "sharedInstance");
+    let om = singleton(env, "ObjectManager", "sharedManager");
+    if ui == nil || gd == nil || om == nil {
+        return Err("主村存档对象还没准备好(userInfoData/GameData/ObjectManager 为空)".to_string());
+    }
+    // 宿主 msg_send 的返回地址不在 K13 的 MAXFAC_GATE_LRS 白名单里,「工人补满」开着也读到存档真值。
+    let s = sel(env, "totalWorkers");
+    let total_old: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "availableWorkers");
+    let avail_old: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "totalRooms");
+    let rooms_old: i32 = msg_send(env, (ui, s));
+
+    // 居民房人口:直接调原版函数,由它自己遍历 rooms 与仓库。
+    let s = sel(env, "getWorkerCountByRoom");
+    let by_room_raw: i32 = msg_send(env, (gd, s));
+
+    // 地图房屋数 + 地图上已建成的银行。
+    let s_count = sel(env, "count");
+    let s_oai = sel(env, "objectAtIndex:");
+    let mut bank_pop: i32 = 0;
+    let s = sel(env, "rooms");
+    let rooms: id = msg_send(env, (om, s));
+    let houses_map: i32 = if rooms == nil {
+        0
+    } else {
+        let n: u32 = msg_send(env, (rooms, s_count));
+        let s_data = sel(env, "data");
+        let s_oid = sel(env, "objectId");
+        let s_state = sel(env, "buildingState");
+        for i in 0..n {
+            let b: id = msg_send(env, (rooms, s_oai, i));
+            if b == nil {
+                continue;
+            }
+            let d: id = msg_send(env, (b, s_data));
+            if d == nil {
+                continue;
+            }
+            let oid: i32 = msg_send(env, (d, s_oid));
+            if oid != BANK_OBJECT_ID {
+                continue;
+            }
+            // getWorkerCountByRoom 只计 buildingState 4/5/6(已建成);在建的银行两边都不计。
+            let st: i32 = msg_send(env, (b, s_state));
+            if (4..=6).contains(&st) {
+                bank_pop += 1;
+            }
+        }
+        n.min(i32::MAX as u32) as i32
+    };
+    // 仓库里的银行:键格式与 getWorkerCountByRoom 0x7ddd4 起的拆法一致(componentsSeparatedByString:@"_",[0]=物品号、[1]=等级),
+    // 值是个数(intValue)。每座只扣 1:银行建成不给工人,之后若有升级,-[Building upgrade] 0xb0baa 照常 addWorker:1,
+    // 所以不论等级,每座银行的居民房人口都恰好比它给总摩尔数的贡献多 1。
+    let s = sel(env, "recycledHouses");
+    let store: id = msg_send(env, (om, s));
+    if store != nil {
+        let s = sel(env, "allKeys");
+        let keys: id = msg_send(env, (store, s));
+        if keys != nil {
+            let n: u32 = msg_send(env, (keys, s_count));
+            let s_ofk = sel(env, "objectForKey:");
+            let s_int = sel(env, "intValue");
+            for i in 0..n {
+                let k: id = msg_send(env, (keys, s_oai, i));
+                if !is_kind_of(env, k, "NSString") {
+                    continue;
+                }
+                let key =
+                    crate::frameworks::foundation::ns_string::to_rust_string(env, k).into_owned();
+                let mut it = key.split('_');
+                let oid = it.next().and_then(|x| x.parse::<i32>().ok()).unwrap_or(0);
+                let level = it.next().and_then(|x| x.parse::<i32>().ok()).unwrap_or(0);
+                if oid != BANK_OBJECT_ID || level < 1 {
+                    continue;
+                }
+                let v: id = msg_send(env, (store, s_ofk, k));
+                let c: i32 = if v == nil {
+                    0
+                } else {
+                    msg_send(env, (v, s_int))
+                };
+                bank_pop += c.max(0);
+            }
+        }
+    }
+    let by_room = (by_room_raw - bank_pop).max(0);
+    let s = sel(env, "houseNumberInRecycler");
+    let houses_store: i32 = msg_send(env, (om, s));
+    let houses = houses_map + houses_store.max(0);
+
+    // 开地上限锁 7 的地块数(只用于提示)。objectCount:type: 签名 i16@0:4i8i12。
+    let s = sel(env, "objectCount:type:");
+    let mut plots: i32 = 0;
+    for pid in PLOT_OBJECT_IDS {
+        let c: i32 = msg_send(env, (om, s, pid, 2i32));
+        plots += c.max(0);
+    }
+
+    let polluted = total_old >= OLD_MAXFAC_VALUE && rooms_old >= OLD_MAXFAC_VALUE;
+    let below_resident = total_old < by_room;
+    let workers_fix = force || polluted || below_resident;
+    let (extra, total_new) = if workers_fix {
+        if !(0..=EXTRA_MOLES_INPUT_MAX).contains(&extra_in) {
+            return Err(format!(
+                "额外摩尔数(寄存器)要在 0..={} 之间(原版最多买 {} 个),当前是 {};先按「清零」再输入",
+                EXTRA_MOLES_INPUT_MAX, EXTRA_MOLES_ORIG_MAX, extra_in
+            ));
+        }
+        (extra_in, by_room + extra_in as i32)
+    } else {
+        ((total_old - by_room) as i64, total_old)
+    };
+    let avail_new = if total_new > total_old {
+        // 与原版 addWorker: 同口径:空闲同加增量。工人补满开过后空闲可能为负,夹回 0..=新总数。
+        (avail_old + (total_new - total_old)).clamp(0, total_new)
+    } else if total_new < total_old {
+        // 本局在忙的(派工中、任务预留)照旧算占用;归还时 addAvailableWorker:@0xbb34c 会夹在新总数以内。
+        // 存盘的空闲数下次读档会被 intiWithUserInfo: 0xb96bc 重置为总数,再由 createIdleWorkers: 扣任务预留,与原版口径一致。
+        let occupied = (total_old - avail_old).clamp(0, total_old.max(0));
+        (total_new - occupied).clamp(0, total_new)
+    } else {
+        avail_old
+    };
+    // 房间:旧版指纹 → 真值 ≥ 现有房屋,且污染后每摆放一次 +1,真值 = 原值 + (rooms_old − 99) ≥ rooms_old − 98;
+    // 否则只在少于现有房屋(原版不可能:房屋不能销毁,每摆一座 +1)时补到现有房屋数。
+    let rooms_new = if polluted {
+        houses.max(rooms_old - (OLD_MAXFAC_VALUE - 1))
+    } else if rooms_old < houses {
+        houses
+    } else {
+        rooms_old
+    };
+    Ok(WorkerRecalcPlan {
+        total_old,
+        avail_old,
+        rooms_old,
+        by_room_raw,
+        bank_pop,
+        by_room,
+        houses_map,
+        houses_store,
+        plots,
+        extra,
+        polluted,
+        below_resident,
+        forced: force,
+        total_new,
+        avail_new,
+        rooms_new,
+    })
+}
+
+/// 按存档重算主村工人/房间并存主档(开发工具页「重算工人/房间」第二次点击 / 文本命令 `workers recalc apply`)。
+pub fn recalc_workers(env: &mut Environment, extra: i64, force: bool) -> DevResult {
+    let p = plan_worker_recalc(env, extra, force)?;
+    if !p.changes() {
+        log!("[MOLEDEV] 工人/房间重算:无需改动,{}", p.describe());
+        return Ok(format!("存档正常,无需重算(未改动存档):{}", p.describe()));
+    }
+    let snap =
+        snapshot_save(env).map_err(|e| format!("重算前保存快照失败:{},为安全起见没有改动", e))?;
+    let ui = user_info_data(env);
+    if ui == nil {
+        return Err("主村 userInfoData 为空,没有改动".to_string());
+    }
+    let mole_note = if p.total_new > p.total_old {
+        // 原版唯一的增长路径:总数、空闲同加,0xbb2cc 记 updateTime_,0xbb316 刷抬头,0xbb344 initMoleActors: 当场生成空闲摩尔。
+        let delta = p.total_new - p.total_old;
+        let s = sel(env, "addWorker:");
+        let _: () = msg_send(env, (ui, s, delta));
+        let s = sel(env, "availableWorkers");
+        let a: i32 = msg_send(env, (ui, s));
+        if a < 0 || a > p.total_new {
+            // 兜底:工人补满开过后空闲数可能本来就是负的,加完仍不在 0..=新总数。
+            let s = sel(env, "setAvailableWorkers:");
+            let _: () = msg_send(env, (ui, s, p.avail_new));
+        }
+        format!("按原版 addWorker: 当场刷出 {} 只空闲摩尔", delta)
+    } else if p.total_new < p.total_old {
+        // 原版没有减少路径,只能用 setter;多出来的空闲摩尔本局还在村里走,下次进主村由 createIdleWorkers: 按新空闲数生成。
+        let s = sel(env, "setTotalWorkers:");
+        let _: () = msg_send(env, (ui, s, p.total_new));
+        let s = sel(env, "setAvailableWorkers:");
+        let _: () = msg_send(env, (ui, s, p.avail_new));
+        "村里多出的空闲摩尔下次进主村或重启后按新数量生成".to_string()
+    } else {
+        "总摩尔不变".to_string()
+    };
+    if p.rooms_new != p.rooms_old {
+        let s = sel(env, "setTotalRooms:");
+        let _: () = msg_send(env, (ui, s, p.rooms_new));
+    }
+    // 与买摩尔 0x65766、addVipGold: 同一条原版写回路径。
+    game_data_call(env, "saveUserInfoData");
+    // 照原版 addWorker: 0xbb304..0xbb316 刷抬头(增加时 addWorker: 已刷过,再刷一次无害)。
+    let wm = singleton(env, "WrapperManager", "sharedManager");
+    if wm != nil {
+        let s = sel(env, "updateUserInfoView:");
+        let _: () = msg_send(env, (wm, s, 3i32));
+    }
+    log!(
+        "[MOLEDEV] 工人/房间重算:总摩尔 {}→{}(居民房人口 {} = 原版 {} − 银行 {},额外摩尔 {}),空闲 {}→{},房间 {}→{}(地图 {} + 仓库 {}),地块 {},污染={} 低于居民房={} 强制={};{};重算前{}",
+        p.total_old,
+        p.total_new,
+        p.by_room,
+        p.by_room_raw,
+        p.bank_pop,
+        p.extra,
+        p.avail_old,
+        p.avail_new,
+        p.rooms_old,
+        p.rooms_new,
+        p.houses_map,
+        p.houses_store,
+        p.plots,
+        p.polluted,
+        p.below_resident,
+        p.forced,
+        mole_note,
+        snap
+    );
+    let max_fac_note = if crate::mole_cheats::is_on("max_facility") {
+        ";「工人补满」还开着,抬头仍显示 99"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "已重算并存档:{}。{}{};重算前{}(可用「快照:下次启动恢复」回滚)",
+        p.describe(),
+        mole_note,
+        max_fac_note,
+        snap
+    ))
+}
+
+/// 测试专用(只开放给文本命令 `workers set`,不上菜单):直接写总摩尔/房间,空闲按读档口径 = 总数,用来无头造出旧版 99 档。
+/// 主档带 md5 尾,nska.py 改不回去;写法与菜单「工人数 = 20」「房间数 = 20」相同,门控与重算相同。
+pub fn set_workers_raw(env: &mut Environment, total: i64, rooms: i64) -> DevResult {
+    main_village_offline_gate(env, "设工人/房间")?;
+    if !(0..=999).contains(&total) || !(0..=999).contains(&rooms) {
+        return Err(format!(
+            "总摩尔与房间都要在 0..=999 之间(当前 {} / {})",
+            total, rooms
+        ));
+    }
+    let ui = user_info_data(env);
+    if ui == nil {
+        return Err("主村 userInfoData 为空,没有改动".to_string());
+    }
+    let s = sel(env, "totalWorkers");
+    let t_old: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "totalRooms");
+    let r_old: i32 = msg_send(env, (ui, s));
+    let (t, r) = (total as i32, rooms as i32);
+    let s = sel(env, "setTotalWorkers:");
+    let _: () = msg_send(env, (ui, s, t));
+    let s = sel(env, "setAvailableWorkers:");
+    let _: () = msg_send(env, (ui, s, t));
+    let s = sel(env, "setTotalRooms:");
+    let _: () = msg_send(env, (ui, s, r));
+    game_data_call(env, "saveUserInfoData");
+    let wm = singleton(env, "WrapperManager", "sharedManager");
+    if wm != nil {
+        let s = sel(env, "updateUserInfoView:");
+        let _: () = msg_send(env, (wm, s, 3i32));
+    }
+    log!(
+        "[MOLEDEV] 工人/房间直接设值(测试用):总摩尔 {}→{},空闲 → {},房间 {}→{}",
+        t_old,
+        t,
+        t,
+        r_old,
+        r
+    );
+    Ok(format!(
+        "已直接设值并存档(测试用):总摩尔 {}→{}(空闲同为 {}),房间 {}→{}",
+        t_old, t, t, r_old, r
+    ))
+}
+
 // ───────────────────────── 任务跳转 ─────────────────────────
+
+/// [2026-09-25 第五轮遗留 MISC-3] 读 [[SceneMannager sharedManager] curSceneId](+sharedManager @8@0:4、curSceneId i8@0:4);单例拿不到返回 -1。
+/// 必须走宿主 msg_send,不能直读 ivar +12:-[ActorManager changeAvailableMolerForTask:]@0x9d9f8 自己也是发消息读它
+/// (0x9da1c sharedManager、0x9da2c curSceneId,0x9da30 cmp #10),类级拦截不分宿主还是游戏发起,ON_ISLAND 时
+/// mole_cheats 的 ("SceneMannager","curSceneId") 臂把 2 强制成 10 也同样作用于两边,所以这里读到的就是归还时游戏将读到的值。
+fn island_scene_id(env: &mut Environment) -> i32 {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return -1;
+    }
+    let s = sel(env, "curSceneId");
+    msg_send(env, (sm, s))
+}
+
+/// [2026-09-25 第五轮遗留 MISC-3] 黄金岛任务跳转前,照原版 -[NewSceneQuest finish] 归还进行中打工任务(questType 7)占用的工人,
+/// 返回归还人数(没有要还的返回 0)。
+/// 根因:接取 -[NewSceneQuest accept]@0x3289b0 对打工类(0x328cce 判类型 7)在 0x3291ca rsb 取负、0x3291d8 发
+/// [ActorManager changeAvailableMolerForTask:-n] 扣人(带走 n 只摩尔),0x329206 起把开工时刻写进 curQuestResult;原版唯一的归还点是
+/// finish:0x32a130/0x32a144 先写哨兵 4294967295.0(0x32a298),0x32a156 checkQuestState,0x32a16a 判 questState==1,0x32a196 置 2,
+/// 0x32a1c2 判 [curQuestData questType]==7,0x32a1da-0x32a1fc 取 n=[[[curQuestData requireThings] objectAtIndex:0] intValue],
+/// 0x32a22c 发 changeAvailableMolerForTask:+n。开发工具的跳转走 -[NewSceneQuest quickStart:]@0x32b510:0x32b532 questState=0、
+/// 0x32b54a curQuestId=0、0x32b564 nextQuestId=N、0x32b584 curQuestResult=0.0(0x32b608),不归还;以前本会话空闲工人就一直少 n 个、
+/// 地图少 n 只摩尔,要等下次进岛 load_island_userinfo 从总数重算才恢复(quickStart 在 0x32b5b0 存的岛档也带着少掉的空闲数)。
+/// 判据照 -[NewSceneQuest minusNeededWorkers]@0x32ae58(进岛重扣时判「本会话给它扣过人」的原版口径):先 checkQuestState
+/// (@0x32b180:questState 为 2 保持,否则 = curQuestId>0),再 0x32aea2 curQuestResult≠哨兵(0x32af58)、0x32aeb2 questState==1、
+/// 0x32aec8 curQuestType==7。-[NewSceneQuest curQuestType]@0x328150 = curQuestData 为 nil 时 0、否则 [curQuestData questType],与 finish 同判据。
+/// 另加 ActorManager.m_isLoadMap(槽 0xb03e54,+260,BOOL)判据,同 mole_cheats 的 K8 臂:它由 loadMapFromData:forNPC: 在 0x245e0e 置 1,
+/// 进岛 1 秒后 createIdleWorkers: 才在 0x241fde 清 0 并跑 minusNeededWorkers;窗口内本会话还没给任务扣过人,quickStart 之后也不会
+/// 再扣,所以不还。
+/// 归还用与 finish 0x32a22c 同一个调用 changeAvailableMolerForTask:+n(v12@0:4i8),不用 changeAvailableWorkers:(只改计数、不刷摩尔):
+/// 岛分支 0x9dba6 changeAvailableWorkers:+n、0x9dbd4 addMoleForTask:n 刷回摩尔;0x9daa0「空闲≥总数」时原版自己跳过,不会超总数。
+/// 调用方 quest_jump 已保证 curSceneId==10(见那里的场景门),这里再防御性判一次,保证走岛分支 0x9da34 而不是 0x9dae2 主村分支。
+/// 只由菜单点击/文本命令回调调用,不在帧栈上,也不在 intercept 里,不需要恢复 r0-r3;宿主发出的这条消息 LR 不是 0x32a231,
+/// K8 吞归还臂不会误吞。签名逐个按 objc_meta 核过:checkQuestState v8@0:4,questState/curQuestType/curQuestId/curIdleWorkerCount
+/// i8@0:4,getUserInfoData/curQuestData/requireThings/+Instance @8@0:4,curQuestResult d8@0:4,count I8@0:4,objectAtIndex: @12@0:4I8。
+fn island_return_task_workers(env: &mut Environment, quest: id) -> i32 {
+    if quest == nil || island_scene_id(env) != 10 {
+        return 0;
+    }
+    let s = sel(env, "checkQuestState");
+    let _: () = msg_send(env, (quest, s));
+    let s = sel(env, "questState");
+    let state: i32 = msg_send(env, (quest, s));
+    let s = sel(env, "curQuestType");
+    let qtype: i32 = msg_send(env, (quest, s));
+    if state != 1 || qtype != 7 {
+        return 0;
+    }
+    let s = sel(env, "getUserInfoData");
+    let ui: id = msg_send(env, (quest, s));
+    if ui == nil {
+        return 0;
+    }
+    let s = sel(env, "curQuestResult");
+    let started: f64 = msg_send(env, (ui, s));
+    // 哨兵 4294967295.0 = finish 已写过(已归还,等领奖);用 >= 避开浮点相等比较。
+    if started >= 4294967295.0 {
+        return 0;
+    }
+    let s = sel(env, "curQuestData");
+    let qd: id = msg_send(env, (quest, s));
+    if qd == nil {
+        return 0;
+    }
+    let s = sel(env, "requireThings");
+    let things: id = msg_send(env, (qd, s));
+    if things == nil {
+        return 0;
+    }
+    let s = sel(env, "count");
+    let cnt: u32 = msg_send(env, (things, s));
+    if cnt == 0 {
+        return 0;
+    }
+    let s = sel(env, "objectAtIndex:");
+    let first: id = msg_send(env, (things, s, 0u32));
+    if first == nil
+        || !env
+            .objc
+            .object_has_method_named(&env.mem, first, "intValue")
+    {
+        return 0;
+    }
+    let s = sel(env, "intValue");
+    let n: i32 = msg_send(env, (first, s));
+    if n <= 0 {
+        return 0;
+    }
+    let am = singleton(env, "ActorManager", "Instance");
+    if am == nil {
+        return 0;
+    }
+    let off = ivar_offset(env, 0xb03e54, 260);
+    let loading: u8 = env.mem.read(ConstPtr::<u8>::from_bits(am.to_bits() + off));
+    if loading != 0 {
+        log!(
+            "[MOLEDEV] 黄金岛任务跳转:打工任务进行中,但仍在进岛加载窗口内(m_isLoadMap=1),createIdleWorkers: 尚未给它扣人,不归还"
+        );
+        return 0;
+    }
+    let s = sel(env, "curIdleWorkerCount");
+    let before: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "curQuestId");
+    let cur: i32 = msg_send(env, (quest, s));
+    let s = sel(env, "changeAvailableMolerForTask:");
+    let _: () = msg_send(env, (am, s, n));
+    let s = sel(env, "curIdleWorkerCount");
+    let after: i32 = msg_send(env, (ui, s));
+    log!(
+        "[MOLEDEV] 黄金岛任务跳转:打工任务 {} 进行中,照原版 finish 归还 {} 个工人(空闲 {} → {})",
+        cur,
+        n,
+        before,
+        after
+    );
+    n
+}
 
 /// [扫描修 2026-09-15] F7-4 任务跳转:四族 quickStart:。
 /// 核实:-[Quest quickStart:]@0x128500 做的是 questState=0、setCurQuestId:0、setNextQuestId:N,
@@ -443,6 +1147,8 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
 /// vipQuestDataInMap,由 -[GameData saveMapData:] 里的 saveTimeQuestDataInDir/saveVipQuestDataInDir 落盘。
 /// 黄金岛 -[NewSceneQuest quickStart:]@0x32b510 自己会调 saveUserinfoBothInLocalAndRemote。
 /// 任务号范围照原版 onButton*QuestPlus: 的封顶:1..对应数据表 count。
+/// [2026-09-25 第五轮遗留 MISC-3] 黄金岛另要求场景已是黄金岛(curSceneId==10,进出岛途中拒绝);跳离进行中的打工任务前,
+/// 照原版 finish 归还它占用的工人(见 island_return_task_workers)。
 pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> DevResult {
     if env.options.network_access {
         return Err("在线模式下任务进度由服务器同步,不能跳转".to_string());
@@ -486,6 +1192,19 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
         if !on_island {
             return Err("黄金岛任务只能在岛上跳转".to_string());
         }
+        // [2026-09-25 第五轮遗留 MISC-3] 场景门:island_session_active() 在三段过渡时间里也为真——进岛半路失败时进岛窗口在主村残留
+        //   (curSceneId=1,最多 1200 帧)、LoadingHoliday 期间(startNewSceneFrom:toScene: 在 0x24152a 写 2)、离岛过渡(2→1,最多 3600 帧)。
+        //   这时 +[NewSceneQuest sharedInstance]@0x327e08 只在 curSceneId==1(0x327e3c)才返回 nil,curSceneId=2 时照样建出单例、
+        //   读到已载入的岛进度;-[ActorManager changeAvailableMolerForTask:] 在 0x9da30 判场景号不是 10,就走 0x9dae2 主村分支
+        //   (0x9db22/0x9db48 比空闲与总数 → 0x9dba6 changeAvailableWorkers: / 0x9dbd4 addMoleForTask:),归还会加到主村工人上
+        //   (随主档落盘)并往主村刷摩尔;quickStart: 在 0x32b5b0 也会存一份不在场的岛档。所以岛任务跳转只在 curSceneId==10 时执行。
+        //   放在取 NewSceneData/NewSceneQuest 单例之前,过渡窗口里也不会提前建出单例。读法见 island_scene_id。
+        if island_scene_id(env) != 10 {
+            return Err(
+                "进岛加载或离岛过渡中,场景还没切到黄金岛,请等进岛完成后再跳转黄金岛任务"
+                    .to_string(),
+            );
+        }
     } else {
         if on_island {
             return Err("请先回主村再跳转主村任务".to_string());
@@ -518,6 +1237,13 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     if quest == nil {
         return Err(format!("{} 单例不存在", quest_class));
     }
+    // [2026-09-25 第五轮遗留 MISC-3] 必须在 quickStart: 之前:之后 curQuestId 已清零、curQuestData 为 nil,判不出进行中的打工任务;
+    //   放在前面,quickStart 0x32b5b0 的存盘也会带上归还后的空闲数。
+    let returned_workers = if family == QuestFamily::Island {
+        island_return_task_workers(env, quest)
+    } else {
+        0
+    };
     let s = sel(env, "quickStart:");
     let _: () = msg_send(env, (quest, s, quest_id as i32));
     match family {
@@ -572,15 +1298,28 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     );
     // [2026-09-16] A2-05 删掉原来「简体中文下限时/VIP 任务受原版语言门限制」的附注:与反汇编相反。
     // -[VipQuest activate:]@0x38722c 没有语言门;-[TimeQuest activate:] 的语言门在 zh-Hans 下放行(见上)。
-    let note = match family {
-        // 文案保持短:菜单还会在后面追加激活条件,toast 只有 992 宽。
+    // [2026-09-25 第五轮遗留 MISC-3] 黄金岛补一句沙原碎片:inject_sandgarden_fragments 下次进岛按进度兜底
+    //   done(N) = nextQuestId>N && curQuestId!=N(N=81/83),跳过的 81/83 会补发 31005/31007(containsObject: 去重,已有的不重复发)。
+    let skipped = if family == QuestFamily::Island {
+        "被跳过任务的奖励和前置条件不会补发;沙原碎片(任务 81/83 的奖励)下次进岛会按任务进度兜底补发(已有的不重复发)"
+    } else {
+        "被跳过任务的奖励和前置条件不会补发"
+    };
+    let mut note = String::from(match family {
+        // 菜单还会在后面追加激活条件;toast 超宽会自动折行(mole_menu.rs add_toast)。
         // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转同样补发了激活(见上)。
         QuestFamily::Time | QuestFamily::Island => ";已补发激活",
         _ => "",
-    };
+    });
+    if returned_workers > 0 {
+        note.push_str(&format!(
+            ";已照原版归还进行中打工任务的 {} 个工人",
+            returned_workers
+        ));
+    }
     Ok(format!(
-        "已跳到{}任务 {}(被跳过任务的奖励和前置条件不会补发){}",
-        label, quest_id, note
+        "已跳到{}任务 {}({}){}",
+        label, quest_id, skipped, note
     ))
 }
 
@@ -888,6 +1627,17 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
     if hours > TIME_TRAVEL_MAX_HOURS {
         return Err(format!("一次最多前进 {} 小时(一年)", TIME_TRAVEL_MAX_HOURS));
     }
+    // [2026-09-25 第五轮遗留 C] 岛会话中(进岛窗口/在岛上/进岛加载/离岛过渡,见 mole_cheats::island_session_active)不许开始旅行:
+    //   旅行期间 island_flush 的落盘闸不写岛档,从岛上开始旅行的话,之后的岛上进度离岛即丢(下次进岛从盘上重读),
+    //   交任务的奖励却已经 add*InNewScene: 当场进了主档 → 重启后同一条岛任务还能再领。旅行期间进岛另由 enterNewIslands 臂拦下。
+    //   只用 island_session_active(),不另读 curSceneId:那样会连标题画面、节日村、好友村一起拒掉;在岛上 curSceneId 本来就被
+    //   钩子强制成 10,不多给信息。岛档快进、岛任务跳转用的也是这个判据。进岛半路失败时进岛窗口会在主村残留最多 1200 帧
+    //   (约 20 秒),离岛过渡最多 3600 帧,所以文案写「进出岛途中」,并提示等场景切换结束。
+    if crate::mole_cheats::island_session_active() {
+        return Err(
+            "黄金岛上或进出岛途中不能时间旅行(旅行期间岛上进度无法保存),请回到主村、等场景切换结束后再旅行".to_string(),
+        );
+    }
     crate::libc::time::add_time_offset_secs(hours * 3600);
     let total_hours = crate::libc::time::time_offset_secs() / 3600;
     log!(
@@ -898,10 +1648,12 @@ pub fn time_travel_hours(env: &mut Environment, hours: i64) -> DevResult {
     // [2026-09-16] X4-02 成功文案补一句活动中心的限制,与菜单确认文案一致:旅行期间活动侧档只写内存(F2-05),
     // 付费操作的扣款却照常进主档,所以这些操作被禁用(拦截在 mole_activity.rs);旅行中拍的快照活动档仍是旅行前的。
     // [2026-09-24 第四轮 K3 I7-01] 再补一句黄金岛:旅行期间 mole_cheats::island_flush 开头的落盘闸不写任何岛档
-    // (免得把"未来"时间戳写进 island_*.dat,重启后出海/NPC 冷却/打工任务长期卡死)。每次进岛都从磁盘读岛档,
-    // 所以离岛再进、或重启后,岛上进度都回到旅行前。
+    // (免得把"未来"时间戳写进 island_*.dat,重启后出海/NPC 冷却/打工任务长期卡死)。
+    // [2026-09-25 第五轮遗留 C] 只挡落盘会让岛上进度回滚而奖励留在主档(同一条岛任务能反复领),所以现在旅行期间进不了岛
+    // (mole_cheats 的 enterNewIslands 臂拦下并弹提示)、岛会话中开始不了旅行(上面)、岛档快进也停用(island_fast_forward_minutes);
+    // 落盘闸只作兜底。文案同步成「不能进岛,重启后恢复」,与菜单确认文案一致。
     Ok(format!(
-        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致。黄金岛进度在旅行期间不保存,离岛再进或重启后都回到旅行前",
+        "已前进 {} 小时(不可回退),本次运行累计 {} 小时。偏移不跨重启保存:重启后时间回到现实,期间存下的\"未来\"时间要等现实追上。旅行期间活动中心付费操作禁用,此时拍的快照活动数据与主档不一致。旅行期间不能进入黄金岛,岛档快进也停用(岛上进度这段时间无法保存),重启回到现实时间后恢复;要测岛上计时请在不旅行时用「岛档快进」",
         hours, total_hours
     ))
 }
@@ -1420,6 +2172,9 @@ pub fn toggle_trace() -> DevResult {
 
 // ───────────────────────── 无头文本命令 ─────────────────────────
 
+/// [2026-09-25 第五轮遗留 WK99] `workers` 命令的用法提示。
+const WORKERS_USAGE: &str = "用法:workers recalc [force] [额外摩尔数 0..999](只预览) | workers recalc apply [force] [额外摩尔数 0..999] | workers set <总摩尔> <房间>(测试用)";
+
 /// [2026-09-16] A1-04 文本命令的数字参数解析,失败时把原文带进提示。
 fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T, String> {
     raw.parse::<T>()
@@ -1437,6 +2192,9 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 ///   give <物品ID>                                      → mole_items::place_item(与召唤页、隐藏物品页同一入口)
 ///   island ff <分钟>                                   → island_fast_forward_minutes([2026-09-24 第四轮 K4 I4-05] 岛档计时快进,
 ///                                                        主村离线执行、先自动存快照,下次进岛生效)
+///   workers recalc [force] [额外摩尔数]                → plan_worker_recalc 只预览,不写盘([2026-09-25 第五轮遗留 WK99])
+///   workers recalc apply [force] [额外摩尔数]          → recalc_workers(= 菜单「重算工人/房间」第二次点击;先自动存快照)
+///   workers set <总摩尔> <房间>                        → set_workers_raw(测试专用,造旧版 99 档)
 /// 在线模式、场景、数值范围的拒绝都由这些函数自己给出,与菜单点按钮完全一致,这里不另加门。
 /// 刻意不开放时间旅行、快照恢复、删档:菜单上它们要二次确认,脚本一行就触发太危险。
 /// `menu <页名>`:按页名打开菜单要 mole_menu 提供翻页接口(当前页是它的私有状态),那不归本包,先明确报错;
@@ -1516,12 +2274,53 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
                 TIME_SKIP_MAX_MINUTES
             )),
         },
+        // [2026-09-25 第五轮遗留 WK99] 主村工人/房间重算。不带 apply 只预览;写入必须显式带 apply(= 菜单上的第二次确认)。
+        //   force 跳过「旧版 99 指纹 / 少于居民房人口」判定,强制按 居民房人口 + 额外摩尔 重算(只开放在这里,不上菜单);
+        //   set 仅供无头测试造旧版 99 档。
+        "workers" => match args.as_slice() {
+            ["recalc", rest @ ..] => {
+                let mut rest = rest;
+                let apply = rest.first() == Some(&"apply");
+                if apply {
+                    rest = &rest[1..];
+                }
+                let force = rest.first() == Some(&"force");
+                if force {
+                    rest = &rest[1..];
+                }
+                let extra: i64 = match rest {
+                    [] => 0,
+                    [n] => parse_command_number(n, "额外摩尔数")?,
+                    _ => return Err(WORKERS_USAGE.to_string()),
+                };
+                if apply {
+                    recalc_workers(env, extra, force)
+                } else {
+                    let p = plan_worker_recalc(env, extra, force)?;
+                    Ok(if p.changes() {
+                        format!(
+                            "预览(未写入):{}。写入用 workers recalc apply{} [额外摩尔数]",
+                            p.describe(),
+                            if force { " force" } else { "" }
+                        )
+                    } else {
+                        format!("存档正常,无需重算:{}", p.describe())
+                    })
+                }
+            }
+            ["set", t, r] => {
+                let total: i64 = parse_command_number(t, "总摩尔")?;
+                let rooms: i64 = parse_command_number(r, "房间数")?;
+                set_workers_raw(env, total, rooms)
+            }
+            _ => Err(WORKERS_USAGE.to_string()),
+        },
         "menu" => Err(format!(
             "暂不支持按页名打开菜单(「{}」):mole_menu 还没有翻页接口,请用不带参数的 menu 开关菜单",
             args.join(" ")
         )),
         _ => Err(format!(
-            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give / island",
+            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give / island / workers",
             head
         )),
     }

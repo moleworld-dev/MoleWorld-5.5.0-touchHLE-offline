@@ -280,6 +280,19 @@ impl OpenAL<'_> {
         al_sys::alSourceRewind(source)
     }
 
+    pub unsafe fn SourcePlayv(&self, n: ALsizei, sources: *const ALuint) {
+        al_sys::alSourcePlayv(n, sources)
+    }
+    pub unsafe fn SourcePausev(&self, n: ALsizei, sources: *const ALuint) {
+        al_sys::alSourcePausev(n, sources)
+    }
+    pub unsafe fn SourceStopv(&self, n: ALsizei, sources: *const ALuint) {
+        al_sys::alSourceStopv(n, sources)
+    }
+    pub unsafe fn SourceRewindv(&self, n: ALsizei, sources: *const ALuint) {
+        al_sys::alSourceRewindv(n, sources)
+    }
+
     pub unsafe fn SourceQueueBuffers(&self, source: ALuint, nb: ALsizei, buffers: *const ALuint) {
         al_sys::alSourceQueueBuffers(source, nb, buffers)
     }

@@ -290,6 +290,26 @@ fn CGRectIntersectsRect(_env: &mut Environment, rect1: CGRect, rect2: CGRect) ->
             <= (rect1.origin.y + rect1.size.height).min(rect2.origin.y + rect2.size.height)
 }
 
+pub(super) fn CGRectIntersection(_env: &mut Environment, rect1: CGRect, rect2: CGRect) -> CGRect {
+    if rect1 == CGRectNull || rect2 == CGRectNull {
+        return CGRectNull;
+    }
+    assert!(rect1.size.height > 0.0 && rect1.size.width > 0.0); // TODO
+    assert!(rect2.size.height > 0.0 && rect2.size.width > 0.0); // TODO
+    let x = rect1.origin.x.max(rect2.origin.x);
+    let y = rect1.origin.y.max(rect2.origin.y);
+    let width = (rect1.origin.x + rect1.size.width).min(rect2.origin.x + rect2.size.width) - x;
+    let height = (rect1.origin.y + rect1.size.height).min(rect2.origin.y + rect2.size.height) - y;
+    if width < 0.0 || height < 0.0 {
+        return CGRectNull;
+    }
+    assert!(height != 0.0 || width != 0.0); // TODO
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
 fn CGRectGetMinX(_env: &mut Environment, rect: CGRect) -> CGFloat {
     rect.origin.x
 }
@@ -378,7 +398,7 @@ fn CGRectInset(_env: &mut Environment, rect: CGRect, dx: CGFloat, dy: CGFloat) -
     res
 }
 
-fn CGRectIntegral(_env: &mut Environment, rect: CGRect) -> CGRect {
+pub(super) fn CGRectIntegral(_env: &mut Environment, rect: CGRect) -> CGRect {
     if rect == CGRectNull {
         return rect;
     }
@@ -406,6 +426,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGRectEqualToRect(_, _)),
     export_c_func!(CGRectContainsPoint(_, _)),
     export_c_func!(CGRectIntersectsRect(_, _)),
+    export_c_func!(CGRectIntersection(_, _)),
     export_c_func!(CGRectGetMinX(_)),
     export_c_func!(CGRectGetMidX(_)),
     export_c_func!(CGRectGetMaxX(_)),

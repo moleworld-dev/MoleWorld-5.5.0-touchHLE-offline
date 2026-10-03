@@ -95,6 +95,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation UIFont: NSObject
 
+// Values are checked against iPhone 3GS, iOS 4.0.1
++ (CGFloat)labelFontSize {
+    17.0
+}
++ (CGFloat)buttonFontSize {
+    18.0
+}
++ (CGFloat)smallSystemFontSize {
+    12.0
+}
++ (CGFloat)systemFontSize {
+    14.0
+}
+
 + (id)systemFontOfSize:(CGFloat)size {
     let host_object = UIFontHostObject {
         size,

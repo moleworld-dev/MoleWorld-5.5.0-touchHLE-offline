@@ -12,6 +12,7 @@ pub mod ui_alert_view;
 pub mod ui_control;
 pub mod ui_image_view;
 pub mod ui_label;
+pub mod ui_page_control;
 pub mod ui_picker_view;
 pub mod ui_scroll_view;
 pub mod ui_table_view;
@@ -20,20 +21,50 @@ pub mod ui_window;
 
 use super::ui_gesture_recognizer::{self, TouchStage};
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
+use crate::frameworks::core_animation::ca_animation::{
+    kCAFillModeBackwards, CAMediaTimingFillMode,
+};
+use crate::frameworks::core_animation::ca_media_timing_function::{
+    kCAMediaTimingFunctionEaseIn, kCAMediaTimingFunctionEaseInEaseOut,
+    kCAMediaTimingFunctionEaseOut, kCAMediaTimingFunctionLinear,
+};
+use crate::frameworks::core_animation::ca_transaction;
+use crate::frameworks::core_animation::CACurrentMediaTime;
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::cg_color::CGColorRef;
 use crate::frameworks::core_graphics::cg_context::{CGContextClearRect, CGContextRef};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::{ns_array, NSInteger, NSUInteger};
-use crate::mem::MutVoidPtr;
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
+use crate::frameworks::foundation::{ns_array, NSInteger, NSTimeInterval, NSUInteger};
+use crate::mem::{ConstVoidPtr, GuestUSize};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
     todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
-use std::cell::RefCell;
+
+// Internal keys used to store UIView animation parameters in the wrapped
+// CATransaction created by beginAnimations, set by the various setAnimation*
+// methods, and later read by commitAnimations.
+const touchHLE_kCATransactionAnimationId: &str = "_touchHLE_kCATransactionAnimationId";
+const touchHLE_kCATransactionAnimationContext: &str = "_touchHLE_kCATransactionAnimationContext";
+const touchHLE_kCATransactionAnimationDelay: &str = "_touchHLE_kCATransactionAnimationDelay";
+const touchHLE_kCATransactionAnimationRepeatCount: &str =
+    "_touchHLE_kCATransactionAnimationRepeatCount";
+const touchHLE_kCATransactionAnimationRepeatAutoreverses: &str =
+    "_touchHLE_kCATransactionAnimationRepeatAutoreverses";
+const touchHLE_kCATransactionAnimationDelegate: &str = "_touchHLE_kCATransactionAnimationDelegate";
+const touchHLE_kCATransactionAnimationWillStartSelector: &str =
+    "_touchHLE_kCATransactionAnimationWillStartSelector";
+const touchHLE_kCATransactionAnimationDidStopSelector: &str =
+    "_touchHLE_kCATransactionAnimationDidStopSelector";
+
+type UIViewAnimationCurve = NSInteger;
+const UIViewAnimationCurveEaseInOut: UIViewAnimationCurve = 0;
+const UIViewAnimationCurveEaseIn: UIViewAnimationCurve = 1;
+const UIViewAnimationCurveEaseOut: UIViewAnimationCurve = 2;
+const UIViewAnimationCurveLinear: UIViewAnimationCurve = 3;
 
 #[derive(Default)]
 pub struct State {
@@ -46,6 +77,9 @@ pub struct State {
     dirty_layout_count: usize,
     /// [深扫修 2026-09-11] #23(a):合成前布局遍历的重入保护。
     in_layout_pass: bool,
+    /// 上游 0.3.0:当前嵌套的 `+beginAnimations:context:` 块数。`ca_layer.rs` 的
+    /// `is_implicit_animation_enabled` 读它:UIView 背后的图层只在动画块内才产生隐式动画。
+    pub animation_block_count: usize,
 }
 
 pub(super) struct UIViewHostObject {
@@ -87,6 +121,19 @@ impl Default for UIViewHostObject {
     }
 }
 
+#[derive(Default)]
+struct UIViewAnimationDelegateHostObject {
+    animation_id: id, // NSString*
+    context: ConstVoidPtr,
+    delegate: id,
+    will_start_selector: Option<SEL>,
+    did_stop_selector: Option<SEL>,
+    total_animation_count: u32,
+    started_animation_count: u32,
+    finished_animation_count: u32,
+}
+impl HostObject for UIViewAnimationDelegateHostObject {}
+
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
@@ -113,108 +160,14 @@ fn init_common(env: &mut Environment, this: id) -> id {
     this
 }
 
-/// One active `+beginAnimations:context:` … `+commitAnimations` block.
-///
-/// While the stack is non-empty, the animatable UIView setters (`setAlpha:`,
-/// `setCenter:`, `setBounds:`, `setFrame:`) record the layer's *old* value
-/// (boxed) so `commitAnimations` can build a `CABasicAnimation` from the old
-/// value to the now-current model value. Only the keyPaths the interpolation
-/// engine supports (opacity/position/bounds — see `core_animation::animation`)
-/// are captured; everything else just applies its final value with no tween
-/// (so e.g. a `transform` change never reaches the keyPath panic).
-struct AnimContext {
-    duration: CFTimeInterval,
-    /// UIViewAnimationCurve: 0=EaseInOut, 1=EaseIn, 2=EaseOut, 3=Linear.
-    curve: NSInteger,
-    /// (layer, keyPath, boxed-old-value). The box is retained until commit.
-    captures: Vec<(id, &'static str, id)>,
-}
-
-thread_local! {
-    /// Stack of active UIView animation blocks (begin/commitAnimations nest).
-    /// Empty almost always — the capture path costs one bool check otherwise.
-    static ANIM_STACK: RefCell<Vec<AnimContext>> = const { RefCell::new(Vec::new()) };
-}
-
-/// True while inside a `beginAnimations`/`commitAnimations` block.
-fn anim_active() -> bool {
-    ANIM_STACK.with(|s| !s.borrow().is_empty())
-}
-
-/// Box the layer's current value for `key_path` (the supported animatable
-/// keyPaths only). Returns `nil` for unsupported keyPaths.
-fn box_layer_value(env: &mut Environment, layer: id, key_path: &str) -> id {
-    match key_path {
-        "opacity" => {
-            let v: f32 = msg![env; layer opacity];
-            msg_class![env; NSNumber numberWithFloat:v]
-        }
-        "position" => {
-            let v: CGPoint = msg![env; layer position];
-            msg_class![env; NSValue valueWithCGPoint:v]
-        }
-        "bounds" => {
-            let v: CGRect = msg![env; layer bounds];
-            msg_class![env; NSValue valueWithCGRect:v]
-        }
-        _ => nil,
-    }
-}
-
-/// Record the *old* value of `key_path` on `layer` if an animation block is
-/// active and it hasn't been captured yet (keep the earliest "from" value).
-/// Call this in the setter BEFORE writing the new value.
-fn capture_old(env: &mut Environment, layer: id, key_path: &'static str) {
-    if !anim_active() {
-        return;
-    }
-    let already = ANIM_STACK.with(|s| {
-        s.borrow()
-            .last()
-            .map_or(true, |c| c.captures.iter().any(|&(l, k, _)| l == layer && k == key_path))
-    });
-    if already {
-        return;
-    }
-    let boxed = box_layer_value(env, layer, key_path);
-    if boxed == nil {
-        return;
-    }
-    retain(env, boxed);
-    ANIM_STACK.with(|s| {
-        if let Some(c) = s.borrow_mut().last_mut() {
-            c.captures.push((layer, key_path, boxed));
-        }
-    });
-}
-
-/// Pop the top animation block and turn each captured property change into a
-/// `CABasicAnimation` (old value -> current model value) on its layer.
-fn commit_animations(env: &mut Environment) {
-    let Some(ctx) = ANIM_STACK.with(|s| s.borrow_mut().pop()) else {
-        return; // unbalanced commitAnimations — ignore
-    };
-    let timing_name: &str = match ctx.curve {
-        1 => "easeIn",
-        2 => "easeOut",
-        3 => "linear",
-        _ => "easeInEaseOut",
-    };
-    for (layer, key_path, from_box) in ctx.captures {
-        let to_box = box_layer_value(env, layer, key_path);
-        if to_box != nil {
-            let kp: id = get_static_str(env, key_path);
-            let anim: id = msg_class![env; CABasicAnimation animationWithKeyPath:kp];
-            () = msg![env; anim setFromValue:from_box];
-            () = msg![env; anim setToValue:to_box];
-            () = msg![env; anim setDuration:(ctx.duration)];
-            let tname: id = get_static_str(env, timing_name);
-            let timing: id = msg_class![env; CAMediaTimingFunction functionWithName:tname];
-            () = msg![env; anim setTimingFunction:timing];
-            () = msg![env; layer addAnimation:anim forKey:kp];
-        }
-        release(env, from_box);
-    }
+/// [同步上游 0.3.0 2026-10-02] 当前是否处在 `+beginAnimations:context:` 块内。
+/// 我方旧的 UIView 动画实现(thread_local 栈 + 在 setter 里记旧值)已换成上游基于
+/// CATransaction 的实现,见下面 `+beginAnimations:context:` 处的说明。块外调用
+/// `+setAnimation*:` 按 UIKit 语义什么也不做(上游实现会对不存在的事务 unwrap 崩溃)。
+/// 注:计数是全局的、事务是按线程的;UIKit 动画只在主线程用,够用(与上游
+/// `ca_layer.rs` 的 `is_implicit_animation_enabled` 口径一致)。
+fn in_animation_block(env: &Environment) -> bool {
+    env.framework_state.uikit.ui_view.animation_block_count > 0
 }
 
 /// [深扫修 2026-09-11] #23(a):给视图打"需要布局"脏标记(幂等),并维护脏计数。
@@ -439,45 +392,240 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.get_known_class("CALayer", &mut env.mem)
 }
 
-// Legacy (begin/commit) UIView animation block. Property changes made to a view
-// between beginAnimations: and commitAnimations are turned into CABasicAnimations
-// at commit time (see the helpers above). Previously these all no-op'd, so
-// transitions hard-cut; now they tween. iOS default duration is 0.2s.
-+ (())beginAnimations:(id)_animation_id context:(MutVoidPtr)_context {
-    ANIM_STACK.with(|s| {
-        s.borrow_mut().push(AnimContext {
-            duration: 0.2,
-            curve: 0,
-            captures: Vec::new(),
-        })
-    });
+// [同步上游 0.3.0 2026-10-02] UIView 旧式动画(begin/commit 块)改用上游实现:
+// beginAnimations 开一个显式 CATransaction 并把 animation_block_count 加一,块内对视图
+// 图层的属性修改由 ca_layer.rs 的隐式动画记进该事务,commitAnimations 补上委托、延迟、
+// 重复等参数后提交事务。它覆盖了我方旧实现(thread_local 栈 + 在 setAlpha:/setCenter:/
+// setBounds:/setFrame: 里记旧值、commit 时建 CABasicAnimation)的全部场景:透明度/位置/
+// 尺寸照样补间(setFrame: 经 CALayer setFrame: 拆成 setPosition: + setBounds:,同样出动画),
+// 默认时长 0.2 秒、默认曲线 EaseInOut 不变(mole_menu 打开菜单的淡入就走这条路);
+// 此外还补上了我方旧实现一直是空操作的动画委托 willStart/didStop 回调(例如 MBProgressHUD
+// 动画隐藏后要靠 animationFinished:finished:context: 回调才把自己从视图树摘掉,否则以
+// 0.02 的透明度留在最上层继续挡触摸)、延迟、重复次数与往返。
+// 在上游写法上加了几处容错(按 UIKit 原版语义,不让游戏崩):
+// ① 动画块外调用 setAnimation*: 什么也不做(上游会对不存在的事务 unwrap 崩溃);
+// ② 未知动画曲线按 EaseInOut 处理(上游 panic);
+// ③ 负的重复次数按 0 处理(上游 assert 崩溃);
+// ④ 多出来的 commitAnimations 直接忽略(上游会弹空事务栈崩溃、计数下溢);
+// ⑤ 补两处引用计数泄漏:setAnimationDelegate: 多 retain 了一次(事务的 setValue:forKey:
+//    已经持有、提交事务时释放);commitAnimations 新建的中转委托对象没有交还自己那一份
+//    (各动画的 setDelegate: 已各自持有它)。不补的话动画委托(常是 MBProgressHUD 视图
+//    本身)永不释放,它里面活动指示器的转圈定时器会一直跑。
++ (())setAnimationDuration:(NSTimeInterval)duration {
+    log_dbg!("[UIView setAnimationDuration:{:?}]", duration);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationDuration:] 不在动画块内,忽略");
+        return;
+    }
+    () = msg_class![env; CATransaction setAnimationDuration:duration];
 }
+
++ (())setAnimationDelay:(NSTimeInterval)delay {
+    log_dbg!("[UIView setAnimationDelay:{:?}]", delay);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationDelay:] 不在动画块内,忽略");
+        return;
+    }
+    let value: id = msg_class![env; NSNumber numberWithDouble:delay];
+    () = msg_class![env; CATransaction setValue:value forKey:(get_static_str(env, touchHLE_kCATransactionAnimationDelay))];
+}
+
++ (())setAnimationCurve:(UIViewAnimationCurve)curve {
+    log_dbg!("[UIView setAnimationCurve:{:?}]", curve);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationCurve:] 不在动画块内,忽略");
+        return;
+    }
+    let timing_function: id = match curve {
+        UIViewAnimationCurveEaseInOut => {
+            msg_class![env; CAMediaTimingFunction functionWithName:
+                (get_static_str(env, kCAMediaTimingFunctionEaseInEaseOut))]
+        },
+        UIViewAnimationCurveEaseIn => {
+            msg_class![env; CAMediaTimingFunction functionWithName:
+                (get_static_str(env, kCAMediaTimingFunctionEaseIn))]
+        },
+        UIViewAnimationCurveEaseOut => {
+            msg_class![env; CAMediaTimingFunction functionWithName:
+                (get_static_str(env, kCAMediaTimingFunctionEaseOut))]
+        },
+        UIViewAnimationCurveLinear => {
+            msg_class![env; CAMediaTimingFunction functionWithName:
+                (get_static_str(env, kCAMediaTimingFunctionLinear))]
+        },
+        _ => {
+            // [同步上游 0.3.0 2026-10-02] 上游这里 panic;沿用我方旧实现的语义,未知曲线按 EaseInOut。
+            log!("[UIView setAnimationCurve:{}] 未知的动画曲线,按 EaseInOut 处理", curve);
+            msg_class![env; CAMediaTimingFunction functionWithName:
+                (get_static_str(env, kCAMediaTimingFunctionEaseInEaseOut))]
+        },
+    };
+    () = msg_class![env; CATransaction setAnimationTimingFunction:timing_function];
+}
+
++ (())setAnimationRepeatAutoreverses:(bool)repeat_autoreverses {
+    log_dbg!("[UIView setAnimationRepeatAutoreverses:{:?}]", repeat_autoreverses);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationRepeatAutoreverses:] 不在动画块内,忽略");
+        return;
+    }
+    let value: id = msg_class![env; NSNumber numberWithBool:repeat_autoreverses];
+    () = msg_class![env; CATransaction setValue:value forKey:(get_static_str(env, touchHLE_kCATransactionAnimationRepeatAutoreverses))];
+}
+
++ (())setAnimationRepeatCount:(f32)repeat_count {
+    log_dbg!("[UIView setAnimationRepeatCount:{:?}]", repeat_count);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationRepeatCount:] 不在动画块内,忽略");
+        return;
+    }
+    // [同步上游 0.3.0 2026-10-02] 上游这里 assert(repeat_count >= 0),动画引擎
+    // (animation.rs)求值时也有同样的 assert;负数/NaN 在这里先按 0(= 播一次)处理,免得崩。
+    let repeat_count = if repeat_count >= 0.0 {
+        repeat_count
+    } else {
+        log!("[UIView setAnimationRepeatCount:{}] 重复次数非法,按 0 处理", repeat_count);
+        0.0
+    };
+    let value: id = msg_class![env; NSNumber numberWithFloat:repeat_count];
+    () = msg_class![env; CATransaction setValue:value forKey:(get_static_str(env, touchHLE_kCATransactionAnimationRepeatCount))];
+}
+
++ (())setAnimationDelegate:(id)delegate {
+    log_dbg!("[UIView setAnimationDelegate:{:?}]", delegate);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationDelegate:] 不在动画块内,忽略");
+        return;
+    }
+    // [同步上游 0.3.0 2026-10-02] 上游在这里先 retain(env, delegate) 一次,但事务的
+    // setValue:forKey: 自己会 retain、提交事务时 release,那一次 retain 永远没人还(泄漏),去掉。
+    () = msg_class![env; CATransaction setValue:delegate forKey:(get_static_str(env, touchHLE_kCATransactionAnimationDelegate))];
+}
+
++ (())setAnimationWillStartSelector:(SEL)selector {
+    let selector_str = selector.as_str(&env.mem);
+    log_dbg!("[UIView setAnimationWillStartSelector:{:?} ({})]", selector, selector_str);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationWillStartSelector:] 不在动画块内,忽略");
+        return;
+    }
+    let selector_nsstring = from_rust_string(env, selector_str.to_string());
+    () = msg_class![env; CATransaction setValue:selector_nsstring forKey:(get_static_str(env, touchHLE_kCATransactionAnimationWillStartSelector))];
+}
+
++ (())setAnimationDidStopSelector:(SEL)selector {
+    let selector_str = selector.as_str(&env.mem);
+    log_dbg!("[UIView setAnimationDidStopSelector:{:?} ({})]", selector, selector_str);
+    if !in_animation_block(env) {
+        log_dbg!("[UIView setAnimationDidStopSelector:] 不在动画块内,忽略");
+        return;
+    }
+    let selector_nsstring = from_rust_string(env, selector_str.to_string());
+    () = msg_class![env; CATransaction setValue:selector_nsstring forKey:(get_static_str(env, touchHLE_kCATransactionAnimationDidStopSelector))];
+}
+
++ (())beginAnimations:(id)animation_id // NSString*
+              context:(ConstVoidPtr)context {
+    log_dbg!("[UIView beginAnimations:{:?} context:{:?}]", animation_id, context);
+    () = msg_class![env; CATransaction begin];
+    // [同步上游 0.3.0 2026-10-02] 计数提到设默认值之前:上面几个 setAnimation*: 加了
+    // "块外忽略"的容错,先计数,下面的默认时长/曲线才会生效。
+    env.framework_state.uikit.ui_view.animation_block_count += 1;
+    () = msg_class![env; CATransaction setValue:animation_id forKey:(get_static_str(env, touchHLE_kCATransactionAnimationId))];
+    if !context.is_null() {
+        let context: id = msg_class![env; NSNumber numberWithUnsignedInt:(context.to_bits())];
+        () = msg_class![env; CATransaction setValue:context forKey:(get_static_str(env, touchHLE_kCATransactionAnimationContext))];
+    }
+    // Default values
+    () = msg_class![env; UIView setAnimationDuration:0.2];
+    () = msg_class![env; UIView setAnimationCurve:UIViewAnimationCurveEaseInOut];
+}
+
 + (())commitAnimations {
-    commit_animations(env);
-}
-+ (())setAnimationDuration:(CFTimeInterval)duration {
-    ANIM_STACK.with(|s| {
-        if let Some(c) = s.borrow_mut().last_mut() {
-            c.duration = duration;
+    log_dbg!("[UIView commitAnimations]");
+
+    // [同步上游 0.3.0 2026-10-02] 没有配对 beginAnimations:context: 的 commitAnimations
+    // 直接忽略(我方旧实现同此语义);上游会弹空事务栈崩溃、计数下溢。
+    if !in_animation_block(env) {
+        log!("[UIView commitAnimations] 没有对应的 beginAnimations:context:,忽略");
+        return;
+    }
+
+    // TODO: What if there's interleaved UIView animations and CATransactions?
+    let animations = ca_transaction::ThreadLocalState::get_current_transaction(env).unwrap().get_animations();
+
+    let delegate: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationDelegate))];
+    if animations.is_empty() && delegate == nil {
+        log_dbg!("[UIView commitAnimations] with no animations and no delegate, skipping");
+    } else {
+        // Even if the animation block is committed with no animations,
+        // we still proceed so the delegate gets called
+        let animation_delegate = if delegate == nil {
+            nil
+        } else {
+            let animation_delegate = msg_class![env; _touchHLE_UIView_AnimationDelegate new];
+            () = msg![env; animation_delegate setDelegate:delegate];
+            let animation_id: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationId))];
+            () = msg![env; animation_delegate setAnimationId:animation_id];
+            let context: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationContext))];
+            if context != nil {
+                let context: u32 = msg![env; context unsignedIntValue];
+                let context: ConstVoidPtr = ConstVoidPtr::from_bits(context as GuestUSize);
+                () = msg![env; animation_delegate setContext:context];
+            }
+            let will_start_selector: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationWillStartSelector))];
+            if will_start_selector != nil {
+                let will_start_selector = to_rust_string(env, will_start_selector);
+                let will_start_selector = env.objc.lookup_selector(&will_start_selector).unwrap();
+                () = msg![env; animation_delegate setWillStartSelector:will_start_selector];
+            }
+            let did_stop_selector: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationDidStopSelector))];
+            if did_stop_selector != nil {
+                let did_stop_selector = to_rust_string(env, did_stop_selector);
+                let did_stop_selector = env.objc.lookup_selector(&did_stop_selector).unwrap();
+                () = msg![env; animation_delegate setDidStopSelector:did_stop_selector];
+            }
+            let total_animation_count = animations.len() as u32;
+            () = msg![env; animation_delegate setTotalAnimationCount:total_animation_count];
+            animation_delegate
+        };
+        let delay: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationDelay))];
+        let repeat_count: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationRepeatCount))];
+        let repeat_autoreverses: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationRepeatAutoreverses))];
+        for (layer, animation) in animations {
+            log_dbg!("[UIView commitAnimations] adding animation {:?} to layer {:?}", animation, layer);
+            () = msg![env; animation setDelegate:animation_delegate];
+            if delay != nil {
+                let delay: f32 = msg![env; delay floatValue];
+                let begin_time: CFTimeInterval = CACurrentMediaTime(env) + delay as f64;
+                () = msg![env; animation setBeginTime:begin_time];
+                let fill_mode: CAMediaTimingFillMode = get_static_str(env, kCAFillModeBackwards);
+                () = msg![env; animation setFillMode:fill_mode];
+            }
+            if repeat_count != nil {
+                let repeat_count: f32 = msg![env; repeat_count floatValue];
+                () = msg![env; animation setRepeatCount:repeat_count];
+            }
+            if repeat_autoreverses != nil {
+                let repeat_autoreverses: bool = msg![env; repeat_autoreverses boolValue];
+                () = msg![env; animation setAutoreverses:repeat_autoreverses];
+            }
         }
-    });
-}
-+ (())setAnimationCurve:(NSInteger)curve {
-    ANIM_STACK.with(|s| {
-        if let Some(c) = s.borrow_mut().last_mut() {
-            c.curve = curve;
+        // [同步上游 0.3.0 2026-10-02] 交还 new 出来的那一份引用:每个动画的 setDelegate:
+        // 已各自 retain 中转委托,动画播完被移除时随之释放;上游漏了这一句,中转委托连同它
+        // 持有的游戏委托永不释放。没有动画时它在这里就释放(上游此时也不会回调委托)。
+        if animation_delegate != nil {
+            release(env, animation_delegate);
         }
-    });
+    }
+
+    () = msg_class![env; CATransaction commit];
+
+    env.framework_state.uikit.ui_view.animation_block_count -= 1;
 }
-// Accepted and recorded only enough to not break flow. The game (cocos2d) does
-// not use these in practice, but having them present stops them no-op'ing
-// through the missing-selector shim.
-+ (())setAnimationDelay:(CFTimeInterval)_delay {}
-+ (())setAnimationDelegate:(id)_delegate {}
-+ (())setAnimationWillStartSelector:(SEL)_sel {}
-+ (())setAnimationDidStopSelector:(SEL)_sel {}
-+ (())setAnimationRepeatCount:(f32)_count {}
-+ (())setAnimationRepeatAutoreverses:(bool)_autoreverses {}
+
+// [同步上游 0.3.0 2026-10-02] 以下几个上游没有实现,保留我方旧实现的存根:收下消息、
+// 不做任何事,免得落进"不响应选择子"路径(动画始终视为开启)。
 + (())setAnimationBeginsFromCurrentState:(bool)_begins {}
 + (())setAnimationTransition:(NSInteger)_transition forView:(id)_view cache:(bool)_cache {}
 + (())setAnimationsEnabled:(bool)_enabled {}
@@ -879,7 +1027,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setAlpha:(CGFloat)alpha {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    capture_old(env, layer, "opacity");
     msg![env; layer setOpacity:alpha]
 }
 
@@ -929,7 +1076,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setBounds:(CGRect)bounds {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    capture_old(env, layer, "bounds");
     msg![env; layer setBounds:bounds]
 }
 - (CGPoint)center {
@@ -939,7 +1085,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setCenter:(CGPoint)center {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    capture_old(env, layer, "position");
     msg![env; layer setPosition:center]
 }
 - (CGRect)frame {
@@ -948,8 +1093,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setFrame:(CGRect)frame {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    capture_old(env, layer, "position");
-    capture_old(env, layer, "bounds");
     msg![env; layer setFrame:frame]
 }
 - (CGAffineTransform)transform {
@@ -1239,6 +1382,109 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (CGFloat)contentScaleFactor {
     1.0 // TODO
+}
+
+@end
+
+@implementation _touchHLE_UIView_AnimationDelegate: NSObject
+
++ (id)alloc {
+    let host_object = Box::<UIViewAnimationDelegateHostObject>::default();
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())setAnimationId:(id)animation_id { // NSString*
+    retain(env, animation_id);
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).animation_id = animation_id;
+}
+
+- (())setContext:(ConstVoidPtr)context {
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).context = context;
+}
+
+- (())setDelegate:(id)delegate {
+    retain(env, delegate);
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).delegate = delegate;
+}
+
+- (())setWillStartSelector:(SEL)selector {
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).will_start_selector = Some(selector);
+}
+
+- (())setDidStopSelector:(SEL)selector {
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).did_stop_selector = Some(selector);
+}
+
+- (())setTotalAnimationCount:(NSUInteger)count {
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).total_animation_count = count;
+}
+
+- (())dealloc {
+    let UIViewAnimationDelegateHostObject {
+        animation_id,
+        delegate,
+        ..
+    } = *env.objc.borrow::<UIViewAnimationDelegateHostObject>(this);
+    release(env, animation_id);
+    release(env, delegate);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
+// CAAnimationDelegate protocol implementation
+- (())animationDidStart:(id)animation { // CAAnimation*
+    // [同步上游 0.3.0 2026-10-02] 回调游戏委托期间 retain 住自己:commitAnimations 已交还
+    // new 出来的那份引用,本对象只靠各动画持有;游戏若在回调里移除图层动画,本对象(连同它
+    // 持有的游戏委托与 animation_id)可能当场被释放,回调返回后再写计数就是悬垂访问。
+    retain(env, this);
+    let UIViewAnimationDelegateHostObject {
+        started_animation_count,
+        delegate,
+        will_start_selector,
+        context,
+        animation_id,
+        ..
+    } = *env.objc.borrow::<UIViewAnimationDelegateHostObject>(this);
+    let new_started_animation_count = started_animation_count + 1;
+    log_dbg!("[(_touchHLE_UIView_AnimationDelegate*){:?} animationDidStart:{:?}] started_animation_count {} -> {}", this, animation, started_animation_count, new_started_animation_count);
+    if started_animation_count == 0 && delegate != nil && will_start_selector.is_some() {
+        let will_start_selector = will_start_selector.unwrap();
+        log_dbg!("Notifying delegate {:?} {:?} {} with args {:?}, {:?}", delegate, will_start_selector, will_start_selector.as_str(&env.mem), animation_id, context);
+        () = msg_send(env, (delegate, will_start_selector, animation_id, context));
+    }
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).started_animation_count = new_started_animation_count;
+    release(env, this);
+}
+
+- (())animationDidStop:(id)animation // CAAnimation*
+              finished:(bool)finished {
+    // [同步上游 0.3.0 2026-10-02] 同 animationDidStart:,回调期间 retain 住自己。
+    retain(env, this);
+    // [同步上游 0.3.0 2026-10-02] 上游这里 assert!(finished)。目前动画引擎只会报
+    // finished=YES;万一以后出现被中途打断的动画,不崩,只是不计入完成数(与上游计数口径一致)。
+    if !finished {
+        log_dbg!("[(_touchHLE_UIView_AnimationDelegate*){:?} animationDidStop:{:?} finished:NO]", this, animation);
+    }
+    let host_object = env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this);
+    let finished_animation_count = host_object.finished_animation_count;
+    let new_finished_animation_count = finished_animation_count + finished as u32;
+    log_dbg!("[(_touchHLE_UIView_AnimationDelegate*){:?} animationDidStop:{:?} finished:{}] finished_animation_count {} -> {}", this, animation, finished, finished_animation_count, new_finished_animation_count);
+    env.objc.borrow_mut::<UIViewAnimationDelegateHostObject>(this).finished_animation_count = new_finished_animation_count;
+    let UIViewAnimationDelegateHostObject {
+        total_animation_count,
+        finished_animation_count,
+        delegate,
+        did_stop_selector,
+        context,
+        animation_id,
+        ..
+    } = *env.objc.borrow::<UIViewAnimationDelegateHostObject>(this);
+    if finished_animation_count == total_animation_count && delegate != nil && did_stop_selector.is_some() {
+        let did_stop_selector = did_stop_selector.unwrap();
+        let finished: id = msg_class![env; NSNumber numberWithBool:finished];
+        log_dbg!("Notifying delegate {:?} {:?} {} with args {:?}, {:?}, {:?}", delegate, did_stop_selector, did_stop_selector.as_str(&env.mem), animation_id, finished, context);
+        () = msg_send(env, (delegate, did_stop_selector, animation_id, finished, context));
+    }
+    release(env, this);
 }
 
 @end

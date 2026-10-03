@@ -25,7 +25,7 @@ use crate::objc::{
     HostObject, SEL,
 };
 use crate::Environment;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// `NSString*`
@@ -58,10 +58,12 @@ pub const CONSTANTS: ConstantExports = &[
 ];
 
 #[derive(Default)]
-pub struct State {
-    run_loops: HashMap<ThreadId, id>,
+pub struct ThreadLocalState {
+    run_loop: id,
     /// [扫描修 2026-09-15] 主线程 run loop 已处理到的时间旅行跳变代数
     /// (对照 crate::libc::time::time_jump_generation,初值 0 = 从未跳变)。
+    /// [2026-10-02 同步上游 v0.3.0] 上游把 NSRunLoop 状态改成按线程存放(e854299b),全局 State 已删除;
+    /// 本字段随之迁入线程本地状态,只有主线程(线程 0)的这份会被读写,见 deliver_significant_time_change。
     seen_time_jump_generation: u64,
 }
 
@@ -359,7 +361,7 @@ pub fn run_run_loop(
         //  "Implicit transactions are created automatically when the layer
         //  tree is modified by a thread without an active transaction and are
         //  committed automatically when the thread’s runloop next iterates."
-        ca_transaction::State::commit_implicit_transaction(env);
+        ca_transaction::ThreadLocalState::commit_implicit_transaction(env);
 
         // We want to process those only on the main run loop
         if is_main_run_loop {
@@ -485,6 +487,22 @@ pub fn run_run_loop(
             }
         }
 
+        // [2026-09-25 第五轮遗留 V] VIP 信息 1084 回包分发受理点(见 mole_activity::vip_info_poll):离线时 getVipInfo 只置排队标志,
+        // 这里照原版两条分发臂执行(HUD VIP 徽章、VIP 成就判定、贝壳树重排)。只在主线程;没排队时只有一次原子读。
+        // 放在即时落盘之前:岛上 VIP 成就解锁发奖(saveAchieveUnlockData: → showRewards: → addGoldInNewScene:/addXpInNewScene:)
+        // 排的即时落盘在同一轮写掉。
+        if is_main_run_loop && crate::mole_activity::vip_info_pending() {
+            crate::mole_activity::vip_info_poll(env);
+        }
+
+        // [2026-09-25 第五轮遗留 FLUSH] 黄金岛「关键操作即时落盘」受理点:本轮触摸(handle_events)、定时器(CADisplayLink →
+        // CCDirector mainLoop → CCScheduler)、perform 队列都已返回,栈上没有游戏方法体,等价于原 afterDelay:0 的时机,
+        // 但置脏钩子不再在帧栈上发任何消息。只在主线程;没排队时只有一次原子读。自动释放池在 poll 里只包住 island_flush
+        // (与 deliver_significant_time_change、ns_timer 定时器回调、生命周期落盘同一写法),见 mole_cheats::island_flush_now_poll。
+        if is_main_run_loop && crate::mole_cheats::island_flush_now_pending() {
+            crate::mole_cheats::island_flush_now_poll(env);
+        }
+
         if is_main_run_loop {
             media_player::handle_players(env);
         }
@@ -546,11 +564,19 @@ pub fn run_run_loop(
 /// 偏移从未改过(代数为 0)时直接返回,零行为变化;UIApplication 尚未创建(应用选择器阶段)时只记账不发送。
 fn deliver_significant_time_change(env: &mut Environment) {
     let generation = crate::libc::time::time_jump_generation();
-    if generation == env.framework_state.foundation.ns_run_loop.seen_time_jump_generation {
+    // [2026-10-02 同步上游 v0.3.0] 记账字段已迁到线程本地状态;只在主线程 run loop 调用,固定读写线程 0 那份。
+    if generation
+        == env.threads[0]
+            .framework_state
+            .foundation
+            .ns_run_loop
+            .seen_time_jump_generation
+    {
         return;
     }
     // 先记账再发送:回调里若重入 run loop,不会重复补发。
-    env.framework_state
+    env.threads[0]
+        .framework_state
         .foundation
         .ns_run_loop
         .seen_time_jump_generation = generation;
@@ -585,12 +611,12 @@ fn deliver_significant_time_change(env: &mut Environment) {
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
 fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
-    if let std::collections::hash_map::Entry::Vacant(e) = env
+    if env.threads[thread_id]
         .framework_state
         .foundation
         .ns_run_loop
-        .run_loops
-        .entry(thread_id)
+        .run_loop
+        == nil
     {
         let host_object = Box::new(NSRunLoopHostObject {
             audio_units: Vec::new(),
@@ -603,12 +629,15 @@ fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) 
         let new = env
             .objc
             .alloc_static_object(this, host_object, &mut env.mem);
-        e.insert(new);
+        env.threads[thread_id]
+            .framework_state
+            .foundation
+            .ns_run_loop
+            .run_loop = new;
     }
-    *env.framework_state
+    env.threads[thread_id]
+        .framework_state
         .foundation
         .ns_run_loop
-        .run_loops
-        .get(&thread_id)
-        .unwrap()
+        .run_loop
 }

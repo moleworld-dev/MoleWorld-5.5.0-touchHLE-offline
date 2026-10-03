@@ -13,7 +13,7 @@ use super::{CFIndex, CFRange};
 use crate::dyld::FunctionExports;
 use crate::export_c_func;
 use crate::frameworks::foundation::{NSRange, NSUInteger};
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr};
 use crate::objc::{id, msg, msg_class};
 use crate::Environment;
 
@@ -30,6 +30,34 @@ pub fn CFDataCreate(
     let length: NSUInteger = length.try_into().unwrap();
     let new: id = msg_class![env; NSData alloc];
     msg![env; new initWithBytes:bytes length:length]
+}
+
+fn CFDataCreateWithBytesNoCopy(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    bytes: ConstPtr<u8>,
+    length: CFIndex,
+    deallocator: CFAllocatorRef,
+) -> CFDataRef {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
+    // [同步上游 0.3.0 2026-10-02] 上游 25ba5501 只支持 deallocator = kCFAllocatorNull(不释放缓冲),
+    // 写法 env.mem.read(deallocator) 在传 NULL 时直接读空指针崩溃。按 Apple 文档,NULL /
+    // kCFAllocatorDefault / kCFAllocatorSystemDefault 表示「CFData 释放时用默认分配器释放这块缓冲」,
+    // 即 freeWhenDone:YES。游戏里 11 份 JSONKit(如 -[JKSerializer serializeObject:…]@0x1faf9a)
+    // 都是 CFDataCreateWithBytesNoCopy(NULL, 自己 malloc 的输出缓冲, 长度, NULL) 把缓冲交给 CFData;
+    // 分叉版此前本函数未实现(链接成返回 0 的空操作),上游实现后这条路径会必崩,所以补上默认分配器分支。
+    let free_when_done = if deallocator == kCFAllocatorDefault
+        || env.mem.read(deallocator).is_system_default()
+    {
+        true
+    } else {
+        assert!(env.mem.read(deallocator).is_null()); // unimplemented
+        false
+    };
+    let bytes: MutVoidPtr = bytes.cast().cast_mut();
+    let length: NSUInteger = length.try_into().unwrap();
+    let new: id = msg_class![env; NSData alloc];
+    msg![env; new initWithBytesNoCopy:bytes length:length freeWhenDone:free_when_done]
 }
 
 pub fn CFDataGetLength(env: &mut Environment, data: CFDataRef) -> CFIndex {
@@ -52,6 +80,7 @@ fn CFDataGetBytes(env: &mut Environment, data: CFDataRef, range: CFRange, buffer
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFDataCreate(_, _, _)),
+    export_c_func!(CFDataCreateWithBytesNoCopy(_, _, _, _)),
     export_c_func!(CFDataGetLength(_)),
     export_c_func!(CFDataGetBytePtr(_)),
     export_c_func!(CFDataGetBytes(_, _, _)),

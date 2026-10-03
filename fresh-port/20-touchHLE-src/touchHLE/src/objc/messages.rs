@@ -380,6 +380,7 @@ fn objc_msgSend_inner(
     selector: SEL,
     super2: Option<Class>,
     tolerate_type_mismatch: bool,
+    skip_initialize: bool,
 ) {
     crate::mole_perf::MSGSEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log_dbg!(
@@ -935,6 +936,8 @@ fn objc_msgSend_inner(
                     // 之前调用;onBuyVIPGold: 返回 void,下面统一把 r0/r1 清零,寄存器最终状态与原来一致。
                     // [补完 2026-09-15] 同时把本次购买的 itemid / 实发贝壳数 / 档位(含标价)交给 mole_items,
                     // 替原版服务器做「累计充值 → VIP 等级」(原版 1083 上报 + 1084 回包 parseVipInfo 写三值)。
+                    // [2026-09-25 第五轮遗留 V] 1084 回包的分发臂(HUD VIP 徽章、VIP 成就、贝壳树重排)由 on_shells_purchased 末尾
+                    // 照原版 0x117dcc 补发 getVipInfo、交给 mole_activity 在运行循环受理点执行。
                     crate::mole_items::on_shells_purchased(env, item_id, amount, pack);
                 }
                 env.cpu.regs_mut()[0..2].fill(0);
@@ -1080,7 +1083,12 @@ fn objc_msgSend_inner(
             }
         }
     }
-    maybe_initialize_class(env, receiver);
+    // [同步上游 v0.3.0 · 2026-10-02] 上游 c6f73adf:发 +load 时(msg_send_no_initialize)不得先触发 +initialize。
+    // 我方钩子仍放在这之前、照常执行(+load 不在任何钩子白名单里,行为无变化);上游这里原有的
+    // assert!(orig_class != nil) 由上面「isa 为 nil 当作发给 nil」的早返回取代,保持离线健壮性。
+    if !skip_initialize {
+        maybe_initialize_class(env, receiver);
+    }
 
     // Traverse the chain of superclasses to find the method implementation.
 
@@ -1310,6 +1318,7 @@ Type mismatch when sending message {} to {:?}!
 pub(crate) fn objc_msgSend(env: &mut Environment, receiver: id, selector: SEL) {
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        /* skip_initialize: */ false,
     )
 }
 
@@ -1317,6 +1326,20 @@ pub(crate) fn objc_msgSend(env: &mut Environment, receiver: id, selector: SEL) {
 pub(crate) fn _touchHLE_objc_msgSend_tolerant(env: &mut Environment, receiver: id, selector: SEL) {
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ true,
+        /* skip_initialize: */ false,
+    )
+}
+
+/// Variant of `objc_msgSend` that does not trigger `+initialize`.
+#[allow(non_snake_case)]
+pub(crate) fn _touchHLE_objc_msgSend_no_initialize(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+) {
+    objc_msgSend_inner(
+        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        /* skip_initialize: */ true,
     )
 }
 
@@ -1337,6 +1360,7 @@ pub(super) fn objc_msgSend_stret(
 ) {
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        /* skip_initialize: */ false,
     )
 }
 
@@ -1349,6 +1373,7 @@ pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
 ) {
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ true,
+        /* skip_initialize: */ false,
     )
 }
 
@@ -1389,6 +1414,7 @@ pub(super) fn objc_msgSendSuper2(
         selector,
         /* super2: */ Some(class),
         /* tolerate_type_mismatch: */ false,
+        /* skip_initialize: */ false,
     )
 }
 
@@ -1445,6 +1471,27 @@ where
     } else {
         (_touchHLE_objc_msgSend_tolerant as fn(&mut Environment, id, SEL)).call_from_host(env, args)
     }
+}
+
+/// Variant of [msg_send] which does not trigger `+initialize` on the receiver.
+///
+/// This is meant for sending `+load`: the Objective-C runtime guarantees that
+/// `+load` runs before `+initialize`, so it must not go through the normal
+/// [msg_send] path (which would call `maybe_initialize_class` first).
+pub fn msg_send_no_initialize<R, P>(env: &mut Environment, args: P) -> R
+where
+    fn(&mut Environment, id, SEL): CallFromHost<R, P>,
+    (R, P): MsgSendSignature,
+    R: GuestRet,
+{
+    assert!(
+        R::SIZE_IN_MEM.is_none(),
+        "msg_send_no_initialize does not support struct returns"
+    );
+    // Provide type info for dynamic type checking.
+    env.objc.message_type_info = Some(<(R, P) as MsgSendSignature>::type_info());
+    (_touchHLE_objc_msgSend_no_initialize as fn(&mut Environment, id, SEL))
+        .call_from_host(env, args)
 }
 
 /// Counterpart of [MsgSendSignature] for [msg_send_super2].

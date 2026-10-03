@@ -10,7 +10,8 @@ use super::cg_color_space::{
     CGColorSpaceGetModel, CGColorSpaceRef,
 };
 use super::cg_data_provider::{self, CGDataProviderRef};
-use super::CGFloat;
+use super::cg_geometry::{CGPointZero, CGRectIntegral, CGRectIntersection, CGRectNull};
+use super::{CGFloat, CGRect, CGSize};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
@@ -147,7 +148,7 @@ fn CGImageCreate(
         kCGImageByteOrder32Little => {
             // TODO: fix CGImageGetAlphaInfo()
             assert_eq!(alpha_info, kCGImageAlphaNoneSkipFirst); // TODO
-            for chunk in pixels.chunks_exact_mut(4) {
+            for chunk in pixels.as_chunks_mut::<4>().0 {
                 // XRGB in 32 little endian -> RGBX in 32 big endian
                 chunk.swap(0, 2);
                 // Assume opaque, even though it is undefined
@@ -271,6 +272,50 @@ fn CGImageGetBitsPerComponent(_: &mut Environment, _: CGImageRef) -> GuestUSize 
     8 // Fix this when we support anything else
 }
 
+fn CGImageCreateWithImageInRect(
+    env: &mut Environment,
+    image: CGImageRef,
+    rect: CGRect,
+) -> CGImageRef {
+    let (img_w, img_h) = borrow_image(&env.objc, image).dimensions();
+    log_dbg!(
+        "CGImageCreateWithImageInRect: rect {:?}, img dim {:?}",
+        rect,
+        (img_w, img_h)
+    );
+    let rect = CGRectIntegral(env, rect);
+    let intersect = CGRectIntersection(
+        env,
+        rect,
+        CGRect {
+            origin: CGPointZero,
+            size: CGSize {
+                width: img_w as CGFloat,
+                height: img_h as CGFloat,
+            },
+        },
+    );
+    assert!(intersect != CGRectNull);
+    let (x, y, w, h) = (
+        intersect.origin.x as u32,
+        intersect.origin.y as u32,
+        intersect.size.width as u32,
+        intersect.size.height as u32,
+    );
+    assert_eq!(32, CGImageGetBitsPerPixel(env, image));
+    let mut new_pixels = Vec::with_capacity((w * h * 4) as usize);
+    let old_pixels = borrow_image(&env.objc, image).pixels();
+    for i in 0..h {
+        new_pixels.extend_from_slice(
+            &old_pixels[((y + i) * img_w * 4 + x * 4) as usize..][..(w * 4) as usize],
+        );
+    }
+    // Note: instead of keeping reference to the orig image,
+    // we're creating a copy here
+    let new_img = Image::from_pixel_vec(new_pixels, (w, h));
+    from_image(env, new_img)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGImageRelease(_)),
     export_c_func!(CGImageRetain(_)),
@@ -286,4 +331,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGImageGetBytesPerRow(_)),
     export_c_func!(CGImageGetDataProvider(_)),
     export_c_func!(CGImageGetBitsPerComponent(_)),
+    export_c_func!(CGImageCreateWithImageInRect(_, _)),
 ];

@@ -38,8 +38,8 @@ pub use classes::{objc_classes, Class, ClassExports, ClassTemplate};
 // release 下这个再导出没人用;保留导出(让 MSG_N 这组出帧失速计数不被当成死代码),只压掉未使用告警。
 #[allow(unused_imports)]
 pub use messages::{
-    autorelease, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, msg_super,
-    note_present, objc_super, release, retain,
+    autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
+    msg_send_super2, msg_super, note_present, objc_super, release, retain,
 };
 pub use methods::{HostIMP, IMP};
 pub use objects::{
@@ -51,8 +51,8 @@ pub use selectors::{selector, SEL};
 use crate::mem::{ConstVoidPtr, MutPtr};
 use crate::Environment;
 use classes::{
-    class_getInstanceSize, class_getSuperclass, objc_getClass, ClassHostObject, FakeClass,
-    UnimplementedClass,
+    class_getInstanceSize, class_getMethodImplementation, class_getProperty, class_getSuperclass,
+    class_replaceMethod, objc_getClass, ClassHostObject, FakeClass, UnimplementedClass,
 };
 pub(crate) use messages::objc_msgSend;
 use messages::{objc_msgSendSuper2, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature};
@@ -211,6 +211,9 @@ fn objc_storeStrong(env: &mut Environment, location: MutPtr<id>, obj: id) {
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_getSuperclass(_)),
+    export_c_func!(class_getProperty(_, _)),
+    export_c_func!(class_getMethodImplementation(_, _)),
+    export_c_func!(class_replaceMethod(_, _, _, _)),
     export_c_func!(objc_retain(_)),
     export_c_func!(objc_release(_)),
     export_c_func!(objc_autorelease(_)),

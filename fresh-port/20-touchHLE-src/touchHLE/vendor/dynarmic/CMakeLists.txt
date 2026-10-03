@@ -140,6 +140,8 @@ if (DYNARMIC_USE_BUNDLED_EXTERNALS)
     set(CMAKE_DISABLE_FIND_PACKAGE_Zydis ON)
 endif()
 
+set(TSL_ROBIN_MAP_ENABLE_INSTALL ON)
+
 find_package(Boost 1.57 REQUIRED)
 find_package(fmt 9 CONFIG)
 find_package(mcl 0.1.12 EXACT CONFIG)

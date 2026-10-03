@@ -24,7 +24,7 @@ use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::from_rust_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{UILineBreakMode, UILineBreakModeCharacterWrap};
-use crate::mem::{MutVoidPtr, Ptr};
+use crate::mem::{ConstVoidPtr, Ptr};
 use crate::mole_dev::QuestFamily;
 use crate::objc::{id, msg, msg_class, msg_send, nil, release, retain, SEL};
 use crate::Environment;
@@ -150,6 +150,9 @@ pub enum DevTool {
     Trace,
     /// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进:分钟 = 寄存器值,主村离线执行、下次进岛生效(mole_dev::island_fast_forward_minutes)。
     IslandFastForward,
+    /// [2026-09-25 第五轮遗留 WK99] 按存档重算主村工人/房间(额外摩尔数 = 寄存器,只在存档确实要改时才用),主村离线执行,
+    /// 有改动时二次确认(mole_dev::recalc_workers)。
+    RecalcWorkers,
 }
 
 /// [扫描修 2026-09-15] 隐藏物品页的按钮种类(F1-1 / F1-5 / F4-1)。
@@ -437,7 +440,10 @@ fn pages() -> Vec<Page> {
                 ("冷却归零(主村+黄金岛)", ToggleCheat("no_cooldown")),
                 ("建筑瞬完成(主村+黄金岛)", ToggleCheat("instant_build")),
                 // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 删掉 totalRooms 臂、工人 getter 改按调用点白名单返 99,
-                // 不再补房间,标签去掉「房间」。以前的旧逻辑已经经 encodeWithCoder: 写进 userinfo.dat 的 99 无法自动还原。开关键名不变。
+                // 不再补房间,标签去掉「房间」。开关键名不变。
+                // [2026-09-25 第五轮遗留 WK99] 旧逻辑经 encodeWithCoder: 写进 userinfo.dat 的 99 用「开发工具」页「重算工人/房间」还原:
+                //   居民房人口按原版 getWorkerCountByRoom 推出(扣中信银行),额外摩尔(买来的)无记录、由寄存器输入;房间只能还原到下界,
+                //   且只在总摩尔与房间同时 ≥ 99(旧版三项同写 99 的指纹)或少于现有房屋数时才改。
                 ("工人补满(仅主村)", ToggleCheat("max_facility")),
                 ("产出×10(收菜)", ToggleCheat("harvest_mult")),
                 ("任务秒完成免费(主村+黄金岛)", ToggleCheat("free_quest")),
@@ -549,8 +555,11 @@ fn pages() -> Vec<Page> {
                 ("时间旅行+24h(不可回退)", Dev(D::TimeTravelHours(24))),
                 ("存档快照:保存", Dev(D::SnapshotSave)),
                 ("快照:下次启动恢复", Dev(D::SnapshotRestore)),
-                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 11 行首格),不挪动前面任何按钮的坐标。
+                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 10 行首格),不挪动前面任何按钮的坐标。
                 ("岛档快进(分钟)", Dev(D::IslandFastForward)),
+                // [2026-09-25 第五轮遗留 WK99] 追加在末尾 = 第 38 个(下标 37,第 10 行第 2 格,设计坐标 x 267..506、y 487..527,
+                //   4:3 注入 tap 507 637),RowFirst(4) 仍是 10 行,前面所有按钮坐标不动;「开发者 / 调试」页没动,layout_selfcheck 不受影响。
+                ("重算工人/房间", Dev(D::RecalcWorkers)),
             ],
         },
         // 6 [扫描修 2026-09-15] F1-1/F1-5/F4-1 隐藏物品:进商店开关、节日商店模式、目录浏览(放到地图 / 入仓库)。
@@ -963,7 +972,10 @@ fn build(env: &mut Environment, fade: bool) {
         // Doubles as the live exercise of that code path: opacity 0 -> 1 over 0.2s.
         // [扫描修 2026-09-15] 只在打开菜单时淡入;按钮触发的重建不再淡入,否则数字键盘每按一下整个菜单都闪一次。
         () = msg![env; container setAlpha:0.0f32];
-        let null_ctx: MutVoidPtr = Ptr::null();
+        // [同步上游 0.3.0 2026-10-03] 上游 beginAnimations:context: 的 context 是 ConstVoidPtr
+        // (分叉点是 MutVoidPtr),宿主发宿主的消息按 TypeId 严格检查,类型不一致会 panic
+        // 「Type mismatch when sending message」,打开修改器菜单必崩。
+        let null_ctx: ConstVoidPtr = Ptr::null();
         () = msg_class![env; UIView beginAnimations:nil context:null_ctx];
         let dur: f64 = 0.2;
         () = msg_class![env; UIView setAnimationDuration:dur];
@@ -1082,11 +1094,13 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
                 return true;
             }
             PENDING_RESET.with(|c| c.set(false)); // 已确认,下面真删
-        } else if let Some((code, prompt)) = dev_confirm(action) {
+        } else if let Some((code, prompt)) = dev_confirm(env, action) {
             // [扫描修 2026-09-15] 开发工具里不可回退的动作(时间旅行、快照恢复)同样二次确认。
             if PENDING_DEV.with(|c| c.get()) != code {
                 PENDING_DEV.with(|c| c.set(code));
                 PENDING_RESET.with(|c| c.set(false));
+                // [2026-09-25 第五轮遗留 WK99] 只在首次提示时记一行(确认那一下 dev_confirm 也会再跑一遍,不在那里记,免得重复)。
+                log!("[MOLEMENU] 二次确认待定:{}", prompt);
                 set_toast(prompt);
                 rebuild(env);
                 return true;
@@ -1106,17 +1120,11 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
             Action::ToggleCheat(key) => {
                 let on = crate::mole_cheats::is_on(key);
                 // [2026-09-16] G-10 离线切魔法密码开关时说明它只在联机时有意义,开关本身照常翻转。
-                let note = if key == "magic_bypass" && !env.options.network_access {
-                    "(仅联机有效:离线不会出现魔法密码框,私服回 1018 才出现)"
-                } else {
-                    ""
-                };
-                set_toast(format!(
-                    "「{}」已{}{}",
-                    label,
-                    if on { "开启" } else { "关闭" },
-                    note
-                ));
+                // [2026-09-25 第五轮遗留 WK99] 其余开关的副作用说明统一放进 toggle_note(只进 toast,标签与按钮数不变)。
+                let note = toggle_note(key, on, env.options.network_access);
+                let state = if on { "开启" } else { "关闭" };
+                log!("[MOLEMENU] 开关提示:「{}」已{}{}", label, state, note);
+                set_toast(format!("「{}」已{}{}", label, state, note));
             }
             // [复核修 2026-09-15] run_action 删完就直接退出进程,正常走不到这里;留着分支免得落到「已执行」。
             // [2026-09-16] X4-01 删档失败时 run_action 自己写了失败 toast,走上面的 action_wrote_toast 分支,也到不了这里。
@@ -1351,6 +1359,11 @@ fn run_action(env: &mut Environment, action: Action) {
                 return;
             }
             crate::mole_cheats::toggle(key);
+            // [2026-09-25 第五轮遗留 B] 全物品解锁的 VIP 门槛伪值串在这里(菜单触摸上下文,可发宿主消息)预热,
+            //   免得 get_static_str 首次的宿主 alloc 落在列表惯性滚动的 CCScheduler 帧栈上。开关关着时不做事。
+            if key == "all_unlock" {
+                crate::mole_cheats::allunlock_prewarm(env);
+            }
             // Rebuild so the on/off label refreshes immediately.
             rebuild(env);
         }
@@ -2135,6 +2148,15 @@ fn ship_return_now(env: &mut Environment) {
 /// mapData)后直接 `[SceneMannager startNewSceneFrom:1 toScene:10]`;网络门与 state2
 /// 数据门由 mole_cheats 的 intercept 在进岛窗口内放行。跳过飞机过场(热点路径仍带)。
 fn enter_island(env: &mut Environment) {
+    // [2026-09-25 第五轮遗留 C] 时间旅行中不进岛,规则与 mole_cheats 的 enterNewIslands 臂相同(旅行期间岛档不落盘、进岛从盘上重读,
+    //   交任务的奖励却当场进主档 → 同一条岛任务能反复领)。放在 island_arm_entry 与发 enterNewIslands 之前,什么岛状态都不动。
+    //   修改器是盖在游戏画面上的 UIKit 层,游戏的 MessageBox 会被它挡住,所以这里用底部提示说明原因,菜单保持打开。
+    let tt_offset = crate::libc::time::time_offset_secs();
+    if tt_offset != 0 {
+        log!("[MOLEMENU] enter island refused: 时间旅行中(偏移 {} 秒)", tt_offset);
+        set_toast(crate::mole_cheats::ISLAND_TT_ENTER_BLOCKED_MSG.to_string());
+        return;
+    }
     let wm = game_singleton(env, "WrapperManager", "sharedManager");
     let village: id = if wm != nil {
         let s = sel(env, "currentVillageLayer");
@@ -2271,6 +2293,10 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
             format!("岛档快进 {} 分钟", reg),
             dev::island_fast_forward_minutes(env, reg),
         ),
+        DevTool::RecalcWorkers => (
+            format!("按存档重算工人/房间(寄存器 {})", reg),
+            dev::recalc_workers(env, reg, false),
+        ),
     };
     match result {
         Ok(text) => {
@@ -2330,6 +2356,11 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
         DevTool::TimeTravelHours(_) | DevTool::SnapshotRestore => {
             (label.to_string(), color(env, 0.6, 0.25, 0.2, 1.0))
         }
+        // [2026-09-25 第五轮遗留 WK99] 会写主档,用警示色;标签带寄存器值(额外摩尔数,只在存档要改时用)。
+        DevTool::RecalcWorkers => (
+            format!("{} 额外#{}", label, reg),
+            color(env, 0.6, 0.25, 0.2, 1.0),
+        ),
         _ => (label.to_string(), color(env, 0.16, 0.45, 0.7, 1.0)),
     }
 }
@@ -2352,17 +2383,55 @@ fn reset_failure_toast(fail: &crate::save_reset::ResetFailure) -> String {
     }
 }
 
+/// [2026-09-25 第五轮遗留 WK99] 作弊开关的副作用说明(遗留扫描 #12,只改文案不改行为):只写进开关 toast,标签长度、按钮数量
+/// 与菜单布局都不变(标签加长会溢出格子);toast 超宽时 add_toast 会自动折行。说明对应的实现:
+///   · 冷却归零 / 建筑瞬完成 × 探险船:修船/出海/冷却三段时长是 DiscoveryShip 的 ivar,只在两个 init 里调
+///     checkIsFixShipFinished/checkIsDiscoverFinished 时由 mole_cheats 改写(K13 I4-04),中途切换要离岛重进才跟着变;
+///     建筑小游戏与装饰产出(M-M3-2)在帧内前置钩子里当场生效。
+///   · 冷却归零 × 布兰的家:getOutCoolTime 在 OutputHanlder 判定处返回 1(第五轮遗留 F),开着时餐厅恒为可领态,
+///     走不到升级图标段,1~5 级要升级得先关开关。
+///   · 建筑瞬完成:getBuildTime: 的 selref 只在各类 initWithTile:sprite:size:data:(新放下)和 CropInfoView 面板里;
+///     读档的 -[Building initWithMapData:type:] 在 0xae5d8..0xae60c 直接用 [ObjectData build_time] 写 buildTime_,
+///     所以打开前已在建的建筑重进场景也照原版时长。
+///   · 工人补满:只在 MAXFAC_GATE_LRS 的人力门/抬头调用点返回 99(K13),空闲摩尔由 createIdleWorkers: 只在加载地图时
+///     按空闲数生成,中途打开要重进主村;锁 7(开地,0x7dac3)与锁 9(买摩尔,0x7d3bd)也读到 99;
+///     关掉后 -[UserInfoData addAvailableWorker:]@0xbb34c 只夹上限不夹下限,本局空闲数可能为负,读档 intiWithUserInfo:
+///     0xb96bc 复位。旧版写进存档的 99 由开发工具「重算工人/房间」还原(该工具在线时拒绝执行,所以在线不提它)。
+///   · [复核补] 在线模式:探险船那条臂要求 ON_ISLAND,而 ON_ISLAND 只在离线岛总闸块(intercept 里 `if ENABLE_NEWSCENE_ISLAND`,
+///     在线时被强制关闭)里置位,在线时探险船时长根本不受这两个开关影响,所以在线不提「离岛重进」;布兰的家与建筑小游戏/装饰
+///     那几条臂不看在线,照常提示。
+fn toggle_note(key: &str, on: bool, online: bool) -> &'static str {
+    match key {
+        "magic_bypass" if !online => "(仅联机有效:离线不会出现魔法密码框,私服回 1018 才出现)",
+        "no_cooldown" if on && online => "(开着时布兰的家一直是可领取状态,1~5 级要升级请先关掉;建筑小游戏与装饰产出当场生效;在线模式下黄金岛探险船不受影响)",
+        "no_cooldown" if on => "(黄金岛探险船的出海冷却要离岛重进才跟着变;开着时布兰的家一直是可领取状态,1~5 级要升级请先关掉;建筑小游戏与装饰产出当场生效)",
+        "no_cooldown" if !online => "(黄金岛探险船的出海冷却要离岛重进才恢复原时长)",
+        "instant_build" if on && online => "(只对打开后新放下的建筑生效,之前已在建的照原版时长,重进也一样;在线模式下黄金岛探险船不受影响)",
+        "instant_build" if on => "(只对打开后新放下的建筑生效,之前已在建的照原版时长,重进也一样;黄金岛探险船的修船、出海时长要离岛重进才跟着变)",
+        "instant_build" if !online => "(黄金岛探险船的修船、出海时长要离岛重进才恢复原时长)",
+        "max_facility" if on => "(只在人力门与抬头显示按 99 算,存档仍存真值;中途打开要重进主村或重启,空闲摩尔才补满;开着时开地上限按 99 算、买摩尔不受 110 上限,关掉后已开的地、已买的摩尔都保留)",
+        "max_facility" if !online => "(本局空闲工人可能暂时显示异常甚至为负,重启游戏复位;旧版写进存档的 99 到「开发工具」页用「重算工人/房间」还原)",
+        "max_facility" => "(本局空闲工人可能暂时显示异常甚至为负,重启游戏复位)",
+        _ => "",
+    }
+}
+
 /// 需要二次确认的开发工具动作:返回(确认编码, 第一次点击时的提示)。编码非 0 且各动作互不相同。
-fn dev_confirm(action: Action) -> Option<(u32, String)> {
+/// [2026-09-25 第五轮遗留 WK99] 改为接收 env:「重算工人/房间」要先算一遍计划(发宿主消息)。唯一调用点是 handle_touch
+///   (frameworks/uikit.rs handle_events 的 UIKit 事件上下文),不在帧栈上,也不在钩子里。
+fn dev_confirm(env: &mut Environment, action: Action) -> Option<(u32, String)> {
     match action {
         // [2026-09-16] X4-02 确认文案补上活动中心的限制:旅行期间 mole_activity 侧档只写内存(F2-05),付费操作的扣款和发奖
         // 却照常写进主档,所以这些操作在旅行中被禁用(拦截在 mole_activity.rs);旅行中拍快照时,主档是旅行后的,
         // 活动档还是旅行前的。文案超过一行,底部 toast 会自动折行(add_toast)。
-        // [2026-09-24 第四轮 K3 I7-01] 补黄金岛:旅行期间岛档一律不落盘(mole_cheats::island_flush 开头的落盘闸);每次进岛都从磁盘读岛档,离岛再进或重启后都回到旅行前。
-        Action::Dev(DevTool::TimeTravelHours(h)) => Some((
+        // [2026-09-24 第四轮 K3 I7-01] 补黄金岛:旅行期间岛档一律不落盘(mole_cheats::island_flush 开头的落盘闸)。
+        // [2026-09-25 第五轮遗留 C] 只挡落盘会让岛上进度回滚而奖励留在主档,现在旅行期间不能进岛、岛档快进也停用,落盘闸只作兜底;
+        //   文案同步。岛会话中(island_session_active)不再先要确认:第一下就执行,由 time_travel_hours 直接给出拒绝原因,
+        //   免得点两下才知道不行。
+        Action::Dev(DevTool::TimeTravelHours(h)) if !crate::mole_cheats::island_session_active() => Some((
             1000 + h.clamp(0, 1_000_000) as u32,
             format!(
-                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。黄金岛进度在旅行期间不保存,离岛再进或重启后都回到旅行前。再点一次确认",
+                "⚠️ 时间旅行 +{} 小时不可回退(存档时间戳会跟着往前走)。旅行期间活动中心的付费操作(补签、刷新/挖贝、珍珠与脚印兑换)会被禁用,旅行中拍的快照里活动数据与主档不一致。旅行期间不能进入黄金岛,岛档快进也停用(岛上进度这段时间无法保存),重启回到现实时间后恢复;要测岛上计时请在不旅行时用「岛档快进」。再点一次确认",
                 h
             ),
         )),
@@ -2370,6 +2439,22 @@ fn dev_confirm(action: Action) -> Option<(u32, String)> {
             1,
             "⚠️ 下次启动会用快照覆盖当时的存档,再点一次「快照:下次启动恢复」确认".to_string(),
         )),
+        // [2026-09-25 第五轮遗留 WK99] 只有要改动时才二次确认,提示带预览数字;无需改动或被拒(在线、岛上、不在主村、地图加载中、
+        //   有面板开着、寄存器越界)返回 None,直接走 run_dev_tool,由 recalc_workers 给出同一句文案。
+        //   确认码 = 2e9 + 计划摘要(落在 [2e9, 2.1e9),与 1、1000..=1_001_000 不冲突):两次点击之间数值一变就重新提示,
+        //   不会执行没预览过的数字。
+        Action::Dev(DevTool::RecalcWorkers) => {
+            match crate::mole_dev::plan_worker_recalc(env, crate::mole_dev::register_value(), false) {
+                Ok(p) if p.changes() => Some((
+                    2_000_000_000 + p.digest(),
+                    format!(
+                        "⚠️ 按存档重算:{}。会先自动存快照再写主档,再点一次「重算工人/房间」确认",
+                        p.describe()
+                    ),
+                )),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

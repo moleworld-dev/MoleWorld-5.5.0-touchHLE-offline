@@ -20,6 +20,9 @@ impl CFAllocatorHostObject {
     pub fn is_system_default(&self) -> bool {
         self.0 == CFAllocatorType::SystemDefault
     }
+    pub fn is_null(&self) -> bool {
+        self.0 == CFAllocatorType::Null
+    }
 }
 
 // TODO: support other types

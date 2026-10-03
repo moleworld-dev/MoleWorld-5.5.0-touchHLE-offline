@@ -25,7 +25,9 @@ use crate::frameworks::core_foundation::cf_run_loop::{
 };
 use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::mem::{guest_size_of, ConstPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead};
+use crate::mem::{
+    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead,
+};
 use crate::objc::msg;
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
@@ -123,8 +125,9 @@ type AudioQueuePropertyListenerProc = GuestFunction;
 
 const kAudioQueueErr_InvalidBuffer: OSStatus = -66687;
 const kAudioQueueErr_InvalidPropertySize: OSStatus = -66683;
-const kAudioQueueErr_BufferInQueue: OSStatus = -66679;
 const kAudioQueueErr_CannotStart: OSStatus = -66681;
+const kAudioQueueErr_InvalidDevice: OSStatus = -66680;
+const kAudioQueueErr_BufferInQueue: OSStatus = -66679;
 
 pub fn AudioQueueNewOutput(
     env: &mut Environment,
@@ -480,6 +483,26 @@ fn AudioQueueGetProperty(
     }
 
     0 // success
+}
+
+fn AudioQueueSetProperty(
+    _env: &mut Environment,
+    in_aq: AudioQueueRef,
+    in_property_id: AudioQueuePropertyID,
+    in_property_data: ConstVoidPtr,
+    io_data_size: MutPtr<u32>,
+) -> OSStatus {
+    log!(
+        "TODO: AudioQueueSetProperty({:?}, {}, {:?}, {:?}) -> kAudioQueueErr_InvalidDevice",
+        in_aq,
+        debug_fourcc(in_property_id),
+        in_property_data,
+        io_data_size
+    );
+
+    // Error value shouldn't matter that much,
+    // this one is closest to a notion of "unsupported"
+    kAudioQueueErr_InvalidDevice
 }
 
 pub fn log_if_broken_audio_format(format: &AudioStreamBasicDescription) {
@@ -889,9 +912,11 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
     // [扫描修 2026-09-16] AQ-01:finish_stopping_audio_queue 最后会通知 IsRunning
     // 监听(guest 代码),监听里同样可能 Dispose 本队列,那时不能再 unwrap。
-    let state = State::get(&mut env.framework_state);
-
-    if let Some(host_object) = state.audio_queues.get_mut(&in_aq) {
+    // (上游 v0.3.0 4002a4b0 同样改成了 if let,采用上游写法。)
+    if let Some(host_object) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+    {
         host_object.is_running_handler = false;
     }
 }
@@ -1188,6 +1213,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioQueueRemovePropertyListener(_, _, _, _)),
     export_c_func!(AudioQueueGetPropertySize(_, _, _)),
     export_c_func!(AudioQueueGetProperty(_, _, _, _)),
+    export_c_func!(AudioQueueSetProperty(_, _, _, _)),
     export_c_func!(AudioQueuePrime(_, _, _)),
     export_c_func!(AudioQueueStart(_, _)),
     export_c_func!(AudioQueuePause(_)),

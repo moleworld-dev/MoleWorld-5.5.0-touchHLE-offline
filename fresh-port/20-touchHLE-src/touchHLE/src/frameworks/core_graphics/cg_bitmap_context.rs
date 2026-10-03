@@ -9,7 +9,11 @@ use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
 use super::cg_color_space::{
     kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB, CGColorSpaceHostObject, CGColorSpaceRef,
 };
-use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
+use super::cg_context::{
+    kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten, kCGBlendModeMultiply,
+    kCGBlendModeNormal, kCGBlendModeScreen, CGBlendMode, CGContextHostObject, CGContextRef,
+    CGContextSubclass,
+};
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
     kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
@@ -93,8 +97,10 @@ pub fn CGBitmapContextCreate(
         // TODO: is this the correct default?
         rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
         font: Ptr::null(),
-        font_size: 17.0,
+        font_size: 14.0,
         transform: CGAffineTransformIdentity,
+        blend_mode: kCGBlendModeNormal,
+        text_transform: None,
         state_stack: Vec::new(),
     };
     let isa = env
@@ -221,35 +227,77 @@ fn get_pixels<'a>(data: &CGBitmapContextData, mem: &'a mut Mem) -> &'a mut [u8] 
     mem.bytes_at_mut(data.data.cast(), pixel_data_size)
 }
 
-fn blend_alpha(bg: f32, fg: f32) -> f32 {
-    // Alpha is blended the same way in
-    // premultiplied and straight representation.
-    fg + bg * (1.0 - fg)
-}
-
-/// Blends two RGBA non gamma-encoded values, with straight alpha.
-fn blend_straight(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+/// Blends two RGBA non gamma-encoded values, with straight alpha,
+/// using a blend mode.
+fn blend_straight(
+    bg: (f32, f32, f32, f32),
+    fg: (f32, f32, f32, f32),
+    blend_mode: CGBlendMode,
+) -> (f32, f32, f32, f32) {
+    assert_eq!(blend_mode, kCGBlendModeNormal); // TODO
     if fg.3 == 0.0 {
         // If fg.3 == 0.0 we attempt to blend fully transparent color.
         bg
     } else {
-        let new_a = blend_alpha(bg.3, fg.3); // Can't be 0 if fg.3 != 0
+        let neg_fg_a = 1.0 - fg.3;
+        let new_a = fg.3 + bg.3 * neg_fg_a; // Can't be 0 if fg.3 != 0
         (
-            (fg.0 * fg.3 + bg.0 * bg.3 * (1.0 - fg.3)) / new_a,
-            (fg.1 * fg.3 + bg.1 * bg.3 * (1.0 - fg.3)) / new_a,
-            (fg.2 * fg.3 + bg.2 * bg.3 * (1.0 - fg.3)) / new_a,
+            (fg.0 * fg.3 + bg.0 * bg.3 * neg_fg_a) / new_a,
+            (fg.1 * fg.3 + bg.1 * bg.3 * neg_fg_a) / new_a,
+            (fg.2 * fg.3 + bg.2 * bg.3 * neg_fg_a) / new_a,
             new_a,
         )
     }
 }
 
-/// Blends two RGBA non gamma-encoded values, with premultiplied alpha.
-fn blend_premultiplied(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+/// Blends two RGBA non gamma-encoded values, with premultiplied alpha,
+/// using a blend mode.
+/// See [Blending](https://www.w3.org/TR/compositing-1/#blending) for details.
+fn blend_premultiplied(
+    bg: (f32, f32, f32, f32),
+    fg: (f32, f32, f32, f32),
+    blend_mode: CGBlendMode,
+) -> (f32, f32, f32, f32) {
+    if blend_mode == kCGBlendModeCopy {
+        return fg;
+    }
+    // [同步上游 0.3.0 2026-10-03] Normal 模式下前景完全不透明时结果就是前景本身,直接返回。
+    // 上游 afe9c1fb 把 Normal 改成 fg*(1-bg.a) + bg.a*fg + bg*(1-fg.a) 的通用合成式,fg.a == 1 时数学上
+    // 仍等于 fg,但 f32 下 fg*(1-a)+a*fg 并不总严格等于 fg(背景 alpha 256 种 × 前景 256 种里约 9081 组
+    // 差 1 ulp,gamma 编码门槛附近会差 1 级)。短路后数学等价,也让 put_opaque_srgb_pixel(F10-10 不透明
+    // 快速路径)与本慢路径重新逐字节一致。
+    if blend_mode == kCGBlendModeNormal && fg.3 == 1.0 {
+        return fg;
+    }
+    // Blend
+    let blend_res = match blend_mode {
+        kCGBlendModeNormal => (bg.3 * fg.0, bg.3 * fg.1, bg.3 * fg.2),
+        kCGBlendModeMultiply => (bg.0 * fg.0, bg.1 * fg.1, bg.2 * fg.2),
+        kCGBlendModeScreen => (
+            fg.3 * bg.0 + bg.3 * fg.0 - bg.0 * fg.0,
+            fg.3 * bg.1 + bg.3 * fg.1 - bg.1 * fg.1,
+            fg.3 * bg.2 + bg.3 * fg.2 - bg.2 * fg.2,
+        ),
+        kCGBlendModeDarken => (
+            (fg.3 * bg.0).min(bg.3 * fg.0),
+            (fg.3 * bg.1).min(bg.3 * fg.1),
+            (fg.3 * bg.2).min(bg.3 * fg.2),
+        ),
+        kCGBlendModeLighten => (
+            (fg.3 * bg.0).max(bg.3 * fg.0),
+            (fg.3 * bg.1).max(bg.3 * fg.1),
+            (fg.3 * bg.2).max(bg.3 * fg.2),
+        ),
+        _ => unimplemented!("blend mode {}", blend_mode),
+    };
+    // Compose
+    let neg_bg_a = 1.0 - bg.3;
+    let neg_fg_a = 1.0 - fg.3;
     (
-        fg.0 + bg.0 * (1.0 - fg.3),
-        fg.1 + bg.1 * (1.0 - fg.3),
-        fg.2 + bg.2 * (1.0 - fg.3),
-        blend_alpha(bg.3, fg.3),
+        fg.0 * neg_bg_a + blend_res.0 + bg.0 * neg_fg_a,
+        fg.1 * neg_bg_a + blend_res.1 + bg.1 * neg_fg_a,
+        fg.2 * neg_bg_a + blend_res.2 + bg.2 * neg_fg_a,
+        fg.3 + bg.3 * neg_fg_a,
     )
 }
 
@@ -412,6 +460,7 @@ fn put_pixel(
     coords: (i32, i32),
     pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend: bool,
+    blend_mode: CGBlendMode,
 ) {
     let (x, y) = coords;
     if x < 0 || y < 0 {
@@ -436,12 +485,20 @@ fn put_pixel(
     // gamma encoding.
     let (r, g, b, a) = if blend {
         match data.alpha_info {
-            kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel),
+            kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel, blend_mode),
             kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
-                blend_premultiplied(bg_pixel, pixel)
+                blend_premultiplied(bg_pixel, pixel, blend_mode)
             }
-            kCGImageAlphaOnly => (pixel.0, pixel.1, pixel.2, blend_alpha(bg_pixel.3, pixel.3)),
-            _ => pixel,
+            kCGImageAlphaOnly => (
+                pixel.0,
+                pixel.1,
+                pixel.2,
+                pixel.3 + bg_pixel.3 * (1.0 - pixel.3),
+            ),
+            _ => {
+                assert_eq!(blend_mode, kCGBlendModeNormal); // TODO
+                pixel
+            }
         }
     } else {
         pixel
@@ -470,7 +527,9 @@ fn put_pixel(
 ///
 /// 证明:fg.3 == 255.0 / 255.0 == 1.0;背景分量来自 decode 查表或 `byte / 255.0`,都是有限非负数,
 /// 乘 0.0 得 +0.0。
-/// - 预乘:fg.c + bg.c * (1.0 - 1.0) == fg.c + 0.0 == fg.c;alpha = 1.0 + bg.3 * 0.0 == 1.0。
+/// - 预乘:[同步上游 0.3.0 2026-10-03] 上游已把 Normal 改成 fg*(1-bg.a) + bg.a*fg + bg*(1-fg.a),
+///   f32 下不再严格等于 fg;blend_premultiplied 开头对「Normal 且 fg.3 == 1.0」短路直接返回 fg
+///   (alpha 也是 1.0),所以结论不变。快速路径只在 blend_mode == Normal 时走(见调用处)。
 /// - 直通:(fg.c * 1.0 + bg.c * bg.3 * 0.0) / 1.0 == fg.c;new_a == 1.0。
 /// - AlphaOnly:alpha = blend_alpha(bg.3, 1.0) == 1.0;其余格式(None/NoneSkipFirst/NoneSkipLast)原样取 fg。
 ///
@@ -519,6 +578,7 @@ fn put_opaque_srgb_pixel(
 pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    blend_mode: CGBlendMode,
     transform: CGAffineTransform,
     pixels: &'a mut [u8],
 }
@@ -532,6 +592,7 @@ impl CGBitmapContextDrawer<'_> {
             subclass: CGContextSubclass::CGBitmapContext(bitmap_info),
             rgb_fill_color,
             transform,
+            blend_mode,
             ..
         } = objc.borrow(context);
 
@@ -540,6 +601,7 @@ impl CGBitmapContextDrawer<'_> {
         CGBitmapContextDrawer {
             bitmap_info,
             rgb_fill_color,
+            blend_mode,
             transform,
             pixels,
         }
@@ -577,7 +639,14 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
-        put_pixel(&self.bitmap_info, self.pixels, coords, color, blend)
+        put_pixel(
+            &self.bitmap_info,
+            self.pixels,
+            coords,
+            color,
+            blend,
+            self.blend_mode,
+        )
     }
 
     /// [扫描修 2026-09-15] F10-10:不透明 sRGB 源像素快速写入(等价于 blend = true 的 put_pixel),
@@ -653,6 +722,7 @@ fn test_iter_transformed_pixels() {
                 alpha_info: 0,
             },
             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+            blend_mode: kCGBlendModeNormal,
             transform,
             pixels: &mut [],
         }
@@ -793,7 +863,11 @@ pub(super) fn draw_image(
         {
             let base = texel_y_usize * image_width_usize * 4 + texel_x_usize * 4;
             let [r, g, b, a]: [u8; 4] = image_pixels[base..base + 4].try_into().unwrap();
-            if a == 255 {
+            // [同步上游 0.3.0 2026-10-02] 上游新增了混合模式(CGContextSetBlendMode:Multiply/Screen/
+            // Darken/Lighten/Copy,put_pixel 按上下文的 blend_mode 混合)。快速路径的「结果与背景无关」
+            // 证明只对 Normal 成立(例如 Multiply 下不透明源像素的结果是 源×背景),所以非 Normal 模式
+            // 一律走 put_pixel,保持与上游逐字节一致;Normal(默认)下行为与合并前完全相同。
+            if a == 255 && drawer.blend_mode == kCGBlendModeNormal {
                 drawer.put_opaque_srgb_pixel((x, y), [r, g, b]);
             } else {
                 let color = (

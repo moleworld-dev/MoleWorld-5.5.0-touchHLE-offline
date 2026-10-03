@@ -14,9 +14,11 @@ use super::{
     id, ivar_list_t, method_list_t, nil, objc_object, AnyHostObject, HostIMP, HostObject, ObjC,
     IMP, SEL,
 };
+use crate::libc::string::strdup;
 use crate::mach_o::MachO;
 use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead};
 use crate::Environment;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 // [MoleWorld P1] FxHashMap for the per-class methods/ivars tables (hit on every msgSend).
 use rustc_hash::FxHashMap;
@@ -129,6 +131,17 @@ struct category_t {
     _property_list: ConstVoidPtr, // property list (TODO)
 }
 unsafe impl SafeRead for category_t {}
+
+#[repr(C, packed)]
+pub struct objc_property {
+    // TODO: define fields?
+    _pad: u8,
+}
+unsafe impl SafeRead for objc_property {}
+
+/// An opaque type that represents an Objective-C declared property.
+#[allow(non_camel_case_types)]
+type objc_property_t = MutPtr<objc_property>;
 
 /// A template for a class defined with [objc_classes].
 ///
@@ -450,10 +463,11 @@ fn substitute_classes(
     // don't support yet. This isn't "ad blocking" because ads no longer work
     // on real devices anyway :)
     if !(name.starts_with("AdMob")
+        || name.starts_with("AdWhirl")
         || name.starts_with("AltAds")
-        || name.starts_with("Mobclix")
         || name.starts_with("FB") // Facebook
         || name.starts_with("Flurry")
+        || name.starts_with("Mobclix")
         || name.starts_with("OpenFeint")
         || name.starts_with("Tapjoy")
         // TalkingData Game Analytics: TDGAKeyChain reads unbound
@@ -566,6 +580,11 @@ fn substitute_classes(
 }
 
 impl ObjC {
+    /// Iterator over all known classes and their names.
+    pub fn all_classes(&self) -> impl Iterator<Item = (&String, &Class)> {
+        self.classes.iter()
+    }
+
     fn get_class(&self, name: &str, is_metaclass: bool, mem: &Mem) -> Option<Class> {
         let class = self.classes.get(name).copied()?;
         Some(if is_metaclass {
@@ -1071,6 +1090,25 @@ impl ObjC {
             None
         }
     }
+
+    pub fn is_unimplemented_class(&self, class: Class) -> bool {
+        if class == nil {
+            return false;
+        }
+        let host_object = self.get_host_object(class).unwrap();
+        matches!(
+            host_object.as_any().downcast_ref(),
+            Some(UnimplementedClass { .. })
+        )
+    }
+
+    pub fn is_fake_class(&self, class: Class) -> bool {
+        if class == nil {
+            return false;
+        }
+        let host_object = self.get_host_object(class).unwrap();
+        matches!(host_object.as_any().downcast_ref(), Some(FakeClass { .. }))
+    }
 }
 
 pub(super) fn objc_getClass(env: &mut Environment, name: ConstPtr<u8>) -> id {
@@ -1093,5 +1131,139 @@ pub(super) fn class_getInstanceSize(env: &mut Environment, cls: Class) -> GuestU
         0
     } else {
         env.objc.borrow::<ClassHostObject>(cls).instance_size
+    }
+}
+
+pub(super) fn class_getProperty(
+    env: &mut Environment,
+    cls: Class,
+    name: ConstPtr<u8>,
+) -> objc_property_t {
+    if cls == nil {
+        return Ptr::null();
+    }
+    let c_name = env.mem.cstr_at_utf8(name).unwrap();
+    let class_name_string = env.objc.get_class_name(cls).to_owned();
+    if class_name_string == "UIScreen" && c_name == "scale" {
+        // Even if [UIScreen scale] is implemented, we're not yet having a
+        // proper support for `objc_property_t`, so we prefer to return a NULL
+        // here (e.g. property is not declared).
+        // Some games (such as Mirror's Edge) check for those to conditionally
+        // apply some parameters depending on the iOS version without actually
+        // using the property.
+        // We also prefer to not define this as a game-specific hack, because
+        // some other EA games may rely on the same logic.
+        // TODO: support `objc_property_t` properly
+        log!("TODO: class_getProperty(UIScreen, scale) -> NULL");
+        return Ptr::null();
+    }
+    todo!()
+}
+
+pub(super) fn class_replaceMethod(
+    env: &mut Environment,
+    cls: Class,
+    name: SEL,
+    imp: IMP,
+    types: ConstPtr<u8>,
+) -> IMP {
+    // [同步上游 0.3.0 2026-10-03] 摩尔庄园专用防护。上游把 class_replaceMethod 从空操作桩做成了
+    // 真实现,但没有容错。本游戏唯一能走到它的是 NewRelic 的插桩辅助函数 0x76a4c8
+    // (-[iMoleVillageAppDelegate applicationDidFinishLaunching:]@0xef6e → startWithApplicationToken:
+    // → initializeInstrumentation@0x762834 → +[NRNSURLSupport instrumentNSURLConnection]@0x774458):
+    // 它的 types 来自本引擎仍是空操作桩的 method_getTypeEncoding,恒为 NULL(strdup 读 0 地址崩);
+    // 要替换的 NSURLConnection initWithRequest:delegate: 又是宿主方法(下面的 assert 崩)。目前只因
+    // systemVersion 报 "2.0"、NewRelic 自己跳过 iOS 5 以下设备才没触发。防护后:cls 不是真类、
+    // types 为空却要新增方法、或要替换宿主实现时,一律不改动,打一行日志并返回 NULL(与分叉点的
+    // 空操作桩行为一致)。
+    if cls == nil
+        || env
+            .objc
+            .get_host_object(cls)
+            .is_none_or(|host| host.as_any().downcast_ref::<ClassHostObject>().is_none())
+    {
+        log!(
+            "class_replaceMethod: {:?} 不是已实现的类(nil/未实现/伪造类),忽略对 {} 的替换",
+            cls,
+            name.as_str(&env.mem)
+        );
+        return IMP::guest_null();
+    }
+    let types_copy = if types.is_null() {
+        None
+    } else {
+        // TODO: avoid unnecessary copy of types
+        Some(strdup(env, types).cast_const())
+    };
+    let &mut ClassHostObject {
+        ref mut methods,
+        ref mut guest_method_signatures,
+        ..
+    } = env.objc.borrow_mut(cls);
+    if let Entry::Vacant(e) = methods.entry(name) {
+        let Some(types_copy) = types_copy else {
+            log!(
+                "class_replaceMethod: 新增方法 {} 却没有类型编码(types 为 NULL),忽略",
+                name.as_str(&env.mem)
+            );
+            return IMP::guest_null();
+        };
+        // TODO: use `class_addMethod` once implemented
+        log_dbg!(
+            "class_replaceMethod: adding new implementation {:?} for method {}",
+            imp,
+            name.as_str(&env.mem)
+        );
+        e.insert(imp);
+        guest_method_signatures.insert(name, types_copy);
+        return IMP::guest_null();
+    }
+    // TODO: use `method_setImplementation` once implemented
+    // Note: encoding types are ignored
+    if !matches!(methods.get(&name), Some(IMP::Guest(_))) {
+        // [同步上游 0.3.0 2026-10-03] 宿主实现没法作为 guest 函数指针交还调用方,
+        // 也不能被 guest 代码覆盖(上游这里 assert 崩溃):保留宿主实现不替换。
+        log!(
+            "class_replaceMethod: {} 现有实现是宿主方法,不替换,返回 NULL",
+            name.as_str(&env.mem)
+        );
+        if let Some(types_copy) = types_copy {
+            env.mem.free(types_copy.cast().cast_mut());
+        }
+        return IMP::guest_null();
+    }
+    if let Some(types_copy) = types_copy {
+        env.mem.free(types_copy.cast().cast_mut());
+    }
+    let existing = methods.insert(name, imp.clone()).unwrap();
+    log_dbg!(
+        "class_replaceMethod: existing {:?} replaced with {:?} for method {}",
+        existing,
+        imp,
+        name.as_str(&env.mem)
+    );
+    existing
+}
+
+pub(super) fn class_getMethodImplementation(env: &mut Environment, cls: Class, name: SEL) -> IMP {
+    if cls == nil {
+        return IMP::guest_null();
+    }
+    let mut class = cls;
+    loop {
+        let &ClassHostObject {
+            superclass: next,
+            ref methods,
+            ..
+        } = env.objc.borrow(class);
+        if methods.contains_key(&name) {
+            let method = methods.get(&name).unwrap().clone();
+            assert!(matches!(method, IMP::Guest(_))); // TODO
+            return method;
+        } else if next == nil {
+            // TODO: currently this returns NULL for unimplemented host methods
+            return IMP::guest_null();
+        }
+        class = next;
     }
 }

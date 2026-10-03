@@ -9,7 +9,7 @@
 
 #include "GUITestsCGFontGlyphTestsView.h"
 
-#define NUM_TESTS 5
+#define NUM_TESTS 8
 
 #define BITMAP_WIDTH 280
 #define BITMAP_HEIGHT 160
@@ -360,6 +360,150 @@ NSUInteger fontTestNum;
   NSLog([NSString
       stringWithUTF8String:
           "CGFont/CGGlyph test5: 8 rotated CGContextShowGlyphsAtPoint runs"]);
+
+  [self presentContext:context];
+}
+
+// Test 6: explicit CGContextSetTextMatrix. Hand-rolls an upright and a
+// Y-mirrored text matrix to make sure CGContextShowGlyphsAtPoint honours
+// both.
+- (void)test6 {
+  CGContextRef context = [self makeContext];
+  CGContextSetFont(context, [self testFont]);
+  CGContextSetFontSize(context, 1.0); // overridden by CGContextSetTextMatrix
+
+  // CGGlyph glyphs[] = {[self glyphForChar:'L']};
+  CGGlyph glyphs[] = {[self glyphForChar:'M'], [self glyphForChar:'i'],
+                      [self glyphForChar:'r'], [self glyphForChar:'r'],
+                      [self glyphForChar:'o'], [self glyphForChar:'r']};
+  size_t count = sizeof(glyphs) / sizeof(glyphs[0]);
+
+  CGAffineTransform upright =
+      CGAffineTransformMake(32.0, 0.0, 0.0, 32.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, upright);
+  CGContextShowGlyphsAtPoint(context, 10.0, 100.0, glyphs, count);
+
+  CGAffineTransform mirrored =
+      CGAffineTransformMake(32.0, 0.0, 0.0, -32.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, mirrored);
+  CGContextShowGlyphsAtPoint(context, 10.0, 30.0, glyphs, count);
+
+  summaryLabel.text = [NSString
+      stringWithUTF8String:"test6: upright then Y-mirrored \"Mirror\""];
+  paramsLabel1.text = [NSString
+      stringWithUTF8String:"upright matrix: a=32 b=0 c=0 d=32 tx=0 ty=0"];
+  paramsLabel2.text = [NSString
+      stringWithUTF8String:"mirrored matrix: a=32 b=0 c=0 d=-32 tx=0 ty=0"];
+  paramsLabel3.text = [self describeGlyphs:glyphs count:count];
+
+  NSLog([NSString
+      stringWithUTF8String:"CGFont/CGGlyph test6: CGContextSetTextMatrix "
+                           "upright vs Y-mirrored"]);
+
+  [self presentContext:context];
+}
+
+// Test 7: rotation + scale via CGContextSetTextMatrix. Bakes a growing scale
+// and a step rotation into the text matrix (a=s*cos b=s*sin c=-s*sin d=s*cos),
+// leaving the CTM untouched, so CGContextShowGlyphsAtPoint must honour both
+// the text matrix's rotation and scale to fan "tXy" around the bitmap centre
+// at increasing size.
+- (void)test7 {
+  CGContextRef context = [self makeContext];
+  CGContextSetFont(context, [self testFont]);
+  CGContextSetFontSize(context, 1.0); // overridden by CGContextSetTextMatrix
+
+  CGGlyph glyphs[] = {[self glyphForChar:'t'], [self glyphForChar:'X'],
+                      [self glyphForChar:'y']};
+  size_t count = sizeof(glyphs) / sizeof(glyphs[0]);
+
+  CGFloat cx = (CGFloat)BITMAP_WIDTH / 2.0;
+  CGFloat cy = (CGFloat)BITMAP_HEIGHT / 2.0;
+  CGFloat baseScale = 6.0;
+  CGFloat scaleStep = 2.0;
+  CGFloat radius = 30.0;
+  int steps = 8;
+  for (int i = 0; i < steps; i++) {
+    CGFloat angle = (CGFloat)i * (CGFloat)(2.0 * M_PI) / (CGFloat)steps;
+    CGFloat c = (CGFloat)cos(angle);
+    CGFloat s = (CGFloat)sin(angle);
+    CGFloat scale = baseScale + scaleStep * (CGFloat)i;
+    CGAffineTransform rotated = CGAffineTransformMake(
+        scale * c, scale * s, -scale * s, scale * c, 0.0, 0.0);
+    CGContextSetTextMatrix(context, rotated);
+    CGContextShowGlyphsAtPoint(context, cx + radius * c, cy + radius * s,
+                               glyphs, count);
+  }
+
+  summaryLabel.text = [NSString
+      stringWithUTF8String:
+          "test7: \"tXy\" rotated+scaled via CGContextSetTextMatrix, 8 steps"];
+  paramsLabel1.text =
+      [NSString stringWithUTF8String:
+                    "text matrix: a=s*cos b=s*sin c=-s*sin d=s*cos, s=6+2*i"];
+  paramsLabel2.text = [self describeGlyphs:glyphs count:count];
+  paramsLabel3.text = [NSString
+      stringWithUTF8String:"centre=(BITMAP_WIDTH/2, BITMAP_HEIGHT/2), r=30"];
+
+  NSLog([NSString
+      stringWithUTF8String:"CGFont/CGGlyph test7: 8 CGContextSetTextMatrix "
+                           "rotation+scale passes"]);
+
+  [self presentContext:context];
+}
+
+// Test 8: squashed / distorted text via CGContextSetTextMatrix. Drives the
+// text matrix with non-uniform x/y scales and a shear to confirm
+// CGContextShowGlyphsAtPoint honours arbitrary 2x2 components, not just
+// uniform scale + rotation. Four passes: wide, tall, sheared (italic-like),
+// and combined shear+non-uniform-scale.
+- (void)test8 {
+  CGContextRef context = [self makeContext];
+  CGContextSetFont(context, [self testFont]);
+  CGContextSetFontSize(context, 1.0); // overridden by CGContextSetTextMatrix
+
+  CGGlyph glyphs[] = {[self glyphForChar:'S'], [self glyphForChar:'q'],
+                      [self glyphForChar:'u'], [self glyphForChar:'a'],
+                      [self glyphForChar:'s'], [self glyphForChar:'h']};
+  size_t count = sizeof(glyphs) / sizeof(glyphs[0]);
+
+  // Wide: sx=48 sy=16, glyphs stretched horizontally.
+  CGAffineTransform wide =
+      CGAffineTransformMake(48.0, 0.0, 0.0, 16.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, wide);
+  CGContextShowGlyphsAtPoint(context, 10.0, 30.0, glyphs, count);
+
+  // Tall: sx=12 sy=40, glyphs squashed horizontally / stretched vertically.
+  CGAffineTransform tall =
+      CGAffineTransformMake(12.0, 0.0, 0.0, 40.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, tall);
+  CGContextShowGlyphsAtPoint(context, 10.0, 70.0, glyphs, count);
+
+  // Sheared (italic-like): sx=24 sy=24 with c=12 (x sheared by y).
+  CGAffineTransform sheared =
+      CGAffineTransformMake(24.0, 0.0, 12.0, 24.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, sheared);
+  CGContextShowGlyphsAtPoint(context, 10.0, 120.0, glyphs, count);
+
+  // Combined: non-uniform scale plus shear in both axes.
+  CGAffineTransform skewed =
+      CGAffineTransformMake(32.0, 6.0, 10.0, 20.0, 0.0, 0.0);
+  CGContextSetTextMatrix(context, skewed);
+  CGContextShowGlyphsAtPoint(context, 80.0, 80.0, glyphs, count);
+
+  summaryLabel.text = [NSString
+      stringWithUTF8String:
+          "test8: \"Squash\" wide/tall/shear/skew via CGContextSetTextMatrix"];
+  paramsLabel1.text =
+      [NSString stringWithUTF8String:
+                    "wide a=48 d=16; tall a=12 d=40; sheared a=24 c=12 d=24"];
+  paramsLabel2.text =
+      [NSString stringWithUTF8String:"skewed a=32 b=6 c=10 d=20"];
+  paramsLabel3.text = [self describeGlyphs:glyphs count:count];
+
+  NSLog([NSString
+      stringWithUTF8String:
+          "CGFont/CGGlyph test8: 4 CGContextSetTextMatrix distortion passes"]);
 
   [self presentContext:context];
 }

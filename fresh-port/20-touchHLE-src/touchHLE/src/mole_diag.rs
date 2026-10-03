@@ -285,7 +285,7 @@ pub enum Inject {
     /// (frameworks/uikit.rs → ui_application::suspend_app),只是挂起的结束条件换成计时到点,
     /// 用来在桌面上无头验证 guest 侧的切后台流程。
     Suspend(f32),
-    /// [2026-09-16] A1-04 文本开发命令(dev / quest / time / give / island / 带页名的 menu,以及认不出的命令):
+    /// [2026-09-16] A1-04 文本开发命令(dev / quest / time / give / island / workers / 带页名的 menu,以及认不出的命令):
     /// 整行原样交给 frameworks/uikit.rs,在菜单点击同一上下文里调 mole_dev::run_text_command,
     /// 结果写一行 `[DEVCMD] ok|err`,脚本 grep 这一行判断成败,不再按菜单格子坐标点。
     Dev(String),
@@ -313,6 +313,10 @@ static INJECT_QUEUE: Mutex<std::collections::VecDeque<Inject>> =
 ///   `give <物品ID>`                                            — 物品放到当前地图
 ///   `island ff <分钟>`                                         — [2026-09-24 第四轮 K4 I4-05] 岛档计时快进(主村离线执行,
 ///                                                                先自动存快照,把盘上岛档的计时往回拨,下次进岛生效;岛上执行回 err)
+///   `workers recalc [force] [n]`                               — [2026-09-25 第五轮遗留 WK99] 主村工人/房间重算预览(不写盘;
+///                                                                n = 额外摩尔数,只在存档要改时用)
+///   `workers recalc apply [force] [n]`                         — 执行重算(先自动存快照,再按原版路径写回并 saveUserInfoData)
+///   `workers set <总摩尔> <房间>`                              — 测试专用:直接设值造旧版 99 档
 ///   `menu <页名>`                                              — 暂不支持,回 err(不带参数的 menu 照旧开关)
 /// 命令文件见 input_paths():用户数据目录下的 mole_input 优先,兼容 /tmp/mole_input;只认第一条非空行。
 /// 开关见 dev_input_enabled()。

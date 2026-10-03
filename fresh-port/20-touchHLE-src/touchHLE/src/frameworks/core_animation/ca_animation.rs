@@ -149,8 +149,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTimingFunction:(id)timingFunction { // CAMediaTimingFunction*
     log_dbg!("[(CAAnimation*){:?} setTimingFunction:{:?}]", this, timingFunction);
-    env.objc.borrow_mut::<CAAnimationHostObject>(this).timing_function = timingFunction;
+    // [同步上游 0.3.0 2026-10-03] 先 retain 新值、再 release 旧值。上游只 retain 新值不
+    // release 旧值:init 设的 Default 在提交事务换成 EaseInOut 时就漏掉了一份。这多出的一份
+    // 过去恰好抵消了 CATransaction 对 Default 的多余 release;两边现已一并修正
+    // (见 ca_transaction.rs Transaction::new/commit),每个动画块对 Default 的净计数回到 0。
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<CAAnimationHostObject>(this).timing_function,
+        timingFunction,
+    );
     retain(env, timingFunction);
+    release(env, old);
 }
 - (id)timingFunction {
     env.objc.borrow::<CAAnimationHostObject>(this).timing_function

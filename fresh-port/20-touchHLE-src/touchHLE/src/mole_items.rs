@@ -95,10 +95,21 @@ fn restore_regs(env: &mut Environment, saved: [u32; 4]) {
 // 本地日期(游戏时区 + 开发者时间旅行偏移)
 // ============================================================================
 
-/// 当前"本地墙钟秒"(unix 秒 + 本地时区偏移)。时区规则与引擎一致(默认 Asia/Shanghai,MOLE_TZ=host 跟随宿主),
-/// 并加上 mole_dev 时间旅行偏移,保证节日窗口/登录日界与游戏内看到的时间一致。
+/// 当前"本地钟面秒"(unix 秒 + 本地时区偏移)。时区规则与引擎一致(默认 Asia/Shanghai,MOLE_TZ=host 跟随宿主),
+/// 并含 mole_dev 时间旅行偏移,保证节日窗口/登录日界与游戏内看到的时间一致。
+/// [2026-09-25 第五轮遗留 MISC-4] 取时由墙钟(host_now_unix_secs + time_offset_secs)改为 crate::mole_cheats::now_cf_secs():
+/// 与离线 -[NewSceneTimer getCurrentServerTime] 臂、mole_activity 的 local_date/now_cf_u32 同一单调时钟(正常运行时等于墙钟,
+/// 进程内宿主时间回拨时不倒退)。根因:F2-07 统一节日日历后,mole_activity 的 festival_today(废品站高价回收、春节烟花)与这里的
+/// festival_active_mask(节日商店)查的是同一张表,两边必须同一天;只改那边会在回拨跨节日边界时错开一天。
+/// now_cf_secs 已含时间旅行偏移,不能再加 time_offset_secs。进村连续登录 on_enter_village 在进程内回拨时不再走「回拨保持原记录」
+/// 那一支(日界不倒退);跨重启单调时钟从墙钟重新起算,那一支照旧兜底。
 fn local_wall_secs() -> i64 {
-    let unix = crate::libc::time::host_now_unix_secs() + crate::libc::time::time_offset_secs();
+    let cf = crate::mole_cheats::now_cf_secs();
+    let unix = if cf.is_finite() {
+        cf.floor() as i64 + 978_307_200
+    } else {
+        crate::libc::time::host_now_unix_secs() + crate::libc::time::time_offset_secs()
+    };
     unix + crate::libc::time::local_utc_offset_at(unix) as i64
 }
 
@@ -1353,6 +1364,8 @@ fn vip_progress(old_level: i32, value: i32, thresholds: &[i32]) -> (i32, i32) {
 /// ③ 等级/下一级门槛由 vip_progress 按 vip_thresholds()(移植者自拟,非原版数据)算出;
 /// ④ 用 vip_apply 按 parseVipInfo 的顺序调三个原版 setter(setter 自己 CryptUtils 加密),不置 VIP_BUSY,
 ///    让 vip_hook 自然记账并原子落盘;万一没记上(比如本地 VIP 对象还没建),直接写侧档,下次读 VIP 时由 vip_hook 注入。
+/// [2026-09-25 第五轮遗留 V] 1084 回包还有「分发」那一半(主村 0x239f6 / 岛 0x23e7c4:HUD VIP 徽章、VIP 成就、贝壳树重排),
+///    由 on_shells_purchased 末尾照原版入口补发 getVipInfo(mole_activity::request_vip_info)、运行循环受理点执行。
 /// [补完 2026-09-15] 待补项(有意省略,不是原版不弹):parseVipInfo 的首充大礼包。
 /// 原版进村 -[GameManager startGame:]+0xb38(0x19ca0)每次都发 getVipInfo,没充过值的玩家也会先收到一次 VIP 信息,
 /// 本地旧 next 不为 0;第一次真充值后 parseVipInfo 在 0x1c0e34-0x1c0e48 判定「旧等级 [sp+4]=0、旧 VIP 值 [sp+8]=0、
@@ -1360,6 +1373,8 @@ fn vip_progress(old_level: i32, value: i32, thresholds: &[i32]) -> (i32, i32) {
 /// 再 [FirstChargeGiftsLayer layerWithRewards:[wm firstChargeGiftsArray]] showWithTarget:NetworkManager selector:nil。
 /// 所以原版每个玩家第一次充值都会弹首充礼包(-[WrapperManager initFirstChargeGifts]@0x262d58:702×2000、704×10、22022、22023);
 /// 移植版第一次假购买只发贝壳、升 VIP1,没有礼包。
+/// [2026-09-25 第五轮遗留 V] 离线现在也会在进村时补发 getVipInfo,但只补回包的分发臂、不写三值(不走 parseVipInfo),
+/// 旧 next 仍为 0,首充礼包判定照旧不成立。
 /// 暂不复刻的原因(都没法无头验证):① -[FirstChargeGiftsLayer showWithTarget:selector:]@0x3803cc 会取 currentUiLayer 的
 /// tag 6、tag 5 子层(0x380444/0x38048e getChildByTag:)调 performSelector:detach;这里还在商店购买按钮回调的调用栈上,
 /// 若商店正挂在这两个 tag 上,当场拆掉可能留下悬空对象(原版是异步回包触发,不在按钮栈上);
@@ -1441,6 +1456,7 @@ fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option
 /// pack = shell_pack(item_id) 查到的档位(含标价),非充值参数(如 itemid 8 免费贝壳格)为 None。
 /// 先补充值解锁物(F2-1),再做 VIP 累计升级——与原版 onPurchaseSuccessful 先本地发贝壳/解锁、
 /// VIP 三值要等服务器回包(parseVipInfo)才写入的先后一致。
+/// [2026-09-25 第五轮遗留 V] 最后照原版 0x117dcc 补发一次 getVipInfo(只排 1084 回包分发,见 mole_activity::request_vip_info)。
 pub fn on_shells_purchased(
     env: &mut Environment,
     item_id: u32,
@@ -1454,6 +1470,12 @@ pub fn on_shells_purchased(
     recharge_unlock_side_effects(env);
     vip_accumulate(env, item_id, shells, pack);
     restore_regs(env, saved);
+    // [2026-09-25 第五轮遗留 V] 原版 -[InAppPurchaseManager onPurchaseSuccessful] 在 0x117da8 发 1083
+    //   (sendCostMoneyInfoToServerWithUserId:andNumber:)之后,紧接 0x117dcc `[nm getVipInfo]`
+    //   (-[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:] 0x7f284 也发一次)。1084 回包写三值那一半已由上面 vip_accumulate
+    //   替代,这里补分发那一半(HUD VIP 徽章、VIP 成就、贝壳树重排):纯原子置排队标志,不发消息、不碰寄存器、不在 side() 锁内,
+    //   由运行循环受理点 mole_activity::vip_info_poll 在本轮末尾执行。
+    crate::mole_activity::request_vip_info(env, "假充值后补发 getVipInfo(原版 0x117dcc / 0x7f284)");
 }
 
 /// [扫描修 2026-09-15] F2-1 充值解锁物:补上原版「活动期充值」应有的副作用(由 on_shells_purchased 调用)。

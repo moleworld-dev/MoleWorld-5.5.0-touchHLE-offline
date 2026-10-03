@@ -10,7 +10,7 @@ use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::objc::{
     autorelease, id, nil, objc_classes, release, ClassExports, HostObject, NSZonePtr,
 };
-use crate::{msg, msg_class};
+use crate::{msg, msg_class, todo_objc_setter};
 
 type NSURLRequestCachePolicy = NSUInteger;
 const NSURLRequestUseProtocolCachePolicy: NSURLRequestCachePolicy = 0;
@@ -109,6 +109,40 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+- (id)initWithURL:(id)url {
+    if url == nil {
+        return nil;
+    }
+    let url_desc: id = msg![env; url description];
+        log_dbg!(
+        "[(NSURLRequest *){:?} initWithURL:{}]",
+        this,
+        to_rust_string(env, url_desc)
+    );
+
+    // Preserving old behaviour
+    // [同步上游 0.3.0 2026-10-02] 上游新加的单参 initWithURL: 照搬了「离线一律返回 nil」;
+    // 我方在三参版本里已放行本地 file:// URL(HelpLayer 读包内 mole_help.html,否则帮助页空白),
+    // 这里同样放行,两条初始化路径口径一致。
+    let is_file_url: bool = msg![env; url isFileURL];
+    if !env.options.network_access && !is_file_url {
+        log_dbg!(
+            "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{}] -> nil",
+            this,
+            to_rust_string(env, url_desc)
+        );
+        release(env, this);
+        return nil;
+    }
+
+    let url_copy = msg![env; url copy];
+    env.objc.borrow_mut::<NSURLRequestHostObject>(this).url = url_copy;
+    env.objc.borrow_mut::<NSURLRequestHostObject>(this).cache_policy = NSURLRequestUseProtocolCachePolicy;
+    env.objc.borrow_mut::<NSURLRequestHostObject>(this).timeout_interval = 60.0;
+
+    this
+}
+
 - (id)URL {
     env.objc.borrow::<NSURLRequestHostObject>(this).url
 }
@@ -135,6 +169,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 @implementation NSMutableURLRequest: NSURLRequest
+
+- (())setCachePolicy:(NSURLRequestCachePolicy)cache_policy {
+    todo_objc_setter!(this, cache_policy);
+}
 
 - (())setHTTPMethod:(id)http_method { // NSString *
     let http_method_copy = msg![env; http_method copy];
@@ -184,8 +222,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 // setup doesn't crash.
 - (())setTimeoutInterval:(f64)_interval {
 }
-- (())setCachePolicy:(u32)_policy {
-}
+// [同步上游 0.3.0 2026-10-02] setCachePolicy: 原也在这里(空操作);上游 9c66f746 在本类开头加了
+// 带类型的同名桩(todo_objc_setter!,只打一行 TODO 日志、不崩),合并后只保留上游那份,避免重复定义。
 - (())setHTTPShouldHandleCookies:(bool)_v {
 }
 - (())setHTTPShouldUsePipelining:(bool)_v {

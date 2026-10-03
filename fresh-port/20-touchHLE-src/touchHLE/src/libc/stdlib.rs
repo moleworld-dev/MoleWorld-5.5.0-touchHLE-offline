@@ -15,6 +15,7 @@ use crate::libc::wchar::wchar_t;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::{impl_GuestRet_for_large_struct, Environment};
 use std::str::FromStr;
+use std::time::SystemTime;
 
 pub mod qsort;
 
@@ -23,6 +24,7 @@ pub struct State {
     rand: u32,
     random: u32,
     arc4random: u32,
+    fcvt_buf: Option<MutPtr<u8>>,
 }
 
 // Sizes of zero are implementation-defined. macOS will happily give you back
@@ -195,9 +197,27 @@ const RAND_MAX: i32 = i32::MAX;
 fn srand(env: &mut Environment, seed: u32) {
     env.libc_state.stdlib.rand = seed;
 }
+
+// BSD's rand() seed function — we just use host system time,
+// good enough for games that want fresh "fake" randomness each run.
+fn sranddev(env: &mut Environment) {
+    let time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let seed = (time ^ (time >> 32)) as u32;
+    env.libc_state.stdlib.rand = seed;
+}
+
 fn rand(env: &mut Environment) -> i32 {
     env.libc_state.stdlib.rand = prng(env.libc_state.stdlib.rand);
     (env.libc_state.stdlib.rand as i32) & RAND_MAX
+}
+fn rand_r(env: &mut Environment, seed_ptr: MutPtr<u32>) -> i32 {
+    let mut seed = env.mem.read(seed_ptr);
+    seed = prng(seed);
+    env.mem.write(seed_ptr, seed);
+    (seed as i32) & RAND_MAX
 }
 
 // BSD's "better" random number generator, with an implementation that is not
@@ -384,6 +404,35 @@ pub fn strtoul(
         }
     }
 }
+fn wcstoul(
+    env: &mut Environment,
+    nptr: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> u32 {
+    // TODO: support other locales
+    let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
+    assert_eq!(env.mem.read(ctype_locale), b'C');
+
+    let w_string = env.mem.wcstr_at(nptr);
+    assert!(w_string.is_ascii()); // TODO
+
+    assert!(endptr.is_null()); // TODO
+
+    let c_string = env.mem.alloc_and_write_cstr(w_string.as_bytes());
+    // TODO: use str_to_int_inner_generic() instead
+    let res = strtoul(env, c_string.cast_const(), Ptr::null(), base);
+    env.mem.free(c_string.cast());
+    log_dbg!(
+        "wcstoul({:?} ({:?}), {:?}, {}) => {}",
+        nptr,
+        w_string,
+        endptr,
+        base,
+        res
+    );
+    res
+}
 
 fn strtoull(
     env: &mut Environment,
@@ -439,6 +488,36 @@ fn strtol(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, 
             0
         }
     }
+}
+
+fn wcstol(
+    env: &mut Environment,
+    nptr: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> i32 {
+    // TODO: support other locales
+    let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
+    assert_eq!(env.mem.read(ctype_locale), b'C');
+
+    let w_string = env.mem.wcstr_at(nptr);
+    assert!(w_string.is_ascii()); // TODO
+
+    assert!(endptr.is_null()); // TODO
+
+    let c_string = env.mem.alloc_and_write_cstr(w_string.as_bytes());
+    // TODO: use str_to_int_inner_generic() instead
+    let (res, _) = strtol_inner(env, c_string.cast_const(), base as u32).unwrap();
+    env.mem.free(c_string.cast());
+    log_dbg!(
+        "wcstol({:?} ({:?}), {:?}, {}) -> {}",
+        nptr,
+        w_string,
+        endptr,
+        base,
+        res
+    );
+    res
 }
 
 fn realpath(
@@ -530,6 +609,52 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     todo!()
 }
 
+fn fcvt(
+    env: &mut Environment,
+    value: f64,
+    ndigit: i32,
+    decpt: MutPtr<i32>,
+    sign: MutPtr<i32>,
+) -> MutPtr<u8> {
+    log_dbg!("fcvt({}, {}, {:?}, {:?})", value, ndigit, decpt, sign);
+    assert!(ndigit > 0);
+    let fcvt_buf = *env.libc_state.stdlib.fcvt_buf.get_or_insert_with(|| {
+        // TODO: 64 is arbitrary chosen
+        env.mem.alloc(64).cast()
+    });
+    env.mem
+        .write(sign, if value.is_sign_negative() { 1 } else { 0 });
+    if value == 0.0 {
+        let ndigit_size = ndigit as GuestUSize;
+        assert!(ndigit_size < 64); // TODO
+        env.mem.write(decpt, 0);
+        env.mem.bytes_at_mut(fcvt_buf, ndigit_size).fill(b'0');
+        env.mem.write(fcvt_buf + ndigit_size, b'\0');
+        return fcvt_buf;
+    }
+
+    let mut formatted = format!("{:.1$}", value.abs(), ndigit as usize);
+    assert!(formatted.contains('.'));
+    assert!(formatted.len() < 64); // TODO
+
+    let dot_idx = formatted.find('.').unwrap();
+    formatted.remove(dot_idx);
+
+    let leading_zeros_trimmed = formatted.trim_start_matches('0');
+    let leading_zeros_idx = formatted.len() - leading_zeros_trimmed.len();
+
+    env.mem
+        .write(decpt, dot_idx as i32 - leading_zeros_idx as i32);
+
+    let len = leading_zeros_trimmed.len().try_into().unwrap();
+    env.mem
+        .bytes_at_mut(fcvt_buf, len)
+        .copy_from_slice(leading_zeros_trimmed.as_bytes());
+    env.mem.write(fcvt_buf + len, b'\0');
+
+    fcvt_buf
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(malloc(_)),
     export_c_func!(malloc_size(_)),
@@ -543,7 +668,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(atof(_)),
     export_c_func!(strtod(_, _)),
     export_c_func!(srand(_)),
+    export_c_func!(sranddev()),
     export_c_func!(rand()),
+    export_c_func!(rand_r(_)),
     export_c_func!(srandom(_)),
     export_c_func!(random()),
     export_c_func!(arc4random()),
@@ -555,13 +682,16 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(bsearch(_, _, _, _, _)),
     export_c_func!(strtof(_, _)),
     export_c_func!(strtoul(_, _, _)),
+    export_c_func!(wcstoul(_, _, _)),
     export_c_func!(strtoull(_, _, _)),
     export_c_func!(strtol(_, _, _)),
+    export_c_func!(wcstol(_, _, _)),
     export_c_func!(realpath(_, _)),
     export_c_func_aliased!("realpath$DARWIN_EXTSN", realpath(_, _)),
     export_c_func!(mbstowcs(_, _, _)),
     export_c_func!(wcstombs(_, _, _)),
     export_c_func!(system(_)),
+    export_c_func!(fcvt(_, _, _, _)),
 ];
 
 /// A simple wrapper around [atof_inner_generic] for the case of C string.
@@ -695,7 +825,7 @@ where
 
 /// A simple wrapper around [str_to_int_inner_generic]
 /// for the case of C string and i32.
-fn strtol_inner(env: &mut Environment, str: ConstPtr<u8>, base: u32) -> Result<(i32, u32), ()> {
+pub fn strtol_inner(env: &mut Environment, str: ConstPtr<u8>, base: u32) -> Result<(i32, u32), ()> {
     str_to_int_inner_generic(
         env,
         |env, s, idx| Ok(env.mem.read(s + idx)),

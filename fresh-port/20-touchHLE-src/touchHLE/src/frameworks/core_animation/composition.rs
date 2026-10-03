@@ -22,7 +22,7 @@ use crate::gles::GLES; // constants only
 use crate::image::Image;
 use crate::matrix::Matrix;
 use crate::mem::SafeWrite;
-use crate::objc::{id, msg, msg_class, nil, ObjC};
+use crate::objc::{id, msg, msg_class, nil, release, ObjC};
 use crate::Environment;
 use std::time::{Duration, Instant};
 
@@ -424,7 +424,15 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     std::mem::drop(gles);
     window.swap_window();
 
+    // [同步上游 0.3.0 2026-10-03] 动画委托回调外包一个自动释放池。UIView 旧式动画改走
+    // 上游 CATransaction 实现后,这里第一次真正回调 animationDidStart:/animationDidStop:finished:
+    // (中转委托 _touchHLE_UIView_AnimationDelegate 会 numberWithBool:,游戏回调如 MBProgressHUD
+    // animationFinished:finished:context: → done 也会 autorelease)。本函数由 NSRunLoop 直接调用,
+    // 外面没有池,不包的话这些对象都落进 main() 最外层永不排空的池,每次 HUD 隐藏都漏一点。
+    // 写法与 ui_application.rs 等处宿主回调一致。
+    let pool: id = msg_class![env; NSAutoreleasePool new];
     animation_state.update_started_and_finished_animations(env);
+    release(env, pool);
 
     new_recomposite_next
 }
@@ -707,6 +715,7 @@ const INDICES_PER_9PATCH: usize = SQUARE_INDICES.len() * 3 * 3;
 
 fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_9PATCH] {
     let mut out_points = [0.0; FLOATS_PER_9PATCH];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (i, out_points_chunk) in out_points
         .chunks_exact_mut(BASIC_SQUARE_POINTS.len())
         .enumerate()
@@ -728,6 +737,7 @@ fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_
 
 fn make_9patch_indices() -> [u8; INDICES_PER_9PATCH] {
     let mut out_indices = [0; SQUARE_INDICES.len() * 3 * 3];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (i, out_indices_chunk) in out_indices
         .chunks_exact_mut(SQUARE_INDICES.len())
         .enumerate()
