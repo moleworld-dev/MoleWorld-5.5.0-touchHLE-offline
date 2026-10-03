@@ -487,12 +487,14 @@ pub fn run_run_loop(
             }
         }
 
-        // [2026-09-25 第五轮遗留 V] VIP 信息 1084 回包分发受理点(见 mole_activity::vip_info_poll):离线时 getVipInfo 只置排队标志,
-        // 这里照原版两条分发臂执行(HUD VIP 徽章、VIP 成就判定、贝壳树重排)。只在主线程;没排队时只有一次原子读。
+        // [2026-09-25 第五轮遗留 V] VIP 信息 1084 回包分发受理点:离线时 getVipInfo 只置排队标志,
+        // 这里照原版两条分发臂执行(HUD VIP 徽章、VIP 成就判定、贝壳树重排)。只在主线程;没排队时只有几次原子读。
         // 放在即时落盘之前:岛上 VIP 成就解锁发奖(saveAchieveUnlockData: → showRewards: → addGoldInNewScene:/addXpInNewScene:)
         // 排的即时落盘在同一轮写掉。
-        if is_main_run_loop && crate::mole_activity::vip_info_pending() {
-            crate::mole_activity::vip_info_poll(env);
+        // [2026-10-03] 扩成离线活动的统一受理点(见 mole_activity::run_loop_poll):回环截包应答与喂包、离线进村补发、
+        // 岛日常/岛折扣、1084 分发都在这里做,原调用栈(常在 drawScene / CCScheduler 帧栈上)只置标志。
+        if is_main_run_loop && crate::mole_activity::run_loop_pending() {
+            crate::mole_activity::run_loop_poll(env);
         }
 
         // [2026-09-25 第五轮遗留 FLUSH] 黄金岛「关键操作即时落盘」受理点:本轮触摸(handle_events)、定时器(CADisplayLink →
