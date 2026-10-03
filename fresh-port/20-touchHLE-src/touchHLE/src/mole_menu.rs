@@ -153,6 +153,8 @@ pub enum DevTool {
     /// [2026-09-25 第五轮遗留 WK99] 按存档重算主村工人/房间(额外摩尔数 = 寄存器,只在存档确实要改时才用),主村离线执行,
     /// 有改动时二次确认(mole_dev::recalc_workers)。
     RecalcWorkers,
+    /// [2026-10-03] 按经验值重算主村等级(修旧版「等级=N」写进存档的假等级),主村离线执行,有改动时二次确认(mole_dev::recalc_level)。
+    RecalcLevel,
 }
 
 /// [扫描修 2026-09-15] 隐藏物品页的按钮种类(F1-1 / F1-5 / F4-1)。
@@ -562,6 +564,9 @@ fn pages() -> Vec<Page> {
                 // [2026-09-25 第五轮遗留 WK99] 追加在末尾 = 第 38 个(下标 37,第 10 行第 2 格,设计坐标 x 267..506、y 487..527,
                 //   4:3 注入 tap 507 637),RowFirst(4) 仍是 10 行,前面所有按钮坐标不动;「开发者 / 调试」页没动,layout_selfcheck 不受影响。
                 ("重算工人/房间", Dev(D::RecalcWorkers)),
+                // [2026-10-03] 追加在末尾 = 第 39 个(下标 38,第 10 行第 3 格,设计坐标 x 506..745、y 487..527,4:3 注入 tap 507 399),
+                //   仍是 10 行,前面所有按钮坐标不动。
+                ("按经验值重算等级", Dev(D::RecalcLevel)),
             ],
         },
         // 6 [扫描修 2026-09-15] F1-1/F1-5/F4-1 隐藏物品:进商店开关、节日商店模式、目录浏览(放到地图 / 入仓库)。
@@ -2305,6 +2310,7 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
             format!("按存档重算工人/房间(寄存器 {})", reg),
             dev::recalc_workers(env, reg, false),
         ),
+        DevTool::RecalcLevel => ("按经验值重算等级".to_string(), dev::recalc_level(env)),
     };
     match result {
         Ok(text) => {
@@ -2360,8 +2366,8 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
             };
             (format!("{}: {}", label, if on { "开" } else { "关" }), c)
         }
-        // 不可回退的动作用警示色。
-        DevTool::TimeTravelHours(_) | DevTool::SnapshotRestore => {
+        // 不可回退的动作用警示色。[2026-10-03] 按经验值重算等级会写主档,同样用警示色。
+        DevTool::TimeTravelHours(_) | DevTool::SnapshotRestore | DevTool::RecalcLevel => {
             (label.to_string(), color(env, 0.6, 0.25, 0.2, 1.0))
         }
         // [2026-09-25 第五轮遗留 WK99] 会写主档,用警示色;标签带寄存器值(额外摩尔数,只在存档要改时用)。
@@ -2463,6 +2469,18 @@ fn dev_confirm(env: &mut Environment, action: Action) -> Option<(u32, String)> {
                 _ => None,
             }
         }
+        // [2026-10-03] 同上:只有要改动时才二次确认,提示带预览;确认码 = 2.1e9 + 计划摘要(落在 [2.1e9, 2.2e9),
+        //   与重算工人/房间的 [2e9, 2.1e9) 不冲突)。
+        Action::Dev(DevTool::RecalcLevel) => match crate::mole_dev::plan_level_recalc(env) {
+            Ok(p) if p.changes() => Some((
+                2_100_000_000 + p.digest(),
+                format!(
+                    "⚠️ 按经验值重算:{}。以前领过的升级奖励、买过的物品都保留;会先自动存快照再写主档,再点一次「按经验值重算等级」确认",
+                    p.describe()
+                ),
+            )),
+            _ => None,
+        },
         _ => None,
     }
 }

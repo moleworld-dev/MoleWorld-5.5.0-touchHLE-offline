@@ -530,7 +530,7 @@ fn main_map_loading(env: &mut Environment) -> bool {
 /// 仓库摆放(模式 7,rooms_ 可能暂时少一座房)、好友礼物(模式 9)等。
 fn main_village_offline_gate(env: &mut Environment, what: &str) -> Result<(), String> {
     if env.options.network_access {
-        return Err(format!("在线模式下工人/房间以服务器为准,不能{}", what));
+        return Err(format!("在线模式下存档以服务器为准,不能{}", what));
     }
     if crate::mole_cheats::island_session_active() {
         return Err(format!("黄金岛上不能{}(只改主村),请回主村再用", what));
@@ -1018,6 +1018,178 @@ pub fn set_workers_raw(env: &mut Environment, total: i64, rooms: i64) -> DevResu
     Ok(format!(
         "已直接设值并存档(测试用):总摩尔 {}→{}(空闲同为 {}),房间 {}→{}",
         t_old, t, t, r_old, r
+    ))
+}
+
+// ───────────────────────── [2026-10-03] 按经验值重算等级 ─────────────────────────
+
+/// UserInfoData.curLevel_(i,编译期 +16)的 _OBJC_IVAR 槽。存的是 +[CryptUtils encryptInt:]@0x124b28 的密文(XOR 0x01011011),
+/// getter -[UserInfoData curLevel]@0xbaffc 读槽后 decryptInt: 解密;读档 -[UserInfoData initWithCoder:] 0xb9c50..0xb9c82 是
+/// decodeIntForKey:@"curLevel" → encryptInt: → setNewCurLevel:(纯赋值 0xbc184)。
+const UI_CUR_LEVEL_SLOT: u32 = 0xb03ff8;
+const UI_CUR_LEVEL_OFF: u32 = 16;
+const CUR_LEVEL_XOR: u32 = 0x0101_1011;
+
+/// 按经验值重算等级的计划(只读算出,recalc_level 才写)。
+pub struct LevelRecalcPlan {
+    /// 存档里的真实等级(密文 ivar 解出,不受「等级=N」覆盖)。
+    pub level_old: i32,
+    pub xp: i32,
+    /// 按原版 checkUpgrade 口径从经验值推出的等级。
+    pub level_new: i32,
+    /// 等级表级数(114_0.dat,5.5.0 为 52)。
+    pub max_level: i32,
+    /// level_new 这一级的门槛「level<N>」(经验值小于它才停在这一级);经验值超过整张表时为 None。
+    pub need_new: Option<u32>,
+}
+
+impl LevelRecalcPlan {
+    pub fn changes(&self) -> bool {
+        self.level_new != self.level_old
+    }
+
+    pub fn describe(&self) -> String {
+        let basis = match self.need_new {
+            Some(need) => format!(
+                "经验 {} 小于 level{} 门槛 {}",
+                self.xp, self.level_new, need
+            ),
+            None => format!("经验 {} 超过整张等级表(共 {} 级)", self.xp, self.max_level),
+        };
+        if self.changes() {
+            format!("等级 {}→{}({})", self.level_old, self.level_new, basis)
+        } else {
+            format!("等级 {}({})", self.level_old, basis)
+        }
+    }
+
+    /// 二次确认码用的摘要:两次点击之间等级或经验一变,确认码就不同,会重新提示。
+    pub fn digest(&self) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        for v in [self.level_old, self.xp, self.level_new] {
+            h = (h ^ (v as u32)).wrapping_mul(0x0100_0193);
+        }
+        h % 100_000_000
+    }
+}
+
+/// [2026-10-03] 用户拍板:旧版「等级=N」开着时,-[UserInfoData encodeWithCoder:] 读的是被覆盖的 curLevel,把强制等级写进了
+/// userinfo.dat(3ca5ece 起存档读真值,已不再写坏,但以前写进去的还在)。这里按经验值反推真实等级(只读,不写)。
+/// 口径照原版 -[UserInfoData checkUpgrade]@0xba754:从当前等级 L 起,取 [[GameData sharedInstance] upgradeXPs] 的
+/// 「level<L>」(0xba88a 格式串 "level%d",unsignedIntegerValue),经验值 ≥ 它就 L+1 继续(0xba8a6 cmp / bhs,无符号比较),
+/// 第一个经验值小于门槛的 L 就是该有的等级。这里从 1 级起算(假等级可能比真实的高,不能从当前等级往上找);
+/// 经验值超过整张表时取最高级(原版在 0xba852 越过表尾就不再升,满级玩家正好停在最高级)。
+pub fn plan_level_recalc(env: &mut Environment) -> Result<LevelRecalcPlan, String> {
+    main_village_offline_gate(env, "按经验值重算等级")?;
+    let ui = user_info_data(env);
+    let gd = singleton(env, "GameData", "sharedInstance");
+    if ui == nil || gd == nil {
+        return Err("主村存档对象还没准备好(userInfoData/GameData 为空)".to_string());
+    }
+    // 「等级=N」开着时 FORCE_LEVEL 臂对宿主发的 curLevel 也返回强制等级(只对 14 个存档/上传/比较调用点放行真值),
+    // 所以直接读密文 ivar,照原 getter 解密。
+    let off = ivar_offset(env, UI_CUR_LEVEL_SLOT, UI_CUR_LEVEL_OFF);
+    let level_ptr: ConstPtr<u32> = Ptr::from_bits(ui.to_bits().wrapping_add(off));
+    let raw: u32 = env.mem.read(level_ptr);
+    let level_old = (raw ^ CUR_LEVEL_XOR) as i32;
+    let s = sel(env, "xp");
+    let xp: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "upgradeXPs");
+    let table: id = msg_send(env, (gd, s));
+    if table == nil {
+        return Err("等级表 upgradeXPs 还没加载(GameData loadUpgradeXP 未执行)".to_string());
+    }
+    let s = sel(env, "count");
+    let count: u32 = msg_send(env, (table, s));
+    if count == 0 || count > 1000 {
+        return Err(format!("等级表 upgradeXPs 条数异常({})", count));
+    }
+    let s_ofk = sel(env, "objectForKey:");
+    let s_uiv = sel(env, "unsignedIntegerValue");
+    let mut level_new = count as i32;
+    let mut need_new = None;
+    for l in 1..=count {
+        let key =
+            crate::frameworks::foundation::ns_string::from_rust_string(env, format!("level{}", l));
+        let v: id = msg_send(env, (table, s_ofk, key));
+        release(env, key);
+        if v == nil {
+            return Err(format!("等级表缺 level{},不敢推算", l));
+        }
+        let need: u32 = msg_send(env, (v, s_uiv));
+        if (xp as u32) < need {
+            level_new = l as i32;
+            need_new = Some(need);
+            break;
+        }
+    }
+    Ok(LevelRecalcPlan {
+        level_old,
+        xp,
+        level_new,
+        max_level: count as i32,
+        need_new,
+    })
+}
+
+/// 按经验值重算等级并存主档(开发工具页「按经验值重算等级」第二次点击 / 文本命令 `level recalc apply`)。
+/// 往哪个方向改都直接写等级,不走 checkUpgrade:升上来的那段原版当初升级时已发过奖励(假等级是后来被覆盖写进去的),
+/// 再走一遍会重复发;降下去原版本来就没有降级路径。以前按假等级领过的升级奖励、买过的高等级物品都保留。
+/// 实测:假低等级其实到不了这里——原版每次启动 -[MainMenuScene init] 0xb37fc 都调一次 checkUpgrade,读档后就按经验值逐级升回
+/// (照原版发升级奖励);只有原版不会往下修的假高等级要靠本工具。
+pub fn recalc_level(env: &mut Environment) -> DevResult {
+    let p = plan_level_recalc(env)?;
+    if !p.changes() {
+        log!("[MOLEDEV] 按经验值重算等级:无需改动,{}", p.describe());
+        return Ok(format!(
+            "等级与经验值一致,无需重算(未改动存档):{}",
+            p.describe()
+        ));
+    }
+    let snap =
+        snapshot_save(env).map_err(|e| format!("重算前保存快照失败:{},为安全起见没有改动", e))?;
+    let ui = user_info_data(env);
+    if ui == nil {
+        return Err("主村 userInfoData 为空,没有改动".to_string());
+    }
+    // 与读档 initWithCoder: 0xb9c64..0xb9c82 同一写法:encryptInt: 后 setNewCurLevel:。
+    let cu = env.objc.get_known_class("CryptUtils", &mut env.mem);
+    if cu == nil {
+        return Err("找不到 CryptUtils 类,没有改动".to_string());
+    }
+    let s = sel(env, "encryptInt:");
+    let enc: i32 = msg_send(env, (cu, s, p.level_new));
+    let s = sel(env, "setNewCurLevel:");
+    let _: () = msg_send(env, (ui, s, enc));
+    let off = ivar_offset(env, UI_CUR_LEVEL_SLOT, UI_CUR_LEVEL_OFF);
+    let level_ptr: ConstPtr<u32> = Ptr::from_bits(ui.to_bits().wrapping_add(off));
+    let raw: u32 = env.mem.read(level_ptr);
+    let level_now = (raw ^ CUR_LEVEL_XOR) as i32;
+    if level_now != p.level_new {
+        return Err(format!(
+            "写入后读回的等级是 {}(应为 {}),没有存档;重启即恢复原值",
+            level_now, p.level_new
+        ));
+    }
+    game_data_call(env, "saveUserInfoData");
+    // 照原版 addXp: 0xbb12c..0xbb132 刷抬头(等级显示在经验条那一栏)。
+    let wm = singleton(env, "WrapperManager", "sharedManager");
+    if wm != nil {
+        let s = sel(env, "updateUserInfoView:");
+        let _: () = msg_send(env, (wm, s, 1i32));
+    }
+    log!("[MOLEDEV] 按经验值重算等级:{};重算前{}", p.describe(), snap);
+    let forced = crate::mole_cheats::level();
+    let force_note = if forced > 0 {
+        format!(";「等级={}」还开着,抬头仍显示 {} 级", forced, forced)
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "已按经验值重算并存档:{}(以前领过的升级奖励、买过的物品都保留){};重算前{}(可用「快照:下次启动恢复」回滚)",
+        p.describe(),
+        force_note,
+        snap
     ))
 }
 
@@ -2195,6 +2367,8 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 ///   workers recalc [force] [额外摩尔数]                → plan_worker_recalc 只预览,不写盘([2026-09-25 第五轮遗留 WK99])
 ///   workers recalc apply [force] [额外摩尔数]          → recalc_workers(= 菜单「重算工人/房间」第二次点击;先自动存快照)
 ///   workers set <总摩尔> <房间>                        → set_workers_raw(测试专用,造旧版 99 档)
+///   level recalc                                       → plan_level_recalc 只预览,不写盘([2026-10-03] 按经验值重算等级)
+///   level recalc apply                                 → recalc_level(= 菜单「按经验值重算等级」第二次点击;先自动存快照)
 /// 在线模式、场景、数值范围的拒绝都由这些函数自己给出,与菜单点按钮完全一致,这里不另加门。
 /// 刻意不开放时间旅行、快照恢复、删档:菜单上它们要二次确认,脚本一行就触发太危险。
 /// `menu <页名>`:按页名打开菜单要 mole_menu 提供翻页接口(当前页是它的私有状态),那不归本包,先明确报错;
@@ -2315,12 +2489,25 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             }
             _ => Err(WORKERS_USAGE.to_string()),
         },
+        // [2026-10-03] 按经验值重算等级。不带 apply 只预览;写入必须显式带 apply(= 菜单上的第二次确认)。
+        "level" => match args.as_slice() {
+            ["recalc"] => {
+                let p = plan_level_recalc(env)?;
+                Ok(if p.changes() {
+                    format!("预览(未写入):{}。写入用 level recalc apply", p.describe())
+                } else {
+                    format!("等级与经验值一致,无需重算:{}", p.describe())
+                })
+            }
+            ["recalc", "apply"] => recalc_level(env),
+            _ => Err("用法:level recalc(只预览) | level recalc apply".to_string()),
+        },
         "menu" => Err(format!(
             "暂不支持按页名打开菜单(「{}」):mole_menu 还没有翻页接口,请用不带参数的 menu 开关菜单",
             args.join(" ")
         )),
         _ => Err(format!(
-            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give / island / workers",
+            "无法识别的命令「{}」,支持 tap / drag / menu / suspend / dev / quest / story / time / give / island / workers / level",
             head
         )),
     }
