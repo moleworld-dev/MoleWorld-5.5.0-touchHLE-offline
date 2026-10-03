@@ -12135,7 +12135,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     }
     // [2026-09-16] G-07 建筑瞬完成补上 NewSceneShop(黄金岛商铺等)、Bridge、Ladder:三者都直接继承 Object、不是 Building 子类,
     //   各有自己的 getBuildTime:(0x31ecc8/0xd94a0/0xdfd28,与 Building 0xb07c0 同构:build_time × objectCount:type: 转浮点,返回 double)。
-    //   调用点只在各自的 initWithTile:sprite:size:data:(0x31cf74/0xd8668/0xdf0a0)里,所以已经放下的建筑要重进场景才生效。
+    //   调用点只在各自的 initWithTile:sprite:size:data:(0x31cf74/0xd8668/0xdf0a0)里。
+    //   [2026-09-25 第五轮遗留 WK99] 更正原句「已经放下的建筑要重进场景才生效」:只对开关打开后新放下的建筑生效。读档的
+    //   -[Building initWithMapData:type:] 在 0xae5d8..0xae60c 直接用 [ObjectData build_time](property 第 0 位为 1 时 ×0.5)
+    //   写 buildTime_,不经过 getBuildTime:(selref 全量 7 处:Building 两个 initWithTile:…、Bridge/Ladder/NewSceneShop 的
+    //   initWithTile:sprite:size:data:、CropInfoView 两个面板);NewSceneShop/Bridge/Ladder 的读档路径同样不调用它,
+    //   所以打开前已在建的建筑重进场景也照原版时长。菜单开关 toast 已照实说明(mole_menu::toggle_note)。
     //   CropInfoView getBuildTime: 是信息面板自己的方法,不在此列。粗筛走 intercept_wants 末尾的 INSTANT_BUILD 门控。
     if INSTANT_BUILD.load(O)
         && matches!(class, "Building" | "NewSceneShop" | "Bridge" | "Ladder")

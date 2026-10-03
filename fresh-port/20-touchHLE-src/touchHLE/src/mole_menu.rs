@@ -1117,17 +1117,11 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
             Action::ToggleCheat(key) => {
                 let on = crate::mole_cheats::is_on(key);
                 // [2026-09-16] G-10 离线切魔法密码开关时说明它只在联机时有意义,开关本身照常翻转。
-                let note = if key == "magic_bypass" && !env.options.network_access {
-                    "(仅联机有效:离线不会出现魔法密码框,私服回 1018 才出现)"
-                } else {
-                    ""
-                };
-                set_toast(format!(
-                    "「{}」已{}{}",
-                    label,
-                    if on { "开启" } else { "关闭" },
-                    note
-                ));
+                // [2026-09-25 第五轮遗留 WK99] 其余开关的副作用说明统一放进 toggle_note(只进 toast,标签与按钮数不变)。
+                let note = toggle_note(key, on, env.options.network_access);
+                let state = if on { "开启" } else { "关闭" };
+                log!("[MOLEMENU] 开关提示:「{}」已{}{}", label, state, note);
+                set_toast(format!("「{}」已{}{}", label, state, note));
             }
             // [复核修 2026-09-15] run_action 删完就直接退出进程,正常走不到这里;留着分支免得落到「已执行」。
             // [2026-09-16] X4-01 删档失败时 run_action 自己写了失败 toast,走上面的 action_wrote_toast 分支,也到不了这里。
@@ -2383,6 +2377,39 @@ fn reset_failure_toast(fail: &crate::save_reset::ResetFailure) -> String {
             problems,
             fail.not_restored.join("、")
         )
+    }
+}
+
+/// [2026-09-25 第五轮遗留 WK99] 作弊开关的副作用说明(遗留扫描 #12,只改文案不改行为):只写进开关 toast,标签长度、按钮数量
+/// 与菜单布局都不变(标签加长会溢出格子);toast 超宽时 add_toast 会自动折行。说明对应的实现:
+///   · 冷却归零 / 建筑瞬完成 × 探险船:修船/出海/冷却三段时长是 DiscoveryShip 的 ivar,只在两个 init 里调
+///     checkIsFixShipFinished/checkIsDiscoverFinished 时由 mole_cheats 改写(K13 I4-04),中途切换要离岛重进才跟着变;
+///     建筑小游戏与装饰产出(M-M3-2)在帧内前置钩子里当场生效。
+///   · 冷却归零 × 布兰的家:getOutCoolTime 在 OutputHanlder 判定处返回 1(第五轮遗留 F),开着时餐厅恒为可领态,
+///     走不到升级图标段,1~5 级要升级得先关开关。
+///   · 建筑瞬完成:getBuildTime: 的 selref 只在各类 initWithTile:sprite:size:data:(新放下)和 CropInfoView 面板里;
+///     读档的 -[Building initWithMapData:type:] 在 0xae5d8..0xae60c 直接用 [ObjectData build_time] 写 buildTime_,
+///     所以打开前已在建的建筑重进场景也照原版时长。
+///   · 工人补满:只在 MAXFAC_GATE_LRS 的人力门/抬头调用点返回 99(K13),空闲摩尔由 createIdleWorkers: 只在加载地图时
+///     按空闲数生成,中途打开要重进主村;锁 7(开地,0x7dac3)与锁 9(买摩尔,0x7d3bd)也读到 99;
+///     关掉后 -[UserInfoData addAvailableWorker:]@0xbb34c 只夹上限不夹下限,本局空闲数可能为负,读档 intiWithUserInfo:
+///     0xb96bc 复位。旧版写进存档的 99 由开发工具「重算工人/房间」还原(该工具在线时拒绝执行,所以在线不提它)。
+///   · [复核补] 在线模式:探险船那条臂要求 ON_ISLAND,而 ON_ISLAND 只在离线岛总闸块(intercept 里 `if ENABLE_NEWSCENE_ISLAND`,
+///     在线时被强制关闭)里置位,在线时探险船时长根本不受这两个开关影响,所以在线不提「离岛重进」;布兰的家与建筑小游戏/装饰
+///     那几条臂不看在线,照常提示。
+fn toggle_note(key: &str, on: bool, online: bool) -> &'static str {
+    match key {
+        "magic_bypass" if !online => "(仅联机有效:离线不会出现魔法密码框,私服回 1018 才出现)",
+        "no_cooldown" if on && online => "(开着时布兰的家一直是可领取状态,1~5 级要升级请先关掉;建筑小游戏与装饰产出当场生效;在线模式下黄金岛探险船不受影响)",
+        "no_cooldown" if on => "(黄金岛探险船的出海冷却要离岛重进才跟着变;开着时布兰的家一直是可领取状态,1~5 级要升级请先关掉;建筑小游戏与装饰产出当场生效)",
+        "no_cooldown" if !online => "(黄金岛探险船的出海冷却要离岛重进才恢复原时长)",
+        "instant_build" if on && online => "(只对打开后新放下的建筑生效,之前已在建的照原版时长,重进也一样;在线模式下黄金岛探险船不受影响)",
+        "instant_build" if on => "(只对打开后新放下的建筑生效,之前已在建的照原版时长,重进也一样;黄金岛探险船的修船、出海时长要离岛重进才跟着变)",
+        "instant_build" if !online => "(黄金岛探险船的修船、出海时长要离岛重进才恢复原时长)",
+        "max_facility" if on => "(只在人力门与抬头显示按 99 算,存档仍存真值;中途打开要重进主村或重启,空闲摩尔才补满;开着时开地上限按 99 算、买摩尔不受 110 上限,关掉后已开的地、已买的摩尔都保留)",
+        "max_facility" if !online => "(本局空闲工人可能暂时显示异常甚至为负,重启游戏复位;旧版写进存档的 99 到「开发工具」页用「重算工人/房间」还原)",
+        "max_facility" => "(本局空闲工人可能暂时显示异常甚至为负,重启游戏复位)",
+        _ => "",
     }
 }
 
