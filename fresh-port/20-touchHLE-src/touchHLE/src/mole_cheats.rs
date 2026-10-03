@@ -11770,10 +11770,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // All shop / collection items reported as unlocked.
     if ALL_UNLOCK.load(O) {
         match (class, sel) {
-            // 收藏册/音乐"已解锁"显示判定 + 头像所需 VIP 等级 → 满足(返回 YES=1)
-            ("WrapperManager", "isUnlockedItem:")
-            | ("MusicHallLayer", "checkIsUnlockMusic:")
-            | ("AvatarLayer", "checkRequiredVipLevel:") => {
+            // 充值/活动资格门 + 头像所需 VIP 等级 → 满足(返回 YES=1)。
+            // [2026-09-25 第五轮遗留 B] 注释更正:isUnlockedItem: 全二进制只有 0x7d812/0x7d85e 两处 selref,都在
+            //   -[GameData getLockType4Object:] 的锁 13 里(14974/16283 的充值解锁资格,不满足时商店弹 RECHARGE_TO_UNLOCK),
+            //   与收藏册显示无关;checkRequiredVipLevel: 是 -[AvatarLayer test] 0xfe180 头像网格的 VIP 门槛。两者都是门槛,照旧放开。
+            //   删掉 ("MusicHallLayer","checkIsUnlockMusic:"):它唯一的调用点 -[MusicHallLayer table:cellTouched:] 0x210de8 返回 1 时
+            //   0x210df0 直接走 stopPlayBKGMusic:musicId:(0x211794 setMusicIdByUserChoosing: 把所选曲子持久保存),购买分支
+            //   (0x210e2c getLockType4Decorate: 余额锁 3/4 → choosePlay: → onChooseUse → 0x211420 showCostGold:isVip: 扣款 →
+            //   0x211468 addOneMusicIntoUnlockedListWithMusicId: → 0x2114ce saveToLocal)整条被跳过,等于全部曲子白送。原版音乐只有
+            //   价格、没有任何门槛锁可放开;列表显示另走 getAllIdsOfUnlockedMusic(0x211ce0/0x211d9a/0x212306),不受影响。
+            //   去掉后音乐厅照原版付费解锁(购买与存盘都在本地,离线可用)。MusicHallLayer 仍留在 CLASSES 里,不改变消息路由。
+            ("WrapperManager", "isUnlockedItem:") | ("AvatarLayer", "checkRequiredVipLevel:") => {
                 env.cpu.regs_mut()[0] = 1;
                 return true;
             }
