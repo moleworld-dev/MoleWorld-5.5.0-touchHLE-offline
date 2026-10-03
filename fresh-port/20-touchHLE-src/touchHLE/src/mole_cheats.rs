@@ -6522,8 +6522,13 @@ fn build_default_island_mapdata(env: &mut Environment) -> bool {
     //   nextStoryId 离线唯一写点是 -[NewSceneStory nextStep](0x32f5c4):0x32f5fc 判「当前步==stepCount」整节播完才在 0x32f748
     //   setNextStoryId:(curSection+1),所以「nextStoryId<=1」精确等价于「开场第 1 节还没播完」;与原版服务器判据 ==0 等价(离线默认值是 1)。
     //   播完的老档 nextStoryId>=2,绝不重播、不回退进度;剧情本身不发奖,重播第 1 节无副作用,播完 setNextStoryId:2 自动关掉条件。
-    //   前置保留两条:① 主村 GameManager.gameMode ∉ {0,6}(对应 checkActiveStoryQuest 0x24674a/0x24675a 的 currentGameMode 0/6 门;
-    //   沿用原写法读主村 GameManager——NewGameManager.gameMode 已被上面的 seed 段写成 1,读它判不出什么);
+    //   前置保留两条:① 主村 GameManager.gameMode ∉ {0,6}——这正是原版置位点自身的门:parseMapDataWithPackageData:atIndex:
+    //   在 0x22bcd6-0x22bcfc 先判 [[WrapperManager sharedManager] currentGameMode] 不为 6(0x22bce0 beq)、不为 0(0x22bcfc cbz)才置位。
+    //   [2026-09-25 第五轮遗留 MISC-1] 核实:解析 1073 时仍在 LoadingHoliday 中,startNewSceneFrom:toScene: 已在 0x24152a 把 curSceneId
+    //   写成 2,-[WrapperManager currentGameMode]@0x261518 只在 curSceneId==10 时(0x26154a)读 NewGameManager,否则读主村 GameManager,
+    //   所以原版这道门读到的就是主村 gameMode;本函数同样运行在 LoadingHoliday 期间,读主村 GameManager 逐位等价。消费端
+    //   checkActiveStoryQuest 0x24674a/0x24675a 的同名门那时已在岛上(curSceneId=10),读的是 NewGameManager(seed 段/K7 夹取臂已定为 1),
+    //   恒放行,不是这里要对的门。主村为 6 时这次不播、下次进岛再播,与联网一致;去掉这条反而会比联网多播一次,不改;
     //   ② ISLAND_FILE_USERINFO 保护位未置:坏档改名隔离失败、原坏档仍在原路径时(本会话落盘被阻塞,玩家修好文件还能恢复旧进度)
     //   内存里是 init 默认进度,nextStoryId=1 不可信,不补,免得给老玩家重播。
     //   反之坏档改名隔离成功(原档已挪到 .corrupt、位已清)时,内存与之后落盘的都是默认进度(任务链也从第 1 条重来),
