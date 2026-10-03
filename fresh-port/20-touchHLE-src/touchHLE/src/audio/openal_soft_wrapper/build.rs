@@ -41,6 +41,10 @@ fn main() {
         build.out_dir(out_dir);
 
         build.define("LIBTYPE", "STATIC");
+        // [2026-10-03] CMake 4 去掉了对 cmake_minimum_required(VERSION < 3.5) 的兼容,openal-soft 的 CMakeLists.txt
+        // 会直接配置失败;同步上游 0.3.0 后本包版本号变化、构建目录重建时就会碰到。与 dynarmic_wrapper/build.rs 同法
+        // 指定最低策略版本,全新构建不再依赖外部传 CMAKE_POLICY_VERSION_MINIMUM 环境变量(旧版 CMake 忽略该变量,无副作用)。
+        build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
 
         // Don't build extras, we don't need them and they can encounter issues
         // when cross-compiling.
