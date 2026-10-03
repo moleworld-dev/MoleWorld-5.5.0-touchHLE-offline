@@ -150,6 +150,9 @@ pub enum DevTool {
     Trace,
     /// [2026-09-24 第四轮 K4 I4-05] 岛档计时快进:分钟 = 寄存器值,主村离线执行、下次进岛生效(mole_dev::island_fast_forward_minutes)。
     IslandFastForward,
+    /// [2026-09-25 第五轮遗留 WK99] 按存档重算主村工人/房间(额外摩尔数 = 寄存器,只在存档确实要改时才用),主村离线执行,
+    /// 有改动时二次确认(mole_dev::recalc_workers)。
+    RecalcWorkers,
 }
 
 /// [扫描修 2026-09-15] 隐藏物品页的按钮种类(F1-1 / F1-5 / F4-1)。
@@ -437,7 +440,10 @@ fn pages() -> Vec<Page> {
                 ("冷却归零(主村+黄金岛)", ToggleCheat("no_cooldown")),
                 ("建筑瞬完成(主村+黄金岛)", ToggleCheat("instant_build")),
                 // [2026-09-24 第四轮 K14 N-D2-4] 配合 K13(I3-4):max_facility 删掉 totalRooms 臂、工人 getter 改按调用点白名单返 99,
-                // 不再补房间,标签去掉「房间」。以前的旧逻辑已经经 encodeWithCoder: 写进 userinfo.dat 的 99 无法自动还原。开关键名不变。
+                // 不再补房间,标签去掉「房间」。开关键名不变。
+                // [2026-09-25 第五轮遗留 WK99] 旧逻辑经 encodeWithCoder: 写进 userinfo.dat 的 99 用「开发工具」页「重算工人/房间」还原:
+                //   居民房人口按原版 getWorkerCountByRoom 推出(扣中信银行),额外摩尔(买来的)无记录、由寄存器输入;房间只能还原到下界,
+                //   且只在总摩尔与房间同时 ≥ 99(旧版三项同写 99 的指纹)或少于现有房屋数时才改。
                 ("工人补满(仅主村)", ToggleCheat("max_facility")),
                 ("产出×10(收菜)", ToggleCheat("harvest_mult")),
                 ("任务秒完成免费(主村+黄金岛)", ToggleCheat("free_quest")),
@@ -549,8 +555,11 @@ fn pages() -> Vec<Page> {
                 ("时间旅行+24h(不可回退)", Dev(D::TimeTravelHours(24))),
                 ("存档快照:保存", Dev(D::SnapshotSave)),
                 ("快照:下次启动恢复", Dev(D::SnapshotRestore)),
-                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 11 行首格),不挪动前面任何按钮的坐标。
+                // [2026-09-24 第四轮 K4 I4-05] 追加在末尾(第 10 行首格),不挪动前面任何按钮的坐标。
                 ("岛档快进(分钟)", Dev(D::IslandFastForward)),
+                // [2026-09-25 第五轮遗留 WK99] 追加在末尾 = 第 38 个(下标 37,第 10 行第 2 格,设计坐标 x 267..506、y 487..527,
+                //   4:3 注入 tap 507 637),RowFirst(4) 仍是 10 行,前面所有按钮坐标不动;「开发者 / 调试」页没动,layout_selfcheck 不受影响。
+                ("重算工人/房间", Dev(D::RecalcWorkers)),
             ],
         },
         // 6 [扫描修 2026-09-15] F1-1/F1-5/F4-1 隐藏物品:进商店开关、节日商店模式、目录浏览(放到地图 / 入仓库)。
@@ -1082,11 +1091,13 @@ pub fn handle_touch(env: &mut Environment, gx: f32, gy: f32) -> bool {
                 return true;
             }
             PENDING_RESET.with(|c| c.set(false)); // 已确认,下面真删
-        } else if let Some((code, prompt)) = dev_confirm(action) {
+        } else if let Some((code, prompt)) = dev_confirm(env, action) {
             // [扫描修 2026-09-15] 开发工具里不可回退的动作(时间旅行、快照恢复)同样二次确认。
             if PENDING_DEV.with(|c| c.get()) != code {
                 PENDING_DEV.with(|c| c.set(code));
                 PENDING_RESET.with(|c| c.set(false));
+                // [2026-09-25 第五轮遗留 WK99] 只在首次提示时记一行(确认那一下 dev_confirm 也会再跑一遍,不在那里记,免得重复)。
+                log!("[MOLEMENU] 二次确认待定:{}", prompt);
                 set_toast(prompt);
                 rebuild(env);
                 return true;
@@ -2285,6 +2296,10 @@ fn run_dev_tool(env: &mut Environment, tool: DevTool) {
             format!("岛档快进 {} 分钟", reg),
             dev::island_fast_forward_minutes(env, reg),
         ),
+        DevTool::RecalcWorkers => (
+            format!("按存档重算工人/房间(寄存器 {})", reg),
+            dev::recalc_workers(env, reg, false),
+        ),
     };
     match result {
         Ok(text) => {
@@ -2344,6 +2359,11 @@ fn dev_display(env: &mut Environment, label: &str, tool: DevTool) -> (String, id
         DevTool::TimeTravelHours(_) | DevTool::SnapshotRestore => {
             (label.to_string(), color(env, 0.6, 0.25, 0.2, 1.0))
         }
+        // [2026-09-25 第五轮遗留 WK99] 会写主档,用警示色;标签带寄存器值(额外摩尔数,只在存档要改时用)。
+        DevTool::RecalcWorkers => (
+            format!("{} 额外#{}", label, reg),
+            color(env, 0.6, 0.25, 0.2, 1.0),
+        ),
         _ => (label.to_string(), color(env, 0.16, 0.45, 0.7, 1.0)),
     }
 }
@@ -2367,7 +2387,9 @@ fn reset_failure_toast(fail: &crate::save_reset::ResetFailure) -> String {
 }
 
 /// 需要二次确认的开发工具动作:返回(确认编码, 第一次点击时的提示)。编码非 0 且各动作互不相同。
-fn dev_confirm(action: Action) -> Option<(u32, String)> {
+/// [2026-09-25 第五轮遗留 WK99] 改为接收 env:「重算工人/房间」要先算一遍计划(发宿主消息)。唯一调用点是 handle_touch
+///   (frameworks/uikit.rs handle_events 的 UIKit 事件上下文),不在帧栈上,也不在钩子里。
+fn dev_confirm(env: &mut Environment, action: Action) -> Option<(u32, String)> {
     match action {
         // [2026-09-16] X4-02 确认文案补上活动中心的限制:旅行期间 mole_activity 侧档只写内存(F2-05),付费操作的扣款和发奖
         // 却照常写进主档,所以这些操作在旅行中被禁用(拦截在 mole_activity.rs);旅行中拍快照时,主档是旅行后的,
@@ -2387,6 +2409,22 @@ fn dev_confirm(action: Action) -> Option<(u32, String)> {
             1,
             "⚠️ 下次启动会用快照覆盖当时的存档,再点一次「快照:下次启动恢复」确认".to_string(),
         )),
+        // [2026-09-25 第五轮遗留 WK99] 只有要改动时才二次确认,提示带预览数字;无需改动或被拒(在线、岛上、不在主村、地图加载中、
+        //   有面板开着、寄存器越界)返回 None,直接走 run_dev_tool,由 recalc_workers 给出同一句文案。
+        //   确认码 = 2e9 + 计划摘要(落在 [2e9, 2.1e9),与 1、1000..=1_001_000 不冲突):两次点击之间数值一变就重新提示,
+        //   不会执行没预览过的数字。
+        Action::Dev(DevTool::RecalcWorkers) => {
+            match crate::mole_dev::plan_worker_recalc(env, crate::mole_dev::register_value(), false) {
+                Ok(p) if p.changes() => Some((
+                    2_000_000_000 + p.digest(),
+                    format!(
+                        "⚠️ 按存档重算:{}。会先自动存快照再写主档,再点一次「重算工人/房间」确认",
+                        p.describe()
+                    ),
+                )),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

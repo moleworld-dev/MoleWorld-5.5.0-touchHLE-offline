@@ -77,8 +77,9 @@ static INSTANT_CROP: AtomicBool = AtomicBool::new(false);
 static NO_WITHER: AtomicBool = AtomicBool::new(false);
 static NO_COOLDOWN: AtomicBool = AtomicBool::new(false);
 static INSTANT_BUILD: AtomicBool = AtomicBool::new(false);
-/// 主村工人/空闲工人/房间数 getter 恒返回 99(收菜建造不卡人力/容量)。
+/// 主村工人/空闲工人 getter 只在人力门与抬头显示调用点返回 99(MAXFAC_GATE_LRS,K13),收菜建造不卡人力;房间不再拦。
 /// [2026-09-16] G-07 只管主村 UserInfoData,岛上不做(见 intercept 里的说明)。
+/// [2026-09-25 第五轮遗留 WK99] 旧版(K13 前)写进 userinfo.dat 的 99 由开发工具「重算工人/房间」(mole_dev::recalc_workers)还原。
 static MAX_FACILITY: AtomicBool = AtomicBool::new(false);
 /// 收菜结算建筑加成倍率 getter 恒返回 1000(=10倍经验/金币,走原生管线无溢出)。
 static HARVEST_MULT: AtomicBool = AtomicBool::new(false);
@@ -11888,7 +11889,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   (0xb96a2 取 totalWorkers → 0xb96bc 写 availableWorkers_)会把空闲数重置成总数,存档里的负值下次启动也会复位。
     //   关掉开关后本局 HUD 可能短暂显示负数。
     //   totalRooms 臂删掉:selref 全量只有 3 处(intiWithUserInfo:/encodeWithCoder:/encodeUserInfoData),全是复制/编码路径,
-    //   没有一个游戏门,拦它零收益、纯污染存档。已被旧逻辑写成 99 的 userinfo.dat 无法自动还原(不知道真值)。
+    //   没有一个游戏门,拦它零收益、纯污染存档。
+    //   [2026-09-25 第五轮遗留 WK99] 已被旧逻辑写成 99 的 userinfo.dat 由开发工具「重算工人/房间」(mole_dev::recalc_workers)按原版
+    //   恒等式 totalWorkers = getWorkerCountByRoom − 已建成银行数 + 额外摩尔 还原:居民房人口精确推出,额外摩尔(买来的,香草最多 110 + 已建成银行数,
+    //   开过「全物品解锁」或本开关时可能更多)无记录、由寄存器输入;房间只能还原到下界。只在总摩尔与房间同时 ≥ 99(三项同写 99 的
+    //   指纹)或总摩尔少于居民房人口时才改,宿主读这些 getter 的返回地址不在下面白名单里,读到的是真值。
     //   纯改返回寄存器,不发消息;没命中白名单就往下走,最后放行真 getter。
     if MAX_FACILITY.load(O)
         && class == "UserInfoData"
