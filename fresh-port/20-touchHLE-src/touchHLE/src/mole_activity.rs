@@ -323,15 +323,16 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             && crate::mole_cheats::island_session_active()
             && env.cpu.regs()[2] == 10
         {
-            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
-            let perform = sel_named(env, "performSelector:withObject:afterDelay:");
-            let tick = sel_named(env, "moleActivityIslandDailyQuest");
-            let _: () = msg_send(env, (nm, perform, tick, nil, 0.0f64));
+            // [2026-10-03 第六波] 帧栈上只置原子标志(不再在这里发 performSelector:withObject:afterDelay:),
+            //   由运行循环受理点 vip_info_poll 开头的 island_deferred_poll 在当前调用栈整个返回之后构造(见 ISLAND_DAILY_PENDING)。
+            ISLAND_DAILY_PENDING.store(true, O);
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
         }
         if sel == "moleActivityIslandDailyQuest" {
             // NetworkManager 并不实现它,任何状态下都必须接住。
+            // [2026-10-03 第六波] 请求入口已改为置标志 + 运行循环受理(island_deferred_poll),本臂只为接住
+            //   旧写法排进运行循环、尚未执行的回调(同一会话内不会再新排),照旧按当时状态构造或放弃。
             if !env.options.network_access && crate::mole_cheats::island_session_active() {
                 island_daily_quest_apply(env);
             } else {
@@ -354,15 +355,15 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             && env.cpu.regs()[2] == 10
             && !discount_disabled()
         {
-            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
-            let perform = sel_named(env, "performSelector:withObject:afterDelay:");
-            let tick = sel_named(env, "moleActivityIslandDiscount");
-            let _: () = msg_send(env, (nm, perform, tick, nil, 0.0f64));
+            // [2026-10-03 第六波] 同上:帧栈上只置标志,运行循环受理(见 ISLAND_DISCOUNT_PENDING)。
+            ISLAND_DISCOUNT_PENDING.store(true, O);
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
         }
         if sel == "moleActivityIslandDiscount" {
             // NetworkManager 并不实现它,任何状态下都必须接住。
+            // [2026-10-03 第六波] 请求入口已改为置标志 + 运行循环受理(island_deferred_poll),本臂只为接住
+            //   旧写法排进运行循环、尚未执行的回调(同一会话内不会再新排),照旧按当时状态构造或放弃。
             if !env.options.network_access && crate::mole_cheats::island_session_active() {
                 island_discount_apply(env);
             } else {
@@ -3177,7 +3178,42 @@ pub fn vip_info_pending() -> bool {
 /// 时机上是同一轮运行循环末尾,原版是一次网络往返之后;分发臂开头都按 curSceneId 自己判场景,与当时谁是代理无关。
 /// perform 相位不建自动释放池,这里自建一个包住整次分发(updateUI4VIP 里的 stringWithFormat:/spriteFrameByName:、
 /// 成就解锁发奖链都会产生自动释放对象),当场 drain;原版 iOS 每轮运行循环都会 drain,两者等价。
+/// [2026-10-03 第六波] 黄金岛每日任务(E-03,参数 10 的 getDailyTaskListFromServerWithSceneId:)与岛限时折扣(K6,
+/// getDiscountObjectsListFormServerWithMapId:10)的「待受理」标志。两个请求在岛上的调用点都在 -[HolidayVillageLayer onEnter]
+/// (0x239484 / 0x23946a),跑在切场景的 drawScene 帧栈上;以前在那里直接发 performSelector:withObject:afterDelay:0 排回调,
+/// 等于在帧栈上发宿主消息(第五轮 V 复核指出)。现在帧栈上只置标志,由运行循环受理点(ns_run_loop 在 perform 相位之后调的
+/// vip_info_poll → island_deferred_poll)在当前调用栈整个返回之后执行,时机与原 afterDelay:0 等价。
+static ISLAND_DAILY_PENDING: AtomicBool = AtomicBool::new(false);
+static ISLAND_DISCOUNT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// [2026-10-03 第六波] 受理岛日常 / 岛折扣:先取走标志;不在岛上会话或已转在线时只记日志放弃(与原回调臂口径相同)。
+/// 受理点不在任何游戏方法体的栈上,可以自由发消息;构造过程包一层自动释放池(perform 相位本身没有池)。
+fn island_deferred_poll(env: &mut Environment) {
+    let daily = ISLAND_DAILY_PENDING.swap(false, O);
+    let discount = ISLAND_DISCOUNT_PENDING.swap(false, O);
+    if !daily && !discount {
+        return;
+    }
+    if env.options.network_access || !crate::mole_cheats::island_session_active() {
+        log!("[ACTIVITY] 黄金岛每日任务/折扣:受理时已不在岛上会话(或在线),放弃构造");
+        return;
+    }
+    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
+    let new_s = sel_named(env, "new");
+    let pool: id = msg_send(env, (pool_cls, new_s));
+    if daily {
+        island_daily_quest_apply(env);
+    }
+    if discount {
+        island_discount_apply(env);
+    }
+    let drain_s = sel_named(env, "drain");
+    let _: () = msg_send(env, (pool, drain_s));
+}
+
 pub fn vip_info_poll(env: &mut Environment) {
+    // [2026-10-03 第六波] 同一受理点顺带受理岛日常 / 岛折扣(不另改 ns_run_loop.rs 的受理位置)。
+    island_deferred_poll(env);
     if !VIP_INFO_PENDING.swap(false, O) {
         return;
     }
