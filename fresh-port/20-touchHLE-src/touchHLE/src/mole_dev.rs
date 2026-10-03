@@ -445,6 +445,123 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
 
 // ───────────────────────── 任务跳转 ─────────────────────────
 
+/// [2026-09-25 第五轮遗留 MISC-3] 读 [[SceneMannager sharedManager] curSceneId](+sharedManager @8@0:4、curSceneId i8@0:4);单例拿不到返回 -1。
+/// 必须走宿主 msg_send,不能直读 ivar +12:-[ActorManager changeAvailableMolerForTask:]@0x9d9f8 自己也是发消息读它
+/// (0x9da1c sharedManager、0x9da2c curSceneId,0x9da30 cmp #10),类级拦截不分宿主还是游戏发起,ON_ISLAND 时
+/// mole_cheats 的 ("SceneMannager","curSceneId") 臂把 2 强制成 10 也同样作用于两边,所以这里读到的就是归还时游戏将读到的值。
+fn island_scene_id(env: &mut Environment) -> i32 {
+    let sm = singleton(env, "SceneMannager", "sharedManager");
+    if sm == nil {
+        return -1;
+    }
+    let s = sel(env, "curSceneId");
+    msg_send(env, (sm, s))
+}
+
+/// [2026-09-25 第五轮遗留 MISC-3] 黄金岛任务跳转前,照原版 -[NewSceneQuest finish] 归还进行中打工任务(questType 7)占用的工人,
+/// 返回归还人数(没有要还的返回 0)。
+/// 根因:接取 -[NewSceneQuest accept]@0x3289b0 对打工类(0x328cce 判类型 7)在 0x3291ca rsb 取负、0x3291d8 发
+/// [ActorManager changeAvailableMolerForTask:-n] 扣人(带走 n 只摩尔),0x329206 起把开工时刻写进 curQuestResult;原版唯一的归还点是
+/// finish:0x32a130/0x32a144 先写哨兵 4294967295.0(0x32a298),0x32a156 checkQuestState,0x32a16a 判 questState==1,0x32a196 置 2,
+/// 0x32a1c2 判 [curQuestData questType]==7,0x32a1da-0x32a1fc 取 n=[[[curQuestData requireThings] objectAtIndex:0] intValue],
+/// 0x32a22c 发 changeAvailableMolerForTask:+n。开发工具的跳转走 -[NewSceneQuest quickStart:]@0x32b510:0x32b532 questState=0、
+/// 0x32b54a curQuestId=0、0x32b564 nextQuestId=N、0x32b584 curQuestResult=0.0(0x32b608),不归还;以前本会话空闲工人就一直少 n 个、
+/// 地图少 n 只摩尔,要等下次进岛 load_island_userinfo 从总数重算才恢复(quickStart 在 0x32b5b0 存的岛档也带着少掉的空闲数)。
+/// 判据照 -[NewSceneQuest minusNeededWorkers]@0x32ae58(进岛重扣时判「本会话给它扣过人」的原版口径):先 checkQuestState
+/// (@0x32b180:questState 为 2 保持,否则 = curQuestId>0),再 0x32aea2 curQuestResult≠哨兵(0x32af58)、0x32aeb2 questState==1、
+/// 0x32aec8 curQuestType==7。-[NewSceneQuest curQuestType]@0x328150 = curQuestData 为 nil 时 0、否则 [curQuestData questType],与 finish 同判据。
+/// 另加 ActorManager.m_isLoadMap(槽 0xb03e54,+260,BOOL)判据,同 mole_cheats 的 K8 臂:它由 loadMapFromData:forNPC: 在 0x245e0e 置 1,
+/// 进岛 1 秒后 createIdleWorkers: 才在 0x241fde 清 0 并跑 minusNeededWorkers;窗口内本会话还没给任务扣过人,quickStart 之后也不会
+/// 再扣,所以不还。
+/// 归还用与 finish 0x32a22c 同一个调用 changeAvailableMolerForTask:+n(v12@0:4i8),不用 changeAvailableWorkers:(只改计数、不刷摩尔):
+/// 岛分支 0x9dba6 changeAvailableWorkers:+n、0x9dbd4 addMoleForTask:n 刷回摩尔;0x9daa0「空闲≥总数」时原版自己跳过,不会超总数。
+/// 调用方 quest_jump 已保证 curSceneId==10(见那里的场景门),这里再防御性判一次,保证走岛分支 0x9da34 而不是 0x9dae2 主村分支。
+/// 只由菜单点击/文本命令回调调用,不在帧栈上,也不在 intercept 里,不需要恢复 r0-r3;宿主发出的这条消息 LR 不是 0x32a231,
+/// K8 吞归还臂不会误吞。签名逐个按 objc_meta 核过:checkQuestState v8@0:4,questState/curQuestType/curQuestId/curIdleWorkerCount
+/// i8@0:4,getUserInfoData/curQuestData/requireThings/+Instance @8@0:4,curQuestResult d8@0:4,count I8@0:4,objectAtIndex: @12@0:4I8。
+fn island_return_task_workers(env: &mut Environment, quest: id) -> i32 {
+    if quest == nil || island_scene_id(env) != 10 {
+        return 0;
+    }
+    let s = sel(env, "checkQuestState");
+    let _: () = msg_send(env, (quest, s));
+    let s = sel(env, "questState");
+    let state: i32 = msg_send(env, (quest, s));
+    let s = sel(env, "curQuestType");
+    let qtype: i32 = msg_send(env, (quest, s));
+    if state != 1 || qtype != 7 {
+        return 0;
+    }
+    let s = sel(env, "getUserInfoData");
+    let ui: id = msg_send(env, (quest, s));
+    if ui == nil {
+        return 0;
+    }
+    let s = sel(env, "curQuestResult");
+    let started: f64 = msg_send(env, (ui, s));
+    // 哨兵 4294967295.0 = finish 已写过(已归还,等领奖);用 >= 避开浮点相等比较。
+    if started >= 4294967295.0 {
+        return 0;
+    }
+    let s = sel(env, "curQuestData");
+    let qd: id = msg_send(env, (quest, s));
+    if qd == nil {
+        return 0;
+    }
+    let s = sel(env, "requireThings");
+    let things: id = msg_send(env, (qd, s));
+    if things == nil {
+        return 0;
+    }
+    let s = sel(env, "count");
+    let cnt: u32 = msg_send(env, (things, s));
+    if cnt == 0 {
+        return 0;
+    }
+    let s = sel(env, "objectAtIndex:");
+    let first: id = msg_send(env, (things, s, 0u32));
+    if first == nil
+        || !env
+            .objc
+            .object_has_method_named(&env.mem, first, "intValue")
+    {
+        return 0;
+    }
+    let s = sel(env, "intValue");
+    let n: i32 = msg_send(env, (first, s));
+    if n <= 0 {
+        return 0;
+    }
+    let am = singleton(env, "ActorManager", "Instance");
+    if am == nil {
+        return 0;
+    }
+    let off = ivar_offset(env, 0xb03e54, 260);
+    let loading: u8 = env.mem.read(ConstPtr::<u8>::from_bits(am.to_bits() + off));
+    if loading != 0 {
+        log!(
+            "[MOLEDEV] 黄金岛任务跳转:打工任务进行中,但仍在进岛加载窗口内(m_isLoadMap=1),createIdleWorkers: 尚未给它扣人,不归还"
+        );
+        return 0;
+    }
+    let s = sel(env, "curIdleWorkerCount");
+    let before: i32 = msg_send(env, (ui, s));
+    let s = sel(env, "curQuestId");
+    let cur: i32 = msg_send(env, (quest, s));
+    let s = sel(env, "changeAvailableMolerForTask:");
+    let _: () = msg_send(env, (am, s, n));
+    let s = sel(env, "curIdleWorkerCount");
+    let after: i32 = msg_send(env, (ui, s));
+    log!(
+        "[MOLEDEV] 黄金岛任务跳转:打工任务 {} 进行中,照原版 finish 归还 {} 个工人(空闲 {} → {})",
+        cur,
+        n,
+        before,
+        after
+    );
+    n
+}
+
 /// [扫描修 2026-09-15] F7-4 任务跳转:四族 quickStart:。
 /// 核实:-[Quest quickStart:]@0x128500 做的是 questState=0、setCurQuestId:0、setNextQuestId:N,
 /// 要等下一次 Quest activate: 才真正变成任务 N,所以主线跳转后补发 [GameManager activateStoryQuest]
@@ -452,6 +569,8 @@ pub fn island_fast_forward_minutes(env: &mut Environment, minutes: i64) -> DevRe
 /// vipQuestDataInMap,由 -[GameData saveMapData:] 里的 saveTimeQuestDataInDir/saveVipQuestDataInDir 落盘。
 /// 黄金岛 -[NewSceneQuest quickStart:]@0x32b510 自己会调 saveUserinfoBothInLocalAndRemote。
 /// 任务号范围照原版 onButton*QuestPlus: 的封顶:1..对应数据表 count。
+/// [2026-09-25 第五轮遗留 MISC-3] 黄金岛另要求场景已是黄金岛(curSceneId==10,进出岛途中拒绝);跳离进行中的打工任务前,
+/// 照原版 finish 归还它占用的工人(见 island_return_task_workers)。
 pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> DevResult {
     if env.options.network_access {
         return Err("在线模式下任务进度由服务器同步,不能跳转".to_string());
@@ -495,6 +614,19 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
         if !on_island {
             return Err("黄金岛任务只能在岛上跳转".to_string());
         }
+        // [2026-09-25 第五轮遗留 MISC-3] 场景门:island_session_active() 在三段过渡时间里也为真——进岛半路失败时进岛窗口在主村残留
+        //   (curSceneId=1,最多 1200 帧)、LoadingHoliday 期间(startNewSceneFrom:toScene: 在 0x24152a 写 2)、离岛过渡(2→1,最多 3600 帧)。
+        //   这时 +[NewSceneQuest sharedInstance]@0x327e08 只在 curSceneId==1(0x327e3c)才返回 nil,curSceneId=2 时照样建出单例、
+        //   读到已载入的岛进度;-[ActorManager changeAvailableMolerForTask:] 在 0x9da30 判场景号不是 10,就走 0x9dae2 主村分支
+        //   (0x9db22/0x9db48 比空闲与总数 → 0x9dba6 changeAvailableWorkers: / 0x9dbd4 addMoleForTask:),归还会加到主村工人上
+        //   (随主档落盘)并往主村刷摩尔;quickStart: 在 0x32b5b0 也会存一份不在场的岛档。所以岛任务跳转只在 curSceneId==10 时执行。
+        //   放在取 NewSceneData/NewSceneQuest 单例之前,过渡窗口里也不会提前建出单例。读法见 island_scene_id。
+        if island_scene_id(env) != 10 {
+            return Err(
+                "进岛加载或离岛过渡中,场景还没切到黄金岛,请等进岛完成后再跳转黄金岛任务"
+                    .to_string(),
+            );
+        }
     } else {
         if on_island {
             return Err("请先回主村再跳转主村任务".to_string());
@@ -527,6 +659,13 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     if quest == nil {
         return Err(format!("{} 单例不存在", quest_class));
     }
+    // [2026-09-25 第五轮遗留 MISC-3] 必须在 quickStart: 之前:之后 curQuestId 已清零、curQuestData 为 nil,判不出进行中的打工任务;
+    //   放在前面,quickStart 0x32b5b0 的存盘也会带上归还后的空闲数。
+    let returned_workers = if family == QuestFamily::Island {
+        island_return_task_workers(env, quest)
+    } else {
+        0
+    };
     let s = sel(env, "quickStart:");
     let _: () = msg_send(env, (quest, s, quest_id as i32));
     match family {
@@ -581,15 +720,28 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     );
     // [2026-09-16] A2-05 删掉原来「简体中文下限时/VIP 任务受原版语言门限制」的附注:与反汇编相反。
     // -[VipQuest activate:]@0x38722c 没有语言门;-[TimeQuest activate:] 的语言门在 zh-Hans 下放行(见上)。
-    let note = match family {
-        // 文案保持短:菜单还会在后面追加激活条件,toast 只有 992 宽。
+    // [2026-09-25 第五轮遗留 MISC-3] 黄金岛补一句沙原碎片:inject_sandgarden_fragments 下次进岛按进度兜底
+    //   done(N) = nextQuestId>N && curQuestId!=N(N=81/83),跳过的 81/83 会补发 31005/31007(containsObject: 去重,已有的不重复发)。
+    let skipped = if family == QuestFamily::Island {
+        "被跳过任务的奖励和前置条件不会补发;沙原碎片(任务 81/83 的奖励)下次进岛会按任务进度兜底补发(已有的不重复发)"
+    } else {
+        "被跳过任务的奖励和前置条件不会补发"
+    };
+    let mut note = String::from(match family {
+        // 菜单还会在后面追加激活条件;toast 超宽会自动折行(mole_menu.rs add_toast)。
         // [2026-09-24 第四轮 K14 I4-4] 黄金岛跳转同样补发了激活(见上)。
         QuestFamily::Time | QuestFamily::Island => ";已补发激活",
         _ => "",
-    };
+    });
+    if returned_workers > 0 {
+        note.push_str(&format!(
+            ";已照原版归还进行中打工任务的 {} 个工人",
+            returned_workers
+        ));
+    }
     Ok(format!(
-        "已跳到{}任务 {}(被跳过任务的奖励和前置条件不会补发){}",
-        label, quest_id, note
+        "已跳到{}任务 {}({}){}",
+        label, quest_id, skipped, note
     ))
 }
 
