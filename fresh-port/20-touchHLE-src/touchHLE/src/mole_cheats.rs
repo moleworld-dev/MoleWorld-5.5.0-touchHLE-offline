@@ -11733,9 +11733,48 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   明文 FORCE_LEVEL → 明文被当密文存进活对象;此后 curLevel 解密(eors #0x01011011)得到约 1684 万,关掉作弊后
     //   任意一次 saveUserInfoData 就把坏等级永久写进 userinfo.dat。encryptCurLevel 只用于对象间复制密文、与显示
     //   无关,删掉无任何功能损失;不采用"返回 FORCE^0x01011011"备选(那会把作弊从显示覆盖变成真实改档,关掉后回不去)。
+    // [2026-10-03 第六波] 存档/复制/上传/比较这 14 个调用点放行真实等级,其余调用点(等级门槛与显示,约 140 处)照旧返回强制等级。
+    //   根因:以前对所有调用者都返回强制等级,其中 -[UserInfoData encodeWithCoder:] 在 blx@0xba03a 经 curLevel 取值编码,
+    //   开着「等级=N」时任何一次存档(收菜、买东西都会触发 saveUserInfoData)都会把强制等级永久写进 userinfo.dat,关掉作弊也回不去
+    //   (与第四轮修过的「工人补满把 99 写进存档」同一类问题,第五轮 B 复核指出)。升级逻辑 -[UserInfoData addXp:]@0xbb040 直接读写
+    //   等级 ivar、不经 curLevel 取值方法,不受影响。
+    //   做法:照工人补满 MAXFAC_GATE_LRS 的思路按调用点 LR(blx 地址 + 4,带 Thumb 位;选择子装载点按 movw/movt + add pc 逐个算出
+    //   都是 curLevel 的 selref 0xadc5ec)判断。黑名单而不是白名单:门槛与显示类调用点太多(约 140 处),它们拿强制值正是作弊本意;
+    //   会把等级带出内存的只有下面这些。在线时的上传、云存档比较也读真值,不会把假等级报给服务器。
+    //   已被旧逻辑写进存档的强制等级无法自动还原(不记得真值)。
     if FORCE_LEVEL.load(O) > 0 {
+        const FORCE_LEVEL_REAL_LRS: [u32; 14] = [
+            0x7f2fb,  // -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:]:写内购记录
+            0x812b5,  // -[GameData addFindedUserInfo:]:复制进已找到的用户信息(随后 0x812be setCurLevel:)
+            0xba03f,  // -[UserInfoData encodeWithCoder:]:编码存档 userinfo.dat
+            0xbbe3d,  // -[UserInfoData isEqual:]:存档比较
+            0xbc2ff,  // -[UserInfoData encodeUserInfoData]:上传用编码
+            0xe8e3d,  // -[NetworkManager sendInfoToServer]
+            0xe8f6b,  // -[NetworkManager sendInfoToServerWithoutSaveToLocal]
+            0xe9639,  // -[NetworkManager getRandomUserInfo:]
+            0xe9c49,  // -[NetworkManager updateInfoToServer]
+            0x117f1f, // -[InAppPurchaseManager onPurchaseSuccessful] 第 1 处
+            0x1182b9, // -[InAppPurchaseManager onPurchaseSuccessful] 第 2 处
+            0x1bca5b, // +[GameDataCompareLayer checkXPAndVIPGoldForCompare]:云存档比较
+            0x1bccbf, // +[GameDataCompareLayer compareRemoteGameDataWithLocalOne]:云存档比较
+            0x226a17, // -[NetworkManager updateUserInfoDataInNewScene]:岛上上传主档信息
+        ];
         match (class, sel) {
-            ("UserInfoData", "curLevel") | ("NewSceneData", "getLevel") => {
+            ("UserInfoData", "curLevel") => {
+                let lr = env.cpu.regs()[14];
+                if FORCE_LEVEL_REAL_LRS.contains(&lr) {
+                    static LOG1_FORCE_LEVEL_REAL: AtomicBool = AtomicBool::new(false);
+                    log_first_then_dbg!(
+                        LOG1_FORCE_LEVEL_REAL,
+                        "[MOLECHEAT] 等级=N:存档/上传调用点 LR {:#x} 读真实等级,不把强制等级写进存档",
+                        lr
+                    );
+                    return false;
+                }
+                env.cpu.regs_mut()[0] = FORCE_LEVEL.load(O) as u32;
+                return true;
+            }
+            ("NewSceneData", "getLevel") => {
                 env.cpu.regs_mut()[0] = FORCE_LEVEL.load(O) as u32;
                 return true;
             }
