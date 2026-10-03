@@ -588,6 +588,18 @@ impl Window {
 
         // Separate mouse and touch events
         sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+        // [2026-09-25 第五轮遗留 MISC-5] 反方向也关:鼠标不再合成触摸。SDL 2.26.4 SDL_mouse.c:152-156 在安卓/iOS(非 tvOS)上
+        // 默认开,其它平台默认关;开着时外接鼠标左键会再发一路 SDL_MOUSE_TOUCHID 触点(SDL_mouse.c:716-729 按下/抬起、503-512
+        // 按住拖动),下面的 Finger* 分支不看 touch_id、一律映射成 FingerId::Touch(finger_id),于是与 FingerId::Mouse 叠成两指
+        // (单指拖动被当成双指缩放),也不走第四轮 K15 的起拖阈值。设成 0 后 SDL_touch.c:311-315 丢弃这路合成触点,鼠标只走
+        // FingerId::Mouse。实际受益的是安卓(SDLSurface.java:220/236 鼠标走 onNativeMouse → SDL_SendMouseButton);桌面默认本就是 0,
+        // macOS 触控板的 SDL_MOUSE_TOUCHID 触点本来就被丢弃,行为不变。这条提示在视频子系统初始化之后设置,SDL 的提示回调会立即生效,
+        // 与上一行同理。
+        // iOS:make-ios-ipa.sh 生成的 Info.plist 没有 UIApplicationSupportsIndirectInputEvents,按 SDL_uikitevents.m:357-383 与
+        // README-ios.md,系统把外接鼠标当普通触摸送达,走不到 SDL_SendMouseButton,本提示在 iOS 上目前不起作用。将来若给 iOS 加这个键,
+        // 要先修 MouseButtonDown/MouseMotion 在高分屏下的点→像素换算(iOS 开了 allow_highdpi,viewport() 按 drawable 像素算,而鼠标
+        // 事件的 x/y 是点坐标,transform_input_coords 会把点当像素),否则鼠标点击位置会错位——那时已没有合成触点这条坐标正确的路兜底。
+        sdl2::hint::set("SDL_MOUSE_TOUCH_EVENTS", "0");
 
         // SDL2 disables the screen saver by default, but iPhone OS enables
         // the idle timer that triggers sleep by default, so we turn it back on
