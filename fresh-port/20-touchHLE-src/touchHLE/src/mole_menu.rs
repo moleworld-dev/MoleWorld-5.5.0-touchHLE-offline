@@ -450,7 +450,9 @@ fn pages() -> Vec<Page> {
                 ("小游戏奖励满", ToggleCheat("minigame_reward")),
                 ("海底寻宝必中稀有", ToggleCheat("seabed_best")),
                 ("等级", LevelInc),
-                ("全物品解锁", ToggleCheat("all_unlock")),
+                // [2026-10-03] 改名(原「全物品解锁」):第五、六波起主村与黄金岛都只放开等级、人力、VIP、建筑等级这几道门槛,
+                //   摩尔豆/贝壳不够、已拥有/限购、扩地顺序、同类加速卡仍由原版判定,买不到白拿。开关键名不变。
+                ("解除购买门槛", ToggleCheat("all_unlock")),
                 // [2026-09-16] G-05 开关只让成就面板显示全亮,不再挡住真实成就判定,也不会发奖;标签照实说明。开关键名不变。
                 ("成就面板全亮(仅显示,不发奖)", ToggleCheat("all_achieve")),
                 ("魔法密码任意过", ToggleCheat("magic_bypass")),

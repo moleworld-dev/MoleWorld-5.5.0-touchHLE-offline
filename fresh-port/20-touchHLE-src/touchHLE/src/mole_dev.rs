@@ -635,7 +635,7 @@ impl WorkerRecalcPlan {
             let mut notes: Vec<String> = Vec::new();
             if extra_now as i64 > self.orig_extra_max() {
                 notes.push(format!(
-                    "额外摩尔超过原版购买上限 {},多半是开着「工人补满」或「全物品解锁」时买的",
+                    "额外摩尔超过原版购买上限 {},多半是开着「工人补满」或旧版「全物品解锁」(现「解除购买门槛」)时买的",
                     self.orig_extra_max()
                 ));
             }
@@ -679,7 +679,7 @@ impl WorkerRecalcPlan {
             );
             if self.extra > self.orig_extra_max() {
                 s.push_str(&format!(
-                    ";超过原版购买上限 {},只有开着「工人补满」或「全物品解锁」时买才可能",
+                    ";超过原版购买上限 {},只有开着「工人补满」或旧版「全物品解锁」(现「解除购买门槛」)时买才可能",
                     self.orig_extra_max()
                 ));
             }
