@@ -604,6 +604,29 @@ pub fn to_rust_slice(env: &mut Environment, data: id) -> &[u8] {
         .bytes_at(borrowed_data.bytes.cast(), borrowed_data.length)
 }
 
+/// [2026-10-03] 拷出宿主侧 NSData(含可变子类)的字节:不发消息、不 panic。不是宿主 NSData 时返回 None。
+/// 给 mole_activity 在 sendPacket:commandId: 的调用栈上截请求体用(那里可能是帧栈,不发宿主消息)。
+pub fn try_copy_bytes(env: &Environment, data: id) -> Option<Vec<u8>> {
+    let mut host = env.objc.get_host_object(data)?;
+    let borrowed_data = loop {
+        if let Some(d) = host.as_any().downcast_ref::<NSDataHostObject>() {
+            break d;
+        }
+        host = host.as_superclass()?;
+    };
+    if borrowed_data.length == 0 {
+        return Some(Vec::new());
+    }
+    if borrowed_data.bytes.is_null() {
+        return None;
+    }
+    Some(
+        env.mem
+            .bytes_at(borrowed_data.bytes.cast(), borrowed_data.length)
+            .to_vec(),
+    )
+}
+
 // ============================================================================
 // [扫描修 2026-09-15] F11-7:淘米 CDN(mcdn.61.com)静态资源,主要是公告板图片
 // ============================================================================

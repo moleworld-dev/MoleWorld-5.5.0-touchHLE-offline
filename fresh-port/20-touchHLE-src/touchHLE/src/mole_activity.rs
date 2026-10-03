@@ -16,11 +16,13 @@
 //!   24 字节头(6×小端 u32:packetLen、commandID、sendFlag、userID、errorID、deviceIDHash;errorID 恒 0)
 //!   + body + 16 字节 md5(头 ++ body ++ 盐 byte_B3AE64)。与 `-[NetworkManager checkPacketDataSourceWithData:length:]`
 //!   @0xebe28 的校验一致(它把尾 16 字节换成盐再 md5 比较)。
-//! - 组好的包先放宿主队列,再 `performSelector:withObject:afterDelay:0` 调一个本模块自拦的选择子
-//!   `moleActivityLoopback`,在运行循环安全点把包追加进 `NetworkManager.buffer_`(ivar +196,
+//! - [2026-10-03] 截包时只拷下请求体、置标志,应答在运行循环受理点(run_loop_poll,ns_run_loop 主线程 perform 相位之后)算好入队,
+//!   下一轮受理点再把包追加进 `NetworkManager.buffer_`(ivar +196,
 //!   偏移从 guest 的 _OBJC_IVAR 槽 0xb043f0 现读,兼容非脆弱 ivar 修正),然后 msg_send
 //!   `parseBufferWhenDidReadData`@0xebefc(parseData:header:pos: 的唯一调用者)。原版的解码、
 //!   GameManager/各层 onCommandReceived: 分发、hideLoadingLayer 全部照原链路跑。
+//!   以前是截包时当场组回包,再 `performSelector:withObject:afterDelay:0` 排自拦选择子 `moleActivityLoopback` 来喂;
+//!   发包点在 drawScene / CCScheduler 帧栈上时(比如从岛回村的进村补发),等于在帧栈上发宿主消息。
 //! - `parseBufferWhenDidReadData` 每处理完一个包会 `changeStateTo:7 withMessage:@""`(0xec920)。离线网络
 //!   状态机不该被回环改成"已收包",所以回环期间把这一次 state=7 吞掉。
 //! - 它还会 `[UnreadPacketsDic_ removeObjectForKey:@"<sendFlag>"]`;离线真 sendPacket 在登记超时表之前就
@@ -217,6 +219,25 @@ static FIREWORK_DEFERRED: Mutex<Option<(Vec<u8>, u32, Instant)>> = Mutex::new(No
 static FIREWORK_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// [2026-09-16] A1-01 烟花回包等场景就绪的最多检查次数(间隔约 1 秒)。
 const FIREWORK_RETRY_MAX: u32 = 10;
+/// [2026-10-03] FIREWORK_DEFERRED 里是否有包在等(受理点每轮先读它,只有为真才去拿锁看到没到点)。
+static FIREWORK_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// [2026-10-03] 回环改由运行循环受理点驱动(见 run_loop_poll),原调用栈上只做内存读写与原子操作。
+/// 以前 sendPacket:commandId: 臂当场读旁路档、组回包(要给 GameData 等发宿主消息),再 performSelector:withObject:afterDelay:0
+/// 排 moleActivityLoopback;从岛回村时进村补发跑在 CCScheduler 帧栈上(-[NewBaseLoading endLoading] → … → startGame:),
+/// 好友村回家 reduceMemoryCallBack_goToHomeVillage、DailyQuest activate: 等原版发包点也可能在调度器回调里,都违反「帧栈上不发宿主消息」。
+/// 截下的白名单请求:(NetworkManager, 命令号, 请求体拷贝)。★锁绝不跨 msg_send 持有。
+static PENDING_REQUESTS: Mutex<Vec<(u32, u32, Vec<u8>)>> = Mutex::new(Vec::new());
+/// PENDING_REQUESTS 非空(受理点每轮只读这一个原子)。
+static REQUESTS_PENDING: AtomicBool = AtomicBool::new(false);
+/// 本轮有新回包入队;受理点在本轮末尾把它转成 LOOPBACK_ARMED,下一轮受理点再喂(等价原 afterDelay:0 下一轮才到)。
+static LOOPBACK_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 上一轮入队的回包本轮受理点要喂。
+static LOOPBACK_ARMED: AtomicBool = AtomicBool::new(false);
+/// 回包要喂给的 NetworkManager(入队时记下,与原来 performSelector 的接收者相同)。
+static LOOPBACK_NM: AtomicU32 = AtomicU32::new(0);
+/// -[GameManager startGame:] 的离线进村补发(1049 与 startgame_resend_offline)待受理。
+static STARTGAME_RESEND_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// [2026-09-16] F2-06 读到坏档且原样备份失败:本会话 save_state 一律跳过,不拿默认值覆盖原文件。
 static ACT_SAVE_BLOCKED: AtomicBool = AtomicBool::new(false);
@@ -291,24 +312,11 @@ pub fn wants(class: &str, sel: &str) -> bool {
 /// 前置拦截。None = 不归本模块管;Some(true) = 已吞掉调用(返回值寄存器已写好);
 /// Some(false) = 做完副作用后放行真方法(若发过宿主 msg_send,返回前必须恢复 r0-r3)。
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> {
-    // [扫描修 2026-09-15] 回环自用的两个选择子要最先处理:performSelector 排进运行循环的
-    // moleActivityLoopback 在任何状态下都必须接住(NetworkManager 并不实现它,放行会 unrecognized selector)。
+    // [扫描修 2026-09-15] 回环自用的选择子要最先处理:NetworkManager 并不实现它,放行会 unrecognized selector。
+    // [2026-10-03] 宿主已不再排 moleActivityLoopback(回环改由运行循环受理点 run_loop_poll 喂包),这里只保留吞臂防御,
+    //   不做任何事:待喂的包仍在队列里,由受理点照常处理。
     if class == "NetworkManager" {
         if sel == "moleActivityLoopback" {
-            let nm: id = Ptr::from_bits(env.cpu.regs()[0]);
-            if env.options.network_access || crate::mole_cheats::island_session_active() {
-                // 在线/岛上不回环:丢弃队列(正常不会走到这里)。
-                if let Ok(mut q) = LOOPBACK_QUEUE.lock() {
-                    q.clear();
-                }
-                // [2026-09-16] A1-01 等场景的烟花包一并丢弃(已经进岛,村庄场景不会再挂 FireworkLayer)。
-                if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
-                    *d = None;
-                }
-                FIREWORK_IN_FLIGHT.store(false, O);
-            } else {
-                run_loopback(env, nm);
-            }
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
         }
@@ -324,7 +332,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             && env.cpu.regs()[2] == 10
         {
             // [2026-10-03 第六波] 帧栈上只置原子标志(不再在这里发 performSelector:withObject:afterDelay:),
-            //   由运行循环受理点 vip_info_poll 开头的 island_deferred_poll 在当前调用栈整个返回之后构造(见 ISLAND_DAILY_PENDING)。
+            //   由运行循环受理点 run_loop_poll 里的 island_deferred_poll 在当前调用栈整个返回之后构造(见 ISLAND_DAILY_PENDING)。
             ISLAND_DAILY_PENDING.store(true, O);
             env.cpu.regs_mut()[0] = 0;
             return Some(true);
@@ -563,18 +571,34 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
 
         // ── 回环服务器主入口 ──
         ("NetworkManager", "sendPacket:commandId:") => {
-            // [复核修 2026-09-15] R4-1 兜底:handle_send_packet 返回 None(放行真 sendPacket)时若之前发过宿主消息,
-            //   寄存器已被改写;真方法在判 isReachable_ 之前就写 self+204、给 self+172 发 setSendFlag:(0xe235e/0xe2362),
-            //   self 错了必坏堆。这里统一快照,None 时恢复。
-            let saved = save_regs(env);
-            let nm: id = Ptr::from_bits(saved[0]);
-            let body: id = Ptr::from_bits(saved[2]);
-            let cmd = saved[3];
-            let r = handle_send_packet(env, nm, body, cmd);
-            if r.is_none() {
-                restore_regs(env, saved);
+            // [2026-10-03] 原调用栈上只决定接不接、截下请求体拷贝,应答由运行循环受理点算(answer_request,见 PENDING_REQUESTS)。
+            //   这里不发任何宿主消息:请求体从宿主 NSData 直接拷字节。不认识的命令号(以及 MOLE_DISCOUNT=off 时的 1049)
+            //   放行真 sendPacket:commandId:(离线等于空过),只读过寄存器,寄存器未动——真方法在判 isReachable_ 之前就写
+            //   self+204、给 self+172 发 setSendFlag:(0xe235e/0xe2362),r0 必须仍是 NetworkManager。
+            let regs = env.cpu.regs();
+            let (nm_bits, body, cmd): (u32, id, u32) = (regs[0], Ptr::from_bits(regs[2]), regs[3]);
+            if !loopback_accepts(cmd) {
+                return None;
             }
-            r
+            let copied = if body == nil {
+                Some(Vec::new())
+            } else {
+                crate::frameworks::foundation::ns_data::try_copy_bytes(env, body)
+            };
+            let req = copied.unwrap_or_else(|| {
+                log!(
+                    "[ACTIVITY] 回环截包 cmd={}:请求体不是宿主 NSData,按空请求体处理",
+                    cmd
+                );
+                Vec::new()
+            });
+            match PENDING_REQUESTS.lock() {
+                Ok(mut q) => q.push((nm_bits, cmd, req)),
+                Err(_) => return None,
+            }
+            REQUESTS_PENDING.store(true, O);
+            env.cpu.regs_mut()[0] = 0;
+            Some(true)
         }
 
         // ── [补完 2026-09-15] F2-2 限时折扣 1049 ──
@@ -602,25 +626,20 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             // [补完 2026-09-15] F2-2 实测纠正:-[GameManager startGame:] 在 0x1992a 先查 [NetworkManager isConnected],
             // 为假就跳到 0x19e18,整段服务器同步(getFriendsInfo:/getGiftsFromServer/getAmendVIPGoldFromServer/
             // 0x19a56 getDiscountListFromServer)都不执行;回前台那处(0x10f38)又要求 InGameScene 且中信奖励类型≥2。
-            // 所以离线主村原版永远不会发 1049。这里在进村时(前置,商店数组已由 load:type: 加载好)照原版同一个入口
-            // 补发一次:[[NetworkManager sharedInstance] getDiscountListFromServer] → sendPacket:1049 → 回环应答;
-            // 回包排到运行循环再喂,那时 startGame: 已设好 delegateGameData。发过宿主消息,放行前恢复 r0-r3。
+            // 所以离线主村原版永远不会发 1049。这里在进村时(商店数组已由 load:type: 加载好)照原版同一个入口
+            // 补发一次:[[NetworkManager sharedInstance] getDiscountListFromServer] → sendPacket:1049 → 回环应答。
             // [2026-09-16] E-02 / A1-01 / E-03 同一个门内还有公告 1058、春节烟花 1112、每日任务 1074,1049 之后按原版顺序补发
-            //   (见 startgame_resend_offline);全程同一对 save_regs/restore_regs。
-            let saved = save_regs(env);
-            let nm = singleton(env, "NetworkManager", "sharedInstance");
-            if nm != nil {
-                if !discount_disabled() {
-                    let get_list = sel_named(env, "getDiscountListFromServer");
-                    let _: () = msg_send(env, (nm, get_list));
-                }
-                startgame_resend_offline(env, nm);
-            }
-            restore_regs(env, saved);
+            //   (见 startgame_resend_offline)。
+            // [2026-10-03] 从岛回村时本臂跑在 CCScheduler 帧栈上(-[NewBaseLoading endLoading] → … → -[SceneMannager endLoadingScene]
+            //   loadMainVillageScene → startGame → startGame:),以前在这里就地发一串宿主消息。现在只置标志,补发由运行循环受理点
+            //   (run_loop_poll → startgame_resend_poll)在 startGame: 整个返回之后执行;原版这几条也只是发包,回包要等一次网络往返,
+            //   startGame: 后半段不读它们的结果(isUserSelectedNoticeBoardMenu 的读者只有 onCommandReceived:、超时控制与公告解析)。
+            //   只写了一个原子,寄存器未动。
+            STARTGAME_RESEND_PENDING.store(true, O);
             None
         }
         ("NetworkManager", "getDiscountListFromServer") => {
-            // 原版 0x1cb174:state==4 直接返回不发包;其它状态走 sendPacket:commandId:1049,由 handle_send_packet 应答。
+            // 原版 0x1cb174:state==4 直接返回不发包;其它状态走 sendPacket:commandId:1049,由 answer_request 应答。
             // 离线状态机按理到不了 4,这里只是兜底(state==4 时照样本地应答并记日志)。放行路径只读内存,寄存器未动。
             if discount_disabled() {
                 return None;
@@ -630,8 +649,12 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 return None;
             }
             log!("[ACTIVITY] 限时折扣:NetworkManager.state==4,原版不会发 1049,本地兜底应答");
-            let body = encode_discount_list(env);
-            enqueue_reply(env, nm, CMD_DISCOUNT_LIST, body);
+            // [2026-10-03] 与 sendPacket:commandId: 臂同一写法:只截下请求,应答由运行循环受理点算(不在原调用栈上发宿主消息)。
+            match PENDING_REQUESTS.lock() {
+                Ok(mut q) => q.push((nm.to_bits(), CMD_DISCOUNT_LIST, Vec::new())),
+                Err(_) => return None,
+            }
+            REQUESTS_PENDING.store(true, O);
             env.cpu.regs_mut()[0] = 0;
             Some(true)
         }
@@ -862,7 +885,8 @@ fn build_packet(cmd: u32, user_id: u32, device_hash: u32, body: &[u8]) -> Vec<u8
     out
 }
 
-/// 回环包入队并排一次运行循环回调。
+/// 回环包入队,下一轮运行循环受理点再喂(见 run_loop_poll)。
+/// [2026-10-03] 只读 guest 内存、写宿主队列与原子,不发任何宿主消息,任何栈上都能调。
 fn enqueue_reply(env: &mut Environment, nm: id, cmd: u32, body: Vec<u8>) {
     if nm == nil {
         log!("[ACTIVITY] 回环放弃 cmd={}:NetworkManager 为 nil", cmd);
@@ -888,11 +912,11 @@ fn enqueue_reply(env: &mut Environment, nm: id, cmd: u32, body: Vec<u8>) {
     } else {
         return;
     }
-    // 不在发包的调用栈里同步解析(那样回包处理会早于调用方后续的 showLoadingLayer 等),
-    // 排到运行循环的 perform 相位再喂,时序与真网络回包一致。
-    let perform = sel_named(env, "performSelector:withObject:afterDelay:");
-    let tick = sel_named(env, "moleActivityLoopback");
-    let _: () = msg_send(env, (nm, perform, tick, nil, 0.0f64));
+    // 不在发包的调用栈里同步解析(那样回包处理会早于调用方后续的 showLoadingLayer 等)。
+    // [2026-10-03] 以前在这里 performSelector:withObject:afterDelay:0 排 moleActivityLoopback(下一轮 perform 相位喂);
+    //   现在只置标志,本轮受理点把它转成「下一轮喂」,时机相同,但不再在原调用栈上发消息。
+    LOOPBACK_NM.store(nm.to_bits(), O);
+    LOOPBACK_REQUESTED.store(true, O);
 }
 
 /// 运行循环安全点:把队列里的包追加进 buffer_ 并调原版解析。
@@ -908,7 +932,7 @@ fn run_loopback(env: &mut Environment, nm: id) {
     let (firework_pkts, mut packets): (Vec<Vec<u8>>, Vec<Vec<u8>>) = queued
         .into_iter()
         .partition(|p| packet_cmd(p) == CMD_FIREWORK);
-    let fed_firework = feed_or_defer_firework(env, nm, firework_pkts, &mut packets);
+    let fed_firework = feed_or_defer_firework(env, firework_pkts, &mut packets);
     if packets.is_empty() {
         return;
     }
@@ -970,20 +994,16 @@ fn packet_cmd(pkt: &[u8]) -> u32 {
 }
 
 /// [2026-09-16] A1-01 决定本轮喂不喂 1112 烟花包:场景就绪就追加进 packets 并返回 true;没就绪就放进 FIREWORK_DEFERRED,
-/// 约 1 秒后排一次 moleActivityLoopback 重查,最多 FIREWORK_RETRY_MAX 次,超限丢弃(不写 firework_day,下次进村再试)。
-/// 为什么要等:startGame: 由 -[LoadingLayer loadTarget](0x12ee32)调用,之后才切到村庄场景;回包 afterDelay:0 下一轮运行循环就到,
+/// 约 1 秒后由运行循环受理点重查(firework_retry_due),最多 FIREWORK_RETRY_MAX 次,超限丢弃(不写 firework_day,下次进村再试)。
+/// 为什么要等:startGame: 由 -[LoadingLayer loadTarget](0x12ee32)调用,之后才切到村庄场景;回包下一轮运行循环就到,
 /// 而 -[GameManager onCommandReceived:] 的 1112 臂要 curSceneId==1(0x23e90)且 runningScene 有 tag 1 子节点(0x23ed0)才开播,
-/// 否则静默退出。只在运行循环回调里调用(不在帧栈上)。
+/// 否则静默退出。只在运行循环受理点里调用(不在帧栈上)。
 fn feed_or_defer_firework(
     env: &mut Environment,
-    nm: id,
     fresh: Vec<Vec<u8>>,
     packets: &mut Vec<Vec<u8>>,
 ) -> bool {
-    let mut slot = match FIREWORK_DEFERRED.lock() {
-        Ok(mut d) => d.take(),
-        Err(_) => None,
-    };
+    let mut slot = firework_slot_take();
     if slot.is_none() {
         // FIREWORK_IN_FLIGHT 挡住了重复回包,同一轮理论上最多一个 1112;万一有多个只留第一个。
         slot = fresh.into_iter().next().map(|p| (p, 0u32, Instant::now()));
@@ -993,10 +1013,8 @@ fn feed_or_defer_firework(
     };
     let now = Instant::now();
     if tries > 0 && now < not_before {
-        // 别的命令顺路触发的回环轮次:还没到下次检查时间,原样放回,不计次、不重复排程(1 秒后的回调已经在路上)。
-        if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
-            *d = Some((pkt, tries, not_before));
-        }
+        // 别的命令顺路触发的回环轮次:还没到下次检查时间,原样放回,不计次(到点后受理点会再来查)。
+        firework_slot_put(Some((pkt, tries, not_before)));
         return false;
     }
     if firework_scene_ready(env) {
@@ -1020,13 +1038,42 @@ fn feed_or_defer_firework(
         tries + 1,
         FIREWORK_RETRY_MAX
     );
-    if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
-        *d = Some((pkt, tries + 1, now + Duration::from_millis(900)));
-    }
-    let perform = sel_named(env, "performSelector:withObject:afterDelay:");
-    let tick = sel_named(env, "moleActivityLoopback");
-    let _: () = msg_send(env, (nm, perform, tick, nil, 1.0f64));
+    // [2026-10-03] 以前在这里 performSelector:withObject:afterDelay:1.0 排下一次重查;现在只记下最早重查时刻,
+    //   由运行循环受理点每轮看到点没有(firework_retry_due)。
+    firework_slot_put(Some((pkt, tries + 1, now + Duration::from_secs(1))));
     false
+}
+
+/// [2026-10-03] 取走烟花延迟槽(同时清 FIREWORK_WAITING)。
+fn firework_slot_take() -> Option<(Vec<u8>, u32, Instant)> {
+    let slot = match FIREWORK_DEFERRED.lock() {
+        Ok(mut d) => d.take(),
+        Err(_) => None,
+    };
+    FIREWORK_WAITING.store(false, O);
+    slot
+}
+
+/// [2026-10-03] 放回 / 清空烟花延迟槽(同时维护 FIREWORK_WAITING)。
+fn firework_slot_put(slot: Option<(Vec<u8>, u32, Instant)>) {
+    let waiting = slot.is_some();
+    if let Ok(mut d) = FIREWORK_DEFERRED.lock() {
+        *d = slot;
+    }
+    FIREWORK_WAITING.store(waiting, O);
+}
+
+/// [2026-10-03] 烟花延迟槽里有包、且到了下次检查时刻。平时只有一次原子读。
+fn firework_retry_due() -> bool {
+    if !FIREWORK_WAITING.load(O) {
+        return false;
+    }
+    match FIREWORK_DEFERRED.lock() {
+        Ok(d) => d
+            .as_ref()
+            .is_some_and(|(_, _, not_before)| Instant::now() >= *not_before),
+        Err(_) => false,
+    }
 }
 
 /// [2026-09-16] A1-01 与 -[GameManager onCommandReceived:] 1112 臂同一判据:[[SceneMannager sharedManager] curSceneId]==1,
@@ -1721,21 +1768,40 @@ fn preset_layer_tag(env: &mut Environment, acl: id, sender: id) {
     }
 }
 
-/// 回环白名单分派。返回 None 表示不认识这个命令号(放行真 sendPacket,离线等于空过)。
-/// [复核修 2026-09-15] 调用处在 None 时会恢复 r0-r3;但新增分支仍应"发过宿主消息就吞掉",不要依赖兜底。
-fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Option<bool> {
+/// [2026-10-03] 回环白名单:sendPacket:commandId: 臂据此当场决定接不接(接了就吞掉真方法,应答交给运行循环受理点)。
+/// 纯判断,不发消息、不碰寄存器。必须与 answer_request 的分支一一对应。
+fn loopback_accepts(cmd: u32) -> bool {
+    match cmd {
+        // MOLE_DISCOUNT=off 时放行真 sendPacket:commandId:——原离线行为(只 packetsCount+1、setSendFlag 后返回,无折扣)。
+        CMD_DISCOUNT_LIST => !discount_disabled(),
+        CMD_OPEN_BOX_SWITCH
+        | CMD_NOTICE
+        | CMD_ACTIVITY_CENTER
+        | CMD_PURCHASE_IN_ACTIVITY
+        | CMD_FIREWORK
+        | CMD_SIGN_DAYS
+        | CMD_IS_EXCHANGED
+        | CMD_SIGN_EXCHANGE_LIST
+        | CMD_SEABED_INFO
+        | CMD_SEABED_REFRESH
+        | CMD_DAILY_TASK_LIST => true,
+        _ => false,
+    }
+}
+
+/// 回环白名单分派:按截下的请求算应答并入队。
+/// [2026-10-03] 以前叫 handle_send_packet,在 sendPacket:commandId: 的调用栈上同步执行(读旁路档、组回包都要发宿主消息);
+///   现在只由运行循环受理点(run_loop_poll → answer_pending_requests)调用,不在任何游戏方法体的栈上,不碰寄存器。
+///   哪些命令号会走到这里由 loopback_accepts 决定;`req` 是截包时拷下的请求体(nil 请求体为空)。
+fn answer_request(env: &mut Environment, nm: id, cmd: u32, req: &[u8]) {
     match cmd {
         CMD_OPEN_BOX_SWITCH => {
             // F3-8:活动预告页的开宝箱/港游开关。内容已空心化(对应层无入口且图集缺失),不注入,
             // 只显式吞掉并记日志;预告页本身不等回包,不会卡 loading。
             log!("[ACTIVITY] 吞掉 cmd=1217(活动预告开宝箱开关,离线不注入) len=0");
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_NOTICE => {
             enqueue_reply(env, nm, cmd, encode_notices());
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_ACTIVITY_CENTER => {
             // [复核修 2026-09-15] getActivityCenterInfo:target:@0xeacfc:参数既非 1 也非 10 直接返回不发包
@@ -1746,7 +1812,6 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
             //   「scope≠0 回空表」从来不会让主村拿到空表,已按协议语义恢复该分支。)
             //   body≠0(岛)回空表:parseActivityCenterInfo@0x1c18d8 先 resetActivitiesInfoData,count 为 0 时
             //   0x1c197e 直接收尾,安全。目前没有调用点传 10,黄金岛会话也已在 intercept 入口排除,这里只为与协议保持一致。
-            let req = nsdata_bytes(env, body);
             let scope = if req.len() >= 4 {
                 u32::from_le_bytes([req[0], req[1], req[2], req[3]])
             } else {
@@ -1759,43 +1824,32 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                 log!("[ACTIVITY] 活动中心 cmd=1091 scope=0(主村,回本地活动表)");
                 enqueue_reply(env, nm, cmd, encode_activity_center());
             }
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_PURCHASE_IN_ACTIVITY => {
             // 只有购买类活动(type 1)才会发 1092;本地活动表里没有,保险起见回一对 0(8 字节)防 loading 超时。
             enqueue_reply(env, nm, cmd, vec![0u8; 8]);
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_FIREWORK => {
-            // [复核修 2026-09-15] R4-1:下面两种"不回包"情形之前都已发过宿主消息(festival_today 读系统时区、load_state 读盘),
-            //   寄存器已被改写,不能 return None 放行真 sendPacket:commandId:——它在判 isReachable_(0xe2372)之前就先写
-            //   self+204 的 packetsCount(0xe235e)并给 self+172 发 setSendFlag:(0xe2362)。离线真方法也只做这两步就返回
-            //   (0xe2376 → 0xe2770),对离线没有意义,直接吞掉。
+            // 下面几种"不回包"情形:真 sendPacket:commandId: 已在截包时吞掉(离线真方法也只是 packetsCount+1、setSendFlag: 后
+            //   在 0xe2376 → 0xe2770 返回,对离线没有意义),这里只是不入队。
             let (fest, today) = festival_today(env);
             if fest != Festival::Spring {
                 // 窗口外:不回包(与离线原行为一致)。
-                env.cpu.regs_mut()[0] = 0;
-                return Some(true);
+                return;
             }
             let st = load_state(env);
             if st.firework_day == today.ymd() {
                 log!("[ACTIVITY] 春节烟花今天已放过,cmd=1112 不回包");
-                env.cpu.regs_mut()[0] = 0;
-                return Some(true);
+                return;
             }
             if nm != nil && FIREWORK_IN_FLIGHT.swap(true, O) {
                 log!("[ACTIVITY] 春节烟花:已有一个 1112 回包在途,本次不重复回包");
-                env.cpu.regs_mut()[0] = 0;
-                return Some(true);
+                return;
             }
             // [2026-09-16] A1-01 不再在这里写 firework_day:回包要等村庄场景挂好 FireworkLayer 才喂(feed_or_defer_firework),
             //   真开播时由 (FireworkLayer, showFireWorkFullScreen) 钩子记账;没放出来就不扣当天额度。
             // parseFireworkFlag@0x1c2258 只读 1 字节,同时写 showFirework 与 hasFireworkGift。
             enqueue_reply(env, nm, cmd, vec![1u8]);
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_SIGN_DAYS => {
             let today = local_date(env);
@@ -1804,8 +1858,6 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                 save_state(env, &st);
             }
             enqueue_reply(env, nm, cmd, encode_sign_days(&st));
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_IS_EXCHANGED => {
             let today = local_date(env);
@@ -1816,13 +1868,9 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
             let mut b = Vec::with_capacity(4);
             put_u32(&mut b, st.exch_mask & 0xfff);
             enqueue_reply(env, nm, cmd, b);
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_SIGN_EXCHANGE_LIST => {
             enqueue_reply(env, nm, cmd, encode_sign_exchange_list());
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_SEABED_INFO => {
             let mut st = load_state(env);
@@ -1830,8 +1878,6 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                 save_state(env, &st);
             }
             enqueue_reply(env, nm, cmd, encode_seabed_info(&st));
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_SEABED_REFRESH => {
             // 客户端已在 onSureRefreshClick@0x2c250a 本地扣了 3 贝壳(addVipGold:-3),这里重新生成 5 个贝壳。
@@ -1847,26 +1893,18 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                 put_u32(&mut b, *ts);
             }
             enqueue_reply(env, nm, cmd, b);
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_DISCOUNT_LIST => {
             // [补完 2026-09-15] F2-2 主村限时折扣(黄金岛的 1073 不走这里;岛上会话已在 intercept 入口排除)。
-            //   MOLE_DISCOUNT=off 时放行真 sendPacket:commandId:——原离线行为(只 packetsCount+1、setSendFlag 后返回,无折扣);
-            //   此前没发过任何宿主消息,调用处 None 时还会恢复 r0-r3。
-            if discount_disabled() {
-                return None;
-            }
+            //   MOLE_DISCOUNT=off 时 loopback_accepts 不接,真 sendPacket:commandId: 照常空过,走不到这里;
+            //   state==4 兜底臂截下的请求也已先查过开关。
             let body = encode_discount_list(env);
             enqueue_reply(env, nm, cmd, body);
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
         CMD_DAILY_TASK_LIST => {
             // [2026-09-16] E-03 每日任务列表。请求体首字节:0 主村 / 1 黄金岛(getDailyTaskListFromServerWithSceneId:@0x1cb5cc)。
             //   岛上会话在 intercept 入口就已排除,岛上的请求在请求入口改走宿主侧构造(island_daily_quest_apply)。
             //   这里若还收到 1(不在岛上会话却传了 10,正常走不到),不回包,免得在主村场景跑岛上的列表更新。
-            let req = nsdata_bytes(env, body);
             match req.first().copied() {
                 Some(0) => {
                     if let Some(reply) = encode_daily_task_list_main(env) {
@@ -1880,10 +1918,13 @@ fn handle_send_packet(env: &mut Environment, nm: id, body: id, cmd: u32) -> Opti
                     );
                 }
             }
-            env.cpu.regs_mut()[0] = 0;
-            Some(true)
         }
-        _ => None,
+        other => {
+            log!(
+                "[ACTIVITY] 回环受理 cmd={}:不在白名单(loopback_accepts 与本函数不一致),不回包",
+                other
+            );
+        }
     }
 }
 
@@ -2673,7 +2714,9 @@ fn island_discount_apply(env: &mut Environment) {
 ///   vip_info_poll 执行,不走回环(见 request_vip_info)。
 /// 前三个发包方法都不查 state,直接 sendPacket:commandId:(0x1cb33a / 0x1cbc68 / 0x1cb618),由 handle_send_packet 回环应答。
 /// 从岛回村时第四轮 K7 N-D5-2 的 (SceneMannager, loadMainVillageScene) 臂已在 startGame: 之前清掉离岛标志,所以冷启动进村与
-/// 从岛回村都会走到这里。调用方负责 save_regs/restore_regs。
+/// 从岛回村都会走到这里。
+/// [2026-10-03] 只由运行循环受理点调用(startGame: 臂只置标志,见 startgame_resend_poll),不在 startGame: 的调用栈上,不碰寄存器。
+///   三个发包方法照常走原版入口,在 sendPacket:commandId: 臂被截下,同一受理点紧接着算应答,回包下一轮喂。
 fn startgame_resend_offline(env: &mut Environment, nm: id) {
     let gd = singleton(env, "GameData", "sharedInstance");
     if gd != nil {
@@ -2700,11 +2743,12 @@ fn startgame_resend_offline(env: &mut Environment, nm: id) {
 
     // [2026-09-25 第五轮遗留 V] 0x19ca0 `[nm getVipInfo]`(1084):isConnected 门内紧跟 1074(0x19c6c)、圣诞活动标志(0x19c86,不补)之后。
     //   getVipInfo@0xeac2c 本体只有 sendPacket:nil commandId:0x43c、没有别的副作用,这里直接置排队标志,与经原版入口再被
-    //   getVipInfo 臂接住等价,不再多发宿主消息:从岛回村时本函数跑在调度器帧栈上(-[NewBaseLoading endLoading] → … →
+    //   getVipInfo 臂接住等价。startGame: 的两条来路:从岛回村是调度器帧栈(-[NewBaseLoading endLoading] → … →
     //   -[SceneMannager endLoadingScene] 0x241668 loadMainVillageScene → startGame → startGame:,同一次 CCScheduler tick);
     //   冷启动则是 -[LoadingLayer update:] 0x12f30c performSelectorOnMainThread:loadTarget waitUntilDone:NO → perform 相位 →
-    //   loadTarget 0x12f0ea startGame:。受理时 startGame: 早已返回:curSceneId 在 0x12efbc(回村 0x241660)已置 1、
-    //   userInfoLayer 在 0x193f0 已赋值、initGameData(0x19e26)以 gameMode==1 为前提,原版 currentGameMode 门放行。
+    //   loadTarget 0x12f0ea startGame:。两路都在同一轮受理点里先跑本函数、再分发 1084,那时 startGame: 早已返回:
+    //   curSceneId 在 0x12efbc(回村 0x241660)已置 1、userInfoLayer 在 0x193f0 已赋值、initGameData(0x19e26)以 gameMode==1 为前提,
+    //   原版 currentGameMode 门放行。
     request_vip_info(env, "进村补发 getVipInfo(0x19ca0)");
 }
 
@@ -3165,29 +3209,132 @@ pub fn request_vip_info(env: &Environment, why: &str) {
     );
 }
 
-/// [2026-09-25 第五轮遗留 V] 是否有待分发的 1084。ns_run_loop::run_run_loop 主线程每轮都调,只有一次原子读。
-pub fn vip_info_pending() -> bool {
-    VIP_INFO_PENDING.load(O)
-}
-
-/// [2026-09-25 第五轮遗留 V] 「VIP 信息 1084 回包分发」受理点。只由 ns_run_loop::run_run_loop 在主线程、本轮 perform 相位之后、
-/// 「关键操作即时落盘」受理点(mole_cheats::island_flush_now_poll)之前调用:这时本轮触摸、定时器(CADisplayLink → CCDirector
-/// mainLoop → drawScene → CCScheduler)、perform 队列都已返回,栈上没有任何游戏方法体,可以自由发宿主消息;不在 intercept 里,
-/// 不涉及 r0-r3 快照。照第五轮 FLUSH(置脏只排标志、运行循环统一受理)的写法,原因是规则「帧栈上不发宿主消息」:
-/// 调用点里 -[HolidayVillageLayer onEnter] 0x23949c 跑在切场景的 drawScene 帧栈上,从岛回村时的进村补发跑在 CCScheduler tick 里。
-/// 时机上是同一轮运行循环末尾,原版是一次网络往返之后;分发臂开头都按 curSceneId 自己判场景,与当时谁是代理无关。
-/// perform 相位不建自动释放池,这里自建一个包住整次分发(updateUI4VIP 里的 stringWithFormat:/spriteFrameByName:、
-/// 成就解锁发奖链都会产生自动释放对象),当场 drain;原版 iOS 每轮运行循环都会 drain,两者等价。
 /// [2026-10-03 第六波] 黄金岛每日任务(E-03,参数 10 的 getDailyTaskListFromServerWithSceneId:)与岛限时折扣(K6,
 /// getDiscountObjectsListFormServerWithMapId:10)的「待受理」标志。两个请求在岛上的调用点都在 -[HolidayVillageLayer onEnter]
 /// (0x239484 / 0x23946a),跑在切场景的 drawScene 帧栈上;以前在那里直接发 performSelector:withObject:afterDelay:0 排回调,
-/// 等于在帧栈上发宿主消息(第五轮 V 复核指出)。现在帧栈上只置标志,由运行循环受理点(ns_run_loop 在 perform 相位之后调的
-/// vip_info_poll → island_deferred_poll)在当前调用栈整个返回之后执行,时机与原 afterDelay:0 等价。
+/// 等于在帧栈上发宿主消息(第五轮 V 复核指出)。现在帧栈上只置标志,由运行循环受理点 run_loop_poll 在当前调用栈整个返回之后执行,
+/// 时机与原 afterDelay:0 等价。
 static ISLAND_DAILY_PENDING: AtomicBool = AtomicBool::new(false);
 static ISLAND_DISCOUNT_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// [2026-10-03 第六波] 受理岛日常 / 岛折扣:先取走标志;不在岛上会话或已转在线时只记日志放弃(与原回调臂口径相同)。
-/// 受理点不在任何游戏方法体的栈上,可以自由发消息;构造过程包一层自动释放池(perform 相位本身没有池)。
+/// [2026-10-03] 运行循环受理点是否有活要干。ns_run_loop::run_run_loop 主线程每轮都调,平时只有几次原子读。
+/// 以前这里只看 VIP_INFO_PENDING,而岛日常/岛折扣是挂在 VIP 受理里顺带做的:进岛时三者同一帧排上所以碰巧能跑,
+/// 单独排上岛日常或岛折扣时要等到下一次 1084 才会受理。现在每个标志都单独算。
+pub fn run_loop_pending() -> bool {
+    VIP_INFO_PENDING.load(O)
+        || ISLAND_DAILY_PENDING.load(O)
+        || ISLAND_DISCOUNT_PENDING.load(O)
+        || STARTGAME_RESEND_PENDING.load(O)
+        || REQUESTS_PENDING.load(O)
+        || LOOPBACK_REQUESTED.load(O)
+        || LOOPBACK_ARMED.load(O)
+        || FIREWORK_WAITING.load(O)
+}
+
+/// 运行循环受理点。只由 ns_run_loop::run_run_loop 在主线程、本轮 perform 相位之后、「关键操作即时落盘」受理点
+/// (mole_cheats::island_flush_now_poll)之前调用:这时本轮触摸、定时器(CADisplayLink → CCDirector mainLoop → drawScene →
+/// CCScheduler)、perform 队列都已返回,栈上没有任何游戏方法体,可以自由发宿主消息;不在 intercept 里,不涉及 r0-r3 快照。
+/// 照第五轮 FLUSH(置脏只排标志、运行循环统一受理)的写法,原因是规则「帧栈上不发宿主消息」(本仓血泪:帧栈里 msg_send
+/// 曾饿死运行循环、触发调度器重入活锁)。
+/// perform 相位不建自动释放池,这里自建一个包住本轮全部受理(updateUI4VIP 里的 stringWithFormat:/spriteFrameByName:、
+/// 成就解锁发奖链、回包解析都会产生自动释放对象),当场 drain;原版 iOS 每轮运行循环都会 drain,两者等价。
+/// 本轮顺序:
+/// ① 上一轮入队的回包(以及到点的烟花重查)喂进原版解析链——等价原 afterDelay:0 排到下一轮的 moleActivityLoopback;
+/// ② 离线进村补发(startGame: 臂只置了标志):发包方法经 sendPacket:commandId: 臂截下;
+/// ③ 算截下的请求(含 ①② 里新截的)的应答并入队;
+/// ④ 岛日常 / 岛折扣;⑤ VIP 信息 1084 分发(与以前一样在进村补发的同一轮,早于 1049/1058/1074 回包);
+/// ⑥ 本轮新入队的回包留到下一轮 ① 再喂。
+pub fn run_loop_poll(env: &mut Environment) {
+    let feed = LOOPBACK_ARMED.swap(false, O) || firework_retry_due();
+    let work = feed
+        || STARTGAME_RESEND_PENDING.load(O)
+        || REQUESTS_PENDING.load(O)
+        || ISLAND_DAILY_PENDING.load(O)
+        || ISLAND_DISCOUNT_PENDING.load(O)
+        || VIP_INFO_PENDING.load(O);
+    if work {
+        let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
+        let new_s = sel_named(env, "new");
+        let pool: id = msg_send(env, (pool_cls, new_s));
+        if feed {
+            loopback_feed_poll(env);
+        }
+        if STARTGAME_RESEND_PENDING.swap(false, O) {
+            startgame_resend_poll(env);
+        }
+        if REQUESTS_PENDING.swap(false, O) {
+            answer_pending_requests(env);
+        }
+        island_deferred_poll(env);
+        vip_info_poll(env);
+        let drain_s = sel_named(env, "drain");
+        let _: () = msg_send(env, (pool, drain_s));
+    }
+    if LOOPBACK_REQUESTED.swap(false, O) {
+        LOOPBACK_ARMED.store(true, O);
+    }
+}
+
+/// [2026-10-03] ① 喂回包(原 moleActivityLoopback 回调臂做的事)。在线/岛上不回环:丢弃队列与等场景的烟花包。
+fn loopback_feed_poll(env: &mut Environment) {
+    if env.options.network_access || crate::mole_cheats::island_session_active() {
+        if let Ok(mut q) = LOOPBACK_QUEUE.lock() {
+            if !q.is_empty() {
+                log!(
+                    "[ACTIVITY] 回环:喂包时已在线或已进岛,丢弃 {} 个回包",
+                    q.len()
+                );
+            }
+            q.clear();
+        }
+        // [2026-09-16] A1-01 等场景的烟花包一并丢弃(已经进岛,村庄场景不会再挂 FireworkLayer)。
+        firework_slot_put(None);
+        FIREWORK_IN_FLIGHT.store(false, O);
+        return;
+    }
+    let nm: id = Ptr::from_bits(LOOPBACK_NM.load(O));
+    run_loopback(env, nm);
+}
+
+/// [2026-10-03] ② 离线进村补发(原 startGame: 臂就地做的事):1049(MOLE_DISCOUNT=off 时不发)→ startgame_resend_offline。
+fn startgame_resend_poll(env: &mut Environment) {
+    if env.options.network_access || crate::mole_cheats::island_session_active() {
+        log!("[ACTIVITY] 进村补发:受理时已在线或已进岛,放弃");
+        return;
+    }
+    let nm = singleton(env, "NetworkManager", "sharedInstance");
+    if nm == nil {
+        return;
+    }
+    if !discount_disabled() {
+        let get_list = sel_named(env, "getDiscountListFromServer");
+        let _: () = msg_send(env, (nm, get_list));
+    }
+    startgame_resend_offline(env, nm);
+}
+
+/// [2026-10-03] ③ 按截包顺序逐个算应答入队(下一轮喂)。截包之后已转在线或进岛的,整批放弃(与以前「回调到达时清队列」同口径)。
+fn answer_pending_requests(env: &mut Environment) {
+    let reqs: Vec<(u32, u32, Vec<u8>)> = match PENDING_REQUESTS.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => return,
+    };
+    if reqs.is_empty() {
+        return;
+    }
+    if env.options.network_access || crate::mole_cheats::island_session_active() {
+        log!(
+            "[ACTIVITY] 回环受理:截下 {} 个请求后已转在线或已进岛,放弃应答",
+            reqs.len()
+        );
+        return;
+    }
+    for (nm_bits, cmd, req) in reqs {
+        answer_request(env, Ptr::from_bits(nm_bits), cmd, &req);
+    }
+}
+
+/// [2026-10-03 第六波] ④ 受理岛日常 / 岛折扣:先取走标志;不在岛上会话或已转在线时只记日志放弃(与原回调臂口径相同)。
 fn island_deferred_poll(env: &mut Environment) {
     let daily = ISLAND_DAILY_PENDING.swap(false, O);
     let discount = ISLAND_DISCOUNT_PENDING.swap(false, O);
@@ -3198,22 +3345,18 @@ fn island_deferred_poll(env: &mut Environment) {
         log!("[ACTIVITY] 黄金岛每日任务/折扣:受理时已不在岛上会话(或在线),放弃构造");
         return;
     }
-    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
-    let new_s = sel_named(env, "new");
-    let pool: id = msg_send(env, (pool_cls, new_s));
     if daily {
         island_daily_quest_apply(env);
     }
     if discount {
         island_discount_apply(env);
     }
-    let drain_s = sel_named(env, "drain");
-    let _: () = msg_send(env, (pool, drain_s));
 }
 
-pub fn vip_info_poll(env: &mut Environment) {
-    // [2026-10-03 第六波] 同一受理点顺带受理岛日常 / 岛折扣(不另改 ns_run_loop.rs 的受理位置)。
-    island_deferred_poll(env);
+/// [2026-09-25 第五轮遗留 V] ⑤「VIP 信息 1084 回包分发」。调用点里 -[HolidayVillageLayer onEnter] 0x23949c 跑在切场景的 drawScene
+/// 帧栈上,所以请求入口只置标志、在这里分发。时机上是同一轮运行循环末尾,原版是一次网络往返之后;分发臂开头都按 curSceneId
+/// 自己判场景,与当时谁是代理无关。
+fn vip_info_poll(env: &mut Environment) {
     if !VIP_INFO_PENDING.swap(false, O) {
         return;
     }
@@ -3221,12 +3364,7 @@ pub fn vip_info_poll(env: &mut Environment) {
         log!("[ACTIVITY] VIP 信息 1084:受理时已是在线模式,放弃分发");
         return;
     }
-    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
-    let new_s = sel_named(env, "new");
-    let pool: id = msg_send(env, (pool_cls, new_s));
     vip_info_dispatch(env);
-    let drain_s = sel_named(env, "drain");
-    let _: () = msg_send(env, (pool, drain_s));
 }
 
 /// [2026-09-25 第五轮遗留 V] 照 parseData 公共尾 0xe6d9e..0xe6de4 的两次分发:原版先给 delegateGameData(GameManager)发
