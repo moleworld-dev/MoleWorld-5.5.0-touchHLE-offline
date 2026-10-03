@@ -188,6 +188,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation {
+    let prev_orientation = env.window().current_rotation();
     env.on_parent_stack_in_coroutine(|window, _| {window.rotate_device(match orientation {
         UIDeviceOrientationPortrait => DeviceOrientation::Portrait,
         UIDeviceOrientationPortraitUpsideDown => DeviceOrientation::PortraitUpsideDown,
@@ -195,6 +196,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         UIDeviceOrientationLandscapeRight => DeviceOrientation::LandscapeRight,
         _ => unimplemented!("Orientation {} not handled yet", orientation),
     })});
+    if prev_orientation != env.window().current_rotation() {
+        generate_device_orientation_notification(env);
+    }
 }
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation
                      animated:(bool)_animated {
@@ -207,6 +211,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setIdleTimerDisabled:(bool)disabled {
     env.on_parent_stack_in_coroutine(|window, _| window.set_screen_saver_enabled(!disabled))
+}
+
+- (())setNetworkActivityIndicatorVisible:(bool)visible {
+    todo_objc_setter!(this, visible);
 }
 
 // [扫描修 2026-09-15] F12-5:打开外链不再退出游戏。
@@ -489,6 +497,31 @@ pub(super) fn UIApplicationMain(
     // become active.
     // [扫描修 2026-09-15] 抽成 send_did_become_active,与窗口还原(F12-3)共用,行为不变。
     send_did_become_active(env, ui_application);
+
+    // [2026-10-02 同步上游 v0.3.0] 上游 8b37a45f 在启动激活后补发一次设备方向通知(下方英文注释)。
+    // 只放在启动路径,不并进 send_did_become_active:窗口还原、安卓挂起回来([suspend_app])并没有方向变化,
+    // 不应重复播种。上游写在激活的同一个自动释放池里,这里另开一个池包住,发送顺序与上游一致(先激活后方向)。
+    if env
+        .framework_state
+        .uikit
+        .ui_device
+        .is_generating_device_orientation_notifications()
+    {
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        // This is a bit hacky...
+        //
+        // Some apps (e.g. "Dead Space") setup window and views only after
+        // receiving a device orientation change notification.
+        // Setup for this is usually done by calling
+        // `[UIDevice beginGeneratingDeviceOrientationNotifications]` and
+        // registering for UIDeviceOrientationDidChangeNotification
+        // notification in `application:didFinishLaunchingWithOptions:`.
+        //
+        // Here we're helping by seeding a first device orientation change
+        // just after the application becomes active.
+        generate_device_orientation_notification(env);
+        let _: () = msg![env; pool drain];
+    }
 
     // FIXME: There are more messages we should send.
 

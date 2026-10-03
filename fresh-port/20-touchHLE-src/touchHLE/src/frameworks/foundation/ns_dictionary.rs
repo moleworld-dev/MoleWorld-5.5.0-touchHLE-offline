@@ -971,7 +971,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     old_host_obj.release(env);
 }
 
-- (())setDictionary:(id)other {
+// [合并上游 v0.3.0 2026-10-02] 上游 331903de 也加了 setDictionary:(removeAllObjects +
+// addEntriesFromDictionary:)。保留我方写法:走 keyEnumerator/objectForKey: 消息,对任何 NSDictionary
+// (含 guest 子类、非 DictionaryHostObject 的字典)都成立;上游版经 addEntriesFromDictionary: 直接
+// borrow 对方宿主对象,传入非本引擎字典时会 panic。GameData loadUpgradeXP 依赖本方法填等级表。
+- (())setDictionary:(id)other { // NSDictionary *
     () = msg![env; this removeAllObjects];
     if other == nil { return; }
     let enumerator: id = msg![env; other keyEnumerator];
@@ -993,6 +997,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addEntriesFromDictionary:(id)other { // NSDictionary *
+    if other == nil  {
+        return
+    }
     let host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(other));
     for (k, v) in host_obj.map.values().flatten() {
         () = msg![env; this setObject:(*v) forKey:(*k)];

@@ -488,6 +488,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
+// [同步上游 0.3.0 2026-10-02] 上游新增的两个存根照收(只记 TODO 日志);上游同时加的
+// setPagingEnabled: / setShowsHorizontalScrollIndicator: / setShowsVerticalScrollIndicator:
+// 存根被上面我方的真实现(F8-2)覆盖,不重复定义。
+- (())setDirectionalLockEnabled:(bool)enabled {
+    todo_objc_setter!(this, enabled);
+}
+
+- (())setScrollsToTop:(bool)value {
+    todo_objc_setter!(this, value);
+}
+
 - (CGPoint)contentOffset {
     env.objc.borrow::<UIScrollViewHostObject>(this).content_offset
 }

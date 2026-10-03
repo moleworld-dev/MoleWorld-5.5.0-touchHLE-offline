@@ -500,9 +500,10 @@ impl Write for GuestFile {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             GuestFile::File(file) => file.flush(),
-            GuestFile::IpaBundleFile(file) => {
-                panic!("Attempt to flush a read-only file: {file:?}")
-            }
+            GuestFile::IpaBundleFile(file) => Err(std::io::Error::new(
+                std::io::ErrorKind::ReadOnlyFilesystem,
+                format!("Attempt to flush a read-only file: {file:?}"),
+            )),
             GuestFile::ResourceFile(file) => {
                 panic!("Attempt to flush a read-only file: {file:?}")
             }
@@ -610,6 +611,10 @@ impl Fs {
             // directory is expected
             // [MoleWorld 2026-09-16] 真机应用容器里 Library/Caches 同样开箱就有:游戏内置的 TalkingData 等 SDK
             // 直接往 Library/Caches/.talkingdata_ga_* 原子写文件、不先建目录,少了它每次都报 DoesNotExist。
+            // [同步上游 0.3.0 2026-10-03] 上游 6d4ebddd/f233bc78 在这之后另加了一段单独建 Library/Caches
+            // 的代码(理由同上:有些应用默认缓存目录已存在),与本循环重复,已删去。上游那段带的待办
+            // (以后想办法清理缓存目录)照搬在此:
+            // TODO: figure out a way to clean caches
             for sub in ["Preferences", "Caches"] {
                 let path = paths::user_data_base_path()
                     .join(paths::SANDBOX_DIR)
@@ -656,6 +661,29 @@ impl Fs {
                 // symlink
                 "libz.1.1.3.dylib",
                 FsNode::resource_file(format!("{DYLIBS_DIR}/libz.1.2.3.dylib")),
+            )
+            .with_child(
+                "libsqlite3.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libsqlite3.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libsqlite3.0.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libsqlite3.dylib")),
+            )
+            .with_child(
+                "libxml2.2.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libxml2.2.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libxml2.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libxml2.2.dylib")),
+            )
+            .with_child(
+                // symlink
+                "libxml2.2.7.8.dylib",
+                FsNode::resource_file(format!("{DYLIBS_DIR}/libxml2.2.dylib")),
             );
 
         let mut app_dir_children = HashMap::new();

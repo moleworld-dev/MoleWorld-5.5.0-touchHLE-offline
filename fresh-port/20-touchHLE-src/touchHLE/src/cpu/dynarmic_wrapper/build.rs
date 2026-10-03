@@ -32,8 +32,9 @@ fn build_type_windows() -> &'static str {
 fn main() {
     let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = package_root.join("../../..");
+    let dynarmic_root = workspace_root.join("vendor/dynarmic");
 
-    let mut build = cmake::Config::new(workspace_root.join("vendor/dynarmic"));
+    let mut build = cmake::Config::new(&dynarmic_root);
     build.define("DYNARMIC_FRONTENDS", "A32"); // We don't need 64-bit
     build.define("DYNARMIC_WARNINGS_AS_ERRORS", "OFF");
     build.define("DYNARMIC_TESTS", "OFF");
@@ -43,6 +44,11 @@ fn main() {
     // os.cc / format-inl.h 里的 FMT_STRING 报「call to consteval function ... is not a constant
     // expression」,dynarmic 整体编不过。fmt 的 core.h 用 #ifndef FMT_CONSTEVAL 包着自动探测,
     // 预先定义成空即可关闭编译期格式串校验(运行期行为不变,旧编译器上也无副作用)。
+    // [同步上游 0.3.0 2026-10-02] dynarmic 升到 e0f6bd9d 后捆绑的是 fmt 12:base.h 无条件
+    // #define FMT_CONSTEVAL(不再有 #ifndef),这里的 -D 会被头文件覆盖、实际不起作用(-w 下连
+    // 「宏重定义」告警也不显示);fmt 12 本身在 clang 21 下能直接编过(已实测 jit 构建通过)。
+    // 暂时保留这一行,只为外层主仓的 vendor/dynarmic 仍是旧版(fmt 10.1)时也能编过;两边都换到
+    // 新版 dynarmic 后可以删掉。
     build.cxxflag("-DFMT_CONSTEVAL=");
 
     // This is Windows- and Android-specific because on macOS or Linux, you can
@@ -135,7 +141,8 @@ fn main() {
     }
 
     // rerun-if-changed seems to not work if pointed to a directory :(
-    //rerun_if_changed(&workspace_root.join("vendor/dynarmic"));
+    //rerun_if_changed(&dynarmic_root);
+    rerun_if_changed(&workspace_root.join(".git/modules/dynarmic/HEAD"));
 
     cc::Build::new()
         .file(package_root.join("lib.cpp"))

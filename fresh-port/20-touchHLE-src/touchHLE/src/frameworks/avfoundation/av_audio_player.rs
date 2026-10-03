@@ -136,7 +136,19 @@ pub const CLASSES: ClassExports = objc_classes! {
             this
         }
         Err(_) => {
-            assert!(out_error.is_null()); // TODO
+            // [同步上游 0.3.0 2026-10-03] 上游 a5298d5a 把这里的 assert!(out_error.is_null()) 换成了
+            // 无条件写 out_error;调用方传 error:nil 时会写 0 地址崩溃。本游戏
+            // -[IMMraidAudioPlayer connectionDidFinishLoading:]@0x6a0b3c 就传 nil(0x6a0b30 movs r3,#0)。
+            // 与上面 initWithContentsOfURL:error: 一样先判空。
+            if !out_error.is_null() {
+                let domain = ns_string::get_static_str(env, NSOSStatusErrorDomain);
+                let error = msg_class![env; NSError alloc];
+                let code = -1; // TODO: set a proper code
+                let error = msg![env; error initWithDomain:domain code:code userInfo:nil];
+                autorelease(env, error);
+                env.mem.write(out_error, error);
+            }
+
             release(env, this);
             nil
         }
@@ -459,10 +471,8 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
         "_touchHLE_AVAudioPlayerOutputBufferHelper on object of class: {}",
         env.objc.get_class_name(class)
     );
-    assert_eq!(
-        class,
-        env.objc.get_known_class("AVAudioPlayer", &mut env.mem)
-    );
+    let audio_player_class = env.objc.get_known_class("AVAudioPlayer", &mut env.mem);
+    assert!(env.objc.class_is_subclass_of(class, audio_player_class));
 
     let &AVAudioPlayerHostObject {
         audio_file_id,

@@ -1,8 +1,18 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.5)
+
+project(tsl-robin-map VERSION 1.4.0 LANGUAGES CXX)
+
 include(GNUInstallDirs)
 
 
-project(tsl-robin-map VERSION 0.6.2)
+set(IS_MAIN_PROJECT FALSE)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(IS_MAIN_PROJECT TRUE)
+endif()
+
+# Enable the install target if the project is used main project (disable by default if subproject)
+option(TSL_ROBIN_MAP_ENABLE_INSTALL "Enable install target" ${IS_MAIN_PROJECT})
+
 
 add_library(robin_map INTERFACE)
 # Use tsl::robin_map as target, more consistent with other libraries conventions (Boost, Qt, ...)
@@ -24,11 +34,8 @@ if(MSVC)
                    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_DATAROOTDIR}/tsl-robin-map.natvis>")
 endif()
 
-
-
-
-# Installation (only compatible with CMake version >= 3.3)
-if(${CMAKE_VERSION} VERSION_GREATER "3.2")
+# Installation
+if(TSL_ROBIN_MAP_ENABLE_INSTALL)
     include(CMakePackageConfigHelpers)
 
     ## Install include directory and potential natvis file
@@ -51,8 +58,10 @@ if(${CMAKE_VERSION} VERSION_GREATER "3.2")
             DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/cmake/tsl-robin-map")
 
 
+    ## Create local tsl-robin-mapTargets.cmake
+    export(TARGETS robin_map NAMESPACE tsl:: FILE "${CMAKE_CURRENT_BINARY_DIR}/tsl-robin-mapTargets.cmake")
 
-    ## Create and install tsl-robin-mapTargets.cmake
+    ## Create and install global tsl-robin-mapTargets.cmake
     install(TARGETS robin_map
             EXPORT tsl-robin-mapTargets)
 

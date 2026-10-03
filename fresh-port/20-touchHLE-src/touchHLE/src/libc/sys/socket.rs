@@ -273,6 +273,73 @@ fn setsockopt(
     0 // Success
 }
 
+fn getsockname(
+    env: &mut Environment,
+    socket: i32,
+    address: MutPtr<sockaddr>,
+    address_len: MutPtr<socklen_t>,
+) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
+    let type_ = socket_host_object.type_;
+    assert!(type_ == SOCK_STREAM || type_ == SOCK_DGRAM);
+
+    match socket_host_object.type_ {
+        SOCK_DGRAM => {
+            assert!(socket_host_object.tcp_listener.is_none());
+            assert!(socket_host_object.pending_tcp_stream.is_none());
+            let udp_socket = socket_host_object.udp_socket.as_ref().unwrap();
+            let socket_addr = udp_socket.local_addr().unwrap();
+            let local_guest_addr = sockaddr::from_sockaddr_v4(&socket_addr);
+            assert_eq!(env.mem.read(address_len), guest_size_of::<sockaddr>());
+            env.mem.write(address, local_guest_addr);
+        }
+        SOCK_STREAM => {
+            // [同步上游 0.3.0 2026-10-03] 上游这里是 unimplemented!()(以及上面两条对 TCP 状态的
+            // assert),只支持 UDP。分叉点本函数未实现,dyld 链接成返回 0 的空操作桩;上游实现后,
+            // 游戏里 AsyncSocket / TFAsyncSocket / YMLGCDAsyncSocket 的 localHost/localPort/
+            // localAddress 一族(-[AsyncSocket localPortFromNativeSocket4:]@0x11f3c8 等 17 处调用点;
+            // -[AsyncSocket description]@0x11fa20 会调 localPort)只要拿到 socket() 建的 TCP 套接字
+            // 调用它就会必崩。本游戏主协议走 CFStream、不设原生套接字,目前多半走不到,但 SDK 里
+            // 用 socket() 直建 TCP 的 YMLGCDAsyncSocket 可达。按 POSIX 语义补上:
+            // 已连接/监听中的取宿主套接字的本地地址,还没 bind/connect 的返回 0.0.0.0:0;
+            // 缓冲不足一个 sockaddr 时按 EINVAL 失败,实际写入长度回填到 *address_len。
+            let local = if let Some(stream) = socket_host_object.tcp_stream.as_ref() {
+                stream.local_addr().ok()
+            } else if let Some(stream) = socket_host_object.pending_tcp_stream.as_ref() {
+                stream.local_addr().ok()
+            } else if let Some(listener) = socket_host_object.tcp_listener.as_ref() {
+                listener.local_addr().ok()
+            } else {
+                None
+            };
+            let local_guest_addr = match local {
+                Some(addr) if addr.is_ipv4() => sockaddr::from_sockaddr_v4(&addr),
+                _ => sockaddr::from_ipv4_parts([0; 4], 0),
+            };
+            if address.is_null() || address_len.is_null() {
+                set_errno(env, EINVAL);
+                return -1;
+            }
+            let size = guest_size_of::<sockaddr>();
+            if env.mem.read(address_len) < size {
+                set_errno(env, EINVAL);
+                return -1;
+            }
+            env.mem.write(address, local_guest_addr);
+            env.mem.write(address_len, size);
+        }
+        _ => unreachable!(),
+    }
+
+    0 // Success
+}
+
 fn bind(
     env: &mut Environment,
     socket: i32,
@@ -282,7 +349,10 @@ fn bind(
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let socket_host_object = State::get(env).sockets.get(&socket).unwrap();
+    let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
     let type_ = socket_host_object.type_;
     assert!(type_ == SOCK_STREAM || type_ == SOCK_DGRAM);
 
@@ -347,7 +417,11 @@ fn listen(env: &mut Environment, socket: i32, backlog: i32) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let type_ = State::get(env).sockets.get(&socket).unwrap().type_;
+    let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
+    let type_ = socket_host_object.type_;
     assert!(type_ == SOCK_STREAM);
 
     log!(
@@ -367,7 +441,11 @@ fn connect(
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let type_ = State::get(env).sockets.get(&socket).unwrap().type_;
+    let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
+    let type_ = socket_host_object.type_;
     assert!(type_ == SOCK_STREAM);
 
     assert_eq!(address_len, guest_size_of::<sockaddr>());
@@ -1062,6 +1140,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(ioctl(_, _, _)),
     export_c_func!(getsockopt(_, _, _, _, _)),
     export_c_func!(setsockopt(_, _, _, _, _)),
+    export_c_func!(getsockname(_, _, _)),
     export_c_func!(bind(_, _, _)),
     export_c_func!(listen(_, _)),
     export_c_func!(connect(_, _, _)),

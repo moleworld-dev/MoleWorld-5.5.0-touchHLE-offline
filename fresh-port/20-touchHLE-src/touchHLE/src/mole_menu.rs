@@ -24,7 +24,7 @@ use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::from_rust_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{UILineBreakMode, UILineBreakModeCharacterWrap};
-use crate::mem::{MutVoidPtr, Ptr};
+use crate::mem::{ConstVoidPtr, Ptr};
 use crate::mole_dev::QuestFamily;
 use crate::objc::{id, msg, msg_class, msg_send, nil, release, retain, SEL};
 use crate::Environment;
@@ -972,7 +972,10 @@ fn build(env: &mut Environment, fade: bool) {
         // Doubles as the live exercise of that code path: opacity 0 -> 1 over 0.2s.
         // [扫描修 2026-09-15] 只在打开菜单时淡入;按钮触发的重建不再淡入,否则数字键盘每按一下整个菜单都闪一次。
         () = msg![env; container setAlpha:0.0f32];
-        let null_ctx: MutVoidPtr = Ptr::null();
+        // [同步上游 0.3.0 2026-10-03] 上游 beginAnimations:context: 的 context 是 ConstVoidPtr
+        // (分叉点是 MutVoidPtr),宿主发宿主的消息按 TypeId 严格检查,类型不一致会 panic
+        // 「Type mismatch when sending message」,打开修改器菜单必崩。
+        let null_ctx: ConstVoidPtr = Ptr::null();
         () = msg_class![env; UIView beginAnimations:nil context:null_ctx];
         let dur: f64 = 0.2;
         () = msg_class![env; UIView setAnimationDuration:dur];

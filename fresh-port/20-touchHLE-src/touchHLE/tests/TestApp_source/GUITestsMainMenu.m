@@ -7,6 +7,7 @@
 #include "system_headers.h"
 
 #include "GUITestsAppDelegate.h"
+#include "GUITestsBlendModeView.h"
 #include "GUITestsCALayerTestsView.h"
 #include "GUITestsCGFontGlyphTestsView.h"
 #include "GUITestsMainMenu.h"
@@ -64,6 +65,15 @@ UIWindow *window2;
       forControlEvents:UIControlEventTouchUpInside];
   [self addSubview:button3];
 
+  UIButton *button4 = [UIButton buttonWithType:UIButtonTypeRoundedRect];
+  [button4 setTitle:[NSString stringWithUTF8String:"BlendMode tests"]
+           forState:UIControlStateNormal];
+  [button4 setFrame:CGRectMake(40, 380, 240, 40)];
+  [button4 addTarget:self
+                action:@selector(goToBlendModeTests)
+      forControlEvents:UIControlEventTouchUpInside];
+  [self addSubview:button4];
+
   return self;
 }
 
@@ -112,6 +122,12 @@ UIWindow *window2;
 - (void)goToCGFontGlyphTests {
   [((GUITestsAppDelegate *)[[UIApplication sharedApplication]
       delegate]) setMainView:[[[GUITestsCGFontGlyphTestsView alloc]
+                                 initWithFrame:[self frame]] autorelease]];
+}
+
+- (void)goToBlendModeTests {
+  [((GUITestsAppDelegate *)[[UIApplication sharedApplication]
+      delegate]) setMainView:[[[GUITestsBlendModeView alloc]
                                  initWithFrame:[self frame]] autorelease]];
 }
 

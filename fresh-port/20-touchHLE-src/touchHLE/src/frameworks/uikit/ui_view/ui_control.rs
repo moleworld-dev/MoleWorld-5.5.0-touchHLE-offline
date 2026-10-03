@@ -15,7 +15,7 @@ pub mod ui_switch;
 pub mod ui_text_field;
 
 use crate::frameworks::core_graphics::CGPoint;
-use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
     retain, ClassExports, NSZonePtr, SEL,
@@ -33,11 +33,18 @@ pub const UIControlEventTouchUpInside: UIControlEvents = 1 << 6;
 const UIControlEventTouchUpOutside: UIControlEvents = 1 << 7;
 pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
 
-struct UIControlHostObject {
+// TODO: Add the other UIControlContentVerticalAlignment enums
+pub type UIControlContentVerticalAlignment = NSInteger;
+const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment = 0;
+
+// [同步上游 0.3.0 2026-10-03] 放宽到 pub(super):同在 ui_view 下的 ui_page_control(UIPageControl)
+// 要以它为父类宿主对象、并复用 send_actions 发 ValueChanged。
+pub(super) struct UIControlHostObject {
     superclass: super::UIViewHostObject,
     enabled: bool,
     selected: bool,
     highlighted: bool,
+    contentVerticalAlignment: UIControlContentVerticalAlignment,
     /// `UITouch*` of the touch currently being tracked, [nil] if none
     tracked_touch: id,
     tracking: bool,
@@ -53,6 +60,7 @@ impl Default for UIControlHostObject {
             enabled: true,
             selected: false,
             highlighted: false,
+            contentVerticalAlignment: UIControlContentVerticalAlignmentCenter,
             tracked_touch: nil,
             tracking: false,
             action_targets: Vec::new(),
@@ -68,7 +76,12 @@ const UIControlStateSelected: UIControlState = 1 << 2;
 #[allow(dead_code)]
 const UIControlStateFocused: UIControlState = 1 << 3;
 
-fn send_actions(env: &mut Environment, this: id, event: id, control_event: UIControlEvents) {
+pub(super) fn send_actions(
+    env: &mut Environment,
+    this: id,
+    event: id,
+    control_event: UIControlEvents,
+) {
     log_dbg!(
         "Control event {:?} in control {:?} for event {:?}",
         control_event,
@@ -108,6 +121,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         enabled: _,
         selected: _,
         highlighted: _,
+        contentVerticalAlignment: _,
         tracking: _,
         action_targets: _, // targets are weak references, nothing to do
         tracked_touch,
@@ -160,8 +174,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UIControlHostObject>(this).highlighted = highlighted;
 }
 
+- (NSInteger)contentVerticalAlignment {
+    env.objc.borrow::<UIControlHostObject>(this).contentVerticalAlignment
+}
+
+- (())setContentVerticalAlignment:(UIControlContentVerticalAlignment)contentVerticalAlignment {
+    env.objc.borrow_mut::<UIControlHostObject>(this).contentVerticalAlignment = contentVerticalAlignment;
+}
+
 - (bool)tracking {
     env.objc.borrow::<UIControlHostObject>(this).tracking
+}
+
+- (())cancelTrackingWithEvent:(id)_event {
+    // default implementation, subclasses can override this
 }
 
 - (bool)beginTrackingWithTouch:(id)_touch // UITouch*

@@ -200,13 +200,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
-// NSCopying implementation (NSTimeZone is immutable)
-- (id)copyWithZone:(NSZonePtr)_zone {
-    retain(env, this)
-}
+// [同步上游 0.3.0 2026-10-02] 我方原在此处实现 copyWithZone:(不可变对象,retain 自身即可);
+// 上游 a39e7614 在类末尾加了完全相同的实现,同一类里重复定义会被 dylib_list 的查重测试判失败,
+// 合并后只保留类末尾上游那一份,行为不变。
 
 - (id)name {
     env.objc.borrow_mut::<NSTimeZoneHostObject>(this).time_zone
+}
+
+- (id)abbreviation {
+    // TODO: support zone abbreviations
+    ns_string::get_static_str(env, "GMT")
 }
 
 - (NSInteger)secondsFromGMT {
@@ -225,6 +229,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     let kind = env.objc.borrow::<NSTimeZoneHostObject>(this).kind;
     kind_offset_at(kind, unix_secs)
+}
+
+// NSCopying implementation
+- (id)copyWithZone:(NSZonePtr)_zone {
+    retain(env, this)
 }
 
 @end

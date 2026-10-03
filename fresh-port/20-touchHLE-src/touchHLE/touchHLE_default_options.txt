@@ -226,6 +226,24 @@ com.StarByte.NEX: --landscape-left --force-composition
 # In Game controls A = Weapon Select, X = Boost, B = Fire, Y = Missle, Start = Pause
 www.fishlabs.net.GalaxyOnFire: --landscape-right --button-to-touch=A,427,274 --button-to-touch=X,380,254 --button-to-touch=Y,124,291 --button-to-touch=B,444,221 --button-to-touch=Start,444,20
 
+# Palm Heroes
+com.palmheroes.PalmHeroes: --landscape-right
+
+# Silent Hill: The Escape
+com.konami-europe.silenthillescape: --x-tilt-offset=-45
+
+# Dead Space
+com.ea.deadspace.bv: --force-composition
+com.ea.deadspace.inc: --force-composition
+com.ea.deadspace.ipad.bv: --force-composition
+com.ea.deadspace.ipad.inc: --force-composition
+
+# NFS Hot Pursuit
+com.ea.nfshp.bv: --force-composition
+com.ea.nfshp.inc: --force-composition
+com.ea.nfshp.ipad.bv: --force-composition
+com.ea.nfshp.ipad.inc: --force-composition
+
 # MoleWorld 摩尔庄园 5.5.0
 # Force Simplified Chinese. Under English the game caps quests/story by language in -[NewSceneQuest activate:],
 # -[Quest activate:] and -[NewSceneStory activate]: Golden Island stops at quest 70 / story chapter 23 and the

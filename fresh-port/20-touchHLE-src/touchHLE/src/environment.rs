@@ -22,7 +22,7 @@ use crate::{
     window,
 };
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -41,11 +41,13 @@ pub type HostContext = Coroutine<Environment, Environment, Environment>;
 
 /// Bookkeeping for a thread.
 pub struct Thread {
-    /// Once a thread finishes, this is set to false.
-    pub active: bool,
+    /// The current running state of the thread. See [ThreadState].
+    pub state: ThreadState,
     /// If this is not [ThreadBlock::NotBlocked], the thread is not executing
     /// until a certain condition is fufilled.
     pub blocked_by: ThreadBlock,
+    /// Container for thread local state of various child modules
+    pub framework_state: frameworks::ThreadLocalState,
     /// After a secondary thread finishes, this is set to the returned value.
     return_value: Option<MutVoidPtr>,
     /// Context object containing the CPU state for this thread.
@@ -73,14 +75,20 @@ impl Thread {
     fn is_blocked(&self) -> bool {
         !matches!(self.blocked_by, ThreadBlock::NotBlocked)
     }
+    pub fn is_alive(&self) -> bool {
+        !matches!(self.state, ThreadState::Dead)
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, ThreadState::Running | ThreadState::Stepping)
+    }
 }
 
 impl std::fmt::Debug for Thread {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Thread {{ active: {:?}, blocked_by: {:?}, return_value: {:?} }}",
-            self.active, self.blocked_by, self.return_value
+            "Thread {{ state: {:?}, blocked_by: {:?}, return_value: {:?} }}",
+            self.state, self.blocked_by, self.return_value
         )
     }
 }
@@ -155,6 +163,45 @@ pub enum ThreadBlock {
     FileObjectLock(MutPtr<FILE>),
 }
 
+impl std::fmt::Display for ThreadBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThreadBlock::NotBlocked => write!(f, "Running"),
+            ThreadBlock::Sleeping(wake_time) => {
+                let remaining = wake_time.checked_duration_since(Instant::now());
+                match remaining {
+                    Some(dur) => write!(f, "Sleeping for {:.3}s", dur.as_secs_f32()),
+                    None => write!(f, "Waking"),
+                }
+            }
+            ThreadBlock::Mutex(ptr) => write!(f, "Blocked on mutex {ptr:?}"),
+            ThreadBlock::Semaphore(ptr) => write!(f, "Blocked on semaphore {ptr:?}"),
+            ThreadBlock::Condition(ptr, _) => write!(f, "Blocked on condition {ptr:?}"),
+            // tid adds 1 to match gdb's thread numbers
+            ThreadBlock::Joining(tid, _) => write!(f, "Joining on thread {}", tid + 1),
+            ThreadBlock::Suspended(count, old) => {
+                write!(f, "Suspended (count {}, previously {})", count, old)
+            }
+            ThreadBlock::FileObjectLock(ptr) => write!(f, "Waiting for file to unlock {ptr:?}"),
+            // Unlikely to be seen
+            ThreadBlock::WaitingForDebugger(_) => write!(f, "Waiting for debugger"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThreadState {
+    /// The thread is currently running (but may be blocked by a [ThreadBlock])
+    Running,
+    /// The thread is being stepped by the gdb server.
+    Stepping,
+    /// The thread is paused by the gdb server, typically because another
+    /// thread is stepping and client has asked for other threads not to run.
+    Paused,
+    /// The thread has died.
+    Dead,
+}
+
 struct BinaryDependencyNode {
     name: String,
     dependencies: Vec<String>,
@@ -175,7 +222,7 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
     for node in graph {
         let &bin_index = node_to_index
             .get(node.name.as_str())
-            .ok_or_else(|| format!("Failed to find {:?} name mapping", &node.name))?;
+            .ok_or_else(|| format!("Failed to find {:?} name mapping", node.name))?;
 
         // Bin names dont include prefix while dynamic lib paths do
         for dependency in node
@@ -370,10 +417,21 @@ impl Environment {
         let mut mem = mem::Mem::new();
 
         let is_spore = bundle.bundle_identifier().starts_with("com.ea.spore");
+        let is_critter_crunch = bundle
+            .bundle_identifier()
+            .starts_with("com.capybaragames.CritterCrunch")
+            || bundle
+                .bundle_identifier()
+                .starts_with("com.go.starwave.CritterCrunch");
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free = !is_spore;
+        mem.zero_memory_on_free = !is_spore && !is_critter_crunch;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
+        }
+        if is_critter_crunch {
+            // Without this hack, every time a critter 'explodes',
+            // the game crashes with a null page access error.
+            log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
         }
         log!("[boot] splash 已过,即将加载主程序 Mach-O");
         let executable = mach_o::MachO::load_from_file(
@@ -403,6 +461,18 @@ impl Environment {
                         // We build `libz` from sources with our OSS toolchain,
                         // the base address is already set and sliding is not
                         // needed.
+                        0
+                    }
+                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => {
+                        // We build `libsqlite3` from sources with our OSS
+                        // toolchain, the base address is already set and
+                        // sliding is not needed.
+                        0
+                    }
+                    "libxml2.2.dylib" | "libxml2.dylib" | "libxml2.2.7.8.dylib" => {
+                        // We build `libxml2` from sources with our OSS
+                        // toolchain, the base address is already set and
+                        // sliding is not needed.
                         0
                     }
                     _ => unimplemented!("Unknown binary slide for {}", name),
@@ -462,10 +532,93 @@ impl Environment {
                     // will try to poke the top of the stack, so we'll give
                     // it some room.
                     env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+
+                    // [2026-10-02 同步上游 v0.3.0] 上游新增「静态初始化器之前先给定义了 +load 的类发 +load」
+                    // (b77693d2/c6f73adf),这一步可能先于静态初始化器执行 guest 代码,补一条足迹便于崩溃时定位。
+                    crate::mole_sysinfo::milestone(
+                        "即将给定义了 +load 的类发送 +load(上游 v0.3.0 新增步骤)",
+                    );
+                    // Call `+load` method on classes where it's defined.
+                    // TODO: `+load` methods from our image should take priority
+                    // over frameworks ones.
+                    // TODO: a category `+load` method should be called after
+                    // the class's own +load method.
+                    // Note: `+load` is sent without triggering `+initialize`,
+                    // matching the runtime's guarantee that `+load` runs first.
+                    let mut to_be_loaded = Vec::new();
+                    let mut processed = HashSet::new();
+                    let load_sel: objc::SEL = env
+                        .objc
+                        .register_host_selector("load".to_string(), &mut env.mem);
+                    for (class_name, &class) in env.objc.all_classes() {
+                        if processed.contains(&class) {
+                            continue;
+                        }
+                        if env.objc.is_unimplemented_class(class) || env.objc.is_fake_class(class) {
+                            continue;
+                        }
+                        if env
+                            .objc
+                            .object_has_uninherited_method(&env.mem, class, load_sel)
+                        {
+                            log_dbg!("Calling +load on inheritance chain of {} class", class_name);
+                            let mut inherited = Vec::new();
+                            let mut curr_class = class;
+                            while curr_class != objc::nil
+                                && !env.objc.is_unimplemented_class(curr_class)
+                                && !env.objc.is_fake_class(curr_class)
+                            {
+                                if !processed.contains(&curr_class)
+                                    && env.objc.object_has_uninherited_method(
+                                        &env.mem, curr_class, load_sel,
+                                    )
+                                {
+                                    inherited.push(curr_class);
+                                    processed.insert(curr_class);
+                                }
+                                curr_class = env.objc.get_superclass(curr_class);
+                            }
+                            to_be_loaded.extend(inherited.into_iter().rev());
+                        }
+                    }
+                    // [2026-10-02 同步上游 v0.3.0] 本游戏 5.5.0 的 __objc_nlclslist(0x9d4c08,10 项)与
+                    // __objc_nlcatlist(0xb40938,1 项)里实现了 +load 的有:iRate@0x1e8b49 / TaomeeRate@0x4f9e59 /
+                    // TaomeeVersion@0x4fc759(+load 里建 sharedInstance,init 注册启动/回前台通知)、AtomAdapter* 六个
+                    // 广告适配器(向 AtomAdNetworkRegistry registerClass:)、__ARCLite__@0x88355d(补下标方法,调用的
+                    // class_getInstanceMethod/protocol_getMethodDescription/class_addMethod 本引擎未实现,走 dyld 无操作桩)、
+                    // UIColor(Expanded)@0x798d71(建颜色名表)。分叉点的 touchHLE 从不发 +load,这些 SDK 等于没初始化过。
+                    // 其中 iRate 已在 objc/classes.rs 的 substitute_classes 里伪造成 FakeClass,上面的
+                    // is_fake_class 判断会跳过它,实际只给其余各类发送。
+                    // 照原版采纳上游;MOLE_OBJC_LOAD=0 可整体跳过(无头回归对照/排障用),默认发送。
+                    let skip_load = std::env::var("MOLE_OBJC_LOAD").is_ok_and(|v| v.trim() == "0");
+                    if !to_be_loaded.is_empty() {
+                        let names: Vec<&str> = to_be_loaded
+                            .iter()
+                            .map(|&class| env.objc.get_class_name(class))
+                            .collect();
+                        log!(
+                            "[+load] {} 个类实现了 +load{}:{}",
+                            names.len(),
+                            if skip_load {
+                                "(MOLE_OBJC_LOAD=0,全部跳过)"
+                            } else {
+                                ""
+                            },
+                            names.join(", ")
+                        );
+                    }
+                    if !skip_load {
+                        for &class in &to_be_loaded {
+                            () = objc::msg_send_no_initialize(env, (class, load_sel));
+                        }
+                    }
+
                     // Static initializers for libraries must be run before
                     // the initializer in the app binary.
                     crate::mole_sysinfo::milestone(
-                        "即将执行 guest 静态初始化器(首次把 guest ARM 代码 JIT 成机器码并运行)",
+                        // [同步上游 0.3.0 2026-10-03] 足迹文字更正:+load 已先执行过 guest 代码,
+                        // 这里不再是首个 guest 代码执行点。
+                        "即将执行 guest 静态初始化器(+load 已先执行过 guest 代码)",
                     );
                     for bin_idx in env.get_sorted_bin_indices().unwrap() {
                         let Some(bin) = env.bins.get(bin_idx) else {
@@ -545,12 +698,13 @@ impl Environment {
             env
         });
         let main_thread = Thread {
-            active: true,
+            state: ThreadState::Running,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            framework_state: Default::default(),
         };
 
         let mut env = Environment {
@@ -604,10 +758,7 @@ impl Environment {
                 .accept()
                 .map_err(|e| format!("Could not accept connection: {e}"))?;
             echo!("Debugger client connected on {}.", client_addr);
-            let mut gdb_server = gdb::GdbServer::new(client);
-            let step = gdb_server.wait_for_debugger(None, &mut env.cpu, &mut env.mem);
-            assert!(!step, "Can't step right now!"); // TODO?
-            env.gdb_server = Some(Box::new(gdb_server));
+            env.gdb_server = Some(Box::new(gdb::GdbServer::new(client)));
         }
 
         if env.options.dumping_options.linking_info {
@@ -679,12 +830,13 @@ impl Environment {
         });
 
         let main_thread = Thread {
-            active: true,
+            state: ThreadState::Running,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
             guest_context: None,
             host_context: None,
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=0u32.wrapping_sub(1)),
+            framework_state: Default::default(),
         };
 
         let mut env = Environment {
@@ -852,7 +1004,7 @@ impl Environment {
         );
         self.cpu.dump_regs();
         for (tid, thread) in self.threads.iter().enumerate() {
-            if thread.active && tid != self.current_thread {
+            if thread.is_alive() && tid != self.current_thread {
                 echo_no_panic!(
                     "Dumping registers for thread #{} (blocked by {:?})",
                     tid,
@@ -886,7 +1038,7 @@ impl Environment {
         );
         self.stack_trace_for_thread(self.current_thread);
         for tid in 0..self.threads.len() {
-            if self.threads[tid].active && tid != self.current_thread {
+            if self.threads[tid].is_alive() && tid != self.current_thread {
                 echo_no_panic!("Attempting to produce stack trace for thread #{}:", tid);
                 self.stack_trace_for_thread(tid);
             }
@@ -981,7 +1133,7 @@ impl Environment {
                         start_routine.call_from_host(env, (user_data,));
                     let curr_thread = &mut env.threads[env.current_thread];
                     curr_thread.return_value = Some(return_value);
-                    curr_thread.active = false;
+                    curr_thread.state = ThreadState::Dead;
                 });
             }));
             if let Err(e) = res {
@@ -993,12 +1145,13 @@ impl Environment {
         });
 
         self.threads.push(Thread {
-            active: true,
+            state: ThreadState::Running,
             blocked_by: ThreadBlock::NotBlocked,
             return_value: None,
             guest_context: Some(Box::new(cpu::CpuContext::new())),
             host_context: Some(thread_routine),
             stack: Some(stack_alloc.to_bits()..=(stack_high_addr - 1)),
+            framework_state: Default::default(),
         });
 
         let new_thread_id = self.threads.len() - 1;
@@ -1006,6 +1159,11 @@ impl Environment {
         log_dbg!("Created new thread {} with stack {:#x}–{:#x}, will execute function {:?} with data {:?}", new_thread_id, stack_alloc.to_bits(), (stack_high_addr - 1), start_routine, user_data);
 
         new_thread_id
+    }
+
+    #[allow(unused)]
+    pub fn get_tl_framework_state(&mut self) -> &mut frameworks::ThreadLocalState {
+        &mut self.threads[self.current_thread].framework_state
     }
 
     /// Put the current thread to sleep for some duration, running other threads
@@ -1219,9 +1377,12 @@ impl Environment {
     pub fn run(mut self) {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
-        let mut stepping = false;
+        if let Some(mut gdb_server) = self.gdb_server.take() {
+            gdb_server.wait_for_debugger(None, &mut self);
+            self.gdb_server = Some(gdb_server);
+        }
         loop {
-            if stepping {
+            if self.threads[self.current_thread].state == ThreadState::Stepping {
                 self.remaining_ticks = None;
             } else {
                 // 100,000 ticks is an arbitrary number. It needs to be
@@ -1313,32 +1474,11 @@ impl Environment {
                     window.poll_for_events(&self.options);
                 }
                 let curr_thread_block = self.threads[self.current_thread].blocked_by.clone();
-                if stepping || matches!(curr_thread_block, ThreadBlock::WaitingForDebugger(_)) {
-                    if old_context.is_none() {
-                        let old_thread = self.current_thread;
-                        let next_thread = self.schedule_next_thread();
-                        self.switch_thread(&mut old_context, next_thread);
-                        echo!(
-                            "\nGDB WARNING ------- Thread {} has exited - switched thread to {}",
-                            old_thread,
-                            next_thread
-                        );
-                    }
-                    match self.threads[self.current_thread].blocked_by {
-                        ThreadBlock::NotBlocked | ThreadBlock::WaitingForDebugger(_) => {}
-                        _ => {
-                            let old_thread = self.current_thread;
-                            let next_thread = self.schedule_next_thread();
-                            self.switch_thread(&mut old_context, next_thread);
-                            let block = &self.threads[old_thread].blocked_by;
-                            echo!(
-                                "\nGDB WARNING ------- Thread {} is blocked by {:?} - switched thread to {}",
-                                old_thread,
-                                block,
-                                next_thread
-                            );
-                        }
-                    }
+                if matches!(
+                    self.threads[self.current_thread].state,
+                    ThreadState::Stepping
+                ) || matches!(curr_thread_block, ThreadBlock::WaitingForDebugger(_))
+                {
                     let reason = if let ThreadBlock::WaitingForDebugger(reason) = curr_thread_block
                     {
                         self.threads[self.current_thread].blocked_by = ThreadBlock::NotBlocked;
@@ -1346,23 +1486,10 @@ impl Environment {
                     } else {
                         None
                     };
-                    let will_step = self.gdb_server.as_deref_mut().unwrap().wait_for_debugger(
-                        reason.clone(),
-                        self.cpu.as_mut(),
-                        self.mem.as_mut(),
-                    );
-                    if will_step {
-                        stepping = true;
-                    }
+                    let mut gdb_server = self.gdb_server.take().unwrap();
+                    gdb_server.wait_for_debugger(reason.clone(), &mut self);
+                    self.gdb_server = Some(gdb_server);
                 }
-
-                // Don't switch threads if stepping.
-                if stepping {
-                    assert!(old_context.is_some());
-                    return;
-                }
-
-                stepping = false;
 
                 let next_thread = self.schedule_next_thread();
                 if next_thread != self.current_thread {
@@ -1428,7 +1555,7 @@ impl Environment {
     /// This also internally switches the currently used guest context.
     fn switch_thread(&mut self, old_context: &mut Option<HostContext>, new_thread: ThreadId) {
         assert!(new_thread != self.current_thread);
-        assert!(self.threads[new_thread].active);
+        assert!(self.threads[new_thread].is_running());
 
         log_dbg!(
             "Switching thread: {} => {}",
@@ -1439,7 +1566,7 @@ impl Environment {
         let mut guest_ctx = self.threads[new_thread].guest_context.take().unwrap();
         self.cpu.swap_context(&mut guest_ctx);
         assert!(self.threads[self.current_thread].guest_context.is_none());
-        assert!(old_context.is_some() || !self.threads[self.current_thread].active);
+        assert!(old_context.is_some() || !self.threads[self.current_thread].is_alive());
         self.threads[self.current_thread].guest_context = Some(guest_ctx);
 
         let new_host_ctx = self.threads[new_thread].host_context.take().unwrap();
@@ -1556,7 +1683,7 @@ impl Environment {
 
     fn run_inner(&mut self) {
         let initial_thread = self.current_thread;
-        assert!(self.threads[initial_thread].active);
+        assert!(self.threads[initial_thread].is_running());
         assert!(self.threads[initial_thread].guest_context.is_none());
 
         loop {
@@ -1569,14 +1696,15 @@ impl Environment {
                     .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
 
                 match self.handle_cpu_state(state) {
-                    ThreadNextAction::Continue => {}
+                    ThreadNextAction::Continue => {
+                        if self.remaining_ticks.is_none() {
+                            break;
+                        }
+                    }
                     ThreadNextAction::ReturnToHost => return,
                     ThreadNextAction::DebugCpuError(e) => {
                         self.debug_cpu_error(e);
                     }
-                }
-                if self.remaining_ticks.is_none() {
-                    break;
                 }
             }
             // [MoleWorld] 死循环看门狗:进岛卡死时(guest 死循环、drawScene 帧停)在此 dump
@@ -1641,7 +1769,7 @@ impl Environment {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
                 let candidate = &mut self.threads[thread_id];
 
-                if !candidate.active {
+                if !candidate.is_running() {
                     continue;
                 }
                 match candidate.blocked_by {
@@ -1734,7 +1862,7 @@ impl Environment {
                         }
                     }
                     ThreadBlock::Joining(joinee_thread, ptr) => {
-                        if !self.threads[joinee_thread].active {
+                        if !self.threads[joinee_thread].is_alive() {
                             log_dbg!(
                                 "Thread {} joining with now finished thread {}.",
                                 self.current_thread,

@@ -1950,7 +1950,11 @@ impl GLES for GLES1OnGL2<'_> {
 
     // Matrix stack operations
     unsafe fn MatrixMode(&mut self, mode: GLenum) {
-        assert!(mode == gl21::MODELVIEW || mode == gl21::PROJECTION || mode == gl21::TEXTURE);
+        if mode == gl21::MODELVIEW_MATRIX {
+            log_dbg!("Tolerating glMatrixMode({:#x}) of unsupported mode", mode);
+        } else {
+            assert!(mode == gl21::MODELVIEW || mode == gl21::PROJECTION || mode == gl21::TEXTURE);
+        }
         gl21::MatrixMode(mode);
     }
     unsafe fn LoadIdentity(&mut self) {

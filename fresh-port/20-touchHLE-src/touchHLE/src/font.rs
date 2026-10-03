@@ -13,6 +13,8 @@
 //! switch to something like cosmic-text in future, but that has a _lot_ more
 //! dependencies.
 
+use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::paths;
 use owned_ttf_parser::AsFaceRef;
 use rusttype::{vector, GlyphId, Point, Scale};
@@ -229,8 +231,23 @@ impl Font {
             .glyph_hor_advance(owned_ttf_parser::GlyphId(glyph_id))
     }
 
+    pub fn glyph_bounding_box(&self, glyph_id: u16) -> Option<(i16, i16, i16, i16)> {
+        let rect = self
+            .as_face_ref()
+            .glyph_bounding_box(owned_ttf_parser::GlyphId(glyph_id));
+        rect.map(|rect| (rect.x_min, rect.y_min, rect.x_max, rect.y_max))
+    }
+
     pub fn italic_angle(&self) -> Option<f32> {
         self.as_face_ref().italic_angle()
+    }
+
+    pub fn table_data(&self, tag: u32) -> Option<&[u8]> {
+        self.as_face_ref().table_data(owned_ttf_parser::Tag(tag))
+    }
+
+    pub fn number_of_glyphs(&self) -> u16 {
+        self.as_face_ref().number_of_glyphs()
     }
 
     fn line_height_and_gap(&self, font_size: f32) -> (f32, f32) {
@@ -409,7 +426,7 @@ impl Font {
     }
 
     /// Draw text. Calls the provided callback for each glyph that is to be
-    /// drawn. Assumes y starts at the bottom-left corner and points upwards.
+    /// drawn. Assumes y starts at the top-left corner and points downwards.
     /// Used by UIKit for font rendering.
     pub fn draw<F: FnMut(RasterGlyph)>(
         &self,
@@ -420,12 +437,9 @@ impl Font {
         alignment: TextAlignment,
         mut draw_glyph: F,
     ) {
-        // TODO: This code has gone through a rather traumatic series of y sign
-        //       flips and might benefit from refactoring for clarity?
-
         let lines = self.break_lines(font_size, text, wrap);
 
-        let mut line_y = self.v_metrics_scaled(font_size).ascent;
+        let mut baseline = origin.1 + self.v_metrics_scaled(font_size).ascent;
         let (line_height, line_gap) = self.line_height_and_gap(font_size);
 
         // RustType requires a "draw pixel" callback that will be called for
@@ -452,16 +466,12 @@ impl Font {
                 self.scale(font_size),
                 Point {
                     x: origin.0 + line_x_offset,
-                    y: 0.0,
+                    y: baseline,
                 },
             ) {
                 let Some(glyph_bounds) = glyph.pixel_bounding_box() else {
                     continue;
                 };
-                // y needs to be flipped to point up
-                let glyph_height = glyph_bounds.height();
-                let x_offset = glyph_bounds.min.x;
-                let y_offset = ((origin.1 + line_y).round() as i32) + glyph_bounds.max.y;
 
                 // TODO: Refactor this method to support y clipping too.
                 // It's not mandatory since the caller can do it, but it would
@@ -487,14 +497,14 @@ impl Font {
                 });
 
                 let raster_glyph = RasterGlyph {
-                    origin: (x_offset as f32, y_offset as f32 - glyph_height as f32),
-                    dimensions: (glyph_bitmap_bounds.0 as _, glyph_bitmap_bounds.1 as _),
+                    origin: (glyph_bounds.min.x as f32, glyph_bounds.min.y as f32),
+                    dimensions: (glyph_bitmap_bounds.0 as i32, glyph_bitmap_bounds.1 as i32),
                     pixels: &glyph_bitmap,
                 };
 
                 draw_glyph(raster_glyph);
             }
-            line_y += line_height + line_gap;
+            baseline += line_height + line_gap;
         }
     }
 
@@ -510,26 +520,50 @@ impl Font {
         font_size: f32,
         glyphs: I,
         origin: (f32, f32),
+        text_transform: CGAffineTransform,
         mut draw_glyph: F,
     ) where
         I: IntoIterator<Item = GlyphId>,
         F: FnMut(RasterGlyph),
     {
+        // TODO: avoid creating a tmp bitmap
+        let mut tmp_glyph_bitmap: Vec<f32> = Vec::new();
         // Cf. comment in the [Self::draw] function.
         let mut glyph_bitmap: Vec<f32> = Vec::new();
 
-        let start = Point {
-            x: origin.0,
-            y: 0.0,
-        };
+        let inverted_text_transform = text_transform.invert();
+
+        // rusttype only supports scaling, so we render each glyph at a
+        // resolution matched to the effective scale of the text
+        // transform and then resample to apply rotation/mirror/etc.
+        // TODO: apply x and y scales independently?
+        let unit_x = text_transform.apply_to_size(CGSize {
+            width: 1.0,
+            height: 0.0,
+        });
+        let unit_y = text_transform.apply_to_size(CGSize {
+            width: 0.0,
+            height: 1.0,
+        });
+        let tmp_font_scale = unit_x
+            .width
+            .hypot(unit_x.height)
+            .max(unit_y.width.hypot(unit_y.height))
+            .max(1.0);
+
+        let start = Point { x: 0.0, y: 0.0 };
         // This code is adapted from documentation of [rusttype::Font::layout].
         let iter = self
             .font
             .glyphs_for(glyphs.into_iter())
             .scan((None, 0.0), |(last, x), g| {
-                let g = g.scaled(self.scale(font_size));
+                let g = g.scaled(self.scale(font_size * tmp_font_scale));
                 if let Some(last) = last {
-                    *x += self.font.pair_kerning(self.scale(font_size), *last, g.id());
+                    *x += self.font.pair_kerning(
+                        self.scale(font_size * tmp_font_scale),
+                        *last,
+                        g.id(),
+                    );
                 }
                 let w = g.h_metrics().advance_width;
                 let next = g.positioned(start + vector(*x, 0.0));
@@ -541,25 +575,83 @@ impl Font {
             let Some(glyph_bounds) = glyph.pixel_bounding_box() else {
                 continue;
             };
-            log_dbg!("draw_glyphs: glyph {:?}, bounds {:?}", glyph, glyph_bounds);
-            let x_offset = glyph_bounds.min.x;
-            // Note: glyph bounds are reporting y growing downwards, so we are
-            // subtracting here
-            let y_offset = (origin.1.round() as i32) - glyph_bounds.max.y;
+            let rect = CGRect {
+                origin: CGPoint {
+                    x: glyph_bounds.min.x as f32 / tmp_font_scale,
+                    // Note: this is because y is inverted!
+                    y: -glyph_bounds.max.y as f32 / tmp_font_scale,
+                },
+                size: CGSize {
+                    width: glyph_bounds.width() as f32 / tmp_font_scale,
+                    height: glyph_bounds.height() as f32 / tmp_font_scale,
+                },
+            };
 
-            let glyph_bitmap_bounds = (
+            let transformed = text_transform.apply_to_rect(rect);
+            assert!(rect.size.width >= 0.0 && rect.size.height >= 0.0);
+            log_dbg!(
+                "draw_glyphs: glyph {:?}, bounds {:?}, rect {:?}, transformed {:?}",
+                glyph,
+                glyph_bounds,
+                rect,
+                transformed
+            );
+
+            let x_offset = (origin.0 + transformed.origin.x).round() as i32;
+            let y_offset = (origin.1 + transformed.origin.y).round() as i32;
+
+            let tmp_glyph_bitmap_bounds = (
                 glyph_bounds.width() as usize,
                 glyph_bounds.height() as usize,
             );
-            glyph_bitmap.clear();
-            glyph_bitmap.resize(glyph_bitmap_bounds.0 * glyph_bitmap_bounds.1, 0.0);
+            log_dbg!("tmp_glyph_bitmap_bounds {:?}", tmp_glyph_bitmap_bounds);
+            tmp_glyph_bitmap.clear();
+            tmp_glyph_bitmap.resize(tmp_glyph_bitmap_bounds.0 * tmp_glyph_bitmap_bounds.1, 0.0);
 
             glyph.draw(|x, y, coverage| {
                 // Note: need to fill the bitmap in the reverse y order to
                 // account for y sense
-                glyph_bitmap[(glyph_bitmap_bounds.1 - 1 - y as usize) * glyph_bitmap_bounds.0
+                tmp_glyph_bitmap[(tmp_glyph_bitmap_bounds.1 - 1 - y as usize)
+                    * tmp_glyph_bitmap_bounds.0
                     + x as usize] = coverage;
             });
+
+            // Ceil so fractional pixels at the right/bottom edge aren't
+            // clipped.
+            let glyph_bitmap_bounds = (
+                transformed.size.width.ceil() as usize,
+                transformed.size.height.ceil() as usize,
+            );
+            log_dbg!(
+                "x_offset {}, y_offset {}, size {:?}",
+                x_offset,
+                y_offset,
+                glyph_bitmap_bounds
+            );
+            glyph_bitmap.clear();
+            glyph_bitmap.resize(glyph_bitmap_bounds.0 * glyph_bitmap_bounds.1, 0.0);
+
+            for y in 0..glyph_bitmap_bounds.1 {
+                for x in 0..glyph_bitmap_bounds.0 {
+                    let point = CGPoint {
+                        x: transformed.origin.x + x as f32 + 0.5,
+                        y: transformed.origin.y + y as f32 + 0.5,
+                    };
+                    let orig = inverted_text_transform.apply_to_point(point);
+                    let orig_x = (orig.x * tmp_font_scale - glyph_bounds.min.x as f32) as i32;
+                    let orig_y = (orig.y * tmp_font_scale + glyph_bounds.max.y as f32) as i32;
+                    log_dbg!("({}, {}) -> ({}, {})", x, y, orig_x, orig_y);
+                    if orig_x >= 0
+                        && orig_y >= 0
+                        && orig_x < tmp_glyph_bitmap_bounds.0 as i32
+                        && orig_y < tmp_glyph_bitmap_bounds.1 as i32
+                    {
+                        let idx_orig =
+                            (orig_y * tmp_glyph_bitmap_bounds.0 as i32 + orig_x) as usize;
+                        glyph_bitmap[y * glyph_bitmap_bounds.0 + x] = tmp_glyph_bitmap[idx_orig];
+                    }
+                }
+            }
 
             let raster_glyph = RasterGlyph {
                 origin: (x_offset as f32, y_offset as f32),

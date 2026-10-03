@@ -15,8 +15,9 @@ use super::{kCFNotFound, CFComparisonResult, CFIndex, CFOptionFlags, CFRange};
 use crate::abi::{DotDotDot, VaList};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::{ns_string, unichar, NSNotFound, NSRange, NSUInteger};
-use crate::mem::{ConstPtr, MutPtr};
-use crate::objc::{id, msg, msg_class};
+use crate::libc::string::strlen;
+use crate::mem::{ConstPtr, GuestUSize, MutPtr};
+use crate::objc::{id, msg, msg_class, nil, release};
 use crate::Environment;
 
 pub type CFStringRef = super::CFTypeRef;
@@ -38,6 +39,27 @@ fn CFStringAppend(
     appended_string: CFStringRef,
 ) {
     msg![env; the_string appendString:appended_string]
+}
+
+/// [同步上游 0.3.0 2026-10-03] 补实现(两边原先都没有,走 dyld 空操作桩)。上游把
+/// NSMutableCharacterSet 做成了真类后,SBJsonWriter(+initialize@0x2751c0 建 kEscapeChars)的
+/// appendString:into:@0x275b50 遇到含引号/反斜杠/控制字符的串会走逐字符慢路径,普通字符在
+/// 0x275cd0 用本函数追加;不补的话这类串序列化后普通字符全丢、只剩转义序列。同样写法还有
+/// TMI_SBJsonWriter@0x5466c2、MobClickSBJsonWriter、DMOWJsonWriter、SBJsonWriter_AppDriverChina。
+fn CFStringAppendCharacters(
+    env: &mut Environment,
+    the_string: CFMutableStringRef,
+    chars: ConstPtr<unichar>,
+    num_chars: CFIndex,
+) {
+    if num_chars <= 0 {
+        return;
+    }
+    let to_append: id = msg_class![env; NSString alloc];
+    let to_append: id = msg![env; to_append initWithCharacters:chars
+                                                         length:(num_chars as NSUInteger)];
+    () = msg![env; the_string appendString:to_append];
+    release(env, to_append);
 }
 
 fn CFStringAppendCString(
@@ -153,6 +175,24 @@ fn CFStringCreateWithCString(
     let encoding = CFStringConvertEncodingToNSStringEncoding(env, encoding);
     let ns_string: id = msg_class![env; NSString alloc];
     msg![env; ns_string initWithCString:c_string encoding:encoding]
+}
+
+fn CFStringCreateWithCStringNoCopy(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    c_string: ConstPtr<u8>,
+    encoding: CFStringEncoding,
+    deallocator: CFAllocatorRef,
+) -> CFStringRef {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
+    assert!(env.mem.read(deallocator).is_null()); // unimplemented
+    let encoding = CFStringConvertEncodingToNSStringEncoding(env, encoding);
+    let c_len: GuestUSize = strlen(env, c_string);
+    let ns_string: id = msg_class![env; NSString alloc];
+    // Docs of CFStringCreateWithCStringNoCopy says caller should never assume
+    // that the object is using the external buffer (it could be copied or even
+    // dumped). So we can "safely" invoke a method which does copy!
+    msg![env; ns_string initWithBytes:c_string length:c_len encoding:encoding]
 }
 
 fn CFStringCreateWithFormat(
@@ -277,6 +317,79 @@ fn CFStringGetCString(
     let encoding = CFStringConvertEncodingToNSStringEncoding(env, encoding);
     let buffer_size = buffer_size as NSUInteger;
     msg![env; a getCString:buffer maxLength:buffer_size encoding:encoding]
+}
+
+fn CFStringGetBytes(
+    env: &mut Environment,
+    string: CFStringRef,
+    range: CFRange,
+    encoding: CFStringEncoding,
+    loss_byte: u8,
+    is_external: bool,
+    buffer: MutPtr<u8>,
+    max_buf_len: CFIndex,
+    used_buf_len: MutPtr<CFIndex>,
+) -> CFIndex {
+    // [同步上游 0.3.0 2026-10-02] 上游 9496a80c 实现本函数时断言 lossByte == 0、转换必成功。分叉版此前
+    // 本函数未实现(dyld 链接成返回 0 的空操作),游戏里 11 份 JSONKit 都按「返回值 != 字符数就当失败」
+    // 处理,所以一直是安全的。上游实现后有两处必崩:
+    // ① JSONKit 固定传 lossByte = '?'(0x3f):序列化含非 ASCII(如中文)的字符串时
+    //    -[JKSerializer serializeObject:…]@0x1fb5d2(及 TM_/TMA_/TMI_/TDGA/TJ… 前缀副本)走慢路径调到这里;
+    //    转 UTF-8 等能表示全部字符的编码时 lossByte 根本用不上,去掉断言。
+    // ② 转换失败(编码无法表示)时上游 assert!(success):改为按「一个字符都没转换」返回 0,
+    //    与 Apple 遇到无法转换字符即停止的语义同向,也与分叉版原先的返回值一致(lossByte 替换未实现)。
+    // 另外按 Apple 文档补上 buffer 传 NULL 只算长度的用法(上游会往空指针写)。
+    let _ = loss_byte;
+    assert!(!is_external); // TODO
+
+    let range_len = range.length;
+    let range = NSRange {
+        location: range.location.try_into().unwrap(),
+        length: range_len.try_into().unwrap(),
+    };
+    // TODO: avoid copying
+    let substring: id = msg![env; string substringWithRange:range];
+
+    let encoding = CFStringConvertEncodingToNSStringEncoding(env, encoding);
+    let success: bool = if buffer.is_null() {
+        // 只问能否转换、需要多少字节:不写缓冲。
+        let probe: id = msg![env; substring dataUsingEncoding:encoding];
+        probe != nil
+    } else {
+        let buffer_size: NSUInteger = max_buf_len.try_into().unwrap_or(0);
+        ns_string::get_bytes_buffer_inner(env, substring, buffer, buffer_size, encoding, false)
+    };
+    if !success {
+        log!(
+            "Warning: CFStringGetBytes 转换失败(编码 {:#x} 无法表示或缓冲不足),按 0 个字符返回",
+            encoding
+        );
+        if !used_buf_len.is_null() {
+            env.mem.write(used_buf_len, 0);
+        }
+        return 0;
+    }
+    let length: NSUInteger = msg![env; substring length];
+    assert_eq!(length, range_len.try_into().unwrap());
+
+    if !used_buf_len.is_null() {
+        let result_bytes_length: NSUInteger =
+            msg![env; substring lengthOfBytesUsingEncoding:encoding];
+        env.mem
+            .write(used_buf_len, result_bytes_length.try_into().unwrap());
+    }
+
+    length.try_into().unwrap()
+}
+
+fn CFStringGetFileSystemRepresentation(
+    env: &mut Environment,
+    string: CFStringRef,
+    buffer: MutPtr<u8>,
+    max_buflen: CFIndex,
+) -> bool {
+    let max_buflen: NSUInteger = max_buflen.try_into().unwrap();
+    msg![env; string getFileSystemRepresentation:buffer maxLength:max_buflen]
 }
 
 fn CFStringGetLength(env: &mut Environment, the_string: CFStringRef) -> CFIndex {
@@ -415,6 +528,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringTrimWhitespace(_)),
     export_c_func!(CFStringTrim(_, _)),
     export_c_func!(CFStringAppend(_, _)),
+    export_c_func!(CFStringAppendCharacters(_, _, _)),
     export_c_func!(CFStringAppendCString(_, _, _)),
     export_c_func!(CFStringAppendFormat(_, _, _, _)),
     export_c_func!(CFStringConvertEncodingToNSStringEncoding(_)),
@@ -424,6 +538,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringCreateMutableCopy(_, _, _)),
     export_c_func!(CFStringCreateWithBytes(_, _, _, _, _)),
     export_c_func!(CFStringCreateWithCString(_, _, _)),
+    export_c_func!(CFStringCreateWithCStringNoCopy(_, _, _, _)),
     export_c_func!(CFStringCreateWithFormat(_, _, _, _)),
     export_c_func!(CFStringCreateWithFormatAndArguments(_, _, _, _)),
     export_c_func!(CFStringCreateWithSubstring(_, _, _)),
@@ -435,6 +550,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringGetCharactersPtr(_)),
     export_c_func!(CFStringGetCStringPtr(_, _)),
     export_c_func!(CFStringGetCString(_, _, _, _)),
+    export_c_func!(CFStringGetBytes(_, _, _, _, _, _, _, _)),
+    export_c_func!(CFStringGetFileSystemRepresentation(_, _, _)),
     export_c_func!(CFStringGetIntValue(_)),
     export_c_func!(CFStringGetLength(_)),
     export_c_func!(CFStringFind(_, _, _)),
