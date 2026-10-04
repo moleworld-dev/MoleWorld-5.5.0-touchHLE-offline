@@ -37,6 +37,63 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// [2026-10-04 第八轮 R8-D2] 单实例锁的文件句柄,持有到进程结束(退出或崩溃由系统释放)。
+static INSTANCE_LOCK: std::sync::OnceLock<File> = std::sync::OnceLock::new();
+
+/// [2026-10-04 第八轮 R8-D2] 同一存档目录只允许一个游戏进程(用户拍板)。原版前提是 iOS 同一应用只有一个实例;
+/// 移植层的沙盒目录固定为 工作目录/touchHLE_sandbox/<bundle id>/,与进程无关:第二个实例启动会清空同一个 tmp、删掉对方
+/// 正在写的 .touchhle-tmp,两个实例关窗时又都按各自内存整份写主档与 vip.dat,后写者把先写者的进度整段盖掉(回档/串档)。
+/// 受影响的主要是 Windows .bat、Linux 启动脚本和开发用 .command(macOS .app 经 LaunchServices 本来只激活已有实例)。
+/// 做法:对 <沙盒>/.touchhle-instance.lock 用 File::try_lock 取独占锁(Unix flock / Windows LockFileEx)。拿不到 → 提示
+/// 「已经在运行」并以退出码 3 退出,不碰任何存档;文件系统不支持锁(如部分安卓外部存储)→ 记日志后照常启动,不比原来差。
+fn acquire_instance_lock(sandbox: &Path) {
+    if let Err(e) = std::fs::create_dir_all(sandbox) {
+        log!(
+            "[instance] 建沙盒目录 {:?} 失败({}),跳过单实例锁",
+            sandbox,
+            e
+        );
+        return;
+    }
+    let path = sandbox.join(".touchhle-instance.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log!(
+                "[instance] 打不开单实例锁文件 {:?}({}),照常启动(没有防双开保护)",
+                path,
+                e
+            );
+            return;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = INSTANCE_LOCK.set(file);
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let msg = "摩尔庄园已经在运行:同一个存档目录正被另一个游戏进程使用。为免两边互相覆盖存档,本次不启动(没有改动任何存档)。请切换到已经打开的游戏窗口。";
+            log!("[instance] {}", msg);
+            if !crate::options::NO_ERROR_POPUP.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::window::show_error_messagebox(None, msg);
+            }
+            std::process::exit(3);
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            log!(
+                "[instance] 这个文件系统不支持文件锁({}),照常启动(没有防双开保护)",
+                e
+            );
+        }
+    }
+}
+
 /// [深扫修 2026-09-11] 原子写([Fs::write_atomic])在宿主同目录使用的隐藏临时文件后缀。
 /// 完整文件名形如 `.<目标文件名>.touchhle-tmp`。
 const ATOMIC_WRITE_TMP_SUFFIX: &str = ".touchhle-tmp";
@@ -574,6 +631,15 @@ impl Fs {
         let working_directory = GuestPathBuf::from("/".to_string());
 
         let bundle_guest_path = home_directory.join(&bundle_dir_name);
+
+        // [2026-10-04 第八轮 R8-D2] 单实例锁:必须在建目录、清 tmp、删原子写残留之前取到(见 acquire_instance_lock)。
+        if !read_only_mode {
+            acquire_instance_lock(
+                &paths::user_data_base_path()
+                    .join(paths::SANDBOX_DIR)
+                    .join(bundle_id),
+            );
+        }
 
         let directories = ["Documents", "Library", "tmp"];
         let host_path_directories = directories.map(|dir| {
