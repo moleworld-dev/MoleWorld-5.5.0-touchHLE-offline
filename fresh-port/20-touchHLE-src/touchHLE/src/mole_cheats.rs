@@ -7175,15 +7175,31 @@ fn crack_group_on(g: CrackGroup) -> bool {
 /// 仅在 CRACK_PATCHES_DIRTY 时由 intercept 调用一次。写 __TEXT 是 host 侧直写(绕过 guest 只读页)。
 fn apply_crack_patches(env: &mut Environment) {
     for p in CRACK_PATCHES {
-        let bytes: &[u8] = if crack_group_on(p.group) { p.cracked } else { p.vanilla };
+        // [2026-10-04 第八轮 R8-C2] 「修复占卜功能」离线不再写破解字节:0xf4102 那段改写会跳过 1138 取奖池(divineDataArray 只剩
+        //   init 建的 5 个空子数组,水晶球没奖品、每轮只出兜底物、每天第一次免费也没了)。离线改为原版流程 + 按调用点放行三道
+        //   isConnected 门(mole_activity 的 SITE_DIVINE_*)+ 回环应答 1138/1139;在线维持原样(私服是否实现 1138 不在本轮范围)。
+        let on = if p.group == CrackGroup::DivineFix {
+            crack_group_on(p.group) && env.options.network_access
+        } else {
+            crack_group_on(p.group)
+        };
+        let bytes: &[u8] = if on { p.cracked } else { p.vanilla };
         let n = bytes.len() as u32;
         let ptr: MutPtr<u8> = Ptr::from_bits(p.vaddr);
         env.mem.bytes_at_mut(ptr, n).copy_from_slice(bytes);
         env.cpu.invalidate_cache_range(p.vaddr, n);
     }
     log!(
-        "[MOLECHEAT] 破解补丁应用: 越狱={} 修复占卜={} 节日村={} 商城免VIP={} 进新岛={} 跳校验={}",
-        KILL_JAILBREAK.load(O), FIX_DIVINE.load(O), ENTER_HOLIDAY.load(O),
+        "[MOLECHEAT] 破解补丁应用: 越狱={} 修复占卜={}({}) 节日村={} 商城免VIP={} 进新岛={} 跳校验={}",
+        KILL_JAILBREAK.load(O), FIX_DIVINE.load(O),
+        if !FIX_DIVINE.load(O) {
+            "关:原版字节,离线进占卜屋得到原版联网提示"
+        } else if env.options.network_access {
+            "在线:破解字节"
+        } else {
+            "离线:原版字节+按调用点放行+回环奖池"
+        },
+        ENTER_HOLIDAY.load(O),
         STORE_NO_VIP.load(O), ENTER_NEWISLANDS.load(O), SKIP_PARSE_CHECK.load(O)
     );
 }

@@ -395,12 +395,15 @@ fn pages() -> Vec<Page> {
                 ("Mini试玩: 敲木桩(不发奖励)", MiniGame(4)),
                 ("Mini试玩: 钓鱼(不发奖励)", MiniGame(5)),
                 // [扫描修 2026-09-15] F9-3:-[MiniGameManager enterMiniGame:stage:]@0xf3fe8 共 8 个小游戏,补上 7 和 8。
-                //   7 占卜屋:和建筑入口走同一条已打补丁的分支(依赖「修复占卜功能」,默认开);
+                //   7 占卜屋:和建筑入口走同一条分支(依赖「修复占卜功能」,默认开;第八轮起离线走原版取奖池流程,见 mole_activity 的 1138);
                 //   8 左左右右 = 黄金岛 18 级建筑「沙滩WC」的 WashRoomGame,图集自己加载。
                 //   不加 6 涂鸦馆:图集缺失,大概率黑屏或空精灵帧。
                 // [2026-09-24 第五轮补挖 M-M3-3] 8 号在岛上不召唤:-[WashRoomGame updateTop3Record]@0x35c230 会把试玩成绩写进
                 //   NewSceneData.top3RecordOfMiniGame_,岛上会随 island_misc.dat 落盘,混进岛上沙滩WC的真实前三名(见 mini_game)。
-                ("Mini试玩: 占卜屋(不发奖励)", MiniGame(7)),
+                // [2026-10-04 第八轮 R8-C2] 占卜屋不是「试玩」:它的奖励由 DivineGame 自己发(-[DivineGame confirmRandomGift]
+                //   addInvisibleReward:num: 直接入账、-[DivineGame putAllGiftOnMap] 交主界面摆放物品),扣券在 firstCostPlay,
+                //   都不经过上面说的 callbackTarget。第八轮离线有了奖池以后,从这里进去与点建筑完全一样,照常扣券、发奖。
+                ("Mini: 占卜屋(同建筑入口,照常扣券发奖)", MiniGame(7)),
                 ("Mini试玩: 左左右右(沙滩WC,不发奖励)", MiniGame(8)),
                 // [2026-09-16] G-02 丝尔特三键先止损:原实现丢弃了 -[GameData loadMapdataFromResource:]@0x7e11c /
                 // loadUserInfoFromResource:@0x7df8c 的返回值(两者只解档返回、不写 mapdata_),无参 saveMapData 存的是当前场景
@@ -477,6 +480,8 @@ fn pages() -> Vec<Page> {
             buttons: vec![
                 // —— 破解功能(香草基底·默认关;开=往模拟内存写破解精确字节复刻,关=还原香草)——
                 ("去越狱检测", ToggleCheat("kill_jailbreak")),
+                // [2026-10-04 第八轮 R8-C2] 语义更新:离线时不再写破解字节跳过取奖池,而是照原版流程进占卜屋,三道 isConnected 门
+                //   按调用点放行、由回环应答 1138 奖池(移植者自拟,非原版数据)与 1139 每日免费;关掉则得到原版离线提示。在线仍写破解字节。
                 ("修复占卜功能(默认开)", ToggleCheat("fix_divine")),
                 // [扫描修 2026-09-15] F5-9 标签改准(原「节日村进入」):这组补丁落在 -[HolidayVillageLayer onEnter]@0x23938c
                 // 的 isReachable/isConnected/disconnectByMultiLogin 三道门;HolidayVillageLayer 就是可建筑黄金岛的场景层,
@@ -1723,7 +1728,14 @@ fn mini_game(env: &mut Environment, id_: i32) {
     let select: u32 = 0; // NULL SEL
     let _: () = msg_send(env, (mgr, s, id_, play_type, target, select));
     log!("[MOLEMENU] startMiniGame {}", id_);
-    set_toast("试玩模式:结算界面上的摩尔豆/经验不入账,要拿奖励请点已建成的对应建筑".to_string());
+    // [2026-10-04 第八轮 R8-C2] 占卜屋的奖励不走试玩回调,照常入账(见菜单标签处的说明)。
+    if id_ == 7 {
+        set_toast("占卜屋:与点建筑进入相同,照常扣占卜券/贝壳、照常发奖".to_string());
+    } else {
+        set_toast(
+            "试玩模式:结算界面上的摩尔豆/经验不入账,要拿奖励请点已建成的对应建筑".to_string(),
+        );
+    }
 }
 
 /// 一键收获全部。`ObjectManager.farms` 是游戏自己的地块数组(比 tweak 注入的 gFarmTable 干净)。

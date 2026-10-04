@@ -109,6 +109,40 @@ const CMD_DISCOUNT_LIST: u32 = 1049;
 /// [2026-09-16] E-03 1074 getDailyTaskListFromServerWithSceneId:(0x1cb5cc,0x1cb60e `movw r3, #0x432`)→
 /// parseDailyTaskListWithSceneId:pos:len:(0x1c0398)。请求体 1 字节:参数 1 → 0(主村)、10 → 1(黄金岛),其它参数不发包。
 const CMD_DAILY_TASK_LIST: u32 = 1074;
+/// [2026-10-04 第八轮 R8-C2] 1138 -[NetworkManager getDivineDataList]@0x1cbe6c(sendPacket 0x472)→ parseDivineDataList:pos:len:@0x1c4d80。
+/// 回包:[u32 今天已用过免费(非 0=已用,0x1c4eb6 → setHasFreeDivinedToday:)][u32 组数] + 每组 [u32 轮次][u32 件数]
+/// + 件数×[u32 objectId][u32 num][u32 posibility]。轮次 1..=5 进 divineDataArray[轮次-1](0x1c5044 cmp/bls → 0x1c5062),
+/// 轮次 10 → setTopDivinePrize:(0x1c5048,取最后一件),轮次 0 整组跳过,其它丢弃。
+const CMD_DIVINE_LIST: u32 = 1138;
+/// [2026-10-04 第八轮 R8-C2] 1139 setFreeDivineTag(@0x1cbe88):免费占卜那一次在免费分支发出;服务器记「今天已免费」,客户端不读回包。
+const CMD_FREE_DIVINE_TAG: u32 = 1139;
+/// [2026-10-04 第八轮 R8-C2] 占卜的三道 isConnected 门(blx 地址):-[MiniGameManager enterMiniGame:stage:] 占卜分支 0xf4132
+/// (为真才 showLoadingLayer + getDivineDataList)、-[DivineGame firstCostPlay] 0x21638a、-[DivineGame costGoldToDivine] 0x21718a。
+/// 「修复占卜功能」开着时离线按调用点放行,由回环应答 1138/1139(以前是破解字节跳过 1138、奖池恒空)。
+const SITE_DIVINE_ENTER_CONNECTED: u32 = 0xf4132;
+const SITE_DIVINE_FIRST_CONNECTED: u32 = 0x21638a;
+const SITE_DIVINE_COST_CONNECTED: u32 = 0x21718a;
+/// [2026-10-04 第八轮 R8-C2] 离线占卜奖池(用户拍板「恢复流程 + 自拟奖池」,**移植者自拟,非原版数据**;原版奖池只在服务器)。
+/// (轮次, [(objectId, 数量, 概率)]),每轮概率之和必须是 100:-[DivineGame generatePresentId]@0x217f28 用 random()×2⁻³¹×100.0
+/// (0x218044)取整后逐件减 posibility,减到负数那件就是抽中的。特殊编号照原版发奖代码(-[WrapperManager releaseFirstChargeGift:]
+/// 0x2630e6/0x2630ec):701 摩尔豆、702 经验,经 -[DivineGame confirmRandomGift] 0x2170ec addInvisibleReward:num: 直接入账
+/// (719..724 要联网,不用);其余是物品,「拿走所有奖励」-[DivineGame putAllGiftOnMap]@0x2180c0 交给主界面
+/// onAddAllDivineGifts 进摆放模式,由玩家摆进庄园。
+/// 不放贝壳(704):一局只在开始时扣一次(firstCostPlay 0x216402 占卜券 −1,无券时 0x2165b0 贝壳 −1),之后五轮「继续占卜」
+/// 不再扣费,奖池里放贝壳就能拿 1 贝壳换回好几个贝壳、无限刷。
+/// 物品挑各城堡系列里商店不卖、描述写明要去占卜屋拿的那一件(property.dat 无 shop_type):14926 天鹅堡主城沙雕、
+/// 16046 古堡主塔、16103 东欧城堡左塔楼、16212 茉莉公主皇宫副宫,以及描述写明「还可通过占卜屋获得」的 16269 小鸟水台。
+/// 装饰物不能卖回换钱(回收站只收房屋和动物),不构成刷钱途径。越往后轮奖励越好,第 5 轮全是城堡部件(呼应原版台词
+/// 「最好的宝贝放在最后一个水晶球里」);第 10 轮是背景里展示的「今日宝贝」(-[DivineGame setBg] 0x214062 读 topDivinePrize)。
+#[rustfmt::skip]
+const DIVINE_POOL: [(u32, &[(u32, u32, u32)]); 6] = [
+    (1, &[(701, 1000, 45), (702, 300, 45), (16269, 1, 10)]),
+    (2, &[(701, 3000, 40), (702, 800, 40), (16269, 1, 20)]),
+    (3, &[(701, 8000, 35), (702, 2000, 35), (16212, 1, 15), (16103, 1, 15)]),
+    (4, &[(701, 20000, 30), (702, 5000, 30), (16103, 1, 20), (16046, 1, 20)]),
+    (5, &[(16046, 1, 30), (16212, 1, 30), (16103, 1, 20), (14926, 1, 20)]),
+    (10, &[(14926, 1, 100)]),
+];
 
 /// 包尾 md5 用的 16 字节盐(guest 数据段 byte_B3AE64;与私服 mole-protocol::SALT 相同)。
 const SALT: [u8; 16] = [
@@ -491,7 +525,13 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             if lr_is(env, SITE_EDIT_SEABED_CONNECTED) && time_travel_active() {
                 return None;
             }
-            if lr_is(env, SITE_UIL_CONNECTED)
+            // [2026-10-04 第八轮 R8-C2] 占卜三道门(「修复占卜功能」开着时;关着时照原版得到离线提示)。
+            let divine = crate::mole_cheats::is_on("fix_divine")
+                && (lr_is(env, SITE_DIVINE_ENTER_CONNECTED)
+                    || lr_is(env, SITE_DIVINE_FIRST_CONNECTED)
+                    || lr_is(env, SITE_DIVINE_COST_CONNECTED));
+            if divine
+                || lr_is(env, SITE_UIL_CONNECTED)
                 || lr_is(env, SITE_BULLETIN_CONNECTED)
                 || lr_is(env, SITE_SIGN_SHOW_CONNECTED)
                 || lr_is(env, SITE_SEAL_INIT_CONNECTED)
@@ -1305,6 +1345,8 @@ struct ActState {
     hv_daily_day: u32,
     /// 黄金岛列表的 3 个原始值(hashDailyQuestIdInHolidayVillage: 映射之前)。
     hv_daily_vals: Vec<u32>,
+    /// [2026-10-04 第八轮 R8-C2] 占卜今天已经免费过的日期 yyyymmdd(北京时间日界,与 daily_day_key 同口径);1139 时记账,1138 回包据此给首字段。
+    divine_free_day: u32,
 }
 
 impl Default for ActState {
@@ -1325,6 +1367,7 @@ impl Default for ActState {
             daily_vals: Vec::new(),
             hv_daily_day: 0,
             hv_daily_vals: Vec::new(),
+            divine_free_day: 0,
         }
     }
 }
@@ -1338,7 +1381,7 @@ impl ActState {
             .map(|(t, ts)| format!("{},{}", t, ts))
             .collect();
         let mut body = format!(
-            "v=2\nsign_month={}\nsign_days={}\nsign_foot={}\nsign_patch={}\nsign_reward={}\nexch_month={}\nexch_mask={}\npearl={}\ndug={}\nshells={}\nfirework_day={}\ndaily_day={}\ndaily_vals={}\nhv_daily_day={}\nhv_daily_vals={}\n",
+            "v=2\nsign_month={}\nsign_days={}\nsign_foot={}\nsign_patch={}\nsign_reward={}\nexch_month={}\nexch_mask={}\npearl={}\ndug={}\nshells={}\nfirework_day={}\ndaily_day={}\ndaily_vals={}\nhv_daily_day={}\nhv_daily_vals={}\ndivine_free_day={}\n",
             self.sign_month,
             self.sign_days,
             self.sign_foot,
@@ -1353,7 +1396,8 @@ impl ActState {
             self.daily_day,
             join_u32(&self.daily_vals),
             self.hv_daily_day,
-            join_u32(&self.hv_daily_vals)
+            join_u32(&self.hv_daily_vals),
+            self.divine_free_day
         );
         let sum = crate::mole_items::fnv1a(body.as_bytes());
         body.push_str(&format!("sum={:08x}\n", sum));
@@ -1384,6 +1428,7 @@ impl ActState {
                 "daily_vals" => st.daily_vals = parse_u32_list(v),
                 "hv_daily_day" => st.hv_daily_day = num().unwrap_or(0),
                 "hv_daily_vals" => st.hv_daily_vals = parse_u32_list(v),
+                "divine_free_day" => st.divine_free_day = num().unwrap_or(0),
                 "shells" => {
                     let mut shells = Vec::new();
                     for item in v.split(';') {
@@ -1800,7 +1845,9 @@ fn loopback_accepts(cmd: u32) -> bool {
         | CMD_SIGN_EXCHANGE_LIST
         | CMD_SEABED_INFO
         | CMD_SEABED_REFRESH
-        | CMD_DAILY_TASK_LIST => true,
+        | CMD_DAILY_TASK_LIST
+        | CMD_DIVINE_LIST
+        | CMD_FREE_DIVINE_TAG => true,
         _ => false,
     }
 }
@@ -1935,6 +1982,23 @@ fn answer_request(env: &mut Environment, nm: id, cmd: u32, req: &[u8]) {
                 }
             }
         }
+        // [2026-10-04 第八轮 R8-C2] 占卜奖池 1138:照 parseDivineDataList 逐字段编码(奖池见 DIVINE_POOL,移植者自拟)。
+        CMD_DIVINE_LIST => {
+            let body = encode_divine_list(env);
+            enqueue_reply(env, nm, cmd, body);
+        }
+        // [2026-10-04 第八轮 R8-C2] 1139 今天的免费占卜已用:记账,不回包(客户端不读)。时间旅行期间 save_state 只写内存(F2-05)。
+        CMD_FREE_DIVINE_TAG => {
+            let today = daily_day_key(now_cf_u32());
+            let mut st = load_state(env);
+            st.divine_free_day = today;
+            save_state(env, &st);
+            log!(
+                "[ACTIVITY] 占卜 cmd=1139:今天({})的免费占卜已用,记入 {}",
+                today,
+                STATE_FILE
+            );
+        }
         other => {
             log!(
                 "[ACTIVITY] 回环受理 cmd={}:不在白名单(loopback_accepts 与本函数不一致),不回包",
@@ -1942,6 +2006,33 @@ fn answer_request(env: &mut Environment, nm: id, cmd: u32, req: &[u8]) {
             );
         }
     }
+}
+
+// ─────────────────────────────── [2026-10-04 第八轮 R8-C2] 占卜奖池 1138 ───────────────────────────────
+
+/// 1138 回包:首字段「今天已用过免费」(divine_free_day 是今天就是 1),然后 DIVINE_POOL 各组。
+fn encode_divine_list(env: &mut Environment) -> Vec<u8> {
+    let today = daily_day_key(now_cf_u32());
+    let used_free = load_state(env).divine_free_day == today;
+    let mut b = Vec::new();
+    put_u32(&mut b, u32::from(used_free));
+    put_u32(&mut b, DIVINE_POOL.len() as u32);
+    for (round, items) in DIVINE_POOL {
+        put_u32(&mut b, round);
+        put_u32(&mut b, items.len() as u32);
+        for &(id, num, pct) in items {
+            put_u32(&mut b, id);
+            put_u32(&mut b, num);
+            put_u32(&mut b, pct);
+        }
+    }
+    log!(
+        "[ACTIVITY] 占卜 cmd=1138:回奖池 {} 组(轮次 1-5 + 最高大奖;移植者自拟,非原版数据),今天({}){}",
+        DIVINE_POOL.len(),
+        today,
+        if used_free { "已免费过" } else { "还能免费一次" }
+    );
+    b
 }
 
 // ─────────────────────────────── F3-6 系统公告 1058 ───────────────────────────────
@@ -3643,6 +3734,26 @@ mod offline_server_tests {
     use super::*;
 
     #[test]
+    fn divine_pool_each_round_sums_to_100() {
+        // [2026-10-04 第八轮 R8-C2] generatePresentId 按 0..99 逐件减概率,每轮之和必须正好 100 才一定抽得中。
+        for (round, items) in DIVINE_POOL {
+            assert_eq!(
+                items.iter().map(|x| x.2).sum::<u32>(),
+                100,
+                "轮次 {}",
+                round
+            );
+            assert!(
+                items.iter().all(|x| !(719..=724).contains(&x.0)),
+                "轮次 {} 含要联网的编号",
+                round
+            );
+            // 一局只扣 1 张券或 1 贝壳却能连开五轮,奖池里放贝壳就能无限刷贝壳。
+            assert!(items.iter().all(|x| x.0 != 704), "轮次 {} 含贝壳", round);
+        }
+    }
+
+    #[test]
     fn state_v2_roundtrip_truncation_and_legacy() {
         let st = ActState {
             sign_month: 202_609,
@@ -3697,23 +3808,6 @@ mod offline_server_tests {
     }
 
     #[test]
-    fn daily_island_three_slots() {
-        for level in [1, 18, 30] {
-            let vals = pick_daily_island(20_260_916, level);
-            assert!(daily_vals_valid(&vals, true));
-            let ids = daily_ids(&vals, true);
-            assert_eq!(ids.len(), 3);
-            for (i, &quest) in ids.iter().enumerate() {
-                let (s, n) = DAILY_HV_SLOTS[i];
-                assert!(quest >= s && quest < s + n);
-            }
-        }
-        // 1 级:第 1 段都够不着 → 取等级要求最低的 ID 1;第 2 段最低是 ID 10(9 级)
-        let ids = daily_ids(&pick_daily_island(20_260_916, 1), true);
-        assert_eq!(&ids[..2], &[1, 10]);
-    }
-
-    #[test]
     fn daily_main_offline_visit_is_one() {
         for ymd in 20_261_001u32..20_261_031 {
             for level in [1, 4, 5, 8, 9, 10, 30, 52] {
@@ -3729,6 +3823,23 @@ mod offline_server_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn daily_island_three_slots() {
+        for level in [1, 18, 30] {
+            let vals = pick_daily_island(20_260_916, level);
+            assert!(daily_vals_valid(&vals, true));
+            let ids = daily_ids(&vals, true);
+            assert_eq!(ids.len(), 3);
+            for (i, &quest) in ids.iter().enumerate() {
+                let (s, n) = DAILY_HV_SLOTS[i];
+                assert!(quest >= s && quest < s + n);
+            }
+        }
+        // 1 级:第 1 段都够不着 → 取等级要求最低的 ID 1;第 2 段最低是 ID 10(9 级)
+        let ids = daily_ids(&pick_daily_island(20_260_916, 1), true);
+        assert_eq!(&ids[..2], &[1, 10]);
     }
 
     #[test]
