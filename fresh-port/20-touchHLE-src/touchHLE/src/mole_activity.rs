@@ -299,6 +299,8 @@ pub fn wants(class: &str, sel: &str) -> bool {
             sel,
             "checkNetWork" | "onDigShellClick:" | "onSureRefreshClick" | "onExchangeRewardClick:"
         ),
+        // [2026-10-04 第八轮 R8-C1] 海王贝奖励面板自己的网络检查(见 intercept 里的 checkNetWork 臂)
+        "GetItemRewardFromHaiwangLayer" => sel == "checkNetWork",
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
         // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
         "FireworkLayer" => sel == "showFireWorkFullScreen",
@@ -502,11 +504,24 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 None
             }
         }
-        // 三个层自己的 checkNetWork(签到层 0x39a3fc / 脚印兑换层 0x39c7d4 / 海底寻宝层 0x2c28b8):
+        // 三个层自己的 checkNetWork(签到层 0x39a3fc / 脚印兑换层 0x39c7d4 / 海底寻宝层 0x2c28b8;第四个海王贝奖励面板见下):
         // 原版在无网时弹"该功能需要联网"或 showNetWorkError 并返回 NO。离线由回环服务器代答,直接返回 YES。
         ("DailySignLayer", "checkNetWork")
         | ("SealExchangeLayer", "checkNetWork")
         | ("SeabedSeekingTreasureMainLayer", "checkNetWork") => {
+            env.cpu.regs_mut()[0] = 1;
+            Some(true)
+        }
+        // [2026-10-04 第八轮 R8-C1] 第四个:海王贝奖励面板。挖到海王贝(贝壳类型 4,-[SeabedSeekingTreasureMainLayer onDigShellClick:]
+        //   0x2c203a → 0x2c205c 奖励层 setVisible:YES,0x2c2080 displayUIWithBgSpr: 里 generateRandomRewardId 写 rewardId_)后,
+        //   回环 1220 已把这只贝壳换掉并写进 mole_activity.dat;玩家点奖励面板时 -[GetItemRewardFromHaiwangLayer ccTouchBegan:withEvent:]
+        //   @0x3fa544 先在 0x3fa5a2 调本层 checkNetWork@0x3fa710(判 isReachable 0x3fa740 / isConnected 0x3fa75e),离线失败就
+        //   showNetWorkError(GET_ACTION_CENTER_INFO_ERROR「无法获取当前的活动中心数据」,回调 closeMainLayer)并在 0x3fa5ac 返回,
+        //   真正的发奖(0x3fa5cc closeMainLayer → 0x3fa606 initActivityGiftNum:1 → 0x3fa626 onAddActivityGiftToMap:rewardId_ →
+        //   0x3fa654 setIsGetDigHaiwangShellReward:1)整段走不到,奖励永久丢失。同上口径返回 YES,让原版自己关页、发活动礼包、进摆放。
+        //   触摸回调不在帧栈上;只写 r0,不发消息。岛上与在线由 intercept 入口「只在离线主村生效」的总闸排除。
+        ("GetItemRewardFromHaiwangLayer", "checkNetWork") => {
+            log!("[ACTIVITY] 海王贝奖励面板 checkNetWork:离线由回环代答,返回 YES,照原版关页并把奖励发到庄园");
             env.cpu.regs_mut()[0] = 1;
             Some(true)
         }
