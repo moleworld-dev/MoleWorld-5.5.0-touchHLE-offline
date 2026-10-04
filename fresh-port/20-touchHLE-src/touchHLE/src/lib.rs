@@ -52,6 +52,7 @@ mod mole_diag;
 mod mole_framecheck;
 mod mole_items;
 mod mole_menu;
+mod mole_savebak;
 mod mole_sysinfo;
 mod objc;
 mod save_reset;
@@ -624,6 +625,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     // Environment::new 只装载、链接二进制并准备主线程协程,guest 代码(静态初始化器 → _start → UIApplicationMain → 读档)
     // 要等下面 run() 恢复协程才开始执行,所以这里是确定早于读档的最早时机。字节不是破解版时函数什么都不做。
     crate::mole_cheats::restore_cracked_vipgold(&mut env);
+    // [2026-10-04 第八轮 R8-D1] 主档坏档自检:同样必须早于读档。坏的那份用上一代备份换回(见 mole_savebak)。
+    crate::mole_savebak::startup_check(&mut env);
     env.run();
     Ok(())
 }

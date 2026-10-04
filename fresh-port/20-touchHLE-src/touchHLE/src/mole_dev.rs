@@ -252,6 +252,8 @@ pub fn startup(env: &mut Environment) {
                 name,
                 n
             );
+            // [2026-10-04 第八轮 R8-D1] 快照写回后,主档的上一代备份已不是它的上一代,清掉(见 mole_savebak)。
+            crate::mole_savebak::forget_backups(env);
             // 只在恢复成功时删标记。
             if let Err(e) = std::fs::remove_file(&marker) {
                 log!(

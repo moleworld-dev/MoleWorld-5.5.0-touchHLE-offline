@@ -1093,6 +1093,8 @@ impl Fs {
 
         let final_result = match tmp_result {
             Ok(()) => {
+                // [2026-10-04 第八轮 R8-D1] 覆盖主村主档之前,把盘上当前那份(合格才留)存为上一代备份(见 mole_savebak)。
+                crate::mole_savebak::before_replace(&target_host_path);
                 // 2) 同目录 rename 覆盖目标 = 原子替换。
                 match fs::rename(&tmp_host_path, &target_host_path) {
                     Ok(()) => Ok(()),
