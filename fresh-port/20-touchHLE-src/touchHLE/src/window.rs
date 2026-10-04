@@ -487,6 +487,8 @@ static HOST_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// [2026-10-04 第八轮 R8-D4] 见 [HOST_QUIT_REQUESTED]。只有一次无锁原子写,可以在信号处理函数里调用。
+/// 调用者只在桌面 Unix(lib.rs 的 SIGHUP 处理)与 Windows(install_session_end_filter);iOS/安卓没有这两条路。
+#[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
 pub fn request_host_quit() {
     HOST_QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
