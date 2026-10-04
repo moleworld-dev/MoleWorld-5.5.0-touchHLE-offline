@@ -255,8 +255,15 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
 
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
+    // [2026-10-03] 诊断:显示链路 / mainLoop 定时器回调期间算「帧中」(MOLE_FRAMECHECK=1 才生效,见 mole_framecheck)。
+    let in_frame = crate::mole_framecheck::frame_enter(env, selector);
+
     // Signature should be `- (void)timerDidFire:(NSTimer *)which`.
     let _: () = msg_send(env, (target, selector, timer));
+
+    if in_frame {
+        crate::mole_framecheck::frame_exit();
+    }
 
     env.objc
         .borrow_mut::<NSTimerHostObject>(timer)
