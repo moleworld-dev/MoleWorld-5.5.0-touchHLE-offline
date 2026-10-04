@@ -519,6 +519,11 @@ fn objc_msgSend_inner(
     // msg_send 发出(宿主 msg_send 设置它、guest 派发恒为 None):宿主发起时 LR 是陈旧的 main 返回地址,不能拿来判定
     // "谁在问",且宿主必须看到真实坐标。放在跟踪之前不会让跟踪漏看:换算臂转发真方法走的是宿主 msg_send,
     // 同一个选择子会再经过这里一次并被跟踪打印。
+    // [2026-10-03] 诊断:帧中钩子里发出的宿主消息(MOLE_FRAMECHECK=1 才生效,见 mole_framecheck)。
+    if message_type_info.is_some() && crate::mole_framecheck::enabled() {
+        let class_name = env.objc.get_class_name(orig_class).to_string();
+        crate::mole_framecheck::host_message(env, receiver, orig_class, &class_name, selector);
+    }
     if cheats_on && crate::mole_cheats::intercept_fast(env, selector, message_type_info.is_some()) {
         return;
     }
@@ -566,7 +571,13 @@ fn objc_msgSend_inner(
         if cheats_on && crate::mole_cheats::intercept_wants(class_name, sel_str) {
             let class_owned = class_name.to_string();
             let sel_owned = sel_str.to_string();
-            if crate::mole_cheats::intercept(env, &class_owned, &sel_owned) {
+            // [2026-10-03] 诊断:记下正在执行的钩子(MOLE_FRAMECHECK=1 才生效,见 mole_framecheck)。
+            let hooked = crate::mole_framecheck::hook_enter(env, &class_owned, &sel_owned);
+            let handled = crate::mole_cheats::intercept(env, &class_owned, &sel_owned);
+            if hooked {
+                crate::mole_framecheck::hook_exit();
+            }
+            if handled {
                 return;
             }
         }

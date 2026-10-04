@@ -209,6 +209,25 @@ impl ObjC {
         }
     }
 
+    /// [2026-10-03] 诊断用(mole_framecheck):沿继承链找到方法后,它是不是游戏(guest)实现。找不到返回 None。
+    pub fn class_method_is_guest(&self, class: Class, sel: SEL) -> Option<bool> {
+        let mut class = class;
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref methods,
+                ..
+            } = self.borrow(class);
+            if let Some(imp) = methods.get(&sel) {
+                return Some(matches!(imp, IMP::Guest(_)));
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
     /// Variant of `class_has_method` which doesn't account for inheritance.
     pub fn class_has_uninherited_method(&self, class: Class, sel: SEL) -> bool {
         let ClassHostObject { methods, .. } = self.borrow(class);
