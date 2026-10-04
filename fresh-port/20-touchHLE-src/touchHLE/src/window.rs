@@ -478,6 +478,71 @@ fn surface_from_image(image: &Image) -> Surface<'_> {
     surface
 }
 
+/// [2026-10-04 第八轮 R8-D4] 宿主要求结束进程:启动游戏的终端被关掉(SIGHUP)、Windows 注销/关机。
+/// SDL 只把 SIGINT/SIGTERM 和关窗转成 SDL_QUIT,这几种它不管,进程会被直接结束、不走存档链。
+/// 置位方只做这一次原子写(SIGHUP 处理函数里只能做异步信号安全的事;Windows 消息在 SDL 抽消息中途送来),
+/// [Window::poll_for_events] 读到后推一个 [Event::Quit],走与关窗相同的退出流程(ui_application::exit:
+/// 失活存档、终止回调、岛档、vip.dat)。原版 iOS 被用户划掉或被系统回收前也总会先收到失活回调并存档。
+static HOST_QUIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [2026-10-04 第八轮 R8-D4] 见 [HOST_QUIT_REQUESTED]。只有一次无锁原子写,可以在信号处理函数里调用。
+pub fn request_host_quit() {
+    HOST_QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// [2026-10-04 第八轮 R8-D4] Windows 注销/关机:系统先给每个顶层窗口发 WM_QUERYENDSESSION,再发
+/// WM_ENDSESSION;SDL 2.26 两条都不处理(交给 DefWindowProc 回 TRUE),之后进程随时会被结束。
+/// 这两条是「发送」来的消息,不经过 SDL_SetWindowsMessageHook(它只看抽出来的「投递」消息),
+/// 只有 SDL 窗口过程里的 SDL_SYSWMEVENT 看得到,所以打开它、装事件过滤器认出这两条、置退出请求。
+/// 置位后主线程跑退出存档链期间不再抽消息,系统送 WM_ENDSESSION 会等着,存完档进程自己退出。
+/// 过滤器对 SDL_SYSWMEVENT 一律回 0(不进事件队列),其它事件原样放行。必须在 SDL 视频子系统初始化
+/// 之后装(SDL_StartEventLoop 会把 SDL_SYSWMEVENT 重新关掉),且在建窗口之前装
+/// (SDL_SetEventFilter 会清空当时已排队的事件)。
+#[cfg(windows)]
+fn install_session_end_filter() {
+    unsafe extern "C" fn filter(
+        _userdata: *mut std::ffi::c_void,
+        event: *mut sdl2_sys::SDL_Event,
+    ) -> std::ffi::c_int {
+        /// SDL_syswm.h 里 Windows 版 SDL_SysWMmsg 的 C 布局:version 3 字节、subsystem、联合体里的 win。
+        /// sdl2-sys 的绑定是按别的平台预生成的,联合体成员对不上,这里按 C 布局自己声明。
+        #[repr(C)]
+        struct WinSysWmMsg {
+            version: [u8; 3],
+            subsystem: std::ffi::c_int,
+            hwnd: *mut std::ffi::c_void,
+            msg: std::ffi::c_uint,
+            wparam: usize,
+            lparam: isize,
+        }
+        const SDL_SYSWM_WINDOWS: std::ffi::c_int = 1;
+        const WM_QUERYENDSESSION: std::ffi::c_uint = 0x0011;
+        const WM_ENDSESSION: std::ffi::c_uint = 0x0016;
+        unsafe {
+            if (*event).type_ != sdl2_sys::SDL_EventType::SDL_SYSWMEVENT as u32 {
+                return 1;
+            }
+            // SDL_SendSysWMEvent 传进来的是窗口过程栈上的消息,只在本次回调期间有效。
+            let m = (*event).syswm.msg as *const WinSysWmMsg;
+            if !m.is_null() && (*m).subsystem == SDL_SYSWM_WINDOWS {
+                let msg = (*m).msg;
+                if msg == WM_QUERYENDSESSION || (msg == WM_ENDSESSION && (*m).wparam != 0) {
+                    request_host_quit();
+                }
+            }
+        }
+        0
+    }
+    unsafe {
+        sdl2_sys::SDL_EventState(
+            sdl2_sys::SDL_EventType::SDL_SYSWMEVENT as u32,
+            sdl2_sys::SDL_ENABLE as std::ffi::c_int,
+        );
+        sdl2_sys::SDL_SetEventFilter(Some(filter), null_mut());
+    }
+}
+
 /// [MoleWorld] 文本输入是否激活(某个 UITextField 成为第一响应者)。仅此状态下物理
 /// `T` 键当普通字符输入,不再误触发修改器菜单(见 `poll_for_events` 的 T 分支);
 /// `start/stop_text_input` 写、事件翻译处读。用全局原子量(那两个方法是 `&self`)。
@@ -564,6 +629,9 @@ impl Window {
     ) -> Window {
         let sdl_ctx = sdl2::init().unwrap();
         let video_ctx = sdl_ctx.video().unwrap();
+        // [2026-10-04 第八轮 R8-D4] Windows 注销/关机先存档再退出,见 install_session_end_filter。
+        #[cfg(windows)]
+        install_session_end_filter();
 
         // The "hidapi" feature of rust-sdl2 is enabled so that sdl2::sensor
         // is available, but we don't want to enable SDL's HIDAPI controller
@@ -826,6 +894,12 @@ impl Window {
             return;
         }
         self.last_polled = now;
+
+        // [2026-10-04 第八轮 R8-D4] 终端关掉(SIGHUP)、Windows 注销/关机置的退出请求,见 HOST_QUIT_REQUESTED。
+        if HOST_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            log!("[生命周期] 宿主要求结束进程(终端关闭 / 注销 / 关机),按关闭窗口处理:先存档再退出");
+            self.event_queue.push_back(Event::Quit);
+        }
 
         fn transform_input_coords(
             window: &Window,

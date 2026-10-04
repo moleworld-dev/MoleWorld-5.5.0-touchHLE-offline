@@ -6,6 +6,10 @@
 // Allow the crate to have a non-snake-case name (touchHLE).
 // This also allows items in the crate to have non-snake-case names.
 #![allow(non_snake_case)]
+// [2026-10-04 第八轮 R8-D4] Windows 发行版做成图形程序,不再带黑色控制台窗口:点控制台的关闭按钮会把
+// 进程直接结束、不存档,改成图形程序就没有这条路。日志本来就写 touchHLE_log.txt,启动失败和崩溃
+// 有错误弹窗;没有控制台时写 stderr 会被静默丢弃。调试版保留控制台,方便开发时看输出。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[cfg(not(target_os = "ios"))]
 fn main() -> Result<(), String> {

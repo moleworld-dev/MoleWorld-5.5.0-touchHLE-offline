@@ -326,6 +326,37 @@ fn install_native_crash_handler() {
     }
 }
 
+/// [2026-10-04 第八轮 R8-D4] 关掉启动游戏的终端窗口时进程收到 SIGHUP,默认处理是直接结束进程、不存档。
+/// 改成置退出请求,由主线程按关闭窗口处理(见 window::request_host_quit)。处理函数里只做一次原子写:
+/// 不调 SDL、不发宿主消息、不写日志。之后写 stderr 会失败,log.rs 的 echo! 已忽略写错误。
+/// 启动时 SIGHUP 已被忽略(nohup 启动)就保持忽略,不改启动者的选择。
+#[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+fn install_sighup_handler() {
+    extern "C" fn on_sighup(_sig: ::libc::c_int) {
+        window::request_host_quit();
+    }
+    // SAFETY: sigaction 结构按 libc 定义清零后填写,处理函数只做一次无锁原子写(异步信号安全)。
+    unsafe {
+        let mut old: ::libc::sigaction = std::mem::zeroed();
+        if ::libc::sigaction(::libc::SIGHUP, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == ::libc::SIG_IGN
+        {
+            log!("[生命周期] SIGHUP 启动时已被忽略(nohup 等),保持忽略");
+            return;
+        }
+        let mut sa: ::libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sighup as extern "C" fn(::libc::c_int) as ::libc::sighandler_t;
+        ::libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = ::libc::SA_RESTART;
+        if ::libc::sigaction(::libc::SIGHUP, &sa, std::ptr::null_mut()) != 0 {
+            log!(
+                "[生命周期] 装 SIGHUP 处理失败({}),关掉终端时不会先存档",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     // [crash logging] 强制开启 backtrace(若未设),让 panic 钩子能拿到符号栈。
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -377,6 +408,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         );
     }
     echo!();
+
+    // [2026-10-04 第八轮 R8-D4] 关掉启动游戏的终端时先存档再退出。
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    install_sighup_handler();
 
     {
         let base_path = paths::user_data_base_path();
