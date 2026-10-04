@@ -6752,6 +6752,15 @@ pub fn island_session_active() -> bool {
         || ISLAND_EXITING.load(O)
 }
 
+/// [2026-10-04 第八轮 R8-A1] 已经稳稳在岛上:ON_ISLAND 且不在进岛窗口/加载/离岛过场中。只读原子,不发消息。
+/// 给 mole_items 判断「岛上能不能照原版当场弹首充大礼包」用(过场期间不弹)。
+pub fn island_settled() -> bool {
+    ON_ISLAND.load(O)
+        && ISLAND_ENTER_WINDOW.load(O) == 0
+        && !ISLAND_LOADING.load(O)
+        && !ISLAND_EXITING.load(O)
+}
+
 /// 本次进岛请求是否已走到 gate#1(=真 enterNewIslands 通过了前置门)。
 pub fn island_gate1_hit() -> bool {
     ISLAND_GATE1_HIT.load(O)

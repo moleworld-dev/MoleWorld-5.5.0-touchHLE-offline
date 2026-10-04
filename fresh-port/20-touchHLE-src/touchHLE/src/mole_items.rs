@@ -705,6 +705,10 @@ struct Side {
     anchor: Option<Instant>,
     last_flush: Option<Instant>,
     village_entered: bool,
+    /// [2026-10-04 第八轮 R8-A1] 首充大礼包待弹(随 vip.dat 落盘,见 FIRST_CHARGE_PENDING)。
+    first_charge_pending: bool,
+    /// [2026-10-04 第八轮 R8-A2] 充值解锁物待在主村重放落盘(见 RECHARGE_UNLOCK_PENDING)。
+    recharge_unlock_pending: bool,
 }
 
 impl Side {
@@ -719,6 +723,8 @@ impl Side {
             anchor: None,
             last_flush: None,
             village_entered: false,
+            first_charge_pending: false,
+            recharge_unlock_pending: false,
         }
     }
 }
@@ -750,6 +756,13 @@ fn side_serialize(s: &Side) -> Vec<u8> {
     }
     body.push_str(&format!("login={},{}\n", s.last_day, s.streak));
     body.push_str(&format!("online_ms={}\n", s.online_ms));
+    // [2026-10-04 第八轮 R8-A1/A2] 两个充值待办,为 1 才写;旧版本读到未知键会忽略,新版本读旧档按 0。
+    if s.first_charge_pending {
+        body.push_str("first_charge_pending=1\n");
+    }
+    if s.recharge_unlock_pending {
+        body.push_str("recharge_unlock_pending=1\n");
+    }
     let sum = fnv1a(body.as_bytes());
     body.push_str(&format!("sum={:08x}\n", sum));
     body.into_bytes()
@@ -760,6 +773,8 @@ struct SideParsed {
     last_day: i64,
     streak: u32,
     online_ms: u64,
+    first_charge_pending: bool,
+    recharge_unlock_pending: bool,
 }
 
 /// 解析失败(魔数/校验和/字段格式不对)返回 None = 坏档。
@@ -780,6 +795,8 @@ fn side_parse(bytes: &[u8]) -> Option<SideParsed> {
         last_day: 0,
         streak: 0,
         online_ms: 0,
+        first_charge_pending: false,
+        recharge_unlock_pending: false,
     };
     for line in lines {
         if line.is_empty() {
@@ -800,6 +817,8 @@ fn side_parse(bytes: &[u8]) -> Option<SideParsed> {
                 p.streak = b.trim().parse().ok()?;
             }
             "online_ms" => p.online_ms = v.trim().parse().ok()?,
+            "first_charge_pending" => p.first_charge_pending = v.trim() == "1",
+            "recharge_unlock_pending" => p.recharge_unlock_pending = v.trim() == "1",
             _ => {} // 未知键:向前兼容,忽略
         }
     }
@@ -855,6 +874,15 @@ fn side_ensure_loaded(env: &mut Environment) {
         s.last_day = p.last_day;
         s.streak = p.streak;
         s.online_ms = p.online_ms;
+        // [2026-10-04 第八轮 R8-A1/A2] 上次没办完的充值待办(例如岛上充值后没回主村就退出)读回后照常受理。
+        s.first_charge_pending = p.first_charge_pending;
+        s.recharge_unlock_pending = p.recharge_unlock_pending;
+        if p.first_charge_pending {
+            FIRST_CHARGE_PENDING.store(true, O);
+        }
+        if p.recharge_unlock_pending {
+            RECHARGE_UNLOCK_PENDING.store(true, O);
+        }
     }
 }
 
@@ -893,6 +921,8 @@ pub fn forget_sidecar() {
     }
     // side_save 在 save_blocked 时打印的是"坏档未能备份"的提示;这里是有意禁写,先置位免得日志误导。
     SIDE_BLOCK_LOGGED.store(true, O);
+    FIRST_CHARGE_PENDING.store(false, O);
+    RECHARGE_UNLOCK_PENDING.store(false, O);
     log!(
         "[MOLEITEMS] 已清空内存里的 VIP/登录/在线计数,本会话不再写 {}(重启后从零开始)",
         SIDE_FILE
@@ -1397,8 +1427,9 @@ fn vip_progress(old_level: i32, value: i32, thresholds: &[i32]) -> (i32, i32) {
 /// 现在没充值的号由 vip_hook 按服务器口径注入了 VIP1 门槛,「旧 next ≠ 0」与原版一样成立;这里只要旧等级、旧累计都是 0 而新累计 > 0,
 /// 就置 FIRST_CHARGE_PENDING,不在购买按钮的调用栈上弹(原版是异步回包触发)。由运行循环受理点 first_charge_gift_poll 在主村
 /// (curSceneId 1)、currentGameMode == 1 时照上面的顺序调用:-[FirstChargeGiftsLayer showWithTarget:selector:]@0x3803cc 自己在
-/// 0x38040a 要求 currentGameMode == 1,否则直接返回不弹,所以等商店等面板关掉再弹与原版判据一致;岛上不弹,回主村后再弹
-/// (领取 onAddFirstChargeGiftToMap:@0x262f2c 往主村地图摆物品,岛上能否摆没有把握)。
+/// 0x38040a 要求 currentGameMode == 1,否则直接返回不弹,所以等商店等面板关掉再弹与原版判据一致。
+/// [2026-10-04 第八轮 R8-A1] 待弹标志改为随 vip.dat 落盘;用户拍板岛上也照原版当场弹(领取走 -[WrapperManager
+/// onAddFirstChargeGiftToMap:] 0x262f9c 的岛分支,摆到岛上),进岛加载/离岛过场期间不弹。
 /// 调用方已判离线;本函数发宿主 msg_send 但不保存/恢复 r0-r3(由 on_shells_purchased 统一做)。
 fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option<ShellPack>) {
     let Some(pack) = pack else {
@@ -1422,9 +1453,12 @@ fn vip_accumulate(env: &mut Environment, item_id: u32, shells: i32, pack: Option
     let new = VipVals { level, value, next };
     // [2026-10-03] 首充大礼包:与 parseVipInfo 0x1c0e34..0x1c0e48 同判据(旧 next ≠ 0 由 vip_default_vals 的服务器口径保证)。
     if old.level == 0 && old.value <= 0 && new.value > 0 {
+        // [2026-10-04 第八轮 R8-A1] 先写进 Side,下面 vip_apply 触发的 setter 臂 side_save 会把「新累计 + 待弹」一次原子写盘,
+        //   不再出现「累计已写、待弹只在内存」的窗口(以前在岛上首充后没回主村就退出,礼包永久丢失)。
+        side().first_charge_pending = true;
         FIRST_CHARGE_PENDING.store(true, O);
         log!(
-            "[MOLEITEMS] 首充:旧 VIP0 / 累计 0 → 累计 {}(0.1 元),照原版 parseVipInfo 判据应弹首充大礼包;等回到主村、没有面板打开时弹出",
+            "[MOLEITEMS] 首充:旧 VIP0 / 累计 0 → 累计 {}(0.1 元),照原版 parseVipInfo 判据应弹首充大礼包(待弹已随 vip.dat 落盘);在主村或已稳定在岛上、没有面板打开时弹出",
             new.value
         );
     }
@@ -1493,8 +1527,14 @@ pub fn on_shells_purchased(
         return;
     }
     let saved = save_regs(env);
+    // [2026-10-04 第八轮 R8-A2] 充值解锁物的「回主村重放落盘」待办先进 Side;下面 vip_accumulate 里 setter 臂的 side_save
+    //   会把它和新累计一次原子写盘,末尾再显式写一次兜住没经 setter 记账的情形(非充值档位、本地 VIP 对象还没建)。
+    side_ensure_loaded(env);
+    side().recharge_unlock_pending = true;
+    RECHARGE_UNLOCK_PENDING.store(true, O);
     recharge_unlock_side_effects(env);
     vip_accumulate(env, item_id, shells, pack);
+    side_save(env);
     restore_regs(env, saved);
     // [2026-09-25 第五轮遗留 V] 原版 -[InAppPurchaseManager onPurchaseSuccessful] 在 0x117da8 发 1083
     //   (sendCostMoneyInfoToServerWithUserId:andNumber:)之后,紧接 0x117dcc `[nm getVipInfo]`
@@ -1543,12 +1583,23 @@ fn recharge_unlock_side_effects(env: &mut Environment) {
     let unlock_s = sel_of(env, "unlockItem:");
     let _: () = msg_send(env, (wm, unlock_s, 16283i32));
     let _: () = msg_send(env, (wm, unlock_s, 14974i32));
-    let save_s = sel_of(env, "saveToLocal");
-    let _: () = msg_send(env, (gd, save_s));
+    // [2026-10-04 第八轮 R8-A2] 岛上 -[GameData saveToLocal]@0x7cae0 在 0x7cb3e `cmp r0,#0xa` / 0x7cb42 popeq 直接返回,
+    //   解锁物只在内存;回村 loadFromLocal 对键 63 盘上有就覆盖(0x2007a),岛上补的会被旧表冲掉。岛上不再空调它,
+    //   留着 RECHARGE_UNLOCK_PENDING,由 recharge_unlock_replay 回主村、地图加载完后重放并落盘。
+    let on_island = crate::mole_cheats::island_session_active();
+    if !on_island {
+        let save_s = sel_of(env, "saveToLocal");
+        let _: () = msg_send(env, (gd, save_s));
+    }
     log!(
-        "[MOLEITEMS] 充值副作用:gamedataFlag {:#x} → {:#x},解锁 16283 都教授/14974 克劳神父(乐乐水塔/织女鹊桥锁同时解除)",
+        "[MOLEITEMS] 充值副作用:gamedataFlag {:#x} → {:#x},解锁 16283 都教授/14974 克劳神父(乐乐水塔/织女鹊桥锁同时解除){}",
         flag,
-        flag | 0x30
+        flag | 0x30,
+        if on_island {
+            ";岛上存不进主档,回主村地图加载完后重放落盘"
+        } else {
+            ""
+        }
     );
 }
 
@@ -1884,28 +1935,39 @@ static NEG_GOLD_CHECK_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// [2026-10-03] 首充大礼包待弹(见 vip_accumulate 注释);FIRST_CHARGE_NEXT_TRY_MS = 下次检查时刻(进程内毫秒),
 /// 场景或面板不满足时约 0.5 秒再看一次,不必每帧发消息。
+/// [2026-10-04 第八轮 R8-A1] 与 Side.first_charge_pending 同步、随 vip.dat 落盘:以前只在内存,在岛上首充后没回主村就退出,
+///   VIP 累计却已写进 vip.dat,下次「旧累计 0」判据永不成立,礼包永久丢失。
 static FIRST_CHARGE_PENDING: AtomicBool = AtomicBool::new(false);
 static FIRST_CHARGE_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
+/// [2026-10-04 第八轮 R8-A2] 充值解锁物(都教授 16283、克劳神父 14974、gamedataFlag|=0x30)待在主村重放落盘;
+/// 与 Side.recharge_unlock_pending 同步、随 vip.dat 落盘。见 recharge_unlock_replay。
+static RECHARGE_UNLOCK_PENDING: AtomicBool = AtomicBool::new(false);
+static RECHARGE_UNLOCK_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
 
 fn process_ms() -> u64 {
     static T0: OnceLock<Instant> = OnceLock::new();
     T0.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// ns_run_loop::run_run_loop 主线程每轮都调,平时只有两次原子读。
+/// 待办在排队且到了下次检查时刻。
+fn due(pending: &AtomicBool, next_try_ms: &AtomicU64) -> bool {
+    pending.load(Ordering::Relaxed) && process_ms() >= next_try_ms.load(Ordering::Relaxed)
+}
+
+/// ns_run_loop::run_run_loop 主线程每轮都调,平时只有三次原子读。
 pub fn run_loop_pending() -> bool {
     NEG_GOLD_CHECK_PENDING.load(Ordering::Relaxed)
-        || (FIRST_CHARGE_PENDING.load(Ordering::Relaxed)
-            && process_ms() >= FIRST_CHARGE_NEXT_TRY_MS.load(Ordering::Relaxed))
+        || due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS)
+        || due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS)
 }
 
 /// 运行循环受理点(ns_run_loop,perform 相位之后):栈上没有游戏方法体,可以自由发宿主消息;不在 intercept 里,不碰寄存器。
 /// HUD 刷新(updateGold 里要格式化数字串)会产生自动释放对象,包一层池当场 drain(perform 相位本身没有池)。
 pub fn run_loop_poll(env: &mut Environment) {
     let neg_gold = NEG_GOLD_CHECK_PENDING.swap(false, Ordering::Relaxed);
-    let gift = FIRST_CHARGE_PENDING.load(Ordering::Relaxed)
-        && process_ms() >= FIRST_CHARGE_NEXT_TRY_MS.load(Ordering::Relaxed);
-    if !neg_gold && !gift {
+    let gift = due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS);
+    let unlock = due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS);
+    if !neg_gold && !gift && !unlock {
         return;
     }
     let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
@@ -1914,6 +1976,9 @@ pub fn run_loop_poll(env: &mut Environment) {
     if neg_gold {
         neg_gold_check(env);
     }
+    if unlock {
+        recharge_unlock_replay(env);
+    }
     if gift {
         first_charge_gift_poll(env);
     }
@@ -1921,8 +1986,41 @@ pub fn run_loop_poll(env: &mut Environment) {
     let _: () = msg_send(env, (pool, drain_s));
 }
 
-/// [2026-10-03] 弹首充大礼包(照 parseVipInfo 0x1c0e4a..0x1c0ec0 的调用顺序)。只在离线、主村、currentGameMode == 1 时弹;
-/// 条件不满足就约 0.5 秒后再看(标志保留)。
+/// [SceneMannager curSceneId] 与 [WrapperManager currentGameMode](岛上读 NewGameManager.gameMode,-[WrapperManager
+/// currentGameMode]@0x261518 按场景路由);单例拿不到返回 None。
+fn scene_and_mode(env: &mut Environment) -> Option<(i32, i32)> {
+    let sm = shared(env, "SceneMannager", "sharedManager");
+    let wm = shared(env, "WrapperManager", "sharedManager");
+    if sm == nil || wm == nil {
+        return None;
+    }
+    let s = sel_of(env, "curSceneId");
+    let scene: i32 = msg_send(env, (sm, s));
+    let s = sel_of(env, "currentGameMode");
+    let mode: i32 = msg_send(env, (wm, s));
+    Some((scene, mode))
+}
+
+/// [2026-10-04 第八轮] 清掉 vip.dat 里的一个充值待办并写盘(save_blocked 时与 VIP 值一样不落盘)。
+fn clear_side_pending(env: &mut Environment, first_charge: bool) {
+    {
+        let mut s = side();
+        if first_charge {
+            s.first_charge_pending = false;
+        } else {
+            s.recharge_unlock_pending = false;
+        }
+    }
+    side_save(env);
+}
+
+/// [2026-10-03] 弹首充大礼包(照 parseVipInfo 0x1c0e4a..0x1c0ec0 的调用顺序)。条件不满足就约 0.5 秒后再看(标志保留)。
+/// [2026-10-04 第八轮 R8-A1] 用户拍板照原版岛上也当场弹:原版 parseVipInfo 不分场景,礼包层 -[FirstChargeGiftsLayer
+///   showWithTarget:selector:]@0x3803cc 只在 0x38040a 要求 currentGameMode==1(岛上读 NewGameManager.gameMode);领取
+///   -[WrapperManager onAddFirstChargeGiftToMap:]@0x262f2c 在 0x262f9c 判 curSceneId==10 走岛菜单
+///   -[NewSceneVillageMenuLayer onAddFirstChargeGiftToMap:]@0x25d098 摆到岛上。主村:不在岛会话、curSceneId 1;岛上:稳稳在岛上
+///   (island_settled:不在进岛窗口/加载/离岛过场)、curSceneId 10;两边都要 currentGameMode 1。礼包层确实挂上([layer parent] 非 nil)
+///   才清待办并写盘;currentGameMode≠1 时原版在 0x38040c 静默返回,不能据此清位。
 fn first_charge_gift_poll(env: &mut Environment) {
     if env.options.network_access {
         // 在线时 VIP 三值与首充礼包都由服务器回包(parseVipInfo)负责。
@@ -1930,37 +2028,25 @@ fn first_charge_gift_poll(env: &mut Environment) {
         return;
     }
     FIRST_CHARGE_NEXT_TRY_MS.store(process_ms() + 500, O);
-    if crate::mole_cheats::island_session_active() {
+    let Some((scene, mode)) = scene_and_mode(env) else {
         return;
-    }
-    let sm = shared(env, "SceneMannager", "sharedManager");
-    if sm == nil {
-        return;
-    }
-    let s = sel_of(env, "curSceneId");
-    let scene: i32 = msg_send(env, (sm, s));
-    if scene != 1 {
+    };
+    let main_ok = !crate::mole_cheats::island_session_active() && scene == 1 && mode == 1;
+    let island_ok = crate::mole_cheats::island_settled() && scene == 10 && mode == 1;
+    if !main_ok && !island_ok {
         return;
     }
     let wm = shared(env, "WrapperManager", "sharedManager");
-    if wm == nil {
-        return;
-    }
-    let s = sel_of(env, "currentGameMode");
-    let mode: i32 = msg_send(env, (wm, s));
-    if mode != 1 {
-        return;
-    }
     let layer_cls = env
         .objc
         .get_known_class("FirstChargeGiftsLayer", &mut env.mem);
     let nm = shared(env, "NetworkManager", "sharedInstance");
-    if layer_cls == nil {
+    if layer_cls == nil || wm == nil {
         FIRST_CHARGE_PENDING.store(false, O);
-        log!("[MOLEITEMS] ⚠️ 首充大礼包:找不到 FirstChargeGiftsLayer 类,放弃");
+        clear_side_pending(env, true);
+        log!("[MOLEITEMS] ⚠️ 首充大礼包:找不到 FirstChargeGiftsLayer 类或 WrapperManager,放弃");
         return;
     }
-    FIRST_CHARGE_PENDING.store(false, O);
     let s = sel_of(env, "initFirstChargeGifts");
     let _: () = msg_send(env, (wm, s));
     let s = sel_of(env, "firstChargeGiftsArray");
@@ -1968,12 +2054,23 @@ fn first_charge_gift_poll(env: &mut Environment) {
     let s = sel_of(env, "layerWithRewards:");
     let layer: id = msg_send(env, (layer_cls, s, gifts));
     if layer == nil {
+        // 礼物表都建不出来,重试也不会好:放弃并清待办,免得每 0.5 秒刷一次。
+        FIRST_CHARGE_PENDING.store(false, O);
+        clear_side_pending(env, true);
         log!("[MOLEITEMS] ⚠️ 首充大礼包:layerWithRewards: 返回 nil,没有弹出");
         return;
     }
     let s = sel_of(env, "showWithTarget:selector:");
     let null_sel: SEL = SEL::null();
     let _: () = msg_send(env, (layer, s, nm, null_sel));
+    let s = sel_of(env, "parent");
+    let parent: id = msg_send(env, (layer, s));
+    if parent == nil {
+        log_dbg!("[MOLEITEMS] 首充大礼包:礼包层没挂上(currentGameMode 可能刚变),0.5 秒后再试");
+        return;
+    }
+    FIRST_CHARGE_PENDING.store(false, O);
+    clear_side_pending(env, true);
     let count: u32 = if gifts == nil {
         0
     } else {
@@ -1981,9 +2078,46 @@ fn first_charge_gift_poll(env: &mut Environment) {
         msg_send(env, (gifts, s))
     };
     log!(
-        "[MOLEITEMS] 首充大礼包:照原版 parseVipInfo 顺序 initFirstChargeGifts → layerWithRewards:({} 件) → showWithTarget:NetworkManager selector:nil 已弹出",
-        count
+        "[MOLEITEMS] 首充大礼包:照原版 parseVipInfo 顺序 initFirstChargeGifts → layerWithRewards:({} 件) → showWithTarget:NetworkManager selector:nil 已弹出({})",
+        count,
+        if scene == 10 { "黄金岛上当场弹" } else { "主村" }
     );
+}
+
+/// [2026-10-04 第八轮 R8-A2] 充值解锁物回主村重放落盘。原版 -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:] 改内存后
+/// saveToLocal(0x7f3dc/0x7f476),而 saveToLocal 在岛上 0x7cb3e 早退、-[WrapperManager unlockItem:]@0x2612e8 只改内存,回村
+/// loadFromLocal 对键 13 按位或(0x1ee3c)、对键 63 盘上有就覆盖(0x2007a)。所以在不在岛会话、curSceneId 1、currentGameMode 1、
+/// 主村地图加载完([[ActorManager Instance] m_isLoadMap]==0:键 63 已处理完,-[GameData saveMapData:] 0x768fa 不会因加载中静默跳过)
+/// 时重放 recharge_unlock_side_effects(unlockItem: 内部 0x26137e 起枚举去重,gamedataFlag 按位或,都是幂等的)并 saveToLocal,
+/// 然后清待办写盘。主村内充值当场已存过一次,这里再重放一次无害,也兜住充值时 gameMode≠1 致 saveToLocal 被跳过的情形。
+fn recharge_unlock_replay(env: &mut Environment) {
+    if env.options.network_access {
+        RECHARGE_UNLOCK_PENDING.store(false, O);
+        return;
+    }
+    RECHARGE_UNLOCK_NEXT_TRY_MS.store(process_ms() + 500, O);
+    if crate::mole_cheats::island_session_active() {
+        return;
+    }
+    let Some((scene, mode)) = scene_and_mode(env) else {
+        return;
+    };
+    if scene != 1 || mode != 1 {
+        return;
+    }
+    let am = shared(env, "ActorManager", "Instance");
+    if am == nil {
+        return;
+    }
+    let s = sel_of(env, "m_isLoadMap");
+    let loading: bool = msg_send(env, (am, s));
+    if loading {
+        return;
+    }
+    recharge_unlock_side_effects(env);
+    RECHARGE_UNLOCK_PENDING.store(false, O);
+    clear_side_pending(env, false);
+    log!("[MOLEITEMS] 充值解锁物:主村地图已加载完,照原版重放 unlockItem:/gamedataFlag 并 saveToLocal 落盘,待办已清");
 }
 
 fn neg_gold_check(env: &mut Environment) {
