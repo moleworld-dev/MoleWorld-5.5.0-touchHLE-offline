@@ -170,6 +170,47 @@ pub fn before_replace(target: &Path) {
     }
 }
 
+/// [2026-10-04 第八轮收尾] Fs 删除文件成功后调用(removed 是宿主路径):游戏自己删掉主村主档时,清掉上一代备份。
+/// 原版删主档只有三处,删完之后的新档都已不是备份里那一局:
+/// - -[GameData loadUserInfoData] 校验失败 0x75a26/0x75a66 删两份档(之前 0x759fe 把登录身份 setUserId:0),弹框退出,
+///   下次启动按新号;
+/// - -[GameData resetUserGameData]@0x7de50(0x7dec8 map.dat、0x7df0e userinfo.dat),调用者是读地图失败 0x7936a、
+///   设置里「重新开始」-[OptionLayer onRestartYesRestart] 0x14f68c、登录账号与本地档不同
+///   -[MainMenuScene onLoginMainMenuCommandReceived:] 0xb6bb8。
+/// 留着旧备份的话,新档一旦写坏,启动自检会把旧档换回来:「重新开始」被撤销,或新旧两份拼成不配对的一对。
+/// 两份主档是一局的两半,任一被删就整个清掉。原版平时存档不走删除(移植层 write_atomic 用 rename 覆盖),不会误清。
+/// 只做宿主文件操作,不发消息。
+pub fn on_main_save_removed(removed: &Path) {
+    let Some(name) = removed.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if name != USERINFO && name != MAP {
+        return;
+    }
+    let Some(docs) = removed.parent() else {
+        return;
+    };
+    if docs.file_name().and_then(|n| n.to_str()) != Some("Documents") {
+        return;
+    }
+    let Some(sandbox) = docs.parent() else {
+        return;
+    };
+    let dir = sandbox.join(BAK_DIR);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            log!(
+                "[SAVEBAK] 游戏删除了主档 {}(坏档删档 / 重新开始 / 换号),已清掉上一代备份,免得之后把旧档换回新档",
+                name
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            log!("[SAVEBAK] 清备份目录 {:?} 失败:{}", dir, e);
+        }
+    }
+}
+
 fn sandbox_dir(env: &Environment) -> PathBuf {
     crate::paths::user_data_base_path()
         .join(crate::paths::SANDBOX_DIR)

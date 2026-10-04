@@ -1593,6 +1593,8 @@ impl Fs {
                         return Err(FsError::IoError(e));
                     }
                 }
+                // [2026-10-04 第八轮收尾] 游戏删掉主村主档(坏档删档 / 重新开始 / 换号)时清掉上一代备份(见 mole_savebak)。
+                crate::mole_savebak::on_main_save_removed(host_path);
             }
             FsNode::Directory {
                 children,
