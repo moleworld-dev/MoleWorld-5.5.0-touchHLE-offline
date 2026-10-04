@@ -493,6 +493,10 @@ pub fn run_run_loop(
         // 排的即时落盘在同一轮写掉。
         // [2026-10-03] 扩成离线活动的统一受理点(见 mole_activity::run_loop_poll):回环截包应答与喂包、离线进村补发、
         // 岛日常/岛折扣、1084 分发都在这里做,原调用栈(常在 drawScene / CCScheduler 帧栈上)只置标志。
+        // [2026-10-03] 进岛 state1 布局注入受理点(见 mole_cheats::island_inject_poll):进岛加载层的帧栈上只置标志。
+        if is_main_run_loop && crate::mole_cheats::island_inject_pending() {
+            crate::mole_cheats::island_inject_poll(env);
+        }
         if is_main_run_loop && crate::mole_activity::run_loop_pending() {
             crate::mole_activity::run_loop_poll(env);
         }

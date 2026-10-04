@@ -208,6 +208,11 @@ static ISLAND_FLUSHING: AtomicBool = AtomicBool::new(false);
 /// [审计修] 进岛加载中:[LoadingManager enterLoadingWithDelegate:nextSceneId:10] 起,到 [SceneMannager loadNewScene:10] 止。
 /// 以前网络门/加载活锁解除/默认岛注入全挂在 1200 帧窗口上,加载一慢窗口先耗尽就永久卡在加载画面。
 static ISLAND_LOADING: AtomicBool = AtomicBool::new(false);
+/// [2026-10-03] 进岛 state1 的布局注入(build_default_island_mapdata)待运行循环受理。getAllObjectsListFromServerWithStartId: 臂
+/// 跑在 -[LoadingHoliday updateLoading:] 的 CCScheduler 帧栈上,以前就地整套注入(读 8 份岛侧档、建 TMMapData、改 gameMode、
+/// 增删任务对象,几十条宿主消息,MOLE_FRAMECHECK 实测);现在帧里只置这个标志,由 island_inject_poll 在本轮运行循环末尾注入。
+/// 原版这一步本来就是发包后等回包(异步),state2(下一次 updateLoading:)才判 mapData.count,时机与原版一致。
+static ISLAND_INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 /// [审计修] 离岛过渡中:startNewSceneFrom:10 toScene:1 起,到 SceneMannager.curSceneId_ 回到 1 止。
 static ISLAND_EXITING: AtomicBool = AtomicBool::new(false);
 /// SceneMannager 单例指针。drawScene 里只读它 +12 的 curSceneId_ 判定过渡是否完成(绝不在帧栈里发消息)。
@@ -4869,7 +4874,8 @@ fn island_sidecar_save(env: &mut Environment, fname: &str, bit: u32, root: id) -
 /// 之后、return true 之前各调一次。此刻 NewSceneData.mapData 已就位,时序早于 LoadingHoliday case3 的
 /// -[ObjectManager removeAllObjects](0x252f9e)与 loadNewScene→loadMapFromData→loadMapObjects,
 /// 也早于 CafeShop 两个 init(hasQuest 只在 init 算一次)与 HolidayVillageLayer onEnter 的 8 次 checkConditions:。
-/// 跑在 getAllObjectsListFromServerWithStartId: 臂内(该臂 return true 吞掉原方法),可以自由发宿主消息,不涉及 r0-r3。
+/// [2026-10-03] 跑在运行循环受理点 island_inject_poll 里(getAllObjectsListFromServerWithStartId: 臂只置标志),或 state2 兜底里;
+/// 可以自由发宿主消息,不涉及 r0-r3。
 fn island_after_layout_ready(env: &mut Environment) {
     log_dbg!("[MOLECHEAT] island: 挂钩 island_after_layout_ready");
     // ── [K4] 未来时间戳收敛 ──
@@ -5296,6 +5302,31 @@ fn island_request_flush_now() {
         return; // 已经排过一次,本轮受理时会把本次变化一起写掉
     }
     ISLAND_BATCH_MAIN_SAVED.store(false, O); // [第五轮补挖 M-M6-1] 新批次:还没看到原版存主档
+}
+
+/// [2026-10-03] 进岛 state1 布局注入是否在排队(见 ISLAND_INJECT_PENDING)。ns_run_loop 主线程每轮都调,只有一次原子读。
+pub fn island_inject_pending() -> bool {
+    ISLAND_INJECT_PENDING.load(O)
+}
+
+/// [2026-10-03] 进岛 state1 布局注入受理点:ns_run_loop 主线程、本轮 perform 相位之后调用,栈上没有游戏方法体,可以自由发宿主消息。
+/// 仍在进岛加载中才注入(与原臂同一条件);state2 兜底(island_state2_reinject_if_empty)若已先注入,它会清掉标志,这里不重复。
+/// 定时器回调自带自动释放池,这里没有,自建一个包住整次注入。
+pub fn island_inject_poll(env: &mut Environment) {
+    if !ISLAND_INJECT_PENDING.swap(false, O) {
+        return;
+    }
+    if !(ISLAND_ENTER_WINDOW.load(O) > 0 || ISLAND_LOADING.load(O)) {
+        log!("[MOLECHEAT] island: state1 布局注入受理时已不在进岛加载中,放弃");
+        return;
+    }
+    let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
+    let new_s = island_sel(env, "new");
+    let pool: id = msg_send(env, (pool_cls, new_s));
+    let ok = build_default_island_mapdata(env);
+    log_dbg!("[MOLECHEAT] island: state1 布局注入(运行循环受理)ok={}", ok);
+    let drain_s = island_sel(env, "drain");
+    let _: () = msg_send(env, (pool, drain_s));
 }
 
 /// [2026-09-25 第五轮遗留 FLUSH] 「关键操作即时落盘」是否在排队。ns_run_loop::run_run_loop 主线程每轮都调,只有一次原子读。
@@ -6801,6 +6832,8 @@ fn island_state2_reinject_if_empty(env: &mut Environment) {
         ISLAND_INJECTED.with(|c| c.get())
     );
     ISLAND_INJECTED.with(|c| c.set(true));
+    // [2026-10-03] 在这里补注入了,运行循环那次就不要再注入一遍。
+    ISLAND_INJECT_PENDING.store(false, O);
     let ok = build_default_island_mapdata(env);
     let after = island_mapdata_count(env);
     log!(
@@ -11489,10 +11522,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
 
         // state-1 向服务器拉岛物件:离线没有回包,改成本地注入默认岛 mapData,使
         // state-2(mapData.count>0)放行;吞掉发包。每次进岛只注入一次。
+        // [2026-10-03] 帧栈上只置标志(见 ISLAND_INJECT_PENDING),注入由运行循环受理点 island_inject_poll 执行。
         if sel == "getAllObjectsListFromServerWithStartId:" && (ISLAND_ENTER_WINDOW.load(O) > 0 || ISLAND_LOADING.load(O)) {
             if !ISLAND_INJECTED.with(|c| c.get()) {
                 ISLAND_INJECTED.with(|c| c.set(true));
-                build_default_island_mapdata(env);
+                ISLAND_INJECT_PENDING.store(true, O);
             }
             return true;
         }
