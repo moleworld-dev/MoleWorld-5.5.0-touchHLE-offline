@@ -1717,6 +1717,24 @@ fn mini_game(env: &mut Environment, id_: i32) {
         log!("[MOLEMENU] 拒绝岛上试玩左左右右(免得试玩成绩写进岛上前三名)");
         return;
     }
+    // [2026-10-04 第八轮收尾] 物品还在摆放(编辑层挂在场景上)时不召唤。原版各入口这时都先问 [EditMenuLayer isActive]
+    //   (@0x4d4bc,parent 非空即真;小游戏入口 -[GamePlayGoView showWithTarget:selector:gameId:] 0xdec54,建造/好友/邮件按钮等共 22 处)
+    //   并拒绝,菜单直接 startMiniGame: 绕过了这道门:占卜「拿走所有奖励」后还没摆完的奖品会被新开一局的
+    //   -[DivineGame putAllGiftOnMap] 重设 setDivineRewardsList: 冲掉,其它小游戏也会叠在摆放界面上。
+    //   菜单触摸在运行循环里处理,不在帧栈上,可以发消息;sharedInstance 原版各入口也是直接调的。
+    let eml = game_singleton(env, "EditMenuLayer", "sharedInstance");
+    if eml != nil {
+        let is_active = sel(env, "isActive");
+        let active: u8 = msg_send(env, (eml, is_active));
+        if active != 0 {
+            log!(
+                "[MOLEMENU] 拒绝召唤小游戏 {}:正在摆放物品(EditMenuLayer isActive)",
+                id_
+            );
+            set_toast("正在摆放物品:请先摆好或收起,再开小游戏".to_string());
+            return;
+        }
+    }
     let mgr = game_singleton(env, "MiniGameManager", "shareInstance");
     if mgr == nil {
         log!("[MOLEMENU] MiniGameManager == nil");
