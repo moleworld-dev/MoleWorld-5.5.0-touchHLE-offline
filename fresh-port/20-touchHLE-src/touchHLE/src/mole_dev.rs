@@ -1416,6 +1416,18 @@ pub fn quest_jump(env: &mut Environment, family: QuestFamily, quest_id: i64) -> 
     } else {
         0
     };
+    // [2026-10-04 第八轮 R8-B1] 限时/VIP 跳转后会直接 saveMapData(只判 curSceneId==1、对象数、m_isLoadMap);主村好友入口放开后
+    //   离线也能串门,好友村/丝尔特村时 gameMode=0 而 curSceneId 仍是 1,会把别人的地图写进 map.dat。原版 saveToLocal 遇 gameMode 0/6
+    //   跳过(0x7cb14/0x7cb18),这里照同一口径要求 currentGameMode==1,放在 quickStart: 之前,拒绝时不改任何进度。
+    if matches!(family, QuestFamily::Time | QuestFamily::Vip) {
+        let mode = wrapper_game_mode(env);
+        if mode != 1 {
+            return Err(format!(
+                "请先回到自己的庄园、关闭其它面板再跳转{}任务(currentGameMode={})",
+                label, mode
+            ));
+        }
+    }
     let s = sel(env, "quickStart:");
     let _: () = msg_send(env, (quest, s, quest_id as i32));
     match family {
@@ -1917,6 +1929,17 @@ fn local_timestamp() -> String {
 pub fn snapshot_save(env: &mut Environment) -> DevResult {
     if crate::mole_cheats::island_session_active() {
         return Err("请先回到主村再保存快照(离岛时岛档会自动完整落盘)".to_string());
+    }
+    // [2026-10-04 第八轮 R8-B1] 串门(好友村/丝尔特村,gameMode=0)时主村菜单层还在、curSceneId 仍是 1,下面的 saveMapData 会把
+    //   别人的地图写进 map.dat;照原版 saveToLocal 的口径(gameMode 0/6 不存)要求 currentGameMode==1。
+    if main_village_layer(env) != nil {
+        let mode = wrapper_game_mode(env);
+        if mode != 1 {
+            return Err(format!(
+                "请先回到自己的庄园、关闭其它面板再保存快照(currentGameMode={})",
+                mode
+            ));
+        }
     }
     let flushed = if main_village_layer(env) != nil {
         game_data_call(env, "saveUserInfoData");

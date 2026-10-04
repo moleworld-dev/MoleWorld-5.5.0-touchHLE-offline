@@ -398,7 +398,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
         //   活动公告 -[ActivityBulletinLayer onJoinInActivity] 0x3aa7fa、TestLayer/NewSceneTestLayer 调试层(init 与 VIP 值加减按钮);离线走不到的:
         //   进村 -[GameManager startGame:] 0x19ca0(isConnected 门内,由 startgame_resend_offline 补)、内购成功 0x117dcc 与
         //   -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:] 0x7f284(SHELLHOOK 整段绕开,由 mole_items::on_shells_purchased 补)、
-        //   好友村回家 -[FriendsVillageLayer reduceMemoryCallBack_goToHomeVillage] 0x109172(离线没有好友村)。
+        //   好友村回家 -[FriendsVillageLayer reduceMemoryCallBack_goToHomeVillage] 0x109172(第八轮 R8-B1 起主村离线也能进好友村,
+        //   这条回家路径离线可达:跑在回家的调度帧上,本臂只置排队标志,运行循环受理点分发)。
         if sel == "getVipInfo" && !env.options.network_access {
             let lr = env.cpu.regs()[14];
             request_vip_info(env, &format!("离线接住 getVipInfo(调用方 LR={lr:#x})"));

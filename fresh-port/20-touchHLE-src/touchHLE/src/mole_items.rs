@@ -1619,6 +1619,20 @@ pub fn give_goods(env: &mut Environment, id: u32, count: u32) -> Result<String, 
 }
 
 fn give_goods_inner(env: &mut Environment, item: u32, count: u32) -> Result<String, String> {
+    // [2026-10-04 第八轮 R8-B1] 主村好友入口放开后,离线也能串门(好友村/丝尔特村时 GameManager.gameMode=0,而 curSceneId 仍是 1)。
+    //   原版 -[GameData saveToLocal] 在 0x7cb14/0x7cb18 遇 gameMode 0/6 跳过,不会把 NPC 地图存进玩家档;这里直接调 saveMapData
+    //   (它只判 curSceneId==1、对象数、m_isLoadMap),串门时会把别人的地图写进 map.dat。照原版口径只在 currentGameMode==1 时执行。
+    let wm = shared(env, "WrapperManager", "sharedManager");
+    if wm != nil {
+        let mode_s = sel_of(env, "currentGameMode");
+        let mode: i32 = msg_send(env, (wm, mode_s));
+        if mode != 1 {
+            return Err(format!(
+                "请先回到自己的庄园、关闭其它面板再入仓库(currentGameMode={})",
+                mode
+            ));
+        }
+    }
     let gm = shared(env, "GameManager", "sharedManager");
     let ui_s = sel_of(env, "villageUILayer");
     let layer: id = if gm != nil {
