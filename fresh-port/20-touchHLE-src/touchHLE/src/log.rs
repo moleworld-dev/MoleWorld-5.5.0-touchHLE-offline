@@ -87,13 +87,19 @@ macro_rules! echo {
             let formatted_str = format!($($arg)+);
 
             // [MoleWorld iOS] iOS 也走 SDL_Log → NSLog → 统一日志(Console.app 可见,
-            // 真机调试用);eprintln! 到 stderr 仍保留(无害冗余)。
+            // 真机调试用);同时写 stderr(无害冗余)。
             #[cfg(any(target_os = "android", target_os = "ios"))]
             {
                 sdl2::log::log(&formatted_str);
             }
+            // [2026-10-04 第八轮 R8-D4] 不用 eprintln!:它写失败就 panic。启动它的终端被关掉(SIGHUP)、
+            // 管道读端没了之后,写 stderr 会报 EIO/EPIPE,而收到挂断后走的退出存档链第一句就是 echo!,
+            // 会在存档前 panic。这里忽略写错误,日志文件照写。
             #[cfg(not(target_os = "android"))]
-            eprintln!("{}", formatted_str);
+            {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "{}", formatted_str);
+            }
 
             use std::io::Write;
             let mut log_file = $crate::log::get_log_file();
@@ -116,7 +122,10 @@ macro_rules! echo {
                 sdl2::log::log("");
             }
             #[cfg(not(target_os = "android"))]
-            eprintln!("");
+            {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr());
+            }
 
             use std::io::Write;
             let mut log_file = $crate::log::get_log_file();

@@ -59,6 +59,7 @@ pub mod fxhash;
 pub mod mole_jitprobe;
 pub mod mole_watchdog;
 mod mole_menu;
+mod mole_savebak;
 mod mole_sysinfo;
 mod objc;
 mod save_reset;
@@ -338,6 +339,37 @@ fn install_native_crash_handler() {
     }
 }
 
+/// [2026-10-04 第八轮 R8-D4] 关掉启动游戏的终端窗口时进程收到 SIGHUP,默认处理是直接结束进程、不存档。
+/// 改成置退出请求,由主线程按关闭窗口处理(见 window::request_host_quit)。处理函数里只做一次原子写:
+/// 不调 SDL、不发宿主消息、不写日志。之后写 stderr 会失败,log.rs 的 echo! 已忽略写错误。
+/// 启动时 SIGHUP 已被忽略(nohup 启动)就保持忽略,不改启动者的选择。
+#[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+fn install_sighup_handler() {
+    extern "C" fn on_sighup(_sig: ::libc::c_int) {
+        window::request_host_quit();
+    }
+    // SAFETY: sigaction 结构按 libc 定义清零后填写,处理函数只做一次无锁原子写(异步信号安全)。
+    unsafe {
+        let mut old: ::libc::sigaction = std::mem::zeroed();
+        if ::libc::sigaction(::libc::SIGHUP, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == ::libc::SIG_IGN
+        {
+            log!("[生命周期] SIGHUP 启动时已被忽略(nohup 等),保持忽略");
+            return;
+        }
+        let mut sa: ::libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sighup as extern "C" fn(::libc::c_int) as ::libc::sighandler_t;
+        ::libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = ::libc::SA_RESTART;
+        if ::libc::sigaction(::libc::SIGHUP, &sa, std::ptr::null_mut()) != 0 {
+            log!(
+                "[生命周期] 装 SIGHUP 处理失败({}),关掉终端时不会先存档",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     // [crash logging] 强制开启 backtrace(若未设),让 panic 钩子能拿到符号栈。
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -389,6 +421,10 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         );
     }
     echo!();
+
+    // [2026-10-04 第八轮 R8-D4] 关掉启动游戏的终端时先存档再退出。
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    install_sighup_handler();
 
     {
         let base_path = paths::user_data_base_path();
@@ -637,6 +673,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     // Environment::new 只装载、链接二进制并准备主线程协程,guest 代码(静态初始化器 → _start → UIApplicationMain → 读档)
     // 要等下面 run() 恢复协程才开始执行,所以这里是确定早于读档的最早时机。字节不是破解版时函数什么都不做。
     crate::mole_cheats::restore_cracked_vipgold(&mut env);
+    // [2026-10-04 第八轮 R8-D1] 主档坏档自检:同样必须早于读档。坏的那份用上一代备份换回(见 mole_savebak)。
+    crate::mole_savebak::startup_check(&mut env);
     env.run();
     Ok(())
 }

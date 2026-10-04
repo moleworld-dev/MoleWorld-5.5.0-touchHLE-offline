@@ -104,8 +104,10 @@ jobs:
           cd dev-scripts && ./make-windows-bundle.sh C:/t/release/touchHLE.exe && mv touchHLE_windows_bundle/ .. && cd ..
           cp -r ../../01-cracked/Payload/MoleWorld.app touchHLE_windows_bundle/MoleWorld.app
           find touchHLE_windows_bundle/MoleWorld.app \( -name "*.decoded.plist" -o -name ".DS_Store" \) -delete || true
-          # 双击运行的 .bat:cd 到自身目录,带正确参数加载游戏;末尾 pause 便于看到报错
-          printf '@echo off\r\ncd /d "%%~dp0"\r\ntouchHLE.exe "MoleWorld.app" --landscape-right --device-family=ipad\r\npause\r\n' > "touchHLE_windows_bundle/Run-MoleWorld.bat"
+          # 双击运行的 .bat:cd 到自身目录,带正确参数加载游戏。
+          # [2026-10-04 第八轮 R8-D4] touchHLE.exe 发行版已是图形程序(src/bin.rs windows_subsystem):用 start 拉起后
+          # .bat 立即结束、黑色控制台随之关闭,不再留一个点了关闭就会不存档结束游戏的控制台;报错改看错误弹窗与 touchHLE_log.txt。
+          printf '@echo off\r\ncd /d "%%~dp0"\r\nstart "" touchHLE.exe "MoleWorld.app" --landscape-right --device-family=ipad\r\n' > "touchHLE_windows_bundle/Run-MoleWorld.bat"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

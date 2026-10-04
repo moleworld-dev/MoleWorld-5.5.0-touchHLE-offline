@@ -142,6 +142,9 @@ pub fn delete_local_saves(env: &mut Environment) -> Result<usize, ResetFailure> 
             not_restored,
         });
     }
+    // [2026-10-04 第八轮 R8-D1] 删档成功后一并清掉主档上一代备份(见 mole_savebak),免得新号启动时被旧档「恢复」回来。
+    //   (自检只在「档存在且坏」时动作,删档后档不存在本不会恢复,清掉是双保险。)
+    crate::mole_savebak::forget_backups(env);
     Ok(removed.len())
 }
 

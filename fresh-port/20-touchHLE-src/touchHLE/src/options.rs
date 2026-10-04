@@ -13,6 +13,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+/// [2026-10-04 第八轮 R8-D2] 命令行带了 --no-error-popup:比 Options 更早的地方(Fs::new 里的单实例锁)也要知道别弹窗。
+pub static NO_ERROR_POPUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub const OPTIONS_HELP: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/OPTIONS_HELP.txt"));
 
@@ -306,6 +310,7 @@ impl Options {
             self.network_access = true;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
+            NO_ERROR_POPUP.store(true, std::sync::atomic::Ordering::Relaxed);
         } else if let Some(values) = arg.strip_prefix("--dump=") {
             self.dumping_options = parse_dump_options(values)?;
         } else if let Some(path) = arg.strip_prefix("--dump-file=") {

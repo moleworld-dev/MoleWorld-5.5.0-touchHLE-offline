@@ -299,6 +299,8 @@ pub fn wants(class: &str, sel: &str) -> bool {
             sel,
             "checkNetWork" | "onDigShellClick:" | "onSureRefreshClick" | "onExchangeRewardClick:"
         ),
+        // [2026-10-04 第八轮 R8-C1] 海王贝奖励面板自己的网络检查(见 intercept 里的 checkNetWork 臂)
+        "GetItemRewardFromHaiwangLayer" => sel == "checkNetWork",
         "GameData" => sel == "isHighPriceRecycleTime" || sel == "hasFireworkGift",
         // [2026-09-16] A1-01 春节烟花真正开播时才记当天额度
         "FireworkLayer" => sel == "showFireWorkFullScreen",
@@ -398,7 +400,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
         //   活动公告 -[ActivityBulletinLayer onJoinInActivity] 0x3aa7fa、TestLayer/NewSceneTestLayer 调试层(init 与 VIP 值加减按钮);离线走不到的:
         //   进村 -[GameManager startGame:] 0x19ca0(isConnected 门内,由 startgame_resend_offline 补)、内购成功 0x117dcc 与
         //   -[GameData addAlreadyPurchaseVipgoldWithPurchaseInfo:] 0x7f284(SHELLHOOK 整段绕开,由 mole_items::on_shells_purchased 补)、
-        //   好友村回家 -[FriendsVillageLayer reduceMemoryCallBack_goToHomeVillage] 0x109172(离线没有好友村)。
+        //   好友村回家 -[FriendsVillageLayer reduceMemoryCallBack_goToHomeVillage] 0x109172(第八轮 R8-B1 起主村离线也能进好友村,
+        //   这条回家路径离线可达:跑在回家的调度帧上,本臂只置排队标志,运行循环受理点分发)。
         if sel == "getVipInfo" && !env.options.network_access {
             let lr = env.cpu.regs()[14];
             request_vip_info(env, &format!("离线接住 getVipInfo(调用方 LR={lr:#x})"));
@@ -501,11 +504,24 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 None
             }
         }
-        // 三个层自己的 checkNetWork(签到层 0x39a3fc / 脚印兑换层 0x39c7d4 / 海底寻宝层 0x2c28b8):
+        // 三个层自己的 checkNetWork(签到层 0x39a3fc / 脚印兑换层 0x39c7d4 / 海底寻宝层 0x2c28b8;第四个海王贝奖励面板见下):
         // 原版在无网时弹"该功能需要联网"或 showNetWorkError 并返回 NO。离线由回环服务器代答,直接返回 YES。
         ("DailySignLayer", "checkNetWork")
         | ("SealExchangeLayer", "checkNetWork")
         | ("SeabedSeekingTreasureMainLayer", "checkNetWork") => {
+            env.cpu.regs_mut()[0] = 1;
+            Some(true)
+        }
+        // [2026-10-04 第八轮 R8-C1] 第四个:海王贝奖励面板。挖到海王贝(贝壳类型 4,-[SeabedSeekingTreasureMainLayer onDigShellClick:]
+        //   0x2c203a → 0x2c205c 奖励层 setVisible:YES,0x2c2080 displayUIWithBgSpr: 里 generateRandomRewardId 写 rewardId_)后,
+        //   回环 1220 已把这只贝壳换掉并写进 mole_activity.dat;玩家点奖励面板时 -[GetItemRewardFromHaiwangLayer ccTouchBegan:withEvent:]
+        //   @0x3fa544 先在 0x3fa5a2 调本层 checkNetWork@0x3fa710(判 isReachable 0x3fa740 / isConnected 0x3fa75e),离线失败就
+        //   showNetWorkError(GET_ACTION_CENTER_INFO_ERROR「无法获取当前的活动中心数据」,回调 closeMainLayer)并在 0x3fa5ac 返回,
+        //   真正的发奖(0x3fa5cc closeMainLayer → 0x3fa606 initActivityGiftNum:1 → 0x3fa626 onAddActivityGiftToMap:rewardId_ →
+        //   0x3fa654 setIsGetDigHaiwangShellReward:1)整段走不到,奖励永久丢失。同上口径返回 YES,让原版自己关页、发活动礼包、进摆放。
+        //   触摸回调不在帧栈上;只写 r0,不发消息。岛上与在线由 intercept 入口「只在离线主村生效」的总闸排除。
+        ("GetItemRewardFromHaiwangLayer", "checkNetWork") => {
+            log!("[ACTIVITY] 海王贝奖励面板 checkNetWork:离线由回环代答,返回 YES,照原版关页并把奖励发到庄园");
             env.cpu.regs_mut()[0] = 1;
             Some(true)
         }
@@ -2774,6 +2790,11 @@ const DAILY_MAIN_SLOTS: [(u32, u32); 6] = [(1, 9), (10, 7), (17, 6), (23, 3), (2
 const DAILY_MAIN_WIRE_COUNT: usize = 5;
 /// 第 1 个原始值的取值范围 0..18(9 与 6 的最小公倍数):它同时决定第 1 条与第 6 条。
 const DAILY_MAIN_V0_SPAN: u32 = 18;
+/// [2026-10-04 第八轮 R8-B2] 离线时第 6 条固定取 type 6 段的偏移 0 = ID 29「拜访 1 个推荐好友」(act_condition 1,take_level 1)。
+/// ID 30-34 要拜访 2~6 个不同的人:计数 -[DailyQuest visitFriendsVillage:]@0x341e74 按 userId 去重(0x341f0c),
+/// 推荐格、好友格的两个计数点 0x107e18、0x10829e 都在 isReachable 网络门之后,离线唯一能计数的是丝尔特庄园(0x1086d4),
+/// 同一 userId 只算 1 次,所以离线当天做不完。选题规则本就是移植者自拟(原版在服务器),只收窄取值,不动任何原版数据。
+const DAILY_MAIN_OFFLINE_VISIT_OFFSET: u32 = 0;
 
 /// 黄金岛每日任务表 dec/DailyQuestHV.dat(15 条)的 take_level,下标 = 任务 ID − 1。
 const DAILY_HV_TAKE_LEVEL: [u8; 15] = [18, 20, 21, 18, 24, 18, 24, 18, 30, 9, 1, 1, 1, 1, 1];
@@ -2857,6 +2878,8 @@ fn daily_slot_candidates(take_levels: &[u8], start: u32, count: u32, level: i32)
 /// 按日期确定性地挑主村 5 个原始值。规则为移植者自拟(原版选题在服务器,私服也没实现):
 /// 每个类型在 take_level ≤ 当前主村等级的任务里随机取一条,没有够得着的就取该类型等级要求最低的一条。
 /// 第 1 个值同时决定第 1 条(v%9+1)与第 6 条(v%6+29),在 0..18 里找两边都够得着的取值,找不到就只保证第 1 条。
+/// [2026-10-04 第八轮 R8-B2] 第 6 条离线固定为「拜访 1 个推荐好友」(见 DAILY_MAIN_OFFLINE_VISIT_OFFSET),第 1 个值因此只取
+/// 0/6/12,第 1 条随之只会是 ID 1/7/4,仍按等级过滤。当天已落盘的选题照旧复用,次日起生效。
 fn pick_daily_main(ymd: u32, level: i32) -> Vec<u32> {
     let mut state = splitmix64(u64::from(ymd) ^ 0x4d4f_4c45_0432);
     let mut next = || {
@@ -2864,9 +2887,9 @@ fn pick_daily_main(ymd: u32, level: i32) -> Vec<u32> {
         state
     };
     let (s0, n0) = DAILY_MAIN_SLOTS[0];
-    let (s5, n5) = DAILY_MAIN_SLOTS[5];
+    let (_, n5) = DAILY_MAIN_SLOTS[5];
     let ok0 = daily_slot_candidates(&DAILY_MAIN_TAKE_LEVEL, s0, n0, level);
-    let ok5 = daily_slot_candidates(&DAILY_MAIN_TAKE_LEVEL, s5, n5, level);
+    let ok5 = [DAILY_MAIN_OFFLINE_VISIT_OFFSET];
     let mut pool: Vec<u32> = (0..DAILY_MAIN_V0_SPAN)
         .filter(|v| ok0.contains(&(v % n0)) && ok5.contains(&(v % n5)))
         .collect();
@@ -3688,6 +3711,24 @@ mod offline_server_tests {
         // 1 级:第 1 段都够不着 → 取等级要求最低的 ID 1;第 2 段最低是 ID 10(9 级)
         let ids = daily_ids(&pick_daily_island(20_260_916, 1), true);
         assert_eq!(&ids[..2], &[1, 10]);
+    }
+
+    #[test]
+    fn daily_main_offline_visit_is_one() {
+        for ymd in 20_261_001u32..20_261_031 {
+            for level in [1, 4, 5, 8, 9, 10, 30, 52] {
+                let vals = pick_daily_main(ymd, level);
+                let ids = daily_ids(&vals, false);
+                assert_eq!(ids[5], 29, "第 6 条必须是「拜访 1 个推荐好友」");
+                assert!([1, 7, 4].contains(&ids[0]));
+                assert!(
+                    i32::from(DAILY_MAIN_TAKE_LEVEL[(ids[0] - 1) as usize]) <= level,
+                    "第 1 条 ID {} 超出 {} 级",
+                    ids[0],
+                    level
+                );
+            }
+        }
     }
 
     #[test]

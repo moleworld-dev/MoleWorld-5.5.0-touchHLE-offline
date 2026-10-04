@@ -6752,6 +6752,15 @@ pub fn island_session_active() -> bool {
         || ISLAND_EXITING.load(O)
 }
 
+/// [2026-10-04 第八轮 R8-A1] 已经稳稳在岛上:ON_ISLAND 且不在进岛窗口/加载/离岛过场中。只读原子,不发消息。
+/// 给 mole_items 判断「岛上能不能照原版当场弹首充大礼包」用(过场期间不弹)。
+pub fn island_settled() -> bool {
+    ON_ISLAND.load(O)
+        && ISLAND_ENTER_WINDOW.load(O) == 0
+        && !ISLAND_LOADING.load(O)
+        && !ISLAND_EXITING.load(O)
+}
+
 /// 本次进岛请求是否已走到 gate#1(=真 enterNewIslands 通过了前置门)。
 pub fn island_gate1_hit() -> bool {
     ISLAND_GATE1_HIT.load(O)
@@ -9691,7 +9700,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     //   本地门后,0x25a70a 调 [NewSceneData saveUserinfoToLocal]、0x25a728 调 startNewSceneFrom:toScene: 离岛去好友村,
     //   同样没有任何网络门 → 离线点了就被甩进只有自己的空好友图,且岛也退了。原来这道拦截只认主村的类名,
     //   岛上这个入口是漏的。两个类的这个选择子行为一致,合并进同一道拦截即可(弹框失败仍旧恢复寄存器走原版)。
-    if (class == "VillageMenuLayer" || class == "NewSceneVillageMenuLayer")
+    // [2026-10-04 第八轮 R8-B1] 主村不再拦,只拦岛上。根因:主线任务 11「看看外面的世界!」与任务 353「拜访丝尔特的庄园」
+    //   (QuestData init 0x112ba2/0x112c06 置 operationType 1)只能由好友村回家时 -[FriendsVillageLayer
+    //   reduceMemoryCallBack_goToHomeVillage] 0x108f38 [Quest checkAction:6 object:0] 完成,且要 hasVisitedNPC==1
+    //   (0x1279ea;全二进制唯一置 1 点是特色庄园分支 0x10844a)。主村入口被拦后离线新号主线永远卡在第 11 条,
+    //   包内本地的丝尔特庄园(xiaotulv_map,0x108546 loadMapdataFromResource:)也进不去。原版好友村离线并不挂死:
+    //   好友/推荐/访客格在 0x107d6c/0x108106 的 isReachable 门失败时走 0x10832a showErrorMessage(原版连接错误框),
+    //   getFriendsInfo/getTop10Info 离线 isReachable 门直接返回;特色庄园与丝尔特庄园两条本地分支无网络门。
+    //   用户拍板:按原版离线表现,不加额外提示。岛上 NewSceneVillageMenuLayer 继续拦(离岛串门要走岛档落盘与跨场景过场,
+    //   风险大,任务 11/353 在主村就能做)。串门时 gameMode=0,原版 saveToLocal 遇 0/6 跳过;移植层直接 saveMapData 的入口
+    //   (mole_items give_goods_inner、mole_dev quest_jump 限时/VIP 分支、snapshot_save)已补 currentGameMode==1 门。
+    if class == "NewSceneVillageMenuLayer"
         && sel == "onButtonFriendSelected:"
         && !env.options.network_access
     {
@@ -9703,11 +9722,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         ];
         let msg = game_localized_string(env, "ACTION_CENTER_NETWARNING");
         if show_game_message_box(env, msg, 6, nil, SEL::null()) {
-            log!("[MOLECHEAT] 离线:好友/排行/串门入口需要联网 → 弹「该功能需要联网」提示,不卸载主村");
+            log!("[MOLECHEAT] 离线:黄金岛上的好友/排行/串门入口需要联网 → 弹「该功能需要联网」提示,不离岛");
             env.cpu.regs_mut()[0] = 0;
             return true;
         }
-        // 弹框没发出去(类/文案缺失):不静默吞按钮,恢复寄存器走原版(最坏只是进空好友图,能正常回村)。
+        // 弹框没发出去(类/文案缺失):不静默吞按钮,恢复寄存器走原版(最坏只是离岛进空好友图,能正常回村)。
         env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
     }
 
