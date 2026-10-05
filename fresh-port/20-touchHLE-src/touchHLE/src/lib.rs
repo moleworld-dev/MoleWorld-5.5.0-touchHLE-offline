@@ -54,6 +54,7 @@ mod mole_items;
 mod mole_menu;
 mod mole_savebak;
 mod mole_sysinfo;
+mod mole_uid;
 mod objc;
 mod save_reset;
 mod options;

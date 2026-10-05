@@ -7189,6 +7189,8 @@ fn apply_crack_patches(env: &mut Environment) {
         env.mem.bytes_at_mut(ptr, n).copy_from_slice(bytes);
         env.cpu.invalidate_cache_range(p.vaddr, n);
     }
+    // 米米号 = QQ 号:放开账号界面 10 位米米号、资料栏按无符号显示(见 mole_uid.rs)。
+    crate::mole_uid::apply(env);
     log!(
         "[MOLECHEAT] 破解补丁应用: 越狱={} 修复占卜={}({}) 节日村={} 商城免VIP={} 进新岛={} 跳校验={}",
         KILL_JAILBREAK.load(O), FIX_DIVINE.load(O),
