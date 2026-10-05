@@ -121,6 +121,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
+// 十进制数字(Unicode Nd 的常用部分:ASCII 0-9 与全角 0-9)。原版淘米账号界面用它校验「米米号仅由数字组成」,
+// 以前没实现(返回 nil → stringByTrimmingCharactersInSet:nil 原样返回)→ 任何数字都被判非法,米米号框输不进字。
++ (id)decimalDigitCharacterSet {
+    let set: HashSet<unichar> = (0x30..=0x39).chain(0xFF10..=0xFF19).collect();
+
+    let new: id = msg![env; this alloc];
+    env.objc.borrow_mut::<CharacterSetHostObject>(new).set = set;
+
+    autorelease(env, new)
+}
+
 + (id)controlCharacterSet {
     let set = HashSet::from(CONTROL_CHARACTERS.map(|c| unichar::try_from(c).unwrap()));
 
