@@ -160,7 +160,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     false // default value
 }
 - (())setAdjustsFontSizeToFitWidth:(bool)adjusts {
-    assert!(!adjusts); // TODO
+    // 未实现自动缩小字号:按原字号绘制(超长文本可能被截断),不再断言崩溃。
+    // 淘米账号模块的欢迎界面(TMAWelcomeViewController)登录后会设 YES,以前在这里直接闪退。
+    if adjusts {
+        log_dbg!("TODO: [(UILabel*){:?} setAdjustsFontSizeToFitWidth:YES] (ignored)", this);
+    }
 }
 
 - (())setMinimumFontSize:(CGFloat)size {
