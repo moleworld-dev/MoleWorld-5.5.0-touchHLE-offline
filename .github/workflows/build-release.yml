@@ -36,7 +36,9 @@ env:
 
 jobs:
   build-win:
-    runs-on: windows-latest
+    # [2026-10-05 v0.0.8] 固定 windows-2022:windows-latest 已换成带 Visual Studio 2026 的镜像,cmake crate 会请求
+    # 「Visual Studio 18 2026」生成器,而下面固定下载的 CMake 3.31.6 不认识它(sdl2-sys 配置直接失败)。
+    runs-on: windows-2022
     steps:
       - name: Checkout (no LFS, no submodules)
         uses: actions/checkout@v4

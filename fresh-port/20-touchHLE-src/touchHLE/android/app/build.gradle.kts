@@ -197,11 +197,13 @@ cargoNdk {
     }
     // The default feature, "static", makes us use static linking for SDL2 and OpenAL Soft.
     // For Android, we need dynamic linking for SDL2, but static linking for OpenAL Soft.
+    // [MoleWorld 2026-10-05 v0.0.8] CPU 后端改成 Cargo feature 二选一之后(cpu_dynarmic 在默认特性里),
+    // 这里 --no-default-features 必须显式带上 cpu_dynarmic,否则编出来没有任何 CPU 后端(CpuContext 找不到)。
     extraCargoBuildArguments = arrayListOf(
         "--lib",
         "--no-default-features",
         "--features",
-        "touchHLE_openal_soft_wrapper/static,sdl2/bundled"
+        "touchHLE_openal_soft_wrapper/static,sdl2/bundled,cpu_dynarmic"
     )
 }
 
