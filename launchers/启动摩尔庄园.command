@@ -3,7 +3,7 @@
 #  摩尔庄园 5.5.0  ·  touchHLE 启动器 (Apple Silicon macOS)
 #  双击本文件即可启动游戏。
 # ============================================================
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # 本脚本在 launchers/ 下,先回到仓库根
 
 # touchHLE 必须在它自己的目录下运行(要找 touchHLE_dylibs/ 和 touchHLE_fonts/)
 TOUCHHLE_DIR="fresh-port/20-touchHLE-src/touchHLE"

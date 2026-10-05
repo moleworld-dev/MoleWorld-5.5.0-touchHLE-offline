@@ -14,7 +14,7 @@
 use crate::Environment;
 use std::sync::Mutex;
 
-/// 原版帮助页背景的暖黄色(从原版截图 `screenshot/..._IMG_0031.PNG` 采样:
+/// 原版帮助页背景的暖黄色(从原版截图 `docs/images/screenshots/..._IMG_0031.PNG` 采样:
 /// RGB 239,170,66)。
 pub const HELP_BG_RGB: (f32, f32, f32) = (239.0 / 255.0, 170.0 / 255.0, 66.0 / 255.0);
 
@@ -333,7 +333,7 @@ fn local_time_and_tz() -> (String, String) {
 
 /// 权威「用户版本」号 —— 全平台唯一真源,改这一处即同步(窗口标题 / 「关于」页 /
 /// 崩溃诊断块;安卓 versionName / CI 产物名通过 build-release.yml 的 env 与此对齐)。
-pub const USER_VERSION: &str = "v0.0.7 beta";
+pub const USER_VERSION: &str = "v0.0.8 beta";
 
 /// 构建追溯短 hash:CI 在 tag 上构建时由 build-release.yml 注入 github.sha 前 7 位
 /// (编译期 `option_env!` 读 `MOLE_BUILD_HASH`);本地 / 无注入时为 None。

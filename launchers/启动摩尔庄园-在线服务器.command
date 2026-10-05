@@ -6,7 +6,8 @@
 # ============================================================================
 
 # touchHLE 需要 CWD 下有 touchHLE_dylibs/ 与 touchHLE_fonts/,所以先进它的目录。
-TOUCHHLE_DIR="/Users/xiaochoumao/Documents/github repo/摩尔庄园 5.5.0/fresh-port/20-touchHLE-src/touchHLE"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # 本脚本在 launchers/ 下,仓库根在上一级
+TOUCHHLE_DIR="$ROOT/fresh-port/20-touchHLE-src/touchHLE"
 cd "$TOUCHHLE_DIR" || { echo "❌ 进不去 touchHLE 目录:$TOUCHHLE_DIR"; read -r; exit 1; }
 
 # ===================== 可改配置(也可在外部 export 覆盖)=====================
@@ -19,7 +20,7 @@ export MOLE_HUD="${MOLE_HUD:-0}"                            # 调试悬浮窗:�
 export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"
 # ===========================================================================
 
-APP="/Users/xiaochoumao/Documents/github repo/摩尔庄园 5.5.0/fresh-port/01-cracked/Payload/MoleWorld.app"
+APP="$ROOT/fresh-port/01-cracked/Payload/MoleWorld.app"
 BIN="./target/release/touchHLE"
 LOG="/tmp/mole_online_debug.log"
 
