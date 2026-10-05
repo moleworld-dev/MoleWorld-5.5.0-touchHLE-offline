@@ -351,9 +351,125 @@ fn online_login_mimi(env: &Environment) -> Option<u32> {
     if !env.options.network_access {
         return None;
     }
-    std::env::var("MOLE_MIMI")
+    let env_mimi = std::env::var("MOLE_MIMI")
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if account_menu_mode() {
+        // [2026-10-05 伪原版登录] 账号菜单模式:启动器指定的号优先,否则用上次在账号菜单登录成功后记住的号;
+        // 都没有则 0 —— 不自动登录,停在标题画面等玩家点「切换账号」选号。
+        return Some(env_mimi.or_else(|| remembered_account().map(|(u, _)| u)).unwrap_or(0));
+    }
+    env_mimi
+}
+
+/// [2026-10-05 伪原版登录] 账号菜单里登录成功的账号记在用户数据目录(相当于原版存进钥匙串的「记住米米号和密码」),
+/// 下次启动直接用它登录。格式两行:米米号、密码。原版钥匙串存的同样是明文密码。
+const ONLINE_ACCOUNT_FILE: &str = "mole_online_account.txt";
+static REMEMBERED: Mutex<Option<Option<(u32, String)>>> = Mutex::new(None);
+
+fn remembered_account() -> Option<(u32, String)> {
+    let mut g = REMEMBERED.lock().unwrap();
+    if g.is_none() {
+        let path = crate::paths::user_data_base_path().join(ONLINE_ACCOUNT_FILE);
+        let v = std::fs::read_to_string(path).ok().and_then(|t| {
+            let mut it = t.lines();
+            let uid = it.next()?.trim().parse::<u32>().ok().filter(|&u| u != 0)?;
+            Some((uid, it.next().unwrap_or("").to_string()))
+        });
+        *g = Some(v);
+    }
+    g.clone().flatten()
+}
+
+fn remember_account(uid: u32, pwd: &str) {
+    if remembered_account().is_some_and(|(u, p)| u == uid && p == pwd) {
+        return; // 没变就不重写
+    }
+    let path = crate::paths::user_data_base_path().join(ONLINE_ACCOUNT_FILE);
+    let tmp = path.with_extension("tmp");
+    let ok = std::fs::write(&tmp, format!("{uid}\n{pwd}\n")).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    *REMEMBERED.lock().unwrap() = Some(Some((uid, pwd.to_string())));
+    log!("[MOLECHEAT] 账号菜单模式:记住账号 米米号={uid}({})", if ok { "已写入" } else { "写入失败,仅本次有效" });
+}
+
+/// 武装合成登录(下一帧起由 fire_online_login 两阶段连接并发登录包):记下米米号与密码(启动器的优先,否则记住的),
+/// 开庄园持久化补丁(NOP saveMapData 第4道闸),让活图能整包上传。
+fn arm_online_login(mimi: u32) {
+    if LOGIN_ARMED.swap(true, O) {
+        return;
+    }
+    LOGIN_MIMI.store(mimi, O);
+    let boot_pwd = std::env::var("MOLE_PASSWORD")
+        .ok()
+        .or_else(|| remembered_account().filter(|(u, _)| *u == mimi).map(|(_, p)| p));
+    LOGIN_PWD.with(|c| *c.borrow_mut() = boot_pwd);
+    MAP_SYNC_PATCH.store(true, O);
+    CRACK_PATCHES_DIRTY.store(true, O);
+}
+
+/// [2026-10-05 伪原版登录] 淘米账号模块的钥匙串(TMA_SSKeychain,touchHLE 里是假类)在用户数据目录落成一个小文件:
+/// 每行「账号\t值」(值里的 \\、\t、\n 转义)。原版登录成功时 setPassword:forService:account: 存
+/// 「密码@NickName:昵称@IconIdex:头像」(账号 = 米米号)与设备绑定号(账号 9999),打开账号菜单时
+/// passwordForService:account: 取出来静默登录——有了它菜单里才是「你好, 昵称 <米米号>」,修改密码、快速登录才可用。
+const KEYCHAIN_FILE: &str = "mole_keychain.txt";
+static KEYCHAIN: Mutex<Option<Vec<(String, String)>>> = Mutex::new(None);
+
+fn kc_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+}
+
+fn kc_unescape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('t') => o.push('\t'),
+                Some('n') => o.push('\n'),
+                Some(x) => o.push(x),
+                None => {}
+            }
+        } else {
+            o.push(c);
+        }
+    }
+    o
+}
+
+fn keychain_with<R>(f: impl FnOnce(&mut Vec<(String, String)>) -> R) -> R {
+    let mut g = KEYCHAIN.lock().unwrap();
+    if g.is_none() {
+        let path = crate::paths::user_data_base_path().join(KEYCHAIN_FILE);
+        let v = std::fs::read_to_string(path)
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| l.split_once('\t'))
+                    .map(|(a, v)| (kc_unescape(a), kc_unescape(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        *g = Some(v);
+    }
+    f(g.as_mut().unwrap())
+}
+
+fn keychain_save(items: &[(String, String)]) {
+    let path = crate::paths::user_data_base_path().join(KEYCHAIN_FILE);
+    let tmp = path.with_extension("tmp");
+    let body: String = items
+        .iter()
+        .map(|(a, v)| format!("{}\t{}\n", kc_escape(a), kc_escape(v)))
+        .collect();
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 游戏服登录用的密码明文:本次登录记下的(账号菜单里输入的 / 记住的)优先,否则启动器的 MOLE_PASSWORD。
+fn login_password() -> Option<String> {
+    LOGIN_PWD
+        .with(|c| c.borrow().clone())
+        .or_else(|| std::env::var("MOLE_PASSWORD").ok())
 }
 
 // ===== ACCOUNT-MENU MODE: 让 touchHLE 也弹出原版账号管理菜单(切换账号)=====
@@ -389,9 +505,18 @@ static PASSPORT_RESP: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
 /// 最近一次 TMAHttpManager sendRequest: 的命令字(reqID)。touchHLE 模拟原版 ASI 请求构建残缺
 /// (postData 丢了 service/extra_data 等字段),故 reqID 从 sendRequest: 参数直取,代理时据此构造 body。
 static PENDING_REQID: AtomicU32 = AtomicU32::new(0);
+/// [2026-10-05 伪原版登录] 原版淘米请求逐个 -[TMA_ASIFormDataRequest setPostValue:forKey:] 填表单(service、user_id、
+/// passwd、extra_data、udid、sign…)。touchHLE 下 postData 拼不完整,所以在这里按请求对象记下每个键值,代理时原样转发:
+/// 服务端拿到的就是原版客户端真正发出的字段(玩家在账号菜单里输入的米米号、按原版算好的密码哈希、带请求计数的 extra_data)。
+static PASSPORT_FIELDS: Mutex<Vec<(u32, Vec<(String, String)>)>> = Mutex::new(Vec::new());
 /// 玩家点了"切换账号"(showAccountManagerViewWithDelegate:)后置真。只代理这之后的 passport;
 /// 进村后 app 自动发的 autoLogin(走静默登录分支 onLoginRequestFinishWithStatusCode,touchHLE 缺桩 null deref)不碰。
 static MENU_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// [2026-10-05 伪原版登录] 已对主菜单派发过 showLoginView(玩家要选号)。establishConnection 的 isReachable 置位
+/// 只在这之后(或已登录)才做;连接本身在选号前由「暂不连接游戏服」拦下,不会以游客(米米号 0)身份登录。
+static MENU_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 上一次原版登录回调的米米号:换了号才允许用空密码覆盖本次登录密码。
+static LOGIN_MIMI_PREV: AtomicU32 = AtomicU32::new(0);
 /// [扫描修 2026-09-15] F11-1 账号菜单模式:主菜单「切换账号」被拦下后锁存的 MainMenuScene 指针(0 = 无待办)。
 /// 由 drawScene/mainLoop 钩子的寄存器恢复安全区消费(发原版 showLoginView),绝不在按钮回调栈里内联派发。
 static PENDING_SHOW_LOGIN: AtomicU32 = AtomicU32::new(0);
@@ -401,6 +526,19 @@ static CHANGEID_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 static AUTH_FAIL_HINT_PENDING: AtomicBool = AtomicBool::new(false);
 /// [扫描修 2026-09-15] F11-4 112 提示本进程已弹过。密码错时原版会反复重连重登、反复收到 112,只提示一次防刷屏。
 static AUTH_FAIL_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// application/x-www-form-urlencoded 编码(字母数字与 -_.~ 原样,其余 %XX)。
+fn form_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
+}
 
 /// passport 私服端点:连私服 host 的明文 HTTP 端口,发 Host: account-mapi.61.com 让反代路由到 web passport。
 /// MOLE_PASSPORT 覆盖 connect host:port(默认 MOLE_SERVER 的 host + 80 = Caddy 的 http://account-mapi.61.com 块)。
@@ -548,14 +686,36 @@ fn passport_proxy_enqueue(env: &mut Environment, req: id) -> bool {
     // 改用 sendRequest: 抓到的 reqID + 登录米米号自己构造最小 passport body:
     //   service=reqID(服务端按它路由)、user_id/userid=米米号(1012 回显要与请求一致)、
     //   extra_data=reqID(客户端 requestFinish: 算 extra_data%65535=reqID 路由;reqID<65535 故就是 reqID)。
-    let reqid = PENDING_REQID.load(O);
+    let fields: Option<Vec<(String, String)>> = {
+        let mut f = PASSPORT_FIELDS.lock().unwrap();
+        let pos = f.iter().position(|(r, _)| *r == req.to_bits());
+        pos.map(|i| f.remove(i).1)
+    };
+    let real = fields.as_ref().is_some_and(|f| f.iter().any(|(k, _)| k == "service"));
+    let reqid = match &fields {
+        Some(f) if real => f
+            .iter()
+            .find(|(k, _)| k == "service")
+            .and_then(|(_, v)| v.parse::<u32>().ok())
+            .unwrap_or(0),
+        _ => PENDING_REQID.load(O),
+    };
     if reqid == 0 {
         log!("[MOLECHEAT] passport 代理: 未捕获 reqID,放弃代理放行");
         return false;
     }
     let mimi = LOGIN_MIMI.load(O);
-    let body =
-        format!("service={reqid}&user_id={mimi}&userid={mimi}&extra_data={reqid}").into_bytes();
+    let body = match &fields {
+        // 原样转发原版表单(键值按原版顺序,值做表单编码)。
+        Some(f) if real => f
+            .iter()
+            .map(|(k, v)| format!("{}={}", form_escape(k), form_escape(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes(),
+        // 没抓到表单(旧路径):按 reqID + 登录米米号拼最小 body。
+        _ => format!("service={reqid}&user_id={mimi}&userid={mimi}&extra_data={reqid}").into_bytes(),
+    };
     let del_sel = env
         .objc
         .register_host_selector("delegate".to_string(), &mut env.mem);
@@ -564,7 +724,18 @@ fn passport_proxy_enqueue(env: &mut Environment, req: id) -> bool {
     let req_r = retain(env, req);
     let del_r = retain(env, delegate);
     let (host, port) = passport_endpoint();
-    let preview: String = String::from_utf8_lossy(&body[..body.len().min(140)]).into_owned();
+    let preview: String = {
+        let txt = String::from_utf8_lossy(&body).into_owned();
+        let masked: Vec<String> = txt
+            .split('&')
+            .map(|kv| match kv.split_once('=') {
+                Some((k, _)) if k.contains("passwd") || k == "sign" => format!("{k}=***"),
+                _ => kv.to_string(),
+            })
+            .collect();
+        let j = masked.join("&");
+        j.chars().take(220).collect()
+    };
     log!(
         "[MOLECHEAT] passport 代理: {} ({}B) -> {}:{} body={:?}",
         url,
@@ -573,7 +744,7 @@ fn passport_proxy_enqueue(env: &mut Environment, req: id) -> bool {
         port,
         preview
     );
-    let resp: Arc<Mutex<Option<Option<Vec<u8>>>>> = if reqid == 1012 {
+    let resp: Arc<Mutex<Option<Option<Vec<u8>>>>> = if reqid == 1012 && !real {
         // ★autoLogin(1012)直接合成 status_code:1011:客户端 requestFinish: 走 case 1011 →
         //   [viewController showAccountManagerView] 弹账号菜单,绕过 status_code:0 走的
         //   onLoginRequestFinishWithStatusCode(touchHLE 缺桩 → null-page 崩)。
@@ -582,7 +753,8 @@ fn passport_proxy_enqueue(env: &mut Environment, req: id) -> bool {
         log!("[MOLECHEAT] passport 1012 → 合成 status_code:1011(直接弹账号菜单,绕静默登录崩溃路径)");
         Arc::new(Mutex::new(Some(Some(json.into_bytes()))))
     } else {
-        // 其它 reqID(1004 换号输框 / 1006 / 1008 邮箱...)走真代理到私服。
+        // 抓到原版表单的(账号菜单里玩家输入的登录、换号、改密码…)与其它 reqID 都走真代理到私服,
+        // 1012 由服务端验密,回包原样喂回原版 requestFinish:。
         let r: Arc<Mutex<Option<Option<Vec<u8>>>>> = Arc::new(Mutex::new(None));
         let rc = r.clone();
         std::thread::spawn(move || {
@@ -682,7 +854,7 @@ fn fire_online_login(env: &mut Environment) {
         }
         LOGIN_PKT_SENT.store(true, O);
         let mimi = LOGIN_MIMI.load(O);
-        let pwd = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+        let pwd = login_password().unwrap_or_default();
         fire_passport_unload(env, scene, mimi, &pwd);
         log!(
             "[MOLECHEAT] 在线:phase2 原生 passport 回调@state4(挂 delegateLoginMainMenu + 发原生登录),米米号={}",
@@ -801,8 +973,8 @@ fn fire_online_login(env: &mut Environment) {
             .register_host_selector("setUserId:".to_string(), &mut env.mem);
         let _: () = msg_send(env, (uinfo, set_uid, mimi));
     }
-    // TaomeeUserInfo{米米号, MOLE_PASSWORD} — password fallback for the sendType-3 login builder.
-    let pwd = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+    // TaomeeUserInfo{米米号, 密码} — password fallback for the sendType-3 login builder.
+    let pwd = login_password().unwrap_or_default();
     let tui_cls = env.objc.get_known_class("TaomeeUserInfo", &mut env.mem);
     let alloc_s = env
         .objc
@@ -841,7 +1013,7 @@ fn fire_online_login(env: &mut Environment) {
     // onLoginMainMenuCommandReceived: → onButtonPlaySelected:→OnLoginOk→showWithTarget:4 → village.
     // (connect2Server is a FriendsVillageLayer helper; it set delegateGameData but NOT the scene's
     // armed flag / delegateLoginMainMenu, which is why hand-wiring those looped — RE-confirmed.)
-    let pwd_unload = std::env::var("MOLE_PASSWORD").unwrap_or_default();
+    let pwd_unload = login_password().unwrap_or_default();
     fire_passport_unload(env, scene, mimi, &pwd_unload);
     log!(
         "[MOLECHEAT] 在线:phase1 原生 passport 回调(冷态 arm 场景 + establishConnection),米米号={}",
@@ -9997,7 +10169,57 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         //     type 8 的回调就是 onButtonChangeIDSelected: 本身(原方法不读 sender,r2 任意),玩家点「确定」后照原版继续
         //     (重拉存档语义不变),不改账号;之后再点直接走原版。按钮回调不在 drawScene 帧栈上,同 F12-10 的用法。
         //   · 登录包发出前 / 守卫不通过 / 槽值异常:一律放行原方法(= 修前行为)。
-        if class == "MainMenuScene" && sel == "onButtonChangeIDSelected:" && LOGIN_PKT_SENT.load(O)
+        // [2026-10-05 伪原版登录] 账号菜单模式、还没有账号(没记住、启动器也没给):
+        //   · 标题「点击进入游戏」改为弹原版账号菜单(和「切换账号」同一路径),先登录再进村,不以游客身份离线开档;
+        //   · 原版自己连上服务器后发的游客登录包(米米号 0)拦掉 —— 选号成功后由原版回调用选中的号重新登录。
+        if account_menu_mode() && !LOGIN_ARMED.load(O) {
+            // 启动时的新设备注册检查(LoadingLayer checkRegister@0x12fe94):不可达且本机没有米米号时原版弹
+            // 「你的设备现在无法连接网络…」再进标题。账号菜单模式下登录走账号菜单,不需要这条提示,也不做设备注册:
+            // 照原版「本机已有米米号」那条分支(0x12ff88)直接 loadMenuScene。先照原方法开头把自己从调度器摘掉。
+            if class == "LoadingLayer" && sel == "checkRegister" {
+                let this: id = Ptr::from_bits(env.cpu.regs()[0]);
+                let sched_cls = env.objc.get_known_class("CCScheduler", &mut env.mem);
+                let shared = island_sel(env, "sharedScheduler");
+                let sched: id = msg_send(env, (sched_cls, shared));
+                let unsched = island_sel(env, "unscheduleSelector:forTarget:");
+                let cr = island_sel(env, "checkRegister");
+                let _: () = msg_send(env, (sched, unsched, cr, this));
+                let lm = island_sel(env, "loadMenuScene");
+                let _: () = msg_send(env, (this, lm));
+                log!("[MOLECHEAT] 账号菜单模式:跳过新设备注册与无网提示,直接进标题画面(登录走账号菜单)");
+                return true;
+            }
+            if class == "MainMenuScene" && sel == "onButtonPlaySelected:" {
+                let scene = env.cpu.regs()[0];
+                if let Some(enable_ptr) = mainmenu_change_id_guard(env, scene) {
+                    env.mem.write(enable_ptr, 0u8);
+                    if mimi != 0 {
+                        // 记住的号(或启动器指定的号):照原版「进入游戏」直接登录进村。
+                        arm_online_login(mimi);
+                        log!("[MOLECHEAT] 账号菜单模式:「进入游戏」用记住的账号登录 米米号={}", mimi);
+                    } else {
+                        PENDING_SHOW_LOGIN.store(scene, O);
+                        log!("[MOLECHEAT] 账号菜单模式:还没有账号,「进入游戏」改为弹原版账号菜单");
+                    }
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
+            }
+            // 没选号之前不建立游戏服连接(打开菜单时原版 showLoginView 会 reconnectUsingNewHD → establishConnection):
+            // 否则这条连接只能发游客登录包,拦掉后又会在服务端「60 秒内必须登录」到点被断开。选号成功后原版回调
+            // onTaomeeLoginViewDidUnload… 会再调 establishConnection(那时已武装,放行)。
+            if class == "NetworkManager" && sel == "establishConnection" {
+                log!("[MOLECHEAT] 账号菜单模式:还没选号,暂不连接游戏服");
+                return true;
+            }
+            if class == "NetworkManager" && sel == "loginWithDeviceInfoAndUserIDInfoInSendType:" {
+                log!("[MOLECHEAT] 账号菜单模式:还没选号,拦下游客登录包(选号后由原版回调重新登录)");
+                return true;
+            }
+        }
+        if class == "MainMenuScene"
+            && sel == "onButtonChangeIDSelected:"
+            && (LOGIN_PKT_SENT.load(O) || account_menu_mode())
         {
             let scene = env.cpu.regs()[0];
             if let Some(enable_ptr) = mainmenu_change_id_guard(env, scene) {
@@ -10101,7 +10323,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // (2) 登录密码 MD5 块的明文来源:taomeePassword getter 返回 MOLE_PASSWORD。
         //     未设则不拦(空哈希,宽松服务器接受)。
         if LOGIN_ARMED.load(O) && class == "TaomeeUserInfo" && sel == "taomeePassword" {
-            if let Ok(p) = std::env::var("MOLE_PASSWORD") {
+            if let Some(p) = login_password() {
                 let ns = crate::frameworks::foundation::ns_string::from_rust_string(env, p);
                 // [扫描修 2026-09-15] F10-7 getter 返回值按 Cocoa 约定是 autoreleased(游戏不会 release 它),
                 //   以前直接返回 from_rust_string 的 +1 → 每次读密码泄漏一个串。
@@ -10111,12 +10333,15 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             }
         }
         // (G1) Gate A(onButtonChangeIDSelected:)+ Gate C(onTaomeeLoginViewDidUnload:)。
-        if LOGIN_ARMED.load(O) && class == "NetworkManager" && sel == "isReachable" {
+        if (LOGIN_ARMED.load(O) || (account_menu_mode() && MENU_REQUESTED.load(O))) && class == "NetworkManager" && sel == "isReachable" {
             env.cpu.regs_mut()[0] = 1;
             return true;
         }
         // (G2) Gate B(showAccountManagerViewWithDelegate:)。
-        if LOGIN_ARMED.load(O) && class == "TMA_ASIHTTPRequest" && sel == "isNetworkReachable" {
+        if (LOGIN_ARMED.load(O) || (account_menu_mode() && MENU_REQUESTED.load(O)))
+            && class == "TMA_ASIHTTPRequest"
+            && sel == "isNetworkReachable"
+        {
             env.cpu.regs_mut()[0] = 1;
             return true;
         }
@@ -10147,9 +10372,116 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                     log!("[MOLECHEAT] ★切换账号入口,激活 passport 代理");
                 }
             }
+            // (P0') [2026-10-05 伪原版登录] 记下原版表单的每个键值(r2=值,r3=键),代理时原样转发。宿主 msg_send 会改写
+            //      r0-r3,记完恢复快照再放行真方法。
+            if class == "TMA_ASIFormDataRequest" && sel == "setPostValue:forKey:" {
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let (val, key): (id, id) = (Ptr::from_bits(saved[2]), Ptr::from_bits(saved[3]));
+                if key != nil {
+                    let k = crate::frameworks::foundation::ns_string::to_rust_string(env, key).into_owned();
+                    let v = if val == nil {
+                        String::new()
+                    } else {
+                        let d = env.objc.register_host_selector("description".to_string(), &mut env.mem);
+                        let ds: id = msg_send(env, (val, d));
+                        if ds == nil {
+                            String::new()
+                        } else {
+                            crate::frameworks::foundation::ns_string::to_rust_string(env, ds).into_owned()
+                        }
+                    };
+                    let mut f = PASSPORT_FIELDS.lock().unwrap();
+                    if f.len() > 32 {
+                        f.remove(0); // 没被代理掉的旧请求(放行了真发送)不无限累积
+                    }
+                    match f.iter_mut().find(|(r, _)| *r == saved[0]) {
+                        Some((_, kv)) => {
+                            kv.retain(|(kk, _)| *kk != k);
+                            kv.push((k, v));
+                        }
+                        None => f.push((saved[0], vec![(k, v)])),
+                    }
+                }
+                env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+            }
+            // (P4) [2026-10-05 伪原版登录] requestFinish: 收尾(0x4b0156):回包带错误码时,原版在 keyWindow 子视图里找
+            //      UIAlertView,找不到才补弹「系统超时」框——本意是前面已弹过具体错误(如「密码错误」)就不再弹。touchHLE 的
+            //      弹框不在 keyWindow 子视图里,于是每次错误都多弹一个「服务器繁忙」。只拦 requestFinish: 内的这一处调用,
+            //      真正的超时(checkTimeout 发起)照常弹。
+            if class == "TMAHttpManager" && sel == "showSystemTimeoutErrorAlertViewBox" {
+                let lr = env.cpu.regs()[14] & !1;
+                if (0x4aebcc..0x4b036c).contains(&lr) {
+                    log!("[MOLECHEAT] 账号菜单模式:已弹过具体错误提示,略过 requestFinish: 收尾的系统超时框");
+                    return true;
+                }
+            }
             // (P0) 抓 TMAHttpManager sendRequest: 的命令字(reqID),紧接着的 addOperation: 代理时据此构造 body。
             if class == "TMAHttpManager" && sel == "sendRequest:" {
                 PENDING_REQID.store(env.cpu.regs()[2], O);
+            }
+            // (K') [2026-10-05 伪原版登录] 钥匙串读写落到用户数据目录(见 KEYCHAIN_FILE)。
+            //      +passwordForService:account:(r2 服务名,r3 账号)→ 值或 nil;
+            //      +setPassword:forService:account:(r2 值,r3 服务名,账号在栈上 [sp])→ YES;
+            //      +deletePasswordForService:account:(r2 服务名,r3 账号)→ YES。服务名只有 "Taomee.sskeychain" 一个,按账号存。
+            if class == "TMA_SSKeychain"
+                && std::env::var("MOLE_REAL_KEYCHAIN").as_deref() != Ok("1")
+                && matches!(
+                    sel,
+                    "passwordForService:account:" | "setPassword:forService:account:" | "deletePasswordForService:account:"
+                )
+            {
+                let r = env.cpu.regs();
+                let (r2, r3, sp) = (r[2], r[3], r[13]);
+                let s_of = |env: &mut Environment, bits: u32| -> Option<String> {
+                    let o: id = Ptr::from_bits(bits);
+                    (o != nil).then(|| crate::frameworks::foundation::ns_string::to_rust_string(env, o).into_owned())
+                };
+                match sel {
+                    "passwordForService:account:" => {
+                        let acct = s_of(env, r3).unwrap_or_default();
+                        let v = keychain_with(|kc| kc.iter().find(|(a, _)| *a == acct).map(|(_, v)| v.clone()));
+                        env.cpu.regs_mut()[0] = match v {
+                            Some(v) => {
+                                let ns = crate::frameworks::foundation::ns_string::from_rust_string(env, v);
+                                autorelease(env, ns).to_bits()
+                            }
+                            None => 0,
+                        };
+                    }
+                    "setPassword:forService:account:" => {
+                        let acct_bits: u32 = env.mem.read(ConstPtr::<u32>::from_bits(sp));
+                        let (val, acct) = (s_of(env, r2).unwrap_or_default(), s_of(env, acct_bits).unwrap_or_default());
+                        // 原版存的是「密码@NickName:…@IconIdex:…」:同一个号改了密码(修改密码成功后原版重存)就同步到记住的账号。
+                        if let (Ok(uid), Some((ru, rp))) = (acct.parse::<u32>(), remembered_account()) {
+                            let pwd = val.split("@NickName:").next().unwrap_or("").split("@IconIdex:").next().unwrap_or("");
+                            let pwd = pwd.split("@showTag:").next().unwrap_or("");
+                            if uid == ru && !pwd.is_empty() && pwd != rp {
+                                remember_account(uid, pwd);
+                                LOGIN_PWD.with(|c| *c.borrow_mut() = Some(pwd.to_string()));
+                            }
+                        }
+                        keychain_with(|kc| {
+                            kc.retain(|(a, _)| *a != acct);
+                            kc.push((acct, val));
+                            keychain_save(kc);
+                        });
+                        env.cpu.regs_mut()[0] = 1;
+                    }
+                    _ => {
+                        let acct = s_of(env, r3).unwrap_or_default();
+                        keychain_with(|kc| {
+                            kc.retain(|(a, _)| *a != acct);
+                            keychain_save(kc);
+                        });
+                        env.cpu.regs_mut()[0] = 1;
+                    }
+                }
+                return true;
             }
             // (K) keychain 桩:TMA_SSKeychain 被 touchHLE fake 成 nil,登录成功路径拿 allAccounts(nil)
             //     当指针解引用 → null-page 崩。至少让 allAccounts 回【空数组】(非 nil)。
@@ -10231,10 +10563,34 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             if class == "MainMenuScene"
                 && sel == "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:"
             {
-                let uid = env.cpu.regs()[2];
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let uid = saved[2];
                 if uid != 0 {
                     LOGIN_MIMI.store(uid, O);
-                    LOGIN_PWD.with(|c| *c.borrow_mut() = std::env::var("MOLE_PASSWORD").ok());
+                    // [2026-10-05 伪原版登录] 密码取原版回调的入参(玩家在账号菜单里输入的明文),游戏服登录包据此算哈希;
+                    //   登录成功的账号记住,下次启动直接用。
+                    let pw_ns: id = Ptr::from_bits(saved[3]);
+                    let pwd = if pw_ns == nil {
+                        String::new()
+                    } else {
+                        crate::frameworks::foundation::ns_string::to_rust_string(env, pw_ns).into_owned()
+                    };
+                    if !pwd.is_empty() || remembered_account().map(|(u, _)| u) != Some(uid) {
+                        remember_account(uid, &pwd);
+                    }
+                    // 空密码不覆盖已有的(我们自己补发回调时传的就是这里记下的密码,不能被空串冲掉)。
+                    let changed_uid = LOGIN_MIMI_PREV.swap(uid, O) != uid;
+                    if !pwd.is_empty() || changed_uid {
+                        LOGIN_PWD.with(|c| *c.borrow_mut() = Some(pwd));
+                    }
+                    MAP_SYNC_PATCH.store(true, O);
+                    CRACK_PATCHES_DIRTY.store(true, O);
+                    env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
                     if !LOGIN_ARMED.swap(true, O) {
                         log!(
                             "[MOLECHEAT] 账号菜单模式:passport 登录成功 user_id={},武装 TCP 登录链",
@@ -10247,7 +10603,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
         // establishConnection 开头 `if(self->isReachable_)` 读的是 IVAR(G1 只改了方法),
         // 进入前先 [self setIsReachable:YES] 置 ivar,否则直接 bail 不连。放行真方法。
-        if LOGIN_ARMED.load(O) && class == "NetworkManager" && sel == "establishConnection" {
+        if (LOGIN_ARMED.load(O) || (account_menu_mode() && MENU_REQUESTED.load(O))) && class == "NetworkManager" && sel == "establishConnection" {
             // [2026-09-16] F1-04 setIsReachable: 是宿主 msg_send,返回后 r0-r3 是被调方留下的值。现在只因
             //   -[NetworkManager setIsReachable:]@0xed30c 恰好是 `strb r2,[r0,r1]; bx lr` 才保住 r0(r1 已变成 180),
             //   真方法@0xe104c 开头 mov r8,r0 取 self。放行前恢复快照,不靠被调方的实现细节。
@@ -10368,12 +10724,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             //(主菜单的摩尔标志是 placeholder 没登录入口,停标题反而点不动;走熟悉的进村→切换账号流程)。
             if !LOGIN_ARMED.load(O) && !LOGIN_FIRED.load(O) {
                 let n = LOGIN_BOOT_FRAMES.fetch_add(1, O);
-                if n >= 180 && !LOGIN_ARMED.swap(true, O) {
-                    LOGIN_MIMI.store(mimi, O);
-                    LOGIN_PWD.with(|c| *c.borrow_mut() = std::env::var("MOLE_PASSWORD").ok());
-                    // 在线模式开启庄园持久化补丁(NOP saveMapData 第4道闸),让活图能整包上传。
-                    MAP_SYNC_PATCH.store(true, O);
-                    CRACK_PATCHES_DIRTY.store(true, O);
+                // 账号菜单模式下(没有启动器指定的号)不在开机时自动登录:停在标题画面,玩家点「进入游戏」用记住的号登录,
+                // 点「切换账号」换号(见 onButtonPlaySelected: 钩子)。
+                let auto_boot = !account_menu_mode() || std::env::var_os("MOLE_MIMI").is_some();
+                if n >= 180 && mimi != 0 && auto_boot && !LOGIN_ARMED.load(O) {
+                    arm_online_login(mimi);
                     log!("[MOLECHEAT] 在线:启动后自动登录 米米号={}(开启 MapSync 持久化补丁)", mimi);
                 }
             }
@@ -10486,6 +10841,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
             {
                 let pend = PENDING_SHOW_LOGIN.swap(0, O);
                 if pend != 0 {
+                    MENU_REQUESTED.store(true, O);
                     let scene: id = Ptr::from_bits(pend);
                     if MAINMENU_SCENE.load(O) == pend
                         && env

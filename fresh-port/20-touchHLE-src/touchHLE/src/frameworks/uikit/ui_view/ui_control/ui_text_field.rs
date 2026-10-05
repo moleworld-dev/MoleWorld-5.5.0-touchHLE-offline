@@ -471,7 +471,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)becomeFirstResponder {
-    if env.objc.borrow::<UITextFieldHostObject>(this).editing {
+    // [2026-10-05] 切换输入框:UIKit 语义是新框成为第一响应者前,当前第一响应者先 resign。以前这里不 resign 旧框,
+    // 旧框的 editing 标记一直留着;之后再点旧框就因「已在编辑」直接返回 true、第一响应者却还是别的框——
+    // 一旦点过下面的框就再也点不回上面的框(淘米账号菜单的米米号框、旧密码框都中招)。
+    let current = env.framework_state.uikit.ui_responder.first_responder;
+    let editing = env.objc.borrow::<UITextFieldHostObject>(this).editing;
+    if current == this && editing {
+        return true;
+    }
+    if current != nil && current != this {
+        let resigned: bool = msg![env; current resignFirstResponder];
+        if !resigned {
+            return false;
+        }
+    }
+    if editing {
+        // 残留的编辑状态(以前被切走时没收尾):直接把焦点接回来。
+        env.framework_state.uikit.ui_responder.first_responder = this;
+        env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
         return true;
     }
 

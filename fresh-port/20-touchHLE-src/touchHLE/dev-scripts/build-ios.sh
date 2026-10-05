@@ -6,7 +6,7 @@ SB="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin"
 RT=$(ls /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/*/lib/darwin/libclang_rt.ios.a 2>/dev/null | head -1)
 export RUSTC="$SB/rustc"
 export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C link-arg=$RT"
-export IPHONEOS_DEPLOYMENT_TARGET=13.0
+export IPHONEOS_DEPLOYMENT_TARGET=15.0
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 export BOOST_ROOT=/opt/homebrew
 export CMAKE_PREFIX_PATH=/opt/homebrew

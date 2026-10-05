@@ -8,7 +8,7 @@
 # 用法：先构建 iOS 二进制(在 touchHLE 目录):
 #   SB=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin
 #   BOOST_ROOT=/opt/homebrew CMAKE_PREFIX_PATH=/opt/homebrew \
-#     CMAKE_POLICY_VERSION_MINIMUM=3.5 IPHONEOS_DEPLOYMENT_TARGET=13.0 \
+#     CMAKE_POLICY_VERSION_MINIMUM=3.5 IPHONEOS_DEPLOYMENT_TARGET=15.0 \
 #     RUSTC=$SB/rustc $SB/cargo build --release --target aarch64-apple-ios \
 #       --no-default-features --features static,cpu_interpreter --bin touchHLE
 #   然后 dev-scripts/mw-ios-run.sh

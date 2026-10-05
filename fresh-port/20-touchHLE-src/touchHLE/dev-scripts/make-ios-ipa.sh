@@ -9,7 +9,7 @@
 # Build the device executable first（务必带 --no-default-features ...,cpu_interpreter）:
 #   SB=$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin
 #   BOOST_ROOT=/opt/homebrew CMAKE_PREFIX_PATH=/opt/homebrew \
-#     CMAKE_POLICY_VERSION_MINIMUM=3.5 IPHONEOS_DEPLOYMENT_TARGET=13.0 \
+#     CMAKE_POLICY_VERSION_MINIMUM=3.5 IPHONEOS_DEPLOYMENT_TARGET=15.0 \
 #     RUSTC=$SB/rustc $SB/cargo build --release --target aarch64-apple-ios \
 #       --no-default-features --features static,cpu_interpreter --bin touchHLE
 # Then run this from the touchHLE dir: dev-scripts/make-ios-ipa.sh
@@ -51,7 +51,7 @@ cp touchHLE_default_options.txt "$APP/"
 #      多 arm-slice 的 fat、touchHLE 正常加载,证明其 Mach-O 加载器按 arch 选 slice)。
 STUBC="$STAGE/_stub.c"; STUB="$STAGE/_arm64stub.dylib"
 echo 'static int _mw_a64=1; int _mw_a64_keep(void){return _mw_a64;}' > "$STUBC"
-xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=13.0 -dynamiclib -o "$STUB" "$STUBC"
+xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 -dynamiclib -o "$STUB" "$STUBC"
 for dylib in "$APP"/touchHLE_dylibs/*.dylib; do
 	lipo "$dylib" "$STUB" -create -output "$dylib.fat" && mv "$dylib.fat" "$dylib"
 done
@@ -90,7 +90,7 @@ cat > "$APP/Info.plist" <<'PLIST'
 	<key>CFBundlePackageType</key>         <string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>LSRequiresIPhoneOS</key>          <true/>
-	<key>MinimumOSVersion</key>            <string>13.0</string>
+	<key>MinimumOSVersion</key>            <string>15.0</string>
 	<key>UIRequiresFullScreen</key>        <true/>
 	<!-- [MoleWorld iOS] 让 Documents 目录在「文件」app 里可见(日志+存档导入导出) -->
 	<key>UIFileSharingEnabled</key>        <true/>
