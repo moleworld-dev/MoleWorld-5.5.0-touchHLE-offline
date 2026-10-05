@@ -2,108 +2,68 @@
 
 [![Release](https://img.shields.io/github/v/release/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline?include_prereleases&style=flat-square&color=2ea44f&label=下载)](https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/releases)
 [![Stars](https://img.shields.io/github/stars/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline?style=flat-square)](https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/stargazers)
-[![平台](https://img.shields.io/badge/平台-macOS_·_Windows_·_Linux_·_Android-4c8bf5?style=flat-square)](#)
-[![引擎 touchHLE](https://img.shields.io/badge/引擎-touchHLE-f28f1c?style=flat-square)](https://touchhle.org)
+[![平台](https://img.shields.io/badge/平台-macOS_·_Windows_·_Linux_·_Android_·_iOS-4c8bf5?style=flat-square)](#-下载与游玩)
+[![引擎 touchHLE](https://img.shields.io/badge/引擎-touchHLE_0.3.0-f28f1c?style=flat-square)](https://touchhle.org)
 [![License](https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square)](LICENSE)
 
-![摩尔庄园 5.5.0 在 touchHLE 上离线运行（Apple Silicon Mac）](demo.png)
+![摩尔庄园 5.5.0 在 touchHLE 上离线运行（Apple Silicon Mac）](docs/images/demo.png)
 
-把 2015 年已停运下架的《摩尔庄园移动版》（安卓叫《摩尔庄园豪华版》，**2D 平面模拟经营**，非现在的 3D 新版）的最后一个版本 **5.5.0（夏季海洋更新）**，通过 [touchHLE](https://touchhle.org)（Rust 写的 iOS 高层模拟器）**搬到 macOS / Windows / Linux / Android 等现代系统上离线游玩**（iOS 原生版移植进行中）。
+把 2015 年已停运下架的《摩尔庄园移动版》（安卓叫《摩尔庄园豪华版》，**2D 平面模拟经营**，非现在的 3D 新版）的最后一个版本 **5.5.0（夏季海洋更新）**，通过 [touchHLE](https://touchhle.org)（Rust 写的 iOS 高层模拟器）**搬到 macOS / Windows / Linux / Android / iOS 上离线游玩**。
 
 > 💬 想一起玩、聊庄园、反馈问题?欢迎加入摩友交流群 **「摩尔庄园HD·庄园钉子户」**(群号 **578867042**):👉 [点击加入群聊](https://qm.qq.com/q/pLA75s9Vao)
 
-> 这是一台 32 位 ARMv7 的 cocos2d-iphone 老游戏。官方服务器已彻底关停，本项目目标是**不依赖任何服务器、纯离线**把单机部分跑起来、并把原作者真机越狱修改器（贝壳/数值/解锁等）的能力复刻进模拟器。
+> 这是一台 32 位 ARMv7 的 cocos2d-iphone 老游戏，官方服务器早已关停。本项目的目标是**不依赖任何服务器**，让游戏离线时的表现**和当年联网、服务器正常下发时一样**：能补全原版数据就补全，让原版逻辑自己跑，尽量不绕开原版流程、不白送东西。
 
 ---
 
-## 🎯 项目核心诉求
+## 🟢 离线能玩什么
 
-1. **离线可玩**：服务器死了，让村庄、种田、小游戏、商店、升级、存档这些**单机循环**在 touchHLE 上完整跑起来。
-2. **复刻修改器**：把真机 Substrate tweak 的功能（免费贝壳、数值加成、强制 VIP、全解锁、一键收获、调试菜单…）用原生 Rust 在模拟器里重做，按 **T 键**召出菜单。
-3. **抢救资源**：服务器下载的内容离线缺失，尽量从旧版本（1.1.5 / 2.4.3 / 5.4.0）反向找回能补的（音乐、图集等）。
+- **主村经营**：种田收获、建造装饰、房间、商店、升级、主线 / 限时 / VIP 任务、每日任务、成就。
+- **黄金岛（可建筑岛）完整复活**：默认岛与原版一致；商铺经营、餐厅升级、员工打工、咖啡馆许愿任务、超级贝壳树、探险船出海、岛仓库、岛日常与岛商店折扣、岛上 91 条任务链与岛成就，进出岛与退出时都会落盘。
+- **活动中心（本机回环服务器）**：把原本由服务器下发的数据在本机按原协议应答，复活了**活动中心、每日签到（踩脚印）、脚印兑换、海底寻宝、系统公告、限时折扣、春节烟花、VIP 信息、占卜屋**等。
+- **好友入口**：可进特色庄园逛丝尔特庄园，主线「看看外面的世界!」与每日「拜访 1 个推荐好友」离线可完成。
+- **主村小游戏**：切水果、拍虫子、挖矿石、敲木桩、钓鱼；黄金岛沙滩 WC 的「左左右右」。
+- **宽屏适配**：可铺满任意比例屏幕（视野横向扩展、UI 自动居中），也可锁定原版 4:3。
+- **存档安全**：原子写盘、坏档隔离、主档自动保留上一代好档并在坏档时换回；同一存档只允许开一个游戏；切后台、关窗、关终端、注销关机前都会先存档。
+- **内置修改器（按 T）**：数值、召唤、开关（解除购买门槛、冷却归零、建筑瞬完成、强制 VIP 等）、开发工具页（时间旅行、任务跳转、按经验值重算等级等）。修改器只改本地单机数据。
 
----
+## 🔴 离线仍受限
 
-## 🟢 能用（离线已验证）
-
-- **启动进村庄**：开机动画 → 标题 → 村庄场景正常渲染。
-- **核心经营**：种田/收获、建造、装饰、房间、商店（已改为**免费贝壳**，跳过死掉的内购）。
-- **6 个本地小游戏**：切水果、钓鱼、挖矿、涂鸦、犁地、洗澡（重力感应分拣）。
-- **存档**：本地 NSKeyedArchiver + AES 存档可正常读写（修过进游戏解档崩溃）。
-- **丝尔特试玩村（xiaotulv）**：选村界面内置、不联网，可直接浏览（春/冬两套地图）。
-- **内置修改器菜单（按 T）**：
-  - 数值：经验/摩尔豆/贝壳/VIP值/食物/奖励券/时间/任务进度 ±（走游戏自带 `TestLayer`）
-  - 开关：购物免费、金币 x10、经验 x10、**强制 VIP（已修）**、关反作弊、作物瞬熟、永不枯萎、冷却归零、建筑瞬完成
-  - 解锁/成就/收获：解除购买门槛（等级/人力/VIP/建筑等级，钱仍要够）、全成就显示、魔法密码任意过、设头像、设奖励券、一键收获全部地
-  - 召唤本地道具/UI 层（超级贝壳树、水塔、村庄菜单、新版商店…）
-- **离线美术修补**：从 2.4.3 反向移植了 **11 个服务器下载的缺失 BGM/音效** + **成就奖章图集**（`sound.plist`/`achievementiPhone.plist` 实证引用，零回归）。
-- **旧式 UIView 动画**：弹窗/转场的 begin/commitAnimations 已实现（不再硬切）。
-- **黄金岛入口**：点了**干净退回村庄**（不再卡死）。
-
-## 🔴 不能用（离线天然受限，非代码 bug）
-
-- **17 个季节联网活动**：加勒比黄金岛、爱丽丝、史莱克、火焰之战、海底寻宝、世界杯竞猜、放风筝、青团、复活节… 这些活动的**美术是运行时从服务器下载的、本地根本不存在**，且要联网校验状态。离线渲染不出来。菜单里这些召唤项已标 **`(弃用)`**。
-- **神算子（占卜）小游戏**：5.5.0 改成了**联网扭蛋**（概率表服务器下发），离线会等服务器。
-- **多人/好友/UGC 社交、排行榜、广告墙**：纯服务器功能。
-- **「等级不涨」（靠经验自然升级）**：根因是 5.5.0 新增的 `curLevel` XOR 混淆逻辑在 touchHLE 运行时层的处理问题（**不是数据/版本差异**，已用 1.1.5/2.4.3/5.4.0 四版反汇编对比坐实）。**临时绕过**：修改器里直接设等级。
-- **内购（IAP）**：已停，贝壳改为本地免费发放。
-
-## 📊 完成进度
-
-| 模块 | 状态 |
-|---|---|
-| 启动 / 村庄 / 渲染 | ✅ 可用 |
-| 种田 / 建造 / 商店 / 存档 | ✅ 可用 |
-| 6 本地小游戏 | ✅ 可用 |
-| 修改器菜单（9 开关 + 数值 + 解锁/成就/收获） | ✅ 可用 |
-| 离线音乐/成就图修补 | ✅ 已补 |
-| 丝尔特试玩村 | ✅ 可浏览 |
-| 季节联网活动 / 神算子 / 社交 | ❌ 离线无解（缺服务器美术+校验） |
-| 经验自然升级（等级不涨） | ⚠️ 运行时层 bug，有作弊绕过 |
-
-**一句话**：单机核心循环离线可玩；服务器内容受限于"美术/数据本就在服务器、本地没有"，无法离线复活。
+- **离不开真实服务器的玩法**：好友互动与真人串门（推荐 / 访客格）、排行榜、米币、真实内购。离线会给原版的「需要联网」类提示，不会卡死、不丢数据。
+- **其余季节联网活动**（爱丽丝、史莱克、火焰之战等）的美术当年是运行时从服务器下载的，本地不存在，离线多为空壳。
+- 以下内容原版只在服务器上，**为移植者自拟、非原版数据**（代码与游戏内均已标明）：活动中心的本地活动表、脚印兑换表、限时折扣选品、系统公告正文、VIP 升级门槛、占卜屋奖池、离线每日任务选题规则。
 
 ---
 
-## 🛠️ 支持情况 / 怎么跑
+## 📦 下载与游玩
 
-**支持平台**：macOS（Apple Silicon）、Windows x64、Linux x64、Android arm64 —— 这四个平台都提供**开箱即玩**的发布包（游戏已内置进包里，**点击即玩**，无需自己找 IPA）。iOS 原生版**移植进行中**(详见下文)。
+发布包在 GitHub Releases 页：<https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/releases>。四个桌面 / 安卓平台都已**内置游戏、开箱即玩**，无需自己找 IPA、无需登录。
 
-发布包从 GitHub Releases 页下载：<https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline/releases>
+- **🍎 macOS（Apple Silicon）**：下载 `.zip` → 解压 → **右键**「摩尔庄园.app」→「打开」（第一次需这样通过 Gatekeeper，之后双击即可）。
+- **🪟 Windows x64**：下载 `.zip` → 解压 → 双击 **`Run-MoleWorld.bat`**。游戏窗口直接打开，不再带黑色控制台窗口。
+- **🐧 Linux x64**：下载 `.tar.gz` → 解压 → 进文件夹双击 **`启动游戏.sh`**（GNOME 需右键 →「以程序运行」），或在终端里 `./启动游戏.sh`。想要应用菜单图标就运行同目录的 **`安装到应用菜单.sh`**；详见包内 **`如何运行.txt`**。需要系统装有 OpenGL / SDL2 运行库。
+- **🤖 Android arm64**：下载 `.apk` → 安装（需允许「安装未知应用」）→ 直接进游戏。
+- **📱 iOS（arm64）**：基于纯 Rust 解释器后端（无需 JIT），通过 TestFlight 分发测试，不在 Releases 页提供下载；代码在 `feat/ios-interpreter` 分支。
 
-### 🟢 开箱即玩（下载即跑，已内置游戏）
-
-- **🍎 macOS（Apple Silicon）**：下载 `.zip` → 解压 → **右键**「摩尔庄园.app」→「打开」（第一次需这样过 Gatekeeper，之后双击即可）→ 进游戏。
-- **🪟 Windows x64**：下载 `.zip` → 解压 → 双击 **`Run-MoleWorld.bat`** → 进游戏。
-- **🐧 Linux x64**：下载 `.tar.gz` → 解压得到一个文件夹 → 进文件夹双击 **`启动游戏.sh`**(KDE/XFCE 会弹「运行 / Run」；**GNOME 需右键 →「以程序运行 / Run as a Program」**，因为 GNOME 双击 `.sh` 默认只会用文本编辑器打开、不会运行)；也可在终端里 `./启动游戏.sh`。想要桌面/菜单图标(GNOME 最省心)就运行同目录的 **`安装到应用菜单.sh`**;详细说明见包内 **`如何运行.txt`**。需要系统装有 OpenGL / SDL2 运行库。
-- **🤖 Android arm64**：下载 `.apk` → 安装(debug 签名,需在系统里允许「未知来源 / 安装未知应用」)→ 直接进游戏(游戏已内置进 apk,**点击即玩**)。
-
-所有平台进游戏后,按 **T** 键召出修改器菜单。
-
-### 🧪 iOS（原生 arm64,移植进行中 / 实验性,尚未发布）
-
-基于 touchHLE 的 iOS arm64 构建。目前在 **Apple Silicon Mac 的 PlayCover** 上已经能安装、能启动、能跑到 GL 渲染阶段,但卡在 **GLES1.1 上下文**初始化(疑似 PlayCover / iOS-on-Mac 这套环境对古老 GLES1.1 的支持限制,**不是 IPA 本身的问题**);**原生 GLES1.1 的真机**验证尚未进行。该版本**还没有发布**,这里如实标注为「进行中」。
+所有平台进游戏后按 **T** 键召出修改器菜单。存档保存在本机，换平台不互通。
 
 ### 🔧 从源码构建（可选）
 
-1. 进 `fresh-port/20-touchHLE-src/touchHLE/`,执行 `cargo build --release`。
-2. **无需** `git submodule` 初始化 —— vendor 依赖已摊平为仓库里的普通文件;boost 由构建脚本自动下载。
-3. 运行:`./target/release/touchHLE "<MoleWorld.app 路径>" --landscape-right --device-family=ipad`,或在 macOS 上用根目录的 `启动摩尔庄园.command`。游戏包在 `fresh-port/01-cracked/Payload/MoleWorld.app`(已含离线补的音乐/成就图)。
-4. 游戏内按 **T** 召出修改器菜单。
+1. 进 `fresh-port/20-touchHLE-src/touchHLE/`，执行 `cargo build --release`（vendor 依赖已摊平为普通文件，无需初始化子模块；boost 由构建脚本自动下载）。
+2. macOS 上双击 `launchers/` 里的启动脚本即可运行；也可手动执行
+   `./target/release/touchHLE "<仓库>/fresh-port/01-cracked/Payload/MoleWorld.app" --landscape-right --device-family=ipad`。
+3. 启动脚本一览（都在 `launchers/`）：
 
-> Windows / Linux / Android 三个平台的发布包由跨平台 CI(`.github/workflows/build-release.yml`)自动构建并附到 Release;macOS 的特制 `.app` 在本地打包后手动上传。
+| 脚本 | 用途 |
+|---|---|
+| `启动摩尔庄园.command` | 标准启动（iPad 横屏） |
+| `启动摩尔庄园-宽屏.command` | 铺满屏幕、视野横向扩展 |
+| `启动摩尔庄园-锁定比例.command` | 锁定原版 4:3 比例 |
+| `启动摩尔庄园-iPhone版.command` | 以 iPhone 机型运行 |
+| `启动摩尔庄园-在线服务器.command` | 开发用：连接私服的联网模式 |
+| `启动摩尔庄园-账号菜单测试.command` | 开发用：原版账号菜单调试 |
 
----
-
-## 🔬 用了什么工具
-
-- **[touchHLE](https://touchhle.org)** — 本项目的运行基座（Rust iOS 高层模拟器），本仓库是带摩尔庄园移植改动的 fork。
-- **otool / nm / lipo**（Xcode 自带）— 反汇编、ObjC 元数据导出、胖二进制切片。
-- **openssl** — 解密游戏数据表（**AES-128-ECB**，全版本通用 key = ASCII `39653543fa0d66aa`，`getEncrypKey` 前 16 字节）。
-- **plutil / Python** — 解析 bplist 数据表（物品/任务/等级/音乐映射）。
-- **cycript + Mach API**（历史，真机脱壳）— 老越狱设备上 `task_for_pid`+`vm_read_overwrite` 自进程脱壳。
-- **自建无头验证 harness** — 持有脚本跑游戏 + 触摸注入 + framebuffer 截帧（PPM→PNG）。
-- **多 subagent 逆向对比** — 1.1.5 / 2.4.3 / 5.4.0 / 5.5.0 四版的类/方法/物品/场景/小游戏差异分析（报告见 `fresh-port/30-oldver/reports/`）。
+> 四个平台的发布包由 CI（`.github/workflows/build-release.yml`）在推送 `v*` 标签时自动构建并挂到 Release。可调的环境变量与选项见 `fresh-port/20-touchHLE-src/touchHLE/OPTIONS_HELP.txt`。
 
 ---
 
@@ -111,20 +71,30 @@
 
 ```
 .
-├─ README.md  /  NOTICE.md  /  LICENSE        # 说明 / 版权 / MPL-2.0
-├─ demo.png                       # 运行截图(README 顶图)
-├─ ios-packages/                  # 五个版本原始 IPA（Git LFS）：1.1.5 / 2.4.3 / 5.4.0 / 5.5.0 / 5.5.0破解版
-├─ .github/workflows/             # 跨平台发布 CI(Win/Linux/Android)
-├─ 启动摩尔庄园.command           # mac 一键启动脚本
-├─ screenshot/                   # 运行截图
+├─ README.md / NOTICE.md / LICENSE        # 说明 / 版权 / MPL-2.0
+├─ .github/workflows/build-release.yml    # 四平台发版 CI(推 v* 标签触发)
+├─ launchers/                             # macOS 源码运行用的启动脚本(需先 cargo build)
+├─ docs/
+│  ├─ releases/                           # 各版本发版说明
+│  ├─ images/                             # README 配图与原版截图
+│  └─ archive/                            # 早期研究报告与过时文档(仅存档,不再维护)
 └─ fresh-port/
-   ├─ 01-cracked/                # 可运行的 5.5.0 游戏包（含离线补的音乐/成就图）
-   ├─ 02-ida / 03-objc / 04-bridge / 10-recomp   # 逆向产物（类表/方法表/选择子/桥接数据）
-   ├─ 20-touchHLE-src/touchHLE/  # touchHLE 源码 + 本项目改动（mole_cheats/mole_menu/… + 框架补丁）
-   └─ 30-oldver/reports/         # 四版对比研究报告（差异/移除弃用/AES key/数据表）
+   ├─ 01-cracked/Payload/MoleWorld.app    # 游戏本体(原版 5.5.0 + 离线补的音乐/成就图),发版时内置进包
+   └─ 20-touchHLE-src/touchHLE/           # touchHLE 源码 + 本项目全部改动
 ```
 
-> 本项目的主要改动文件：`fresh-port/20-touchHLE-src/touchHLE/src/` 下的 `mole_cheats.rs`（作弊拦截）、`mole_menu.rs`（T 键菜单）、`mole_diag.rs`、`save_reset.rs`，以及对 `objc/messages.rs`、`frameworks/uikit/ui_view.rs`、各 `frameworks/foundation/*` 的补丁。
+> 本项目的主要改动在 `fresh-port/20-touchHLE-src/touchHLE/src/`：`mole_cheats.rs`（钩子总调度、黄金岛离线、修改器开关）、`mole_activity.rs`（本机回环服务器）、`mole_items.rs`（物品、VIP、充值）、`mole_menu.rs`（T 键菜单）、`mole_dev.rs`（开发工具）、`mole_savebak.rs`（主档备份）、`save_reset.rs`，以及对 `objc/`、`frameworks/` 下各框架实现的补丁。
+
+---
+
+## 🔬 用了什么工具
+
+- **[touchHLE](https://touchhle.org)** — 本项目的运行基座（Rust iOS 高层模拟器），本仓库是带摩尔庄园移植改动的 fork，已同步到上游 v0.3.0。
+- **otool / nm / lipo / IDA** — 反汇编、ObjC 元数据导出；所有修复都以原版二进制的反汇编为依据。
+- **openssl / plutil / Python** — 解密与解析游戏数据表（**AES-128-ECB**，全版本通用 key = ASCII `39653543fa0d66aa`）。
+- **cycript + Mach API**（历史，真机脱壳）— 老越狱设备上 `task_for_pid`+`vm_read_overwrite` 自进程脱壳。
+- **自建无头验证 harness** — 脚本驱动游戏 + 触摸注入 + 帧截图 + 坏档注入，每次修复都配回归测试。
+- **旧版对比研究** — 1.1.5 / 2.4.3 / 5.4.0 / 5.5.0 四版差异分析（报告存档在 `docs/archive/oldver-reports/`）。
 
 ---
 

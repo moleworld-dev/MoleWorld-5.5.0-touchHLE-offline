@@ -4,7 +4,7 @@
 #  双击本文件即可启动。画面保持 4:3 原始比例、四周黑边、不变形。
 #  (想自由拉伸铺满 → 用「启动摩尔庄园.command」;想 iPhone 版 → 用「…-iPhone版.command」)
 # ============================================================
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # 本脚本在 launchers/ 下,先回到仓库根
 
 TOUCHHLE_DIR="fresh-port/20-touchHLE-src/touchHLE"
 BIN="$TOUCHHLE_DIR/target/release/touchHLE"

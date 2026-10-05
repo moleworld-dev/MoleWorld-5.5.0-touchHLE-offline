@@ -6,7 +6,7 @@
 #        retina(-hd 高清)美术因模拟器 UIScreen.scale 写死 1.0 暂不会加载。
 #  想要最清晰 → 用 iPad 版(「启动摩尔庄园.command」/「…-锁定比例.command」)。
 # ============================================================
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # 本脚本在 launchers/ 下,先回到仓库根
 
 TOUCHHLE_DIR="fresh-port/20-touchHLE-src/touchHLE"
 BIN="$TOUCHHLE_DIR/target/release/touchHLE"

@@ -7,7 +7,8 @@
 #  双击运行;终端实时打印日志;Ctrl-C 结束。
 # ============================================================================
 
-TOUCHHLE_DIR="/Users/xiaochoumao/Documents/github repo/摩尔庄园 5.5.0/fresh-port/20-touchHLE-src/touchHLE"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # 本脚本在 launchers/ 下,仓库根在上一级
+TOUCHHLE_DIR="$ROOT/fresh-port/20-touchHLE-src/touchHLE"
 cd "$TOUCHHLE_DIR" || { echo "❌ 进不去 touchHLE 目录:$TOUCHHLE_DIR"; read -r; exit 1; }
 
 # ===================== 可改配置 =====================
@@ -21,7 +22,7 @@ export MOLE_FIX_MAPEXTEND="${MOLE_FIX_MAPEXTEND:-1}"        # 扩地区键安全
 # 如需直连其它地址覆盖:export MOLE_PASSPORT="login.moleworld.net:80"
 # ====================================================
 
-APP="/Users/xiaochoumao/Documents/github repo/摩尔庄园 5.5.0/fresh-port/01-cracked/Payload/MoleWorld.app"
+APP="$ROOT/fresh-port/01-cracked/Payload/MoleWorld.app"
 BIN="./target/release/touchHLE"
 LOG="/tmp/mole_account_menu.log"
 

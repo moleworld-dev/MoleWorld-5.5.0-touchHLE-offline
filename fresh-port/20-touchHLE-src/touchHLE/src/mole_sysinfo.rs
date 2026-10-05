@@ -14,7 +14,7 @@
 use crate::Environment;
 use std::sync::Mutex;
 
-/// 原版帮助页背景的暖黄色(从原版截图 `screenshot/..._IMG_0031.PNG` 采样:
+/// 原版帮助页背景的暖黄色(从原版截图 `docs/images/screenshots/..._IMG_0031.PNG` 采样:
 /// RGB 239,170,66)。
 pub const HELP_BG_RGB: (f32, f32, f32) = (239.0 / 255.0, 170.0 / 255.0, 66.0 / 255.0);
 

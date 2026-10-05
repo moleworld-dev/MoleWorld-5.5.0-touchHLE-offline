@@ -8,7 +8,7 @@
 #  ★想窗口模式: 去掉下面的 --fullscreen(窗口可拖拽缩放、填满无黑边,
 #    但拖成很不同的比例会轻微拉伸;别指望它像全屏那样完美)。
 # ============================================================
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."   # 本脚本在 launchers/ 下,先回到仓库根
 
 TOUCHHLE_DIR="fresh-port/20-touchHLE-src/touchHLE"
 BIN="$TOUCHHLE_DIR/target/release/touchHLE"
