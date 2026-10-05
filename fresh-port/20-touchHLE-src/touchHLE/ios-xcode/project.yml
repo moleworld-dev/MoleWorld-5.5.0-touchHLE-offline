@@ -2,7 +2,7 @@ name: MoleWorldHD
 options:
   bundleIdPrefix: org.touchhle
   deploymentTarget:
-    iOS: "13.0"
+    iOS: "15.0"
 targets:
   MoleWorldHD:
     type: application
