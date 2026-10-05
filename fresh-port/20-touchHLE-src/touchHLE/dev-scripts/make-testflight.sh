@@ -122,7 +122,7 @@ for DD in "" "/Applications/Xcode-beta.app/Contents/Developer" "/Applications/Xc
   rm -f "$APP/Assets.car"
   env ${DD:+DEVELOPER_DIR="$DD"} xcrun actool "$STAGE/Assets.xcassets" --compile "$APP" --app-icon AppIcon \
     --output-partial-info-plist "$STAGE/icon-partial.plist" \
-    --platform iphoneos --minimum-deployment-target 13.0 \
+    --platform iphoneos --minimum-deployment-target 15.0 \
     --target-device iphone --target-device ipad > "$STAGE/actool.log" 2>&1 || true
   if [ -f "$APP/Assets.car" ]; then ACTOOL_OK=1; echo "✓ actool 成功(DEVELOPER_DIR=${DD:-默认 Xcode})"; break; fi
 done
@@ -153,7 +153,7 @@ cat > "$APP/Info.plist" <<PLIST
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleDevelopmentRegion</key>   <string>zh_CN</string>
 	<key>LSRequiresIPhoneOS</key>          <true/>
-	<key>MinimumOSVersion</key>            <string>13.0</string>
+	<key>MinimumOSVersion</key>            <string>15.0</string>
 	<key>UIRequiresFullScreen</key>        <true/>
 	<key>UIFileSharingEnabled</key>        <true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key> <true/>
@@ -216,7 +216,7 @@ if [ -z "$SDK_DECL" ]; then
 	echo "✗ 读不出 LC_BUILD_VERSION,拒绝出包"; exit 1
 elif [ "$SDK_MAJOR" -ge 27 ]; then
 	echo "  sdk 声明 $SDK_DECL >= 27(iOS 27 会 UIScene trap)→ 降到 26.5"
-	vtool -set-build-version 2 13.0 26.5 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1 \
+	vtool -set-build-version 2 15.0 26.5 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1 \
 	  && mv "$APP/$APPNAME.patched" "$APP/$APPNAME" && chmod +x "$APP/$APPNAME" \
 	  || { echo "✗ vtool 降 SDK 失败"; exit 1; }
 elif [ "$SDK_MAJOR" -lt 26 ]; then
