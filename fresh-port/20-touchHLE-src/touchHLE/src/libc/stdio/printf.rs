@@ -151,7 +151,14 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
             _ => None,
         };
 
-        let specifier = get_format_char(&env.mem, format_char_idx);
+        // 苹果的 %D / %U / %O 是 %ld / %lu / %lo 的旧写法(32 位下与 %d / %u / %o 相同)。原版淘米账号模块的
+        // 「是否需要验证码」请求用 @"%@=%D" 拼参数,以前这里 unimplemented! 直接崩:账号菜单点「切换帐号」即闪退。
+        let specifier = match get_format_char(&env.mem, format_char_idx) {
+            b'D' => b'd',
+            b'U' => b'u',
+            b'O' => b'o',
+            c => c,
+        };
         format_char_idx += 1;
 
         if !ALL_SPECIFIERS.contains(&specifier) {
