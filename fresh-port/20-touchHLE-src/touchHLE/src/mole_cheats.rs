@@ -9240,11 +9240,15 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
 fn ui43_mode() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面靠启动器 export MOLE_UI43=1;iOS 没有环境变量,
-    // 宽屏(--fill-screen 算出的逻辑屏比 4:3 宽)时自动开。MOLE_UI43=0/1 仍可覆盖;非 iOS 平台默认值不变。
+    // 宽屏(--fill-screen 算出的逻辑屏比 4:3 宽)时自动开。MOLE_UI43=0/1 仍可覆盖。
+    // [2026-10-05 v0.0.8] 安卓同 iOS:入口已带 --fill-screen,也没有环境变量,宽屏时自动开(否则 UI 弹框贴左)。桌面默认值不变。
     *S.get_or_init(|| {
         std::env::var("MOLE_UI43")
             .map(|v| v != "0")
-            .unwrap_or_else(|_| cfg!(target_os = "ios") && crate::window::is_widescreen())
+            .unwrap_or_else(|_| {
+                cfg!(any(target_os = "ios", target_os = "android"))
+                    && crate::window::is_widescreen()
+            })
     })
 }
 
