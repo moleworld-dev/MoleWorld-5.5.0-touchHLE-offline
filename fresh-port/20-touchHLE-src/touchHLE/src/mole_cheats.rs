@@ -2427,6 +2427,36 @@ fn island_save_blocked(env: &mut Environment, path: id, bit: u32, fname: &str) -
 ///   checkUserinfoMd5: 里 len-16 下溢,<16 时 touchHLE 宿主直接 panic(每次启动崩溃循环),16~19 则走原版删档分支把
 ///   完好的 map.dat 一起删掉。这里把它改名为 userinfo.dat.corrupt 隔离:游戏按"无 userinfo"启动,map.dat 保住。
 ///   (≥20 字节但 md5 不符的档仍交给原版反作弊分支处理,不在这里改语义。)
+/// [2026-10-05 v0.0.8 P0] 离线新号:读地图前若盘上有 userinfo.dat 却没有 map.dat,照原版注册新号的流程先存一份默认地图。
+/// 原版 -[GameData saveMapData:]@0x7681c 在 ObjectManager 物件数 < 14 时直接不存(0x76934 cmp #0xe / blo),新号的默认
+/// 地图不到 14 个物件,所以离线新号凑满 14 个物件之前一次地图档都不会写。联网时没这个问题:注册完成
+/// -[MainMenuScene onRegisterFinished] 0xb8310 / -[LoadingLayer onRegisterFinished] 0x131a28 会调
+/// -[GameData saveDefaultMapData]@0x7ae48(createDefaultMapData → archiveRootObject:toFile: map.dat → saveUserInfoData),
+/// 不受这道门槛限制;离线没有注册这一步。于是下一次 -[GameData loadFromLocal] 走到 loadMapData@0x79054 读不到地图,
+/// 0x79370 resetUserGameData 删档换新号:新号玩到 14 个物件之前退出重开、或去好友村逛完回家
+/// (-[FriendsVillageLayer goToHomeVillage] 同样走 loadFromLocal),等级、摩尔豆全部清零(实测 3 级新号回家变回 1 级)。
+/// 做法:照注册流程补调 saveDefaultMapData,原版随后读到的就是这份默认地图。没存进地图档的新建筑会回到默认布局,
+/// 与联网时(盘上同样只有注册时那份默认地图)一致;等级、经验、摩尔豆等在 userinfo.dat 里,照常保留。
+/// 盘上连 userinfo.dat 都没有(真正的第一次启动)就不动,走原版新游戏流程。
+fn seed_default_map_before_load(env: &mut Environment, gd: id) {
+    if gd == nil
+        || crate::mole_savebak::main_map_exists(env)
+        || !crate::mole_savebak::main_userinfo_exists(env)
+    {
+        return;
+    }
+    let s = island_sel(env, "saveDefaultMapData");
+    let _: () = msg_send(env, (gd, s));
+    log!(
+        "[MOLECHEAT] 离线新号:有 userinfo.dat 却没有地图档(原版物件不足 14 个不存地图,联网注册时才会先存默认地图),照原版 saveDefaultMapData 补存默认地图,避免 loadMapData 删档换新号。现在 map.dat {}",
+        if crate::mole_savebak::main_map_exists(env) {
+            "已写出"
+        } else {
+            "仍不存在"
+        }
+    );
+}
+
 fn guard_userinfo_before_load(env: &mut Environment, gd: id) {
     if gd == nil {
         return;
@@ -7189,6 +7219,8 @@ fn apply_crack_patches(env: &mut Environment) {
         env.mem.bytes_at_mut(ptr, n).copy_from_slice(bytes);
         env.cpu.invalidate_cache_range(p.vaddr, n);
     }
+    // 米米号 = QQ 号:放开账号界面 10 位米米号、资料栏按无符号显示(见 mole_uid.rs)。
+    crate::mole_uid::apply(env);
     log!(
         "[MOLECHEAT] 破解补丁应用: 越狱={} 修复占卜={}({}) 节日村={} 商城免VIP={} 进新岛={} 跳校验={}",
         KILL_JAILBREAK.load(O), FIX_DIVINE.load(O),
@@ -9208,11 +9240,15 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
 fn ui43_mode() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // [同步 iOS 2026-09-16] 移植自 iOS 分支 c9ad2b6:桌面靠启动器 export MOLE_UI43=1;iOS 没有环境变量,
-    // 宽屏(--fill-screen 算出的逻辑屏比 4:3 宽)时自动开。MOLE_UI43=0/1 仍可覆盖;非 iOS 平台默认值不变。
+    // 宽屏(--fill-screen 算出的逻辑屏比 4:3 宽)时自动开。MOLE_UI43=0/1 仍可覆盖。
+    // [2026-10-05 v0.0.8] 安卓同 iOS:入口已带 --fill-screen,也没有环境变量,宽屏时自动开(否则 UI 弹框贴左)。桌面默认值不变。
     *S.get_or_init(|| {
         std::env::var("MOLE_UI43")
             .map(|v| v != "0")
-            .unwrap_or_else(|_| cfg!(target_os = "ios") && crate::window::is_widescreen())
+            .unwrap_or_else(|_| {
+                cfg!(any(target_os = "ios", target_os = "android"))
+                    && crate::window::is_widescreen()
+            })
     })
 }
 
@@ -9675,6 +9711,20 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         ];
         let gd: id = Ptr::from_bits(saved[0]);
         guard_userinfo_before_load(env, gd);
+        env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+        return false;
+    }
+    // [2026-10-05 v0.0.8 P0] 离线新号读地图前补存默认地图(详见 seed_default_map_before_load)。在线时地图以服务器为准,不碰。
+    //   前置钩子里发了消息,快照并恢复 r0-r3 再放行真方法(与上面 loadUserInfoData 同一调用点 -[GameData loadFromLocal])。
+    if class == "GameData" && sel == "loadMapData" && !env.options.network_access {
+        let saved = [
+            env.cpu.regs()[0],
+            env.cpu.regs()[1],
+            env.cpu.regs()[2],
+            env.cpu.regs()[3],
+        ];
+        let gd: id = Ptr::from_bits(saved[0]);
+        seed_default_map_before_load(env, gd);
         env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
         return false;
     }

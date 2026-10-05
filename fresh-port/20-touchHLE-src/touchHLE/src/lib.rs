@@ -61,6 +61,7 @@ pub mod mole_watchdog;
 mod mole_menu;
 mod mole_savebak;
 mod mole_sysinfo;
+mod mole_uid;
 mod objc;
 mod save_reset;
 mod options;
@@ -115,6 +116,9 @@ pub extern "C" fn SDL_main(
             ipa_path,
             String::from("--landscape-right"),
             String::from("--device-family=ipad"),
+            // [2026-10-05 v0.0.8] 与 iOS 入口一致:按真机屏幕比例算 guest 逻辑屏(短边锁 768、长边随屏比、钳在 [4:3, 2.4]),
+            // 全面屏铺满、不拉伸;以前安卓不传,宽屏手机两侧各留一条大黑边。4:3 平板算出来仍是 1024x768,与原来一样。
+            String::from("--fill-screen"),
         ],
         None => vec![String::new()],
     };

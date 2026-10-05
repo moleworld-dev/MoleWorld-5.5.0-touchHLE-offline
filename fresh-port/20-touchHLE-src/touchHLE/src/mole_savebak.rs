@@ -211,6 +211,16 @@ pub fn on_main_save_removed(removed: &Path) {
     }
 }
 
+/// [2026-10-05 v0.0.8 P0] 主村地图档 Documents/map.dat 在盘上是否存在(宿主侧 stat,不发消息)。
+pub fn main_map_exists(env: &Environment) -> bool {
+    sandbox_dir(env).join("Documents").join(MAP).is_file()
+}
+
+/// [2026-10-05 v0.0.8 P0] 主村用户档 Documents/userinfo.dat 在盘上是否存在(宿主侧 stat,不发消息)。
+pub fn main_userinfo_exists(env: &Environment) -> bool {
+    sandbox_dir(env).join("Documents").join(USERINFO).is_file()
+}
+
 fn sandbox_dir(env: &Environment) -> PathBuf {
     crate::paths::user_data_base_path()
         .join(crate::paths::SANDBOX_DIR)

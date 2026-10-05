@@ -1841,8 +1841,26 @@ pub const CLASSES: ClassExports = objc_classes! {
             break;
         }
     }
-    // TODO: handle over/underflow properly
-    st[..cutoff].parse().unwrap_or(0)
+    // 溢出处理:iOS 的 intValue 超出 int32 时封顶;原来这里直接得 0。
+    // ★米米号 = QQ 号:原版账号模块用 intValue 解析米米号(切换账号、历史账号、登录回包核对),
+    //   大于 2147483647 的 QQ 号(如 3000000002)要按位保留成 uint32,赋给 unsigned long 后才是原号;
+    //   更大的数按 iOS 封顶。
+    match st[..cutoff].parse::<i64>() {
+        Ok(v) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => v as i32,
+        Ok(v) if v > i32::MAX as i64 && v <= u32::MAX as i64 => v as u32 as i32,
+        Ok(v) if v > 0 => i32::MAX,
+        Ok(_) => i32::MIN,
+        Err(_) => {
+            let digits = st[..cutoff].trim_start_matches(['+', '-']);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                0
+            } else if st.starts_with('-') {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }
+    }
 }
 
 - (id)lowercaseString {
