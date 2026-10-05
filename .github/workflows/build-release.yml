@@ -25,13 +25,13 @@ env:
   # [MoleWorld] 版本号大一统:用户版 + versionCode 在此集中管理(与 src/mole_sysinfo.rs
   # 的 USER_VERSION 对齐;发版只改这两行 + 打对应 tag)。追溯号注入完整 github.sha,Rust
   # (option_env! MOLE_BUILD_HASH)与 gradle(System.getenv)各自取前 7 位 → 全平台一致
-  # 显示 "v0.0.6 beta (xxxxxxx)"。
-  MOLE_USER_VERSION: "v0.0.6 beta"
-  MOLE_VERSION_CODE: "6"
+  # 显示 "v0.0.8 beta (xxxxxxx)"。
+  MOLE_USER_VERSION: "v0.0.8 beta"
+  MOLE_VERSION_CODE: "8"
   # [MoleWorld] 资产文件名用的版本 slug(无空格,对应 USER_VERSION)。★发版只改上面三行 + 这行,
   # 下面 10 处资产名统一用 ${MOLE_VERSION_SLUG}(run: 里 shell 展开)/ ${{ env.MOLE_VERSION_SLUG }}
   # (with: 里 GitHub 表达式),不再逐个硬编码 v0.0.X,避免漏改导致产物名与版本号不一致。
-  MOLE_VERSION_SLUG: "v0.0.6_beta"
+  MOLE_VERSION_SLUG: "v0.0.8_beta"
   MOLE_BUILD_HASH: ${{ github.sha }}
 
 jobs:
