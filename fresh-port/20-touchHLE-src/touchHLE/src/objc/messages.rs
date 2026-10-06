@@ -621,43 +621,6 @@ fn objc_msgSend_inner(
                 }
             }
         } else {
-            // [MoleWorld iOS · P0 从好友村返回后主村只剩背景] 保护那份【地图数据字典】不被原地清空。
-            // 实测(纯读 host 字典 count):首次进村 -[GameManager loadMapFromData:] 拿到的字典 0x30017440
-            // count=7;从好友村返回时【同一个指针】count 变成 0 → -[GameManager
-            // loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 处命中 `count==0` 早退 → 直接调回调返回,
-            // 一个 loadMapObjects: 都不执行 → 地面/建筑/人物/村庄UI 全不加载,只剩背景装饰。
-            // 这里按【receiver 指针精确比对】吞掉对那一个字典的 removeAllObjects(只影响它,不动别的容器),
-            // 使返回时数据仍在 → 早退不再命中 → 走正常加载路径。仅离线生效。
-            // [合并复核 2026-09-24] 门控到 iOS / 解释器构建(与上面的头像重建跳过同一口径):这是 iOS 分支 91eb00f
-            // 的修复,main 从没有过;main 的 F9-4 已在离线时拦下好友入口(弹「该功能需要联网」、不卸载主村),
-            // 桌面走不到这条「进好友村再返回」的路径。吞掉 removeAllObjects 后 loadMapData 若读档成功会与旧内容
-            // 叠加,桌面上没经过验证,按「iOS 改动不得改变桌面默认行为」不对桌面生效;iOS 上照旧作为兜底保留。
-            // (mole_cheats 侧也只在 iOS 记录 MAPDATA_PTR,所以桌面开 cpu_interpreter 时这里指针恒为 0、实际也不命中。)
-            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
-            {
-                let mapdata_ptr = crate::mole_cheats::MAPDATA_PTR
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if mapdata_ptr != 0
-                    && receiver.to_bits() == mapdata_ptr
-                    && !env.options.network_access
-                    && selector
-                        == env
-                            .objc
-                            .register_host_selector("removeAllObjects".to_string(), &mut env.mem)
-                {
-                    use std::sync::atomic::{AtomicU32, Ordering as O2};
-                    static N: AtomicU32 = AtomicU32::new(0);
-                    let n = N.fetch_add(1, O2::Relaxed);
-                    if n < 4 {
-                        log!(
-                            "[MOLECHEAT] 保护地图数据字典 {:?}:吞掉第 {} 次 removeAllObjects(防返回主村空村)",
-                            receiver, n
-                        );
-                    }
-                    env.cpu.regs_mut()[0] = 0;
-                    return;
-                }
-            }
             // 每帧 drawScene 入口复位头像重建预算(早于本帧 updateTick→render 遍历)。不拦截,照常派发。
             let draw_scene_sel = env
                 .objc

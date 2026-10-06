@@ -1929,6 +1929,12 @@ fn local_timestamp() -> String {
 /// 复制到 <user_data>/snapshots/<时间戳>/。黄金岛上不做:岛档的完整落盘入口 island_flush 是
 /// mole_cheats 的私有函数(不归本包,不能调),而离岛时它会自动跑,所以要求先回主村。
 pub fn snapshot_save(env: &mut Environment) -> DevResult {
+    // [2026-10-06 第十轮 R10-B2] 快照目录(<user_data>/snapshots)不分单机/联机,而恢复只在单机做:联机时存的
+    //   快照(复制的是联机沙盒)下次单机「恢复快照」会被当成最新一份,整份覆盖单机档。与恢复口径一致,
+    //   联机模式不保存快照(联机存档以服务器为准)。
+    if env.options.network_access {
+        return Err("在线模式下存档以服务器为准,不支持保存快照(快照只用于单机存档)".to_string());
+    }
     if crate::mole_cheats::island_session_active() {
         return Err("请先回到主村再保存快照(离岛时岛档会自动完整落盘)".to_string());
     }

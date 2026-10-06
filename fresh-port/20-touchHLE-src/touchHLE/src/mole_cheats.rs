@@ -310,14 +310,6 @@ static LAST_RTT_MS: AtomicU32 = AtomicU32::new(0);
 /// whether the server's 1001 map unarchives to a non-empty dict in THIS unarchiver (#2).
 static LAST_MAP_COUNT: AtomicI32 = AtomicI32::new(-99);
 
-/// [MoleWorld iOS · P0 返回主村空村] 首次进村时 -[GameManager loadMapFromData:] 拿到的那个
-/// **地图数据字典**的 guest 指针(实测 0x30017440,count=7)。返回主村时同一个指针的 count 变成 0
-/// (被原地清空)→ -[GameManager loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 处
-/// `count==0` 早退 → 一个地图对象都不加载 → 只剩背景。记住它以便(a)追踪谁清空的、(b)拦住清空。
-/// [同步 iOS 2026-09-24] 只在 iOS 记录(intercept 里 #[cfg(target_os = "ios")] 那一块);桌面恒为 0,
-/// messages.rs 按它保护地图字典的那条在桌面永不命中。
-#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
-pub static MAPDATA_PTR: AtomicU32 = AtomicU32::new(0);
 /// The HUD must NOT msg_send during the connect window (state 4/6) — doing so starved the run-loop
 /// and dropped the cf_stream Open event. STATE_IS_7 (set by the changeStateTo: hook) gates HUD
 /// startup to AFTER the connection is up; HUD_TIMER_SET latches a 1s self-rescheduling tick that
@@ -10110,7 +10102,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
 
     // [同步 iOS 2026-09-24 · 91eb00f] 下面这一块是 iOS 无 JIT 解释器上「点好友卡死 + 返回主村空村」根治在本文件里的部分,
     //   整块 #[cfg(target_os = "ios")]:桌面(JIT)上发包风暴很快跑完、main 一直放行原方法,离线点好友也已由上面 F9-4
-    //   弹「需要联网」提示,不进好友村;桌面不记 MAPDATA_PTR,messages.rs 里按指针保护地图字典的那条也就不会生效。
+    //   弹「需要联网」提示,不进好友村。
     //   位置:放在新模块调度【之后】(iOS 分支原来在 UI43 臂之后、模块调度之前)。mole_activity 的离线回环要按命令号先拿到
     //   sendPacket:commandId:,它不认识的命令(返回 None,寄存器已恢复)才落到这里被吞;黄金岛会话里下面岛臂的吞包本来也是吞。
     #[cfg(target_os = "ios")]
@@ -10179,26 +10171,6 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         // 实测:曾在此对 loadMapFromData: 加"读 mapdata.count"的诊断 → 主村地图加载失败、整屏纯绿(HUD 正常)。
         // 规则:intercept 里做 msg_send 只允许配 `return true`(吞掉该调用);要观测放行路径,另找安全时机
         // (如帧边界、或在 host 实现的框架函数里),不要在派发前动寄存器。
-
-        // [MoleWorld iOS · P0 返回主村空村 · 修复的一半] 记住那份【地图数据字典】的指针。
-        // 首次进村走 -[GameManager loadMapFromData:](无 selector 版本),其 arg1(r2)就是完整的地图字典
-        // (实测 count=7)。记下它,messages.rs 便可按【指针精确比对】吞掉后续对这一个字典的
-        // removeAllObjects —— 因为 -[GameData loadMapData](0x79054)会"先清空再读 map.dat",而离线读档
-        // 失败时它永不回填(失败分支 resetUserGameData 的返回值被调用方丢弃),导致返回主村时
-        // -[GameManager loadMapFromData:selector:mapData:forNPC:] 在 0x20b16 命中 `count==0` 早退 →
-        // 背景画了但一个 loadMapObjects 都不跑 = 只剩背景。详见 memory: moleworld-return-home-empty-solved。
-        // 纯读寄存器 + host 字典 count,不发任何消息(见上方血泪教训),放行路径安全。
-        if !env.options.network_access && sel == "loadMapFromData:" {
-            let r2 = env.cpu.regs()[2];
-            if let Some(n) = crate::frameworks::foundation::ns_dictionary::host_dict_count(
-                env,
-                crate::objc::id::from_bits(r2),
-            ) {
-                if n > 0 && MAPDATA_PTR.swap(r2, O) != r2 {
-                    log!("[MOLECHEAT] 记住地图数据字典 {:#x}(count={}),将保护它不被清空", r2, n);
-                }
-            }
-        }
     }
 
     // ===== ONLINE MODE:登录通行证绕过 + 米米号注入(全 gate 在 online_login_mimi) =====

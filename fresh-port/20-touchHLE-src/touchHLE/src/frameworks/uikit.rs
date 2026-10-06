@@ -314,6 +314,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             // [扫描修 2026-09-15] F12-3:桌面窗口最小化/还原(W2 在 window.rs 发出)→ 原版失活/激活回调
             // 与对应通知;不发 DidEnterBackground/WillEnterForeground。细节见 ui_application.rs。
             Event::WindowMinimized => ui_application::handle_window_minimized(env),
+            Event::AppLowMemory => ui_application::handle_memory_warning(env),
             Event::WindowRestored => ui_application::handle_window_restored(env),
             // [MoleWorld iOS] On iOS, losing focus (Control Center, home-indicator,
             // notification) or going to the background must PAUSE — not kill — the

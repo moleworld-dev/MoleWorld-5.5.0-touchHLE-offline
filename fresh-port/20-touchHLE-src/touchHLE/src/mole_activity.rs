@@ -2246,22 +2246,35 @@ fn encode_sign_exchange_list() -> Vec<u8> {
     b
 }
 
-/// 拦 -[NetworkManager getFoodsExchangeToSure:](1120,r2 = foodPrintExchangeIndex,1 起;
-/// 0x266600/0x4f806 都要求 >=1 才发)。原版扣脚印在服务器侧,这里在旁路档扣并记兑换位。
+/// 拦 -[NetworkManager getFoodsExchangeToSure:](1120)。r2 是【0 起】的兑换项下标:三处发包
+/// 0x26662a / 0x4f830 / 0x53654 都是 `subs r2, r0, #1`,即 foodPrintExchangeIndex(= 菜单 tag + 1,
+/// 0x39c70a)减 1;0x266600/0x4f806 要求 foodPrintExchangeIndex >= 1 才发。与 1119 回包的兑换位
+/// (parseIsExchangedInfo 0x1c4288:第 i 位 ↔ 第 i 项,0 起)一致。
+/// [2026-10-06 第十轮 R10-C2] 这里曾按 1 起处理:兑第 1 项发的 0 被当成越界忽略(不扣脚印、不记已兑,
+/// 同月可无限白拿),其余各项扣的、记的都是上一项。现按 0 起。
+/// 原版扣脚印在服务器侧,这里在旁路档扣并记兑换位。本月该项已兑过时按已处理应答、不再扣:兑换菜单
+/// 0x39bf58~0x39bf74 用 hasExchangedItemDataFix 禁用已兑项,玩家不能在同月重新发起同一项,同一位的
+/// 重复 1120 只会来自 onCancelExchange 0x53660 / onButtonOkSelected: 0x4f83c 带着旧下标的重发。
 fn sign_exchange_confirm(env: &mut Environment, index: u32) {
     let today = local_date(env);
     let mut st = load_state(env);
     sign_roll_month(&mut st, today.ym());
     let idx = index as usize;
-    if idx == 0 || idx > SIGN_EXCHANGE_TABLE.len() {
+    if idx >= SIGN_EXCHANGE_TABLE.len() {
         log!("[ACTIVITY] 脚印兑换忽略:index={} 超出本地兑换表", index);
         save_state(env, &st);
         return;
     }
-    let (cost, item, num) = SIGN_EXCHANGE_TABLE[idx - 1];
-    let bit = 1u32 << (idx - 1);
+    let (cost, item, num) = SIGN_EXCHANGE_TABLE[idx];
+    let bit = 1u32 << idx;
     if st.exch_mask & bit != 0 {
-        log!("[ACTIVITY] 脚印兑换提示:第 {} 项本月已兑过,仍按客户端请求扣脚印", index);
+        log!(
+            "[ACTIVITY] 脚印兑换:第 {} 项(index={})本月已兑过,按已处理应答,不再扣脚印",
+            idx + 1,
+            index
+        );
+        save_state(env, &st);
+        return;
     }
     st.sign_foot = st.sign_foot.saturating_sub(cost);
     st.exch_mask |= bit;
