@@ -380,6 +380,9 @@ fn mouse_drag_slop() -> f32 {
     })
 }
 
+/// [2026-10-06 第九轮 R9-B3] 同类手指事件合并成一次多指事件的时间窗口(毫秒)。见 poll_for_events 的 Finger* 臂。
+const MULTI_TOUCH_MERGE_MS: u32 = 4;
+
 /// [2026-10-05 第九轮 R9-B8] 触屏手指的一次性起拖阈值(guest 点),默认与鼠标相同 8 点。
 /// 根因同上(-[ObjSelector touchMove:]@0x4b270 无阈值置 isMoved,touchEnd: 0x4b2c8 见到就不处理点击)。
 /// 第四轮只给鼠标加了阈值,触屏手指保持零容差;但安卓触屏按下到抬起之间几乎必然有几像素抖动,
@@ -1765,7 +1768,16 @@ impl Window {
                                 x,
                                 y,
                                 ..
-                            } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
+                            } if timestamp.wrapping_sub(curr_timestamp) <= MULTI_TOUCH_MERGE_MS
+                                && next.is_same_kind_as(&event)
+                                && !map.contains_key(&FingerId::Touch(finger_id)) =>
+                            {
+                                // [2026-10-06 第九轮 R9-B3] 合并窗口从「毫秒时间戳完全相等」放宽到「与首条相差不超过
+                                // MULTI_TOUCH_MERGE_MS 毫秒、且该手指还不在本组里」。安卓 SDLSurface.onTouch 对一次 ACTION_MOVE
+                                // 逐个 pointer 调 onNativeTouch,每条的时间戳是各自入队时的 SDL_GetTicks(),跨毫秒就被拆成
+                                // 两次单指 TouchesMove:-[GameManager processTouch:withType:] 0x1a6f8 见 count==1 走单指平移
+                                // (地图被拖走一截、ObjSelector 置 isMoved),count≥2 才 0x1a7ce zoom:touch2:,缩放一顿一顿。
+                                // 同一手指的第二条一出现就停止合并,单指连续移动仍逐条下发(切水果轨迹不变);不跨 Down/Up/Cancel。
                                 let abs_coords = finger_absolute_coords(self, (x, y));
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 map.insert(FingerId::Touch(finger_id), coords);
