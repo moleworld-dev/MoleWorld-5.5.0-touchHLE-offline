@@ -32,6 +32,161 @@ pub(super) struct State {
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    /// [2026-10-06 第十轮 R10-A2] 快路径浮层纹理里可能还有不透明内容的区域(GL 坐标 x0, y0, x1, y1,
+    /// 左闭右开、自下而上),即上一次浮层合成画到的范围。下一次读回要连它一起读,旧位置才会被擦成透明。
+    overlay_dirty: Option<(u32, u32, u32, u32)>,
+    /// [2026-10-06 第十轮 R10-A2] 上一趟浮层合成画完时浮层状态的签名(见 overlay_signature)。没变就不再重画、
+    /// 不再读回上传,快路径继续叠加已有的浮层纹理;停止叠加时清空,浮层再出现时必定重画。
+    overlay_signature: Option<u64>,
+}
+
+/// [2026-10-06 第十轮 R10-A2] 只画「找全屏层时被跳过的小浮层」的一趟合成:targets 是那几个浮层,
+/// bbox 记下实际画到的屏幕范围(点坐标 min_x, min_y, max_x, max_y),只读回这一块。
+struct OverlayPass {
+    targets: Vec<id>,
+    bbox: Option<[f32; 4]>,
+}
+
+impl OverlayPass {
+    /// 把单位四边形经 modelview 变换后的四个角并进 bbox。
+    fn include(&mut self, modelview: &Matrix<4>) {
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            let [px, py, _, w] = modelview.transform([x, y, 0.0, 1.0]);
+            let (px, py) = if w != 0.0 && w != 1.0 { (px / w, py / w) } else { (px, py) };
+            if !px.is_finite() || !py.is_finite() {
+                continue;
+            }
+            let b = self.bbox.get_or_insert([px, py, px, py]);
+            b[0] = b[0].min(px);
+            b[1] = b[1].min(py);
+            b[2] = b[2].max(px);
+            b[3] = b[3].max(py);
+        }
+    }
+}
+
+/// [2026-10-06 第十轮 R10-A2] 快路径浮层的状态签名:浮层本身及其上级链的几何、显隐、不透明度,浮层子树里每层的
+/// 几何、显隐、不透明度、底色、圆角、待重绘标志、位图来源与「纹理是否已是最新」,加上画布尺寸。浮层不变时
+/// (绝大多数帧)签名相同,整趟浮层合成可以跳过——否则每秒 60 趟合成+读回+上传会把无 JIT 的帧率拖低。
+/// 有动画在跑时返回 None(每趟都要重画)。须在 display_layers 之后算(重绘会把「纹理已是最新」清掉)。
+fn overlay_signature(objc: &ObjC, targets: &[id], canvas: (u32, u32)) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    fn hash_geometry(host: &CALayerHostObject, h: &mut DefaultHasher) {
+        let t = host.affine_transform;
+        for v in [
+            host.bounds.origin.x,
+            host.bounds.origin.y,
+            host.bounds.size.width,
+            host.bounds.size.height,
+            host.position.x,
+            host.position.y,
+            host.anchor_point.x,
+            host.anchor_point.y,
+            t.a,
+            t.b,
+            t.c,
+            t.d,
+            t.tx,
+            t.ty,
+            host.opacity,
+        ] {
+            v.to_bits().hash(h);
+        }
+        host.hidden.hash(h);
+    }
+    fn is_animating(host: &CALayerHostObject) -> bool {
+        !host.animations.is_empty() || !host.anonymous_animations.is_empty()
+    }
+    fn hash_subtree(objc: &ObjC, layer: id, h: &mut DefaultHasher) -> bool {
+        let host = objc.borrow::<CALayerHostObject>(layer);
+        if is_animating(host) {
+            return false;
+        }
+        layer.hash(h);
+        hash_geometry(host, h);
+        if host.hidden {
+            return true;
+        }
+        if let Some(c) = host.background_color {
+            for v in [c.r, c.g, c.b, c.a] {
+                v.to_bits().hash(h);
+            }
+        }
+        host.corner_radius.to_bits().hash(h);
+        host.needs_display.hash(h);
+        host.contents.hash(h);
+        host.cg_context.is_some().hash(h);
+        host.presented_pixels.is_some().hash(h);
+        host.gles_texture_is_up_to_date.hash(h);
+        host.sublayers.len().hash(h);
+        host.sublayers
+            .iter()
+            .all(|&child| hash_subtree(objc, child, h))
+    }
+    let mut h = DefaultHasher::new();
+    canvas.hash(&mut h);
+    for &target in targets {
+        if !hash_subtree(objc, target, &mut h) {
+            return None;
+        }
+        let mut ancestor = objc.borrow::<CALayerHostObject>(target).superlayer();
+        while ancestor != nil {
+            let host = objc.borrow::<CALayerHostObject>(ancestor);
+            if is_animating(host) {
+                return None;
+            }
+            ancestor.hash(&mut h);
+            hash_geometry(host, &mut h);
+            ancestor = host.superlayer();
+        }
+    }
+    Some(h.finish())
+}
+
+/// [2026-10-06 第十轮 R10-A2] 本次认出全屏层时被跳过的小浮层(只有 iOS 会跳过)。
+/// 设环境变量 MOLE_FASTPATH_OVERLAY=0 可关掉叠加,退回旧行为(被跳过的浮层不画),用于对比帧率或排查。
+#[cfg(target_os = "ios")]
+fn fastpath_overlays() -> Vec<id> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("MOLE_FASTPATH_OVERLAY").map_or(true, |v| v != "0")) {
+        return Vec::new();
+    }
+    super::ca_eagl_layer::skipped_overlays()
+}
+#[cfg(not(target_os = "ios"))]
+fn fastpath_overlays() -> Vec<id> {
+    Vec::new()
+}
+
+/// [2026-10-06 第十轮 R10-A2] 交给游戏上下文:上传浮层画布区域并设定快路径是否叠加(见 eagl)。
+#[cfg(target_os = "ios")]
+unsafe fn hand_overlay_to_guest(
+    env: &mut Environment,
+    canvas: (u32, u32),
+    upload: Option<((u32, u32, u32, u32), &[u8])>,
+    content: (u32, u32, u32, u32),
+    active: bool,
+) {
+    crate::frameworks::opengles::upload_fastpath_overlay_region(env, canvas, upload, content, active);
+}
+#[cfg(not(target_os = "ios"))]
+unsafe fn hand_overlay_to_guest(
+    _env: &mut Environment,
+    _canvas: (u32, u32),
+    _upload: Option<((u32, u32, u32, u32), &[u8])>,
+    _content: (u32, u32, u32, u32),
+    _active: bool,
+) {
+}
+
+fn set_fastpath_overlay_inactive(env: &mut Environment) {
+    env.framework_state
+        .core_animation
+        .composition
+        .overlay_signature = None;
+    #[cfg(target_os = "ios")]
+    crate::frameworks::opengles::set_fastpath_overlay_inactive();
 }
 
 struct MiscGlObjects {
@@ -82,13 +237,28 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         return None;
     }
 
-    if find_fullscreen_eagl_layer(env) != nil {
-        // No composition done, EAGLContext will present directly.
-        log_dbg!("Using CAEAGLLayer fast path, skipping composition");
-        return None;
-    }
+    // [2026-10-06 第十轮 R10-A2] iOS 认全屏层时会跳过未聚焦的小浮层(无 JIT 必须留在快路径保帧率),原先这些浮层
+    // 整段不画:公告板正文(UITextView)、好友村搜索框都看不见,与原版不符。现在快路径下照样走到这里,但只把这几个
+    // 浮层画进一张透明画布、只读回画到的那一块,交给游戏上下文,快路径出帧时叠加上去(eagl::draw_overlay_texture)。
+    // 整个过程在运行循环里做,不在游戏 drawScene 帧栈上。桌面/安卓不跳过浮层,行为不变。
+    let mut overlay_pass: Option<OverlayPass> = if find_fullscreen_eagl_layer(env) != nil {
+        let targets = fastpath_overlays();
+        if targets.is_empty() {
+            set_fastpath_overlay_inactive(env);
+            // No composition done, EAGLContext will present directly.
+            log_dbg!("Using CAEAGLLayer fast path, skipping composition");
+            return None;
+        }
+        Some(OverlayPass {
+            targets,
+            bbox: None,
+        })
+    } else {
+        set_fastpath_overlay_inactive(env);
+        None
+    };
 
-    if env.options.print_fps {
+    if env.options.print_fps && overlay_pass.is_none() {
         env.framework_state
             .core_animation
             .composition
@@ -137,10 +307,20 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         .map(|window| {
             let layer: id = msg![env; window layer];
             // Ensure layer bitmaps are up to date.
-            display_layers(env, layer);
+            // [2026-10-06 第十轮 R10-A2] 浮层合成只画浮层,只需更新浮层子树的位图(见下)。整棵树都 display
+            // 会把游戏自身每帧标脏的层(例如全屏 EAGL 视图)也重绘一遍,快路径原本从不做这件事,
+            // 实测好友村帧率从 24.5 掉到 15。
+            if overlay_pass.is_none() {
+                display_layers(env, layer);
+            }
             layer
         })
         .collect();
+    if let Some(pass) = &overlay_pass {
+        for target in pass.targets.clone() {
+            display_layers(env, target);
+        }
+    }
 
     let screen_bounds: CGRect = {
         let screen: id = msg_class![env; UIScreen mainScreen];
@@ -149,6 +329,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let scale_hack: u32 = env.options.scale_hack.get();
     let fb_width = screen_bounds.size.width as u32 * scale_hack;
     let fb_height = screen_bounds.size.height as u32 * scale_hack;
+
+    // [2026-10-06 第十轮 R10-A2] 浮层没有任何变化:快路径继续叠加已有的浮层纹理,这一趟什么都不做。
+    if let Some(pass) = &overlay_pass {
+        let signature = overlay_signature(&env.objc, &pass.targets, (fb_width, fb_height));
+        if signature.is_some()
+            && signature
+                == env
+                    .framework_state
+                    .core_animation
+                    .composition
+                    .overlay_signature
+        {
+            return new_recomposite_next;
+        }
+    }
     let present_frame_args = (
         env.window().viewport(),
         env.window().rotation_matrix(),
@@ -344,7 +539,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Clear the framebuffer and set up state to prepare for rendering
     unsafe {
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
-        gles.ClearColor(0.0, 0.0, 0.0, 1.0);
+        // 浮层画布底色全透明(叠加到游戏画面上),完整合成照旧黑底。
+        if overlay_pass.is_some() {
+            gles.ClearColor(0.0, 0.0, 0.0, 0.0);
+        } else {
+            gles.ClearColor(0.0, 0.0, 0.0, 1.0);
+        }
         gles.Clear(gles11::COLOR_BUFFER_BIT);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
 
@@ -381,6 +581,8 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
+                &mut overlay_pass,
+                false,
             );
         }
     }
@@ -403,65 +605,125 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         assert_eq!(gles.GetError(), 0);
     }
 
-    // [2026-10-06] iOS:合成画布改在【游戏 EAGL 上下文的视图】里呈现。SDL 在 iOS 上给每个 GL 上下文各配一个视图、
-    // 设为当前时挂到窗口上;在内部上下文里换帧的画面,下一帧游戏切回自己的上下文就被换掉,弹框等覆盖层永远看不到。
-    // 内部上下文与游戏上下文不共享纹理,所以读回画布像素交给游戏上下文上传后呈现,
-    // 见 eagl::present_composited_pixels_in_guest_view。
-    #[cfg(target_os = "ios")]
-    let presented_in_guest_view = {
-        // 画布仍绑在合成 FBO 上:读回整张画布像素(RGBA,自下而上的行序与纹理一致)。
-        let mut pixels = vec![0u8; (fb_width * fb_height * 4) as usize];
-        unsafe {
-            gles.PixelStorei(gles11::PACK_ALIGNMENT, 4);
-            gles.ReadPixels(
-                0,
-                0,
-                fb_width as _,
-                fb_height as _,
-                gles11::RGBA,
-                gles11::UNSIGNED_BYTE,
-                pixels.as_mut_ptr() as *mut _,
-            );
-        }
+    if let Some(pass) = overlay_pass {
+        // [2026-10-06 第十轮 R10-A2] 浮层合成:读回「这次画到的范围 ∪ 上次画到的范围」(后者擦掉旧位置),
+        // 交给游戏上下文上传进浮层纹理。什么都没画(浮层全隐藏)就停止叠加,脏区留到下次一并擦。
+        let scale = scale_hack as f32;
+        let current = pass.bbox.and_then(|[min_x, min_y, max_x, max_y]| {
+            let x0 = ((min_x * scale).floor() - 1.0).clamp(0.0, fb_width as f32) as u32;
+            let x1 = ((max_x * scale).ceil() + 1.0).clamp(0.0, fb_width as f32) as u32;
+            let y0 = ((min_y * scale).floor() - 1.0).clamp(0.0, fb_height as f32) as u32;
+            let y1 = ((max_y * scale).ceil() + 1.0).clamp(0.0, fb_height as f32) as u32;
+            // 画布 y 向下,GL 行自下而上。
+            (x1 > x0 && y1 > y0).then_some((x0, fb_height - y1, x1, fb_height - y0))
+        });
+        let composition_state = &mut env.framework_state.core_animation.composition;
+        let readback = current.map(|cur| {
+            let region = match composition_state.overlay_dirty {
+                Some((dx0, dy0, dx1, dy1)) => (
+                    cur.0.min(dx0.min(fb_width)),
+                    cur.1.min(dy0.min(fb_height)),
+                    cur.2.max(dx1.min(fb_width)),
+                    cur.3.max(dy1.min(fb_height)),
+                ),
+                None => cur,
+            };
+            composition_state.overlay_dirty = Some(cur);
+            let (x0, y0, x1, y1) = region;
+            let (width, height) = (x1 - x0, y1 - y0);
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            unsafe {
+                gles.PixelStorei(gles11::PACK_ALIGNMENT, 4);
+                gles.ReadPixels(
+                    x0 as _,
+                    y0 as _,
+                    width as _,
+                    height as _,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    pixels.as_mut_ptr() as *mut _,
+                );
+            }
+            ((x0, y0, width, height), pixels)
+        });
         std::mem::drop(gles);
+        let signature = overlay_signature(&env.objc, &pass.targets, (fb_width, fb_height));
+        env.framework_state
+            .core_animation
+            .composition
+            .overlay_signature = signature;
         unsafe {
-            crate::frameworks::opengles::present_composited_pixels_in_guest_view(
+            hand_overlay_to_guest(
                 env,
-                &pixels,
-                fb_width,
-                fb_height,
-                present_frame_args.1,
-            )
-        }
-    };
-    #[cfg(not(target_os = "ios"))]
-    let presented_in_guest_view = {
-        std::mem::drop(gles);
-        false
-    };
-    if !presented_in_guest_view {
-        let window = env.window.as_mut().unwrap();
-        let mut gles = window.make_internal_gl_ctx_current();
-        // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
-        // window's default framebuffer (0 on desktop/Android, the CAEAGLLayer FBO on
-        // iOS) before drawing, so we no longer hardcode-bind framebuffer 0 here.
-        unsafe {
-            gles.BindTexture(gles11::TEXTURE_2D, texture);
-            present_frame(
-                gles.as_mut(),
-                present_frame_args.0,
-                present_frame_args.3, // full_size
-                present_frame_args.1,
-                present_frame_args.2,
-                window_default_fbo,
+                (fb_width, fb_height),
+                readback
+                    .as_ref()
+                    .map(|(region, pixels)| (*region, pixels.as_slice())),
+                current.unwrap_or((0, 0, 0, 0)),
+                readback.is_some(),
             );
-            // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer
-            // 契约:呈现当前绑定的 renderbuffer;present_frame 期间可能绑了别的)。
-            #[cfg(target_os = "ios")]
-            gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
         }
-        std::mem::drop(gles);
-        window.swap_window();
+    } else {
+        // [2026-10-06] iOS:合成画布改在【游戏 EAGL 上下文的视图】里呈现。SDL 在 iOS 上给每个 GL 上下文各配一个视图、
+        // 设为当前时挂到窗口上;在内部上下文里换帧的画面,下一帧游戏切回自己的上下文就被换掉,弹框等覆盖层永远看不到。
+        // 内部上下文与游戏上下文不共享纹理,所以读回画布像素交给游戏上下文上传后呈现,
+        // 见 eagl::present_composited_pixels_in_guest_view。
+        #[cfg(target_os = "ios")]
+        let presented_in_guest_view = {
+            // 画布仍绑在合成 FBO 上:读回整张画布像素(RGBA,自下而上的行序与纹理一致)。
+            let mut pixels = vec![0u8; (fb_width * fb_height * 4) as usize];
+            unsafe {
+                gles.PixelStorei(gles11::PACK_ALIGNMENT, 4);
+                gles.ReadPixels(
+                    0,
+                    0,
+                    fb_width as _,
+                    fb_height as _,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    pixels.as_mut_ptr() as *mut _,
+                );
+            }
+            std::mem::drop(gles);
+            unsafe {
+                crate::frameworks::opengles::present_composited_pixels_in_guest_view(
+                    env,
+                    &pixels,
+                    fb_width,
+                    fb_height,
+                    present_frame_args.1,
+                )
+            }
+        };
+        #[cfg(not(target_os = "ios"))]
+        let presented_in_guest_view = {
+            std::mem::drop(gles);
+            false
+        };
+        if !presented_in_guest_view {
+            let window = env.window.as_mut().unwrap();
+            let mut gles = window.make_internal_gl_ctx_current();
+            // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
+            // window's default framebuffer (0 on desktop/Android, the CAEAGLLayer FBO on
+            // iOS) before drawing, so we no longer hardcode-bind framebuffer 0 here.
+            unsafe {
+                gles.BindTexture(gles11::TEXTURE_2D, texture);
+                present_frame(
+                    gles.as_mut(),
+                    present_frame_args.0,
+                    present_frame_args.3, // full_size
+                    present_frame_args.1,
+                    present_frame_args.2,
+                    window_default_fbo,
+                );
+                // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer
+                // 契约:呈现当前绑定的 renderbuffer;present_frame 期间可能绑了别的)。
+                #[cfg(target_os = "ios")]
+                gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
+            }
+            std::mem::drop(gles);
+            window.swap_window();
+        }
     }
 
     // [同步上游 0.3.0 2026-10-03] 动画委托回调外包一个自动释放池。UIView 旧式动画改走
@@ -510,6 +772,10 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+    // [2026-10-06 第十轮 R10-A2] Some = 浮层合成:只画 targets 里的浮层及其子层,其余层只往下走、不画。
+    overlay: &mut Option<OverlayPass>,
+    // 浮层合成时:祖先里已有目标浮层(本层要画)。
+    inside_overlay: bool,
 ) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
@@ -526,8 +792,13 @@ unsafe fn composite_layer_recursive(
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
+    let draw_self = match overlay {
+        None => true,
+        Some(pass) => inside_overlay || pass.targets.contains(&layer),
+    };
+
     let opacity = opacity * host_obj.opacity;
-    let cumulative_transform = {
+    let (cumulative_transform, modelview) = {
         let CALayerHostObject { bounds, .. } = host_obj;
 
         // Update the transform to match this layer's co-ordinate space.
@@ -538,18 +809,17 @@ unsafe fn composite_layer_recursive(
         // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
         // so it will have the right size in this layer's co-ordinate space.
         gles.MatrixMode(gles11::MODELVIEW);
-        load_matrix(
-            gles.as_mut(),
+        let modelview =
             Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
                 .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
-                .multiply(&cumulative_transform),
-        );
+                .multiply(&cumulative_transform);
+        load_matrix(gles.as_mut(), modelview);
 
-        cumulative_transform
+        (cumulative_transform, modelview)
     };
 
     // Draw background color, if any
-    let have_background = if let Some(background_color) = host_obj.background_color {
+    let have_background = if let (true, Some(background_color)) = (draw_self, host_obj.background_color) {
         let misc = env
             .framework_state
             .core_animation
@@ -626,9 +896,10 @@ unsafe fn composite_layer_recursive(
         false
     };
 
-    let need_texture = host_obj.presented_pixels.is_some()
-        || host_obj.contents != nil
-        || host_obj.cg_context.is_some();
+    let need_texture = draw_self
+        && (host_obj.presented_pixels.is_some()
+            || host_obj.contents != nil
+            || host_obj.cg_context.is_some());
     let need_update = need_texture && !host_obj.gles_texture_is_up_to_date;
 
     if need_texture {
@@ -732,6 +1003,12 @@ unsafe fn composite_layer_recursive(
     }
     std::mem::drop(gles);
 
+    if have_background || need_texture {
+        if let Some(pass) = overlay.as_mut() {
+            pass.include(&modelview);
+        }
+    }
+
     // avoid holding mutable borrow while recursing
     let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
     for &child_layer in &original_host_obj.sublayers.clone() {
@@ -742,6 +1019,8 @@ unsafe fn composite_layer_recursive(
             child_layer,
             cumulative_transform,
             opacity,
+            overlay,
+            draw_self,
         )
     }
 }
