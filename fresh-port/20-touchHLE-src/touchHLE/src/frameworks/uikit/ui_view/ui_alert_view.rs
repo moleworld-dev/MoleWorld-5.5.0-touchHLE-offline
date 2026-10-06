@@ -407,11 +407,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 /// 无头模式或 MOLE_ALERT_AUTODISMISS(设为非 "0" 的值)时,沿用旧的"约 1 帧后按索引 0 自动关闭"。
-/// [2026-10-06 P0] iOS 默认也走自动关闭(MOLE_ALERT_AUTODISMISS=0 可关):iOS 上这个宿主画的覆盖层
-/// 显示不出来(iPad 模拟器实测:第一个框时整屏发白,第二个框时只见游戏画面、看不到框),游戏却停在后面等
-/// 玩家点「确定」。离线时每次启动都会弹原版「你的设备现在无法连接网络」框(首次安装还有内购说明框),
-/// 玩家只能在屏幕上乱点、碰巧点中看不见的按钮才能进游戏——即「每次打开都要等很久、有时打不开、卡在初始
-/// 页面」。v0.0.7 及以前所有平台都是自动关闭,iOS 先恢复这一行为;等 iOS 上覆盖层能正常显示后再去掉。
+/// [2026-10-06] 曾因 iOS 上覆盖层画不出来而让 iOS 默认自动关闭(ac4b354);iOS 线已修好合成画布的呈现
+/// (改在游戏上下文的视图里呈现,见 iOS 线 eagl::present_composited_pixels_in_guest_view),恢复照原版等玩家点。
 fn auto_dismiss_mode(env: &Environment) -> bool {
     if env.options.headless {
         return true;
@@ -420,7 +417,7 @@ fn auto_dismiss_mode(env: &Environment) -> bool {
     *FLAG.get_or_init(|| {
         std::env::var("MOLE_ALERT_AUTODISMISS")
             .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(cfg!(target_os = "ios"))
+            .unwrap_or(false)
     })
 }
 
