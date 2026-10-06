@@ -1051,6 +1051,14 @@ fn stats_getter(env: &mut Environment, sel: &str) -> Option<bool> {
     Some(true)
 }
 
+/// [2026-10-06 第九轮 R9-D1] 离线回环 1051/1050 回包用:(连续登录天数, 累计在线秒),与 stats_getter 的返回值同源。
+/// 进村补发在 startGame: 臂(on_enter_village 已先记好当天)之后的受理点执行,这里只读侧档,不改、不落盘。
+pub(crate) fn offline_login_stats(env: &mut Environment) -> (u32, u32) {
+    side_ensure_loaded(env);
+    let s = side();
+    (s.streak, online_total_secs(&s).min(u32::MAX as u64) as u32)
+}
+
 /// 应用切后台/退出:在线计时暂停并落盘;回前台:进过村才恢复计时。只做宿主状态,不发消息。
 fn app_lifecycle(env: &mut Environment, sel: &str) -> Option<bool> {
     if env.options.network_access || !side().loaded {
