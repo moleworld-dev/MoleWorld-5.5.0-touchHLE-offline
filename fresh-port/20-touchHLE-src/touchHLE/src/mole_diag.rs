@@ -235,6 +235,9 @@ pub enum Inject {
     /// A touch-move step (for synthesising a drag/pan gesture).
     Move(f32, f32),
     Up(f32, f32),
+    /// [2026-10-05] `pinch` 两指捏合的一步:phase 0 按下 / 1 移动 / 2 抬起,a、b 是两根手指的游戏坐标。
+    /// 两根手指用 FingerId::Touch(1001/1002),与真机手指经窗口换算后走同一条触摸分发路径(含系统弹框、UI43 换算)。
+    Pinch(u8, (f32, f32), (f32, f32)),
     /// Toggle the debug menu (same as pressing T) — lets the harness drive the
     /// menu without synthesising a keyboard event.
     Menu,
@@ -342,6 +345,34 @@ pub fn next_inject() -> Option<Inject> {
                 x1, y1, x2, y2, steps
             ));
             Some(Inject::Down(x1, y1))
+        }
+        // [2026-10-05] `pinch <cx> <cy> <起始间距> <结束间距> [步数]`:两指以 (cx,cy) 为中点、沿游戏坐标 x 轴对称,
+        // 间距从起始线性变到结束(结束 < 起始 = 捏合缩小,> = 张开放大),逐步排队,最后两指同时抬起。
+        Some("pinch") => {
+            let cx: f32 = it.next()?.parse().ok()?;
+            let cy: f32 = it.next()?.parse().ok()?;
+            let d0: f32 = it.next()?.parse().ok()?;
+            let d1: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24)
+                .clamp(2, 240);
+            let at = |d: f32| ((cx - d / 2.0, cy), (cx + d / 2.0, cy));
+            let mut q = INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+            for i in 1..=steps {
+                let d = d0 + (d1 - d0) * (i as f32 / steps as f32);
+                let (a, b) = at(d);
+                q.push_back(Inject::Pinch(1, a, b));
+            }
+            let (a, b) = at(d1);
+            q.push_back(Inject::Pinch(2, a, b));
+            log_line(&format!(
+                "INJECT pinch ({}, {}) 间距 {} -> {} ({} steps)",
+                cx, cy, d0, d1, steps
+            ));
+            let (a, b) = at(d0);
+            Some(Inject::Pinch(0, a, b))
         }
         Some("suspend") => {
             // [补完 2026-09-15] 缺省 3 秒;解析失败或非有限值(如 NaN/inf)按缺省处理;
