@@ -868,7 +868,34 @@ impl Window {
                 wb.allow_highdpi();
                 log!("[MOLE-RES] HiDPI 开启(allow_highdpi):drawable=设备原生像素");
             }
-            wb.build().unwrap()
+            let built = wb.build().unwrap();
+            // [2026-10-06 第九轮 R9-B4 第一步:诊断] 安卓铺满时逻辑屏比例(AUTO_PORTRAIT)按 display_bounds(0) = 整块物理屏
+            // (SDLSurface getRealMetrics)算;带刘海/挖孔的手机若系统让开刘海,实际画布更窄,而定制逻辑屏时 viewport 直接铺满
+            // drawable、不做等比,画面会横向压扁「让位宽 / 屏宽」。是否让位因机型与 ROM 设置而异,先只记一行三组尺寸,
+            // 请刘海屏玩家回传 touchHLE_log.txt 确认后再改成按画布尺寸算。不改任何行为。
+            #[cfg(target_os = "android")]
+            {
+                let phys = screen_size;
+                let win = built.size();
+                let draw = built.drawable_size();
+                let phys_l = (phys.0.max(phys.1), phys.0.min(phys.1));
+                let draw_l = (draw.0.max(draw.1), draw.0.min(draw.1));
+                let squash = if draw_l.0 > 0 && draw_l.1 > 0 && phys_l.1 > 0 {
+                    (phys_l.0 as f64 / phys_l.1 as f64) / (draw_l.0 as f64 / draw_l.1 as f64)
+                } else {
+                    1.0
+                };
+                log!(
+                    "[MOLE-RES] 安卓 物理屏 {}x{},画布 window.size() {}x{} / drawable_size() {}x{};物理屏宽高比 ÷ 画布宽高比 = {:.4}{}",
+                    phys.0, phys.1, win.0, win.1, draw.0, draw.1, squash,
+                    if (squash - 1.0).abs() > 0.005 {
+                        "(画布比物理屏窄:铺满时横向会压扁这个比例,刘海让位?请回传本日志)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            built
         } else if fullscreen {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
             let window = video_ctx
