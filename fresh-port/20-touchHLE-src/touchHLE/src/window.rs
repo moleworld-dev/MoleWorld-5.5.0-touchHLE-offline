@@ -529,6 +529,9 @@ pub enum Event {
     /// [扫描修 2026-09-15] F12-3:桌面窗口从最小化/隐藏还原(SDL Restored/Shown/Maximized)。只在此前
     /// 发过 WindowMinimized 时发一次;由 frameworks/uikit.rs 转成 applicationDidBecomeActive: 与对应通知。
     WindowRestored,
+    /// [2026-10-06 第十轮 R10-A3] 系统低内存警告(SDL_APP_LOWMEMORY:iOS applicationDidReceiveMemoryWarning、
+    /// Android onLowMemory)。由 frameworks/uikit.rs 转成 applicationDidReceiveMemoryWarning: 与对应通知。
+    AppLowMemory,
 }
 
 /// [补完 2026-09-15] 切后台挂起的结束条件,见 [Window::suspend_until_foreground]。
@@ -1715,6 +1718,12 @@ impl Window {
                     // iOS 仍按上游在 uikit.rs 里退出,不会回来。
                     self.enable_event_polling = false;
                     continue;
+                }
+                // [2026-10-06 第十轮 R10-A3] 系统低内存警告以前落到 `_ => continue` 被丢掉,游戏从没收到过
+                //   applicationDidReceiveMemoryWarning:。入队,由 frameworks/uikit.rs 在运行循环里转发。
+                E::AppLowMemory { .. } => {
+                    log!("[生命周期] 收到系统低内存警告");
+                    Event::AppLowMemory
                 }
                 E::AppTerminating { .. } => {
                     log!("Received app-will-terminate event.");

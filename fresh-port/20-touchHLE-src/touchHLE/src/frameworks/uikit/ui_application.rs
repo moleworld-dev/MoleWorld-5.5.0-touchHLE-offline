@@ -664,6 +664,38 @@ pub(super) fn handle_window_minimized(env: &mut Environment) {
     send_will_resign_active(env, ui_application);
 }
 
+/// [2026-10-06 第十轮 R10-A3] 系统低内存警告(`Event::AppLowMemory`):照 UIKit 给应用委托发
+/// `applicationDidReceiveMemoryWarning:`(若实现)并广播 `UIApplicationDidReceiveMemoryWarningNotification`。
+/// 本游戏 -[iMoleVillageAppDelegate applicationDidReceiveMemoryWarning:]@0x1123c 只调
+/// [[CCDirector sharedDirector] purgeCachedData](0x11268),即 [CCLabelBMFont purgeCachedData] +
+/// [[CCTextureCache sharedTextureCache] removeUnusedTextures](@0x2c7e30):只释放没人引用的纹理与位图字体缓存。
+/// 以前这个事件被丢掉,内存吃紧时游戏一次也没收到过,iOS 上更容易被系统杀掉。
+/// 由运行循环里的 handle_events 调用,不在游戏 drawScene 帧栈上。
+pub(super) fn handle_memory_warning(env: &mut Environment) {
+    if env.is_app_picker {
+        return;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    if ui_application == nil {
+        log!("[生命周期] 低内存警告:UIApplication 尚未创建,忽略");
+        return;
+    }
+    log!("[生命周期] 低内存警告 → applicationDidReceiveMemoryWarning: + UIApplicationDidReceiveMemoryWarningNotification");
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if delegate != nil
+        && env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "applicationDidReceiveMemoryWarning:")
+    {
+        () = msg![env; delegate applicationDidReceiveMemoryWarning:ui_application];
+    }
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let notif_name = get_static_str(env, UIApplicationDidReceiveMemoryWarningNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
 /// [扫描修 2026-09-15] F12-3:桌面窗口从最小化还原(`Event::WindowRestored`)。
 /// 只有之前真的发过失活才配对发 `applicationDidBecomeActive:`(游戏在里面 resume/resumeMiniGame、
 /// checkIsNightComing/showNightVillage、SystemTimeCheck check、clearAllNotification),
