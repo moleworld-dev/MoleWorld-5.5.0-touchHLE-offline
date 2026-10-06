@@ -84,6 +84,7 @@ cat > "$APP/Info.plist" <<'PLIST'
 	<key>LSRequiresIPhoneOS</key>          <true/>
 	<key>MinimumOSVersion</key>            <string>15.0</string>
 	<key>UIRequiresFullScreen</key>        <true/>
+	<key>UIStatusBarHidden</key>           <true/>
 	<!-- [MoleWorld iOS] 让 Documents 目录在「文件」app 里可见(日志+存档导入导出) -->
 	<key>UIFileSharingEnabled</key>        <true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key> <true/>
