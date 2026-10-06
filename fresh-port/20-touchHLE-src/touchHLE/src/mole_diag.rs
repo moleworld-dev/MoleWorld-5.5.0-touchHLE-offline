@@ -485,6 +485,17 @@ pub fn next_inject() -> Option<Inject> {
             log_line("INJECT kbhide(SDL_StopTextInput)");
             None
         }
+        // [2026-10-06 第十轮 R10-A3] `lowmem`:往 SDL 队列压一个 SDL_APP_LOWMEMORY(与 iOS/安卓系统低内存警告同一个事件),
+        // 在桌面上验证 poll_for_events → applicationDidReceiveMemoryWarning: 的整条转发链。
+        Some("lowmem") => {
+            unsafe {
+                let mut ev: sdl2::sys::SDL_Event = std::mem::zeroed();
+                ev.type_ = sdl2::sys::SDL_EventType::SDL_APP_LOWMEMORY as u32;
+                sdl2::sys::SDL_PushEvent(&mut ev);
+            }
+            log_line("INJECT lowmem(SDL_APP_LOWMEMORY)");
+            None
+        }
         Some("suspend") => {
             // [补完 2026-09-15] 缺省 3 秒;解析失败或非有限值(如 NaN/inf)按缺省处理;
             // 钳到 0–3600 秒,避免 Duration::from_secs_f32 / Instant 加法溢出 panic。
