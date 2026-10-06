@@ -13,6 +13,9 @@ mod eagl;
 // [2026-10-06] 合成器在 iOS 上借游戏上下文的视图呈现画布(见 eagl::present_composited_pixels_in_guest_view)。
 #[cfg(target_os = "ios")]
 pub(crate) use eagl::present_composited_pixels_in_guest_view;
+// [2026-10-06 第十轮 R10-A2] 快路径叠加被跳过的小浮层(见 eagl::upload_fastpath_overlay_region)。
+#[cfg(target_os = "ios")]
+pub(crate) use eagl::{set_fastpath_overlay_inactive, upload_fastpath_overlay_region};
 pub(crate) mod gles_guest;
 
 use touchHLE_gl_bindings::gles11::types::GLenum;

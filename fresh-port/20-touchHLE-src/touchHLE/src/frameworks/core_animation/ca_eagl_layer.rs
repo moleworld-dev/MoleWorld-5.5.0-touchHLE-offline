@@ -43,6 +43,21 @@ const ACCEPT_ROTATED_FULLSCREEN_LAYER: bool = cfg!(target_os = "ios");
 /// 必须这么换帧率;桌面有 JIT、慢合成路径跑得动,保持 main 行为(小浮层照常合成显示)。
 const SKIP_UNFOCUSED_SMALL_OVERLAYS: bool = cfg!(target_os = "ios");
 
+// [2026-10-06 第十轮 R10-A2] 最近一次 find_fullscreen_eagl_layer 认出全屏层时,下降途中被跳过的「未聚焦小浮层」
+// (压在游戏全屏层之上、按原版本该看得见:公告板正文 UITextView、好友村搜索框等)。快路径不经合成器,
+// 原先这些浮层整段不画;现在合成器在运行循环里据此只把它们另画一张透明画布,由快路径叠加到游戏帧上
+// (见 composition.rs 的浮层合成与 eagl::draw_fastpath_overlay)。没认出全屏层或没跳过任何浮层时为空。
+// 只在主线程用。
+thread_local! {
+    static SKIPPED_OVERLAYS: std::cell::RefCell<Vec<id>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [2026-10-06 第十轮 R10-A2] 最近一次认出全屏层时被跳过的小浮层(见 SKIPPED_OVERLAYS)。
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub fn skipped_overlays() -> Vec<id> {
+    SKIPPED_OVERLAYS.with(|s| s.borrow().clone())
+}
+
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 ///
@@ -57,6 +72,8 @@ const SKIP_UNFOCUSED_SMALL_OVERLAYS: bool = cfg!(target_os = "ios");
 /// and present it directly from the app's context. This function is used to
 /// determine when that will happen.
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
+    SKIPPED_OVERLAYS.with(|s| s.borrow_mut().clear());
+    let mut skipped: Vec<id> = Vec::new();
     // [MoleWorld] 编辑文本时强制走 composition 路径(返回 nil = 无 fullscreen 快路径),
     // 否则 UITextField/UILabel 的逐字符更新永远不上屏(快路径只 present 游戏 GL renderbuffer,
     // recomposite 又在 fullscreen-EAGL 处早退跳过 UIKit overlay)。返回 nil 后 presentRenderbuffer:
@@ -192,6 +209,7 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         for &cand in subs.iter().rev() {
             if SKIP_UNFOCUSED_SMALL_OVERLAYS && overlay_is_ignorable(env, cand, screen_bounds.size)
             {
+                skipped.push(cand);
                 continue;
             }
             next_layer = Some(cand);
@@ -233,6 +251,7 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         }
     }
 
+    SKIPPED_OVERLAYS.with(|s| *s.borrow_mut() = skipped);
     layer
 }
 

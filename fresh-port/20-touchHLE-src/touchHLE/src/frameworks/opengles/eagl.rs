@@ -66,6 +66,17 @@ thread_local! {
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
+// [2026-10-06 第十轮 R10-A2] iOS 快路径的浮层画布纹理(建在游戏上下文里):(纹理名, 画布宽, 画布高, 是否叠加,
+// 有内容的矩形 x0, y0, x1, y1 [GL 坐标,左闭右开])。
+// 合成器在运行循环里只把「找全屏层时被跳过的小浮层」画进一张透明的整屏画布,读回变动区域交给这里上传
+// (upload_fastpath_overlay_region);快路径出帧时在游戏画面之上半透明叠加这张纹理(draw_overlay_texture),
+// 公告板正文、好友村搜索框等浮层照原版可见,又不必为它们退回每帧整屏回读的慢路径。
+#[cfg(target_os = "ios")]
+thread_local! {
+    static OVERLAY_TEX: std::cell::Cell<(GLuint, u32, u32, bool, (u32, u32, u32, u32))> =
+        const { std::cell::Cell::new((0, 0, 0, false, (0, 0, 0, 0))) };
+}
+
 pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
     /// Mapping of OpenGL ES renderbuffer names to `EAGLDrawable` instances
@@ -590,6 +601,8 @@ unsafe fn present_bound_texture_preserving_state(
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     window_default_fbo: GLuint,
+    // [2026-10-06 第十轮 R10-A2] 画完主纹理后再叠加的浮层(只有 iOS 快路径会传),见 FastpathOverlay。
+    overlay: Option<FastpathOverlay>,
 ) {
     let old_arrays = {
         let mut old_arrays = [gles11::FALSE; gles1_on_gl2::ARRAYS.len()];
@@ -654,6 +667,12 @@ unsafe fn present_bound_texture_preserving_state(
     // Draw the quad
     log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
     present_frame(gles, viewport, full_size, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
+    #[cfg(target_os = "ios")]
+    if let Some(overlay) = overlay {
+        draw_overlay_texture(gles, viewport, overlay);
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = overlay;
 
     // [MoleWorld iOS · 性能] 不再每帧删除 present 纹理——它被 PRESENT_TEX 缓存下来供下一帧复用
     // (尺寸变化或上下文重建时会在上面重建)。这样每帧省掉一次驱动侧的纹理分配+释放。
@@ -719,6 +738,169 @@ unsafe fn present_bound_texture_preserving_state(
         gles11::TEXTURE_ENV_MODE,
         old_tex_env_mode_arr.as_ptr().cast(),
     );
+}
+
+/// [2026-10-06 第十轮 R10-A2] 快路径要叠加的浮层:浮层画布纹理、画布尺寸、有内容的矩形(GL 坐标 x0, y0, x1, y1)、
+/// 画布的旋转(浮层画布与合成画布同为竖屏画布,用窗口方向的旋转;游戏帧本身是横屏不旋转)。
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(super) struct FastpathOverlay {
+    texture: GLuint,
+    canvas: (u32, u32),
+    content: (u32, u32, u32, u32),
+    rotation_matrix: crate::matrix::Matrix<2>,
+}
+
+/// [2026-10-06 第十轮 R10-A2] 在 present_frame 画好的画面上,用预乘 alpha 混合(与合成器一致:ONE, ONE_MINUS_SRC_ALPHA)
+/// 叠加浮层画布。只画有内容的那块矩形,不画整屏:模拟器的 GLES 是软件光栅化,每帧多一个整屏混合四边形
+/// 实测好友村帧率从 24.5 掉到 14.5。映射与 present_frame 一致:顶点 v 对应纹理坐标 R·(v/2)+0.5(绕中心旋转),
+/// 所以纹理坐标 tc 处的顶点是 v = 2·R⁻¹·(tc−0.5)。不清屏。只在 present_bound_texture_preserving_state
+/// 存还状态的区间里调用。
+#[cfg(target_os = "ios")]
+unsafe fn draw_overlay_texture(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    overlay: FastpathOverlay,
+) {
+    let FastpathOverlay {
+        texture,
+        canvas: (canvas_w, canvas_h),
+        content: (x0, y0, x1, y1),
+        rotation_matrix,
+    } = overlay;
+    if x1 <= x0 || y1 <= y0 || canvas_w == 0 || canvas_h == 0 {
+        return;
+    }
+    let Some(inverse) = rotation_matrix.inverse() else {
+        return;
+    };
+    if gles.IsTexture(texture) != gles11::TRUE {
+        return;
+    }
+    gles.Viewport(viewport.0 as _, viewport.1 as _, viewport.2 as _, viewport.3 as _);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+    gles.ActiveTexture(gles11::TEXTURE0);
+    gles.ClientActiveTexture(gles11::TEXTURE0);
+    let (s0, s1) = (x0 as f32 / canvas_w as f32, x1 as f32 / canvas_w as f32);
+    let (t0, t1) = (y0 as f32 / canvas_h as f32, y1 as f32 / canvas_h as f32);
+    let tex_coords: [f32; 12] = [s0, t0, s0, t1, s1, t0, s1, t0, s0, t1, s1, t1];
+    let mut vertices = [0f32; 12];
+    let mut i = 0;
+    while i < tex_coords.len() {
+        let [x, y] = inverse.transform([tex_coords[i] - 0.5, tex_coords[i + 1] - 0.5]);
+        vertices[i] = 2.0 * x;
+        vertices[i + 1] = 2.0 * y;
+        i += 2;
+    }
+    gles.MatrixMode(gles11::TEXTURE);
+    gles.LoadIdentity();
+    gles.EnableClientState(gles11::VERTEX_ARRAY);
+    gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
+    gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
+    gles.BindTexture(gles11::TEXTURE_2D, texture);
+    gles.Enable(gles11::TEXTURE_2D);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    gles.Enable(gles11::BLEND);
+    gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+    gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+    gles.Disable(gles11::BLEND);
+}
+
+/// [2026-10-06 第十轮 R10-A2] 快路径下没有要叠加的浮层(浮层消失、改走完整合成等):停止叠加。纹理留着复用。
+#[cfg(target_os = "ios")]
+pub(crate) fn set_fastpath_overlay_inactive() {
+    OVERLAY_TEX.with(|c| {
+        let (texture, width, height, _, content) = c.get();
+        c.set((texture, width, height, false, content));
+    });
+}
+
+/// [2026-10-06 第十轮 R10-A2] 由合成器在运行循环里调用(不在游戏 drawScene 帧栈上,不发任何消息):在游戏上下文里
+/// 把浮层画布的一块区域(GL 行序,自下而上;region = x, y, 宽, 高)写进浮层纹理,并标记快路径要不要叠加它。
+/// 纹理不存在或画布尺寸变了就新建一张全透明的(区域以外本来就是透明的,不必整张重传)。
+/// 结束时游戏上下文保持为当前上下文,SDL 随之把游戏视图挂回窗口(合成时切到内部上下文挂上的是内部视图)。
+/// 返回 false = 当前线程没有游戏上下文。
+#[cfg(target_os = "ios")]
+pub(crate) unsafe fn upload_fastpath_overlay_region(
+    env: &mut Environment,
+    canvas: (u32, u32),
+    upload: Option<((u32, u32, u32, u32), &[u8])>,
+    content: (u32, u32, u32, u32),
+    active: bool,
+) -> bool {
+    if env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+        .is_none()
+    {
+        return false;
+    }
+    let gles_ctx = super::get_thread_context(
+        &mut env.framework_state.opengles,
+        &mut env.objc,
+        env.current_thread,
+    );
+    let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
+    let gles = gles_boxed.as_mut();
+    let (mut texture, cached_w, cached_h, _, _) = OVERLAY_TEX.with(|c| c.get());
+    if let Some(((x, y, width, height), pixels)) = upload {
+        let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
+        let old_unpack_alignment: GLint = get_int(gles, gles11::UNPACK_ALIGNMENT);
+        gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 4);
+        let reusable = texture != 0
+            && cached_w == canvas.0
+            && cached_h == canvas.1
+            && gles.IsTexture(texture) == gles11::TRUE;
+        if reusable {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+        } else {
+            if texture != 0 && gles.IsTexture(texture) == gles11::TRUE {
+                gles.DeleteTextures(1, &texture);
+            }
+            texture = 0;
+            gles.GenTextures(1, &mut texture);
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+            let zeros = vec![0u8; (canvas.0 * canvas.1 * 4) as usize];
+            gles.TexImage2D(
+                gles11::TEXTURE_2D,
+                0,
+                gles11::RGBA as _,
+                canvas.0 as _,
+                canvas.1 as _,
+                0,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                zeros.as_ptr() as *const _,
+            );
+            // NPOT 画布:iOS 原生 GLES1 只有 CLAMP_TO_EDGE + 非 mipmap 过滤时才完整,否则采样成纯白。
+            gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
+            gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
+            gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+            gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+        }
+        if width > 0 && height > 0 {
+            gles.TexSubImage2D(
+                gles11::TEXTURE_2D,
+                0,
+                x as _,
+                y as _,
+                width as _,
+                height as _,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                pixels.as_ptr() as *const _,
+            );
+        }
+        gles.PixelStorei(gles11::UNPACK_ALIGNMENT, old_unpack_alignment);
+        gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
+        OVERLAY_TEX.with(|c| c.set((texture, canvas.0, canvas.1, active, content)));
+    } else {
+        OVERLAY_TEX.with(|c| c.set((texture, cached_w, cached_h, active, content)));
+    }
+    log_once!("[合成] iOS:快路径叠加被跳过的小浮层(公告板正文、搜索框等)");
+    true
 }
 
 /// [2026-10-06] iOS:把合成器画好的整屏画布送进【游戏 EAGL 上下文的视图】里呈现。
@@ -820,6 +1002,7 @@ pub(crate) unsafe fn present_composited_pixels_in_guest_view(
         rotation_matrix,
         virtual_cursor_visible_at,
         window_default_fbo,
+        None,
     );
     gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
     std::mem::drop(gles_boxed);
@@ -876,6 +1059,27 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let rotation_matrix = crate::matrix::Matrix::<2>::identity();
     #[cfg(not(target_os = "ios"))]
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
+    // [2026-10-06 第十轮 R10-A2] 合成器备好了浮层画布、且这次找全屏层时确实跳过了浮层,就叠加上去
+    // (浮层画布是竖屏画布,用窗口方向的旋转)。浮层刚消失时 skipped_overlays 已为空,不会叠出残影。
+    #[cfg(target_os = "ios")]
+    let overlay = {
+        let (texture, canvas_w, canvas_h, active, content) = OVERLAY_TEX.with(|c| c.get());
+        if active
+            && texture != 0
+            && !crate::frameworks::core_animation::ca_eagl_layer::skipped_overlays().is_empty()
+        {
+            Some(FastpathOverlay {
+                texture,
+                canvas: (canvas_w, canvas_h),
+                content,
+                rotation_matrix: env.window.as_mut().unwrap().rotation_matrix(),
+            })
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "ios"))]
+    let overlay = None;
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
     // [MoleWorld iOS] 窗口真实默认 framebuffer(桌面/安卓=0),传给 present_frame 绑定。
     let window_default_fbo = env.window.as_ref().unwrap().default_framebuffer();
@@ -1015,6 +1219,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         rotation_matrix,
         virtual_cursor_visible_at,
         window_default_fbo,
+        overlay,
     );
 
     // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER:SDL 的 presentRenderbuffer

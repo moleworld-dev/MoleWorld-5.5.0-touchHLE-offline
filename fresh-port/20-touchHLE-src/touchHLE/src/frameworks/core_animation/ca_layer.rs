@@ -71,6 +71,11 @@ pub(super) struct CALayerHostObject {
 impl HostObject for CALayerHostObject {}
 
 impl CALayerHostObject {
+    /// [2026-10-06 第十轮 R10-A2] 只读取上级图层(合成器判断快路径浮层有没有变化时要沿上级链看)。
+    pub(super) fn superlayer(&self) -> id {
+        self.superlayer
+    }
+
     /// Internal helper method: generate a transformation matrix to transform
     /// from the superlayer's co-ordinate space (the space that the layer's
     /// position is specified in) to the layer's internal co-ordinate space
