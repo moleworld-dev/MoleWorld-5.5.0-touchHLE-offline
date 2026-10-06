@@ -109,22 +109,29 @@ impl ResourceFile {
 
 /// [MoleWorld iOS] 从 bundle 根的 touchHLE_dylibs.zip 里按 basename 提取一个 guest 动态库
 /// 到可写临时目录并打开(见 ResourceFile::open 的注释)。提取结果缓存,后续直接复用。
+/// [2026-10-06 第十轮 R10-A4] 缓存只在大小与 zip 里的条目一致时才复用:以前只看文件在不在,
+/// 换包后(例如 84c3b4b 把 libz 从 209632 字节换成 53452 字节)会一直用旧版本;写缓存改为同目录临时文件
+/// + 改名,解压到一半被杀不会留下截断的库。
 #[cfg(not(target_os = "android"))]
 fn open_from_dylibs_zip(base: &Path, path: &str) -> Option<std::fs::File> {
     let name = Path::new(path).file_name()?.to_str()?;
     let cache = std::env::temp_dir().join("touchHLE_dylibs").join(name);
-    if cache.is_file() {
-        return std::fs::File::open(&cache).ok();
-    }
     let zip_file = std::fs::File::open(base.join("touchHLE_dylibs.zip")).ok()?;
     let mut archive = zip::ZipArchive::new(zip_file).ok()?;
     let mut entry = archive.by_name(name).ok()?;
+    if std::fs::metadata(&cache).is_ok_and(|m| m.is_file() && m.len() == entry.size()) {
+        return std::fs::File::open(&cache).ok();
+    }
     let mut buf = Vec::new();
     entry.read_to_end(&mut buf).ok()?;
     if let Some(dir) = cache.parent() {
         std::fs::create_dir_all(dir).ok()?;
     }
-    std::fs::write(&cache, &buf).ok()?;
+    let tmp = cache.with_file_name(format!("{}.tmp{}", name, std::process::id()));
+    if std::fs::write(&tmp, &buf).is_err() || std::fs::rename(&tmp, &cache).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
     std::fs::File::open(&cache).ok()
 }
 impl std::fmt::Debug for ResourceFile {
