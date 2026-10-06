@@ -187,6 +187,15 @@ AUX_CALLSITES = (
     (0x1a3f84, "FishObject", "setFishPosition:isLeft:"),
     (0x1af8c2, "BugObject", "initwithFile:"),
     (0x35e6ac, "WashRoomActor", "initWithIndex:type:parentNode:pathType:"),
+    # [2026-10-06 第九轮 R9-B5] 升级烟花:LevelUpEffectLayer 类级保持真实宽度,但它的三个挂载点
+    # (-[LevelUpLayer displayUI] 0x13abc2、-[NewSceneLevelUp displayUI] 0x331ac4、
+    # -[CommonChristmasFatherGiftLayer showTotalReward] 0xd164)都在已右移的居中根层下,且都传特效号 1,
+    # -[LevelUpEffectLayer initAllEffect:] 0x1943b4 走 alleffect1~4,各取一次 winSize 按「宽 × 系数」撒炸点;
+    # 拿真实宽又随根层再偏 off,烟花扎堆右侧。这四处按 1024 设计宽算,炸点落回居中 4:3 升级框的原版构图。
+    (0x1940d0, "LevelUpEffectLayer", "alleffect1"),
+    (0x194194, "LevelUpEffectLayer", "alleffect2"),
+    (0x19425c, "LevelUpEffectLayer", "alleffect3"),
+    (0x19432a, "LevelUpEffectLayer", "alleffect4"),
 )
 
 # 7) 历史死条目:已验收的 UI43_CALLSITES 里有、但并不是 winSize 调用点的地址。[2026-09-16]
