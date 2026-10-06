@@ -477,6 +477,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let current = env.framework_state.uikit.ui_responder.first_responder;
     let editing = env.objc.borrow::<UITextFieldHostObject>(this).editing;
     if current == this && editing {
+        // [2026-10-06 第九轮 R9-B1] 点正在编辑的输入框:UIKit 真机会重新显示键盘。安卓返回键 / iPad 收起键是系统直接
+        // SDL_StopTextInput,不经过这里,第一响应者和 editing 都还在;以前直接 return,键盘再也弹不出来,只能关面板重开。
+        // SDL_StartTextInput 每次都会 ShowScreenKeyboard,键盘已显示时是空操作;不重发键盘通知、不改第一响应者。
+        if !crate::window::mole_text_input_active() {
+            log!("[文本输入] 再点正在编辑的输入框,重新弹出键盘");
+        }
+        env.on_parent_stack_in_coroutine(|window, _| window.start_text_input());
         return true;
     }
     if current != nil && current != this {

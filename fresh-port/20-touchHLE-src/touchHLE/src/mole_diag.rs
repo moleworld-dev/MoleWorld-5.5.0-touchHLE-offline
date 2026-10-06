@@ -471,6 +471,13 @@ pub fn next_inject() -> Option<Inject> {
             ));
             None
         }
+        // [2026-10-06 第九轮 R9-B1] `kbhide`:模拟安卓返回键 / iPad 收起键——系统直接 SDL_StopTextInput,不经过 touchHLE、
+        // 不碰文本输入标志,用来在桌面上验证窗口层的单向同步与输入框重新弹键盘。
+        Some("kbhide") => {
+            unsafe { sdl2::sys::SDL_StopTextInput() };
+            log_line("INJECT kbhide(SDL_StopTextInput)");
+            None
+        }
         Some("suspend") => {
             // [补完 2026-09-15] 缺省 3 秒;解析失败或非有限值(如 NaN/inf)按缺省处理;
             // 钳到 0–3600 秒,避免 Duration::from_secs_f32 / Instant 加法溢出 panic。

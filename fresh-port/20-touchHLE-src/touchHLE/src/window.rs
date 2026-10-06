@@ -991,6 +991,19 @@ impl Window {
         }
         self.last_polled = now;
 
+        // [2026-10-06 第九轮 R9-B1] 系统自己收起了屏幕键盘(安卓返回键 → SDLActivity DummyEdit.onKeyPreIme →
+        // onNativeKeyboardFocusLost → SDL_StopTextInput;iPad 键盘右下角收起键 → keyboardWillHide: → SDL_StopTextInput),
+        // touchHLE 不知情,文本输入标志会一直停在 true(物理 T 键被当字符、滚轮捏合被挡)。这里只做单向同步:标志为 true
+        // 而 SDL 已不在文本输入时把标志清掉。绝不能直接用 SDL_IsTextInputActive() 赋值——桌面 SDL_VideoInit 在没有屏幕
+        // 键盘时默认开着文本输入(SDL_video.c:555-556),直接赋值会让桌面标志恒为 true。输入框本身的第一响应者不动,
+        // 再点同一个框时由 -[UITextField becomeFirstResponder] 的早退分支重新 start_text_input 弹出键盘。
+        if MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            && unsafe { sdl2_sys::SDL_IsTextInputActive() } == sdl2_sys::SDL_bool::SDL_FALSE
+        {
+            MOLE_TEXT_INPUT_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            log!("[文本输入] 系统收起了键盘(返回键 / 收起键),同步清掉文本输入标志");
+        }
+
         // [2026-10-04 第八轮 R8-D4] 终端关掉(SIGHUP)、Windows 注销/关机置的退出请求,见 HOST_QUIT_REQUESTED。
         if HOST_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             log!("[生命周期] 宿主要求结束进程(终端关闭 / 注销 / 关机),按关闭窗口处理:先存档再退出");
