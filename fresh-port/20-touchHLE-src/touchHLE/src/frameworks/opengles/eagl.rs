@@ -580,6 +580,259 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     (pixel_buffer, width_u32, height_u32)
 }
 
+/// [2026-10-06] 从 present_renderbuffer 抽出:在当前上下文(游戏的 EAGL 上下文)里,保存游戏会依赖的 GL 状态
+/// (客户端数组、开关、三种矩阵、颜色、视口、清屏色、缓冲绑定与指针、混合、纹理环境),用 present_frame 把当前
+/// 绑定的 TEXTURE_2D 画到窗口默认 framebuffer,再原样恢复。调用方负责事先绑定纹理、事后换帧与恢复其它绑定。
+unsafe fn present_bound_texture_preserving_state(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    full_size: (u32, u32),
+    rotation_matrix: crate::matrix::Matrix<2>,
+    virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    window_default_fbo: GLuint,
+) {
+    let old_arrays = {
+        let mut old_arrays = [gles11::FALSE; gles1_on_gl2::ARRAYS.len()];
+        for (is_enabled, info) in old_arrays.iter_mut().zip(gles1_on_gl2::ARRAYS.iter()) {
+            gles.GetBooleanv(info.name, is_enabled);
+            gles.DisableClientState(info.name);
+        }
+        old_arrays
+    };
+    let old_capabilities = {
+        let mut old_capabilities = [gles11::FALSE; gles1_on_gl2::CAPABILITIES.len()];
+        for (is_enabled, &name) in old_capabilities
+            .iter_mut()
+            .zip(gles1_on_gl2::CAPABILITIES.iter())
+        {
+            gles.GetBooleanv(name, is_enabled);
+            gles.Disable(name);
+        }
+        old_capabilities
+    };
+    let old_matrix_mode: GLenum = get_int(gles, gles11::MATRIX_MODE) as _;
+    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
+        gles.MatrixMode(mode);
+        gles.PushMatrix();
+        gles.LoadIdentity();
+    }
+    let old_color: [GLfloat; 4] = get_floats(gles, gles11::CURRENT_COLOR);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+
+    // Back up other things that will be modified while drawing.
+    let old_viewport: (GLint, GLint, GLsizei, GLsizei) = {
+        let [x, y, width, height] = get_ints(gles, gles11::VIEWPORT);
+        (x, y, width as _, height as _)
+    };
+    let old_clear_color: [GLfloat; 4] = get_floats(gles, gles11::COLOR_CLEAR_VALUE);
+    let old_array_buffer: GLuint = get_int(gles, gles11::ARRAY_BUFFER_BINDING) as _;
+    let old_vertex_array_binding: GLuint = get_int(gles, gles11::VERTEX_ARRAY_BUFFER_BINDING) as _;
+    let old_vertex_array_size: GLint = get_int(gles, gles11::VERTEX_ARRAY_SIZE);
+    let old_vertex_array_type: GLenum = get_int(gles, gles11::VERTEX_ARRAY_TYPE) as _;
+    let old_vertex_array_stride: GLsizei = get_int(gles, gles11::VERTEX_ARRAY_STRIDE) as _;
+    let old_vertex_array_pointer = get_ptr(gles, gles11::VERTEX_ARRAY_POINTER);
+    let old_tex_coord_array_binding: GLuint =
+        get_int(gles, gles11::TEXTURE_COORD_ARRAY_BUFFER_BINDING) as _;
+    let old_tex_coord_array_size: GLint = get_int(gles, gles11::TEXTURE_COORD_ARRAY_SIZE);
+    let old_tex_coord_array_type: GLenum = get_int(gles, gles11::TEXTURE_COORD_ARRAY_TYPE) as _;
+    let old_tex_coord_array_stride: GLsizei =
+        get_int(gles, gles11::TEXTURE_COORD_ARRAY_STRIDE) as _;
+    let old_tex_coord_array_pointer = get_ptr(gles, gles11::TEXTURE_COORD_ARRAY_POINTER);
+    let old_blend_sfactor: GLenum = get_int(gles, gles11::BLEND_SRC) as _;
+    let old_blend_dfactor: GLenum = get_int(gles, gles11::BLEND_DST) as _;
+
+    let old_tex_env_mode = get_tex_env_int(gles, gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE);
+    // if the mode is REPLACE, we don't have to reset the other texture
+    // environment values
+    let tex_env_mode_arr = [gles11::REPLACE; 1];
+    gles.TexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        tex_env_mode_arr.as_ptr().cast(),
+    );
+
+    // Draw the quad
+    log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
+    present_frame(gles, viewport, full_size, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
+
+    // [MoleWorld iOS · 性能] 不再每帧删除 present 纹理——它被 PRESENT_TEX 缓存下来供下一帧复用
+    // (尺寸变化或上下文重建时会在上面重建)。这样每帧省掉一次驱动侧的纹理分配+释放。
+
+    // Restore all the state saved before rendering
+    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
+        match is_enabled {
+            gles11::TRUE => gles.EnableClientState(info.name),
+            gles11::FALSE => gles.DisableClientState(info.name),
+            _ => unreachable!(),
+        }
+    }
+    for (&is_enabled, &name) in old_capabilities
+        .iter()
+        .zip(gles1_on_gl2::CAPABILITIES.iter())
+    {
+        match is_enabled {
+            gles11::TRUE => gles.Enable(name),
+            gles11::FALSE => gles.Disable(name),
+            _ => unreachable!(),
+        }
+    }
+    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
+        gles.MatrixMode(mode);
+        gles.PopMatrix();
+    }
+    gles.MatrixMode(old_matrix_mode);
+    gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
+    gles.Viewport(
+        old_viewport.0,
+        old_viewport.1,
+        old_viewport.2,
+        old_viewport.3,
+    );
+    gles.ClearColor(
+        old_clear_color[0],
+        old_clear_color[1],
+        old_clear_color[2],
+        old_clear_color[3],
+    );
+    // GL_ARRAY_BUFFER is implicitly used by the Pointer functions but is also
+    // an independent binding.
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_vertex_array_binding);
+    gles.VertexPointer(
+        old_vertex_array_size,
+        old_vertex_array_type,
+        old_vertex_array_stride,
+        old_vertex_array_pointer,
+    );
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_tex_coord_array_binding);
+    gles.TexCoordPointer(
+        old_tex_coord_array_size,
+        old_tex_coord_array_type,
+        old_tex_coord_array_stride,
+        old_tex_coord_array_pointer,
+    );
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer);
+    gles.BlendFunc(old_blend_sfactor, old_blend_dfactor);
+
+    let old_tex_env_mode_arr = [old_tex_env_mode; 1];
+    gles.TexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        old_tex_env_mode_arr.as_ptr().cast(),
+    );
+}
+
+/// [2026-10-06] iOS:把合成器画好的整屏画布送进【游戏 EAGL 上下文的视图】里呈现。
+/// 根因:iOS 版 SDL 每个 GL 上下文各有一个视图,UIKit_GL_MakeCurrent([context.sdlView setSDLWindow:])
+/// 把当前上下文的视图挂到窗口上。合成器在自己的内部上下文里画好(弹框、输入框等 UIKit 覆盖层都在里面)、换帧,
+/// 但游戏下一帧切回自己的上下文(慢路径每帧都要读游戏 renderbuffer),SDL 又把游戏上下文的视图挂回去——那个视图
+/// 停在覆盖层出现前快速路径的最后一帧,于是屏幕定格、覆盖层永远看不到(iPad 模拟器:合成画布读回中心是弹框深蓝,
+/// 屏幕两帧差异 0)。内部上下文与游戏上下文不共享纹理(游戏上下文用 initWithAPI: 单独创建),所以由调用方把画布
+/// 像素读回,这里在游戏上下文里上传到一张专用纹理(COMPOSITE_TEX,跨帧复用),照快速路径的做法画到视图、绑回视图
+/// renderbuffer、换帧、恢复游戏的绑定。只在有覆盖层(慢路径)时走,慢路径本来每帧也要读回一次游戏画面。
+/// 返回 false = 当前线程没有游戏上下文,调用方退回原来的内部上下文呈现。
+#[cfg(target_os = "ios")]
+pub(crate) unsafe fn present_composited_pixels_in_guest_view(
+    env: &mut Environment,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    rotation_matrix: crate::matrix::Matrix<2>,
+) -> bool {
+    thread_local! {
+        static COMPOSITE_TEX: std::cell::Cell<(GLuint, u32, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+    }
+    if env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+        .is_none()
+    {
+        return false;
+    }
+    let viewport = env.window.as_mut().unwrap().viewport();
+    let full_size = env.window.as_ref().unwrap().drawable_size();
+    let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    let window_default_fbo = env.window.as_ref().unwrap().default_framebuffer();
+    let window_default_rbo = env.window.as_ref().unwrap().default_renderbuffer();
+
+    let gles_ctx = super::get_thread_context(
+        &mut env.framework_state.opengles,
+        &mut env.objc,
+        env.current_thread,
+    );
+    let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
+    let gles = gles_boxed.as_mut();
+    let renderbuffer: GLuint = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as _;
+    let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
+    let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
+    let old_unpack_alignment: GLint = get_int(gles, gles11::UNPACK_ALIGNMENT);
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 4);
+
+    let (mut texture, cached_w, cached_h) = COMPOSITE_TEX.with(|c| c.get());
+    let reusable = texture != 0
+        && cached_w == width
+        && cached_h == height
+        && gles.IsTexture(texture) == gles11::TRUE;
+    if reusable {
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.TexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
+            width as _,
+            height as _,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr() as *const _,
+        );
+    } else {
+        if texture != 0 && gles.IsTexture(texture) == gles11::TRUE {
+            gles.DeleteTextures(1, &texture);
+        }
+        texture = 0;
+        gles.GenTextures(1, &mut texture);
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.TexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGBA as _,
+            width as _,
+            height as _,
+            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            pixels.as_ptr() as *const _,
+        );
+        // NPOT 画布:iOS 原生 GLES1 只有 CLAMP_TO_EDGE + 非 mipmap 过滤时才完整,否则采样成纯白。
+        gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as _);
+        gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_MAG_FILTER, gles11::LINEAR as _);
+        gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE as _);
+        gles.TexParameteri(gles11::TEXTURE_2D, gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE as _);
+        COMPOSITE_TEX.with(|c| c.set((texture, width, height)));
+    }
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, old_unpack_alignment);
+    log_once!("[合成] iOS:合成画布改在游戏上下文的视图里呈现(弹框、输入框等覆盖层可见)");
+    present_bound_texture_preserving_state(
+        gles,
+        viewport,
+        full_size,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        window_default_fbo,
+    );
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
+    std::mem::drop(gles_boxed);
+    env.window.as_ref().unwrap().swap_window();
+    let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
+    let gles = gles_boxed.as_mut();
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
+    gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+    true
+}
+
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
@@ -753,133 +1006,15 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     // going to draw. Back up the old state while doing so, so it can be
     // restored later. The app's subsequent drawing will be messed up if we
     // don't restore it.
-    let old_arrays = {
-        let mut old_arrays = [gles11::FALSE; gles1_on_gl2::ARRAYS.len()];
-        for (is_enabled, info) in old_arrays.iter_mut().zip(gles1_on_gl2::ARRAYS.iter()) {
-            gles.GetBooleanv(info.name, is_enabled);
-            gles.DisableClientState(info.name);
-        }
-        old_arrays
-    };
-    let old_capabilities = {
-        let mut old_capabilities = [gles11::FALSE; gles1_on_gl2::CAPABILITIES.len()];
-        for (is_enabled, &name) in old_capabilities
-            .iter_mut()
-            .zip(gles1_on_gl2::CAPABILITIES.iter())
-        {
-            gles.GetBooleanv(name, is_enabled);
-            gles.Disable(name);
-        }
-        old_capabilities
-    };
-    let old_matrix_mode: GLenum = get_int(gles, gles11::MATRIX_MODE) as _;
-    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
-        gles.MatrixMode(mode);
-        gles.PushMatrix();
-        gles.LoadIdentity();
-    }
-    let old_color: [GLfloat; 4] = get_floats(gles, gles11::CURRENT_COLOR);
-    gles.Color4f(1.0, 1.0, 1.0, 1.0);
-
-    // Back up other things that will be modified while drawing.
-    let old_viewport: (GLint, GLint, GLsizei, GLsizei) = {
-        let [x, y, width, height] = get_ints(gles, gles11::VIEWPORT);
-        (x, y, width as _, height as _)
-    };
-    let old_clear_color: [GLfloat; 4] = get_floats(gles, gles11::COLOR_CLEAR_VALUE);
-    let old_array_buffer: GLuint = get_int(gles, gles11::ARRAY_BUFFER_BINDING) as _;
-    let old_vertex_array_binding: GLuint = get_int(gles, gles11::VERTEX_ARRAY_BUFFER_BINDING) as _;
-    let old_vertex_array_size: GLint = get_int(gles, gles11::VERTEX_ARRAY_SIZE);
-    let old_vertex_array_type: GLenum = get_int(gles, gles11::VERTEX_ARRAY_TYPE) as _;
-    let old_vertex_array_stride: GLsizei = get_int(gles, gles11::VERTEX_ARRAY_STRIDE) as _;
-    let old_vertex_array_pointer = get_ptr(gles, gles11::VERTEX_ARRAY_POINTER);
-    let old_tex_coord_array_binding: GLuint =
-        get_int(gles, gles11::TEXTURE_COORD_ARRAY_BUFFER_BINDING) as _;
-    let old_tex_coord_array_size: GLint = get_int(gles, gles11::TEXTURE_COORD_ARRAY_SIZE);
-    let old_tex_coord_array_type: GLenum = get_int(gles, gles11::TEXTURE_COORD_ARRAY_TYPE) as _;
-    let old_tex_coord_array_stride: GLsizei =
-        get_int(gles, gles11::TEXTURE_COORD_ARRAY_STRIDE) as _;
-    let old_tex_coord_array_pointer = get_ptr(gles, gles11::TEXTURE_COORD_ARRAY_POINTER);
-    let old_blend_sfactor: GLenum = get_int(gles, gles11::BLEND_SRC) as _;
-    let old_blend_dfactor: GLenum = get_int(gles, gles11::BLEND_DST) as _;
-
-    let old_tex_env_mode = get_tex_env_int(gles, gles11::TEXTURE_ENV, gles11::TEXTURE_ENV_MODE);
-    // if the mode is REPLACE, we don't have to reset the other texture
-    // environment values
-    let tex_env_mode_arr = [gles11::REPLACE; 1];
-    gles.TexEnviv(
-        gles11::TEXTURE_ENV,
-        gles11::TEXTURE_ENV_MODE,
-        tex_env_mode_arr.as_ptr().cast(),
-    );
-
-    // Draw the quad
-    log_once!("[appframe] 首次 EAGL present_renderbuffer → present_frame(app 自身渲染首帧;已绑默认 VAO 的 EAGL 上下文)");
-    present_frame(gles, viewport, full_size, rotation_matrix, virtual_cursor_visible_at, window_default_fbo);
-
-    // [MoleWorld iOS · 性能] 不再每帧删除 present 纹理——它被 PRESENT_TEX 缓存下来供下一帧复用
-    // (尺寸变化或上下文重建时会在上面重建)。这样每帧省掉一次驱动侧的纹理分配+释放。
-
-    // Restore all the state saved before rendering
-    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
-        match is_enabled {
-            gles11::TRUE => gles.EnableClientState(info.name),
-            gles11::FALSE => gles.DisableClientState(info.name),
-            _ => unreachable!(),
-        }
-    }
-    for (&is_enabled, &name) in old_capabilities
-        .iter()
-        .zip(gles1_on_gl2::CAPABILITIES.iter())
-    {
-        match is_enabled {
-            gles11::TRUE => gles.Enable(name),
-            gles11::FALSE => gles.Disable(name),
-            _ => unreachable!(),
-        }
-    }
-    for mode in [gles11::MODELVIEW, gles11::PROJECTION, gles11::TEXTURE] {
-        gles.MatrixMode(mode);
-        gles.PopMatrix();
-    }
-    gles.MatrixMode(old_matrix_mode);
-    gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
-    gles.Viewport(
-        old_viewport.0,
-        old_viewport.1,
-        old_viewport.2,
-        old_viewport.3,
-    );
-    gles.ClearColor(
-        old_clear_color[0],
-        old_clear_color[1],
-        old_clear_color[2],
-        old_clear_color[3],
-    );
-    // GL_ARRAY_BUFFER is implicitly used by the Pointer functions but is also
-    // an independent binding.
-    gles.BindBuffer(gles11::ARRAY_BUFFER, old_vertex_array_binding);
-    gles.VertexPointer(
-        old_vertex_array_size,
-        old_vertex_array_type,
-        old_vertex_array_stride,
-        old_vertex_array_pointer,
-    );
-    gles.BindBuffer(gles11::ARRAY_BUFFER, old_tex_coord_array_binding);
-    gles.TexCoordPointer(
-        old_tex_coord_array_size,
-        old_tex_coord_array_type,
-        old_tex_coord_array_stride,
-        old_tex_coord_array_pointer,
-    );
-    gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer);
-    gles.BlendFunc(old_blend_sfactor, old_blend_dfactor);
-
-    let old_tex_env_mode_arr = [old_tex_env_mode; 1];
-    gles.TexEnviv(
-        gles11::TEXTURE_ENV,
-        gles11::TEXTURE_ENV_MODE,
-        old_tex_env_mode_arr.as_ptr().cast(),
+    // [2026-10-06] 保存游戏 GL 状态 → 画当前绑定的 TEXTURE_2D → 恢复,抽成 present_bound_texture_preserving_state,
+    // 合成路径在 iOS 上也用它(见 present_composited_pixels_in_guest_view)。
+    present_bound_texture_preserving_state(
+        gles,
+        viewport,
+        full_size,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        window_default_fbo,
     );
 
     // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER:SDL 的 presentRenderbuffer

@@ -10,6 +10,9 @@
 //! topic.
 
 mod eagl;
+// [2026-10-06] 合成器在 iOS 上借游戏上下文的视图呈现画布(见 eagl::present_composited_pixels_in_guest_view)。
+#[cfg(target_os = "ios")]
+pub(crate) use eagl::present_composited_pixels_in_guest_view;
 pub(crate) mod gles_guest;
 
 use touchHLE_gl_bindings::gles11::types::GLenum;
