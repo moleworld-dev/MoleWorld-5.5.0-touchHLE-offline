@@ -256,20 +256,27 @@ const FINGER_MOTION: u32 = sdl2::sys::SDL_EventType::SDL_FINGERMOTION as u32;
 const FINGER_UP: u32 = sdl2::sys::SDL_EventType::SDL_FINGERUP as u32;
 
 /// [2026-10-05 第九轮] fdrag/fpinch 用:把 (事件类型, 手指号, 归一化 x, 归一化 y) 序列推进 SDL 事件队列。
-/// pair_same_ts = true 时,同类型、相邻两条(两指同一步)共用一个时间戳,窗口层会把它们合并成同一帧的两指事件;
-/// 其余每条一个新时间戳,保证按顺序逐条翻译、不会被误合并。rust-sdl2 的 push_event 不支持手指事件
-/// (event.rs to_ll 对 Finger* 返回 None),所以直接调 SDL_PushEvent;它是线程安全的。只在注入通道打开时可达。
+/// 注意 SDL_PushEvent 会把时间戳改写成推送时刻的 SDL_GetTicks()(毫秒),所以时间戳靠真实间隔来区分:
+/// 每条之间睡 3 毫秒(下一步/下一类事件,窗口层不会把它们误当成同一帧);pair_same_ts = true 时同类、相邻两条
+/// (两指同一步)紧挨着推、共用同一毫秒;为 false 时两指之间睡 2 毫秒,模拟安卓逐指上报跨毫秒。
+/// rust-sdl2 的 push_event 不支持手指事件(event.rs to_ll 对 Finger* 返回 None),所以直接调 SDL_PushEvent;
+/// 它是线程安全的。只在注入通道打开时可达;整串最多睡约 1 秒(240 步),只用于测试。
 fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool) {
-    let base = unsafe { sdl2::sys::SDL_GetTicks() };
-    let mut ts = base;
     for (i, &(type_, finger, x, y)) in seq.iter().enumerate() {
-        let share = pair_same_ts && i > 0 && seq[i - 1].0 == type_ && seq[i - 1].1 != finger;
-        if !share {
-            ts += 1;
+        if i > 0 {
+            let pair = seq[i - 1].0 == type_ && seq[i - 1].1 != finger;
+            let gap_ms = match (pair, pair_same_ts) {
+                (true, true) => 0,
+                (true, false) => 2,
+                (false, _) => 3,
+            };
+            if gap_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            }
         }
         let ev = sdl2::sys::SDL_TouchFingerEvent {
             type_,
-            timestamp: ts,
+            timestamp: 0, // SDL_PushEvent 会改写
             // 与真机设备号、SDL_MOUSE_TOUCHID(-1)都不冲突的测试设备号。
             touchId: 0x4d4f4c45,
             fingerId: finger,
@@ -441,7 +448,7 @@ pub fn next_inject() -> Option<Inject> {
         }
         // [2026-10-05 第九轮] `fpinch <ncx> <ncy> <起始间距> <结束间距> [步数] [split]`:两根原始手指(0/1)以归一化
         // (ncx,ncy) 为中点、沿画面水平方向对称,间距(归一化宽度)线性变化。split=1 时同一步两根手指的移动用不同
-        // 时间戳(模拟安卓逐指上报、窗口层无法合并成同一帧),缺省 0 = 同一时间戳。
+        // 时间戳(两指之间真实间隔 2 毫秒,模拟安卓逐指上报跨毫秒),缺省 0 = 同一毫秒。
         Some("fpinch") => {
             let cx: f32 = it.next()?.parse().ok()?;
             let cy: f32 = it.next()?.parse().ok()?;
