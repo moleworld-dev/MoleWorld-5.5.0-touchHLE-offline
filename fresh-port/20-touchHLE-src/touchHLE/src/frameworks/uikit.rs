@@ -178,6 +178,8 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     // [扫描修 2026-09-15] F12-1:队首系统弹框还没挂上就在这里挂到 keyWindow
     // (show 时只入队;keyWindow 未建好 / 作弊菜单开着时下一轮再试)。
     ui_view::ui_alert_view::pump(env);
+    // [MoleWorld iOS] 后台期间收到的低内存警告回到前台后补发(见 ui_application::handle_memory_warning)。
+    ui_application::deliver_pending_memory_warning(env);
 
     // [MoleWorld DIAG] Inject a synthetic tap from /tmp/mole_input so the game
     // can be driven without host input (the window is on its own macOS Space and

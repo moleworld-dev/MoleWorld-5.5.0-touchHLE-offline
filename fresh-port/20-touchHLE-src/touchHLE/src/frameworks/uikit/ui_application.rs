@@ -798,6 +798,13 @@ pub(super) fn handle_memory_warning(env: &mut Environment) {
     if env.is_app_picker {
         return;
     }
+    // [MoleWorld iOS] 真后台里不碰 GPU(iOS 会杀掉在后台动 GPU 的应用),而原版回调会 removeUnusedTextures
+    // 删 GL 纹理:记下来,回到前台后由 deliver_pending_memory_warning 补发。
+    if env.window.as_ref().map_or(false, |w| w.is_backgrounded()) {
+        MEMORY_WARNING_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        log!("[生命周期] 低内存警告:应用在后台,回到前台后再转发给游戏");
+        return;
+    }
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
     if ui_application == nil {
         log!("[生命周期] 低内存警告:UIApplication 尚未创建,忽略");
@@ -817,6 +824,21 @@ pub(super) fn handle_memory_warning(env: &mut Environment) {
     let notif_name = get_static_str(env, UIApplicationDidReceiveMemoryWarningNotification);
     () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
     let _: () = msg![env; pool drain];
+}
+
+/// [MoleWorld iOS] 后台期间收到、还没转发的低内存警告(见 handle_memory_warning)。
+static MEMORY_WARNING_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [MoleWorld iOS] 回到前台后补发后台期间收到的低内存警告。handle_events 每轮先调它,平时只是一次原子读。
+pub(super) fn deliver_pending_memory_warning(env: &mut Environment) {
+    if !MEMORY_WARNING_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+        || env.window.as_ref().map_or(false, |w| w.is_backgrounded())
+    {
+        return;
+    }
+    MEMORY_WARNING_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    log!("[生命周期] 已回到前台:补发后台期间的低内存警告");
+    handle_memory_warning(env);
 }
 
 /// [扫描修 2026-09-15] F12-3:桌面窗口从最小化还原(`Event::WindowRestored`)。
