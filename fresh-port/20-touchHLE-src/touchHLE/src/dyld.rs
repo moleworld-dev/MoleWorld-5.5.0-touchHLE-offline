@@ -26,7 +26,19 @@ use crate::abi::{CallFromGuest, GuestFunction};
 /// No-op host function used to make calls to unimplemented guest functions
 /// non-fatal (MoleWorld offline port). Defined at module scope so its address is
 /// genuinely `'static` and doesn't entangle the borrow inference of callers.
-fn unimplemented_func_noop(_env: &mut Environment) {}
+///
+/// [2026-10-05 第九轮 R9-A1] 返回前把 r0/r1 清零,让日志里的「returns 0」成真。原来什么都不写,
+/// 调用方拿到的是调用前的 r0:InMobi 的 -[IMNiceParamsMgr collectNiceParams] 在 0x4497da `movs r0,#5`
+/// 后调 CNCopySupportedInterfaces,空桩「返回」5,0x4497e8 的判空没拦住,当成接口数组去读
+/// kCNNetworkInfoKeySSID(未绑定的非懒加载槽 = 0)→ 0x449824 读 0 地址崩溃。新号第一次切后台回前台
+/// 时 InMobi 就会在后台线程跑这条,整个游戏闪退。返回 NULL 正是真机没连 Wi-Fi 时的原版分支
+/// (跳到 0x4499e6 跳过 Wi-Fi 采集)。r0/r1 按 AAPCS 本就是调用方不保留的寄存器,对返回 void 的
+/// 函数(如 SCNetworkReachabilityUnscheduleFromRunLoop)清零没有影响。
+fn unimplemented_func_noop(env: &mut Environment) {
+    let regs = env.cpu.regs_mut();
+    regs[0] = 0;
+    regs[1] = 0;
+}
 static UNIMPLEMENTED_FUNC_NOOP: fn(&mut Environment) = unimplemented_func_noop;
 use crate::cpu::Cpu;
 use crate::frameworks::foundation::ns_string;
