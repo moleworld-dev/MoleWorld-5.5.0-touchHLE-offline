@@ -228,17 +228,44 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
 /// Tell SDL2 what orientation we want. Only useful on Android.
 fn set_sdl2_orientation(orientation: DeviceOrientation) {
     // Despite the name, this hint works on Android too.
-    sdl2::hint::set(
-        "SDL_IOS_ORIENTATIONS",
-        match orientation {
-            DeviceOrientation::Portrait => "Portrait",
-            // The inversion is deliberate. These probably correspond to
-            // iPhone OS content orientations?
-            DeviceOrientation::PortraitUpsideDown => "PortraitUpsideDown",
-            DeviceOrientation::LandscapeLeft => "LandscapeRight",
-            DeviceOrientation::LandscapeRight => "LandscapeLeft",
-        },
-    );
+    let hint = match orientation {
+        DeviceOrientation::Portrait => "Portrait",
+        // The inversion is deliberate. These probably correspond to
+        // iPhone OS content orientations?
+        DeviceOrientation::PortraitUpsideDown => "PortraitUpsideDown",
+        DeviceOrientation::LandscapeLeft => "LandscapeRight",
+        DeviceOrientation::LandscapeRight => "LandscapeLeft",
+    };
+    sdl2::hint::set("SDL_IOS_ORIENTATIONS", hint);
+}
+
+/// [2026-10-06 第九轮 R9-B2] 安卓加速度 → 原版 iPad 的 UIAcceleration 机身坐标(x 沿竖屏短边、y 沿竖屏长边)。
+/// SDL 传感器(SDL_androidsensor.c:168-178)原样交出 ASensorEvent.data,轴以【设备自然方向】为准,不按屏幕旋转。
+/// 自然竖屏的手机:原始轴就是竖屏机身坐标,与 iPad 一致,原样用(现状)。自然横屏的平板(多数三星 Tab、联想平板):
+/// 原始 x 沿长边,差 90°。换算口径:平板在游戏的主横屏方向(REVERSE_LANDSCAPE,旋转码 180)时,要和手机在同一方向
+/// (旋转码 270)给出同样的值。按 SDLSurface.onSensorChanged 的屏幕坐标规则 M(r)(90°:(-y,x),180°:(-x,-y),
+/// 270°:(y,-x)),guest = M(270)⁻¹·M(180)·raw = (raw_y, -raw_x)。用户拍板「照原版」:固定按机身换算,手机/平板翻转 180°
+/// 后倾斜方向跟原版 iPad、我们的 iOS 版一样反过来,不跟画面走。
+/// `rotation`:当前显示旋转码(0/90/180/270,来自 SDL_GetDisplayOrientation;安卓上它把旋转 0 一律叫 PORTRAIT,
+/// 只当旋转码用)。窗口永远是横屏,所以旋转码 0/180 = 设备自然方向是横屏;None(拿不到)按原样。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn android_accel_to_ipad_body(x: f32, y: f32, rotation: Option<u32>) -> (f32, f32) {
+    match rotation {
+        Some(0) | Some(180) => (y, -x),
+        _ => (x, y),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_display_rotation() -> Option<u32> {
+    use sdl2_sys::SDL_DisplayOrientation as O;
+    match unsafe { sdl2_sys::SDL_GetDisplayOrientation(0) } {
+        O::SDL_ORIENTATION_PORTRAIT => Some(0),
+        O::SDL_ORIENTATION_LANDSCAPE => Some(90),
+        O::SDL_ORIENTATION_PORTRAIT_FLIPPED => Some(180),
+        O::SDL_ORIENTATION_LANDSCAPE_FLIPPED => Some(270),
+        _ => None,
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -2116,6 +2143,26 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
+                // [2026-10-06 第九轮 R9-B2] 自然横屏的安卓平板换算到 iPad 机身坐标(见 android_accel_to_ipad_body)。
+                #[cfg(target_os = "android")]
+                let (x, y) = {
+                    let rotation = android_display_rotation();
+                    static LOGGED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(u32::MAX);
+                    let code = rotation.unwrap_or(999);
+                    if LOGGED.swap(code, std::sync::atomic::Ordering::Relaxed) != code {
+                        log!(
+                            "[重力] 显示旋转码 {:?}:{}",
+                            rotation,
+                            if matches!(rotation, Some(0) | Some(180)) {
+                                "设备自然方向是横屏,加速度按 iPad 竖屏机身坐标换算 (y, -x)"
+                            } else {
+                                "设备自然方向是竖屏,原始轴即机身坐标,原样使用"
+                            }
+                        );
+                    }
+                    android_accel_to_ipad_body(x, y, rotation)
+                };
                 return (x, y, z);
             }
         }
@@ -2860,4 +2907,34 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
             .filter_map(|loc| loc.country)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod accel_remap_tests {
+    use super::android_accel_to_ipad_body as remap;
+
+    #[test]
+    fn natural_portrait_phone_unchanged() {
+        // 自然竖屏手机在横屏窗口里旋转码是 90/270,原样(与改动前一致)。
+        assert_eq!(remap(0.3, -0.7, Some(270)), (0.3, -0.7));
+        assert_eq!(remap(0.3, -0.7, Some(90)), (0.3, -0.7));
+        assert_eq!(remap(0.3, -0.7, None), (0.3, -0.7));
+    }
+
+    #[test]
+    fn natural_landscape_tablet_rotated() {
+        // 自然横屏平板(旋转码 0/180):M(270)⁻¹·M(180)·raw = (y, -x),翻转 180° 后同一机身换算不变(照原版)。
+        assert_eq!(remap(0.3, -0.7, Some(180)), (-0.7, -0.3));
+        assert_eq!(remap(0.3, -0.7, Some(0)), (-0.7, -0.3));
+    }
+
+    #[test]
+    fn tablet_matches_phone_in_same_screen_orientation() {
+        // 同一个「屏幕坐标系里的重力」(sx, sy):手机 r=270 时 raw = M(270)⁻¹·S = (-sy, sx);
+        // 平板 r=180 时 raw = M(180)⁻¹·S = (-sx, -sy)。两者换算后应相同。
+        let (sx, sy) = (0.25_f32, 0.6_f32);
+        let phone = remap(-sy, sx, Some(270));
+        let tablet = remap(-sx, -sy, Some(180));
+        assert_eq!(phone, tablet);
+    }
 }
