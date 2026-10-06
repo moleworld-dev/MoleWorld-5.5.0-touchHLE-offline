@@ -122,8 +122,6 @@ impl ObjC {
                 "render",
                 // 每帧 drawScene 入口复位头像重建预算(anim_render_reset_frame_budget)。
                 "drawScene",
-                // [P0 返回主村空村] 保护"地图数据字典"不被原地清空(见 messages.rs 的 removeAllObjects 钩子)。
-                "removeAllObjects",
                 "showNetWorkError",
                 // [合并注 2026-09-24] main 的 F1-05(2026-09-16)删掉了钩子块里 -[UserInfoData initWithCoder:] 贝壳还原臂
                 // 与 LogoLayer 四个标题页按钮(onMenuKefu/ChangeAccount/ChangePlayer/VersionInfo)删档臂,这里同步去掉
