@@ -339,7 +339,98 @@ fn mouse_drag_slop() -> f32 {
     })
 }
 
-/// [2026-09-24 第四轮 K15 I1-8] 鼠标左键一次按下的起拖状态(只用于 FingerId::Mouse)。
+/// [2026-10-05 第九轮 R9-B8] 触屏手指的一次性起拖阈值(guest 点),默认与鼠标相同 8 点。
+/// 根因同上(-[ObjSelector touchMove:]@0x4b270 无阈值置 isMoved,touchEnd: 0x4b2c8 见到就不处理点击)。
+/// 第四轮只给鼠标加了阈值,触屏手指保持零容差;但安卓触屏按下到抬起之间几乎必然有几像素抖动,
+/// 4:3 下 1 个 guest 点只有约 1.4 物理像素(1080 高的屏),坐标取整到点后照样发出 TouchesMove,
+/// 于是村里点建筑/作物/摩尔大多被吞掉(HUD 的 CCMenu 按钮不受影响)——玩家反馈的「点不动」。
+/// 桌面注入「按下→移动 1 点→抬起」点房子实测面板不弹,原地点击才弹。
+/// 只对单指生效:同时按下两根及以上手指时全部立即放行(捏合缩放照原样逐帧下发)。
+/// 环境变量 MOLE_TOUCH_DRAG_SLOP 可改阈值(点),0 = 关闭(恢复为任何移动都下发)。
+const TOUCH_DRAG_SLOP_DEFAULT: f32 = 8.0;
+fn touch_drag_slop() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_TOUCH_DRAG_SLOP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOUCH_DRAG_SLOP_DEFAULT)
+    })
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
+/// (多指手势不抑制移动、抬起也按真实坐标上报)。同一手指号重复按下(漏了抬起)直接覆盖。
+fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<FingerId, Coords>) {
+    for (finger, &coords) in map {
+        if let FingerId::Touch(id) = *finger {
+            state.insert(
+                id,
+                MouseDragState {
+                    down: coords,
+                    broke: false,
+                },
+            );
+        }
+    }
+    if state.len() > 1 {
+        for drag in state.values_mut() {
+            drag.broke = true;
+        }
+    }
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指移动:还没越过阈值、离按下点不足阈值的手指从本次事件里去掉
+/// (不更新按下点);越过时把本帧真实坐标作为第一个移动下发(ui_touch 的上一位置仍是按下点,位移不丢)。
+/// 返回 false = 本次事件里的手指全被抑制,不入队。没有记录的手指(例如挂起前按下)原样下发。
+fn touch_slop_move(
+    state: &mut HashMap<i64, MouseDragState>,
+    map: &mut HashMap<FingerId, Coords>,
+) -> bool {
+    let slop = touch_drag_slop();
+    map.retain(|finger, coords| {
+        let FingerId::Touch(id) = *finger else {
+            return true;
+        };
+        let Some(drag) = state.get_mut(&id) else {
+            return true;
+        };
+        if drag.broke {
+            return true;
+        }
+        let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
+        if (dx * dx + dy * dy).sqrt() < slop {
+            return false;
+        }
+        drag.broke = true;
+        log_dbg!(
+            "[触屏起拖] 手指 {} 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
+            id,
+            slop,
+            drag.down,
+            coords
+        );
+        true
+    });
+    !map.is_empty()
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指抬起:没越过阈值(游戏一个移动也没收到)的手指按【按下点】上报,
+/// 游戏看到的是原地点击,与鼠标 K15 的处理一致;越过的按真实坐标。
+fn touch_slop_up(state: &mut HashMap<i64, MouseDragState>, map: &mut HashMap<FingerId, Coords>) {
+    for (finger, coords) in map.iter_mut() {
+        if let FingerId::Touch(id) = *finger {
+            if let Some(drag) = state.remove(&id) {
+                if !drag.broke {
+                    *coords = drag.down;
+                }
+            }
+        }
+    }
+}
+
+/// [2026-09-24 第四轮 K15 I1-8] 鼠标左键一次按下的起拖状态(只用于 FingerId::Mouse;
+/// 第九轮 R9-B8 起也用于触屏手指,见 touch_slop_down)。
 struct MouseDragState {
     /// 按下点(transform_input_coords 之后的 guest 整数点,与发给游戏的 TouchesDown 坐标相同)。
     down: Coords,
@@ -607,6 +698,8 @@ pub struct Window {
     /// [2026-09-24 第四轮 K15 I1-8] 鼠标左键本次按下的起拖状态;None = 没有在跟踪的按下
     /// (此时左键移动按原样下发)。见 [MouseDragState]、mouse_drag_slop。
     mouse_drag: Option<MouseDragState>,
+    /// [2026-10-05 第九轮 R9-B8] 触屏各手指(SDL 手指号)本次按下的起拖状态。见 touch_drag_slop。
+    touch_drag: HashMap<i64, MouseDragState>,
     /// [扫描修 2026-09-15] F12-3:上一次发出的窗口最小化状态,用来给 WindowMinimized/WindowRestored 去重。
     window_minimized: bool,
     /// Whether or not we are on the "main" environment stack (rather than
@@ -834,6 +927,7 @@ impl Window {
             pinch: None,
             mouse_left_down: false,
             mouse_drag: None,
+            touch_drag: HashMap::new(),
             window_minimized: false,
             on_main_stack: true,
         };
@@ -1283,6 +1377,8 @@ impl Window {
                     ..
                 } => {
                     self.mouse_drag = None;
+                    // [2026-10-05 第九轮 R9-B8] 触屏起拖状态同理清掉:之后仍按着的手指移动/抬起按原样下发。
+                    self.touch_drag.clear();
                     continue;
                 }
                 _ => {}
@@ -1608,10 +1704,22 @@ impl Window {
                         }
                     }
                     log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
+                    // [2026-10-05 第九轮 R9-B8] 单指起拖阈值(见 touch_drag_slop)。
                     match event {
-                        E::FingerUp { .. } => Event::TouchesUp(map),
-                        E::FingerMotion { .. } => Event::TouchesMove(map),
-                        E::FingerDown { .. } => Event::TouchesDown(map),
+                        E::FingerUp { .. } => {
+                            touch_slop_up(&mut self.touch_drag, &mut map);
+                            Event::TouchesUp(map)
+                        }
+                        E::FingerMotion { .. } => {
+                            if !touch_slop_move(&mut self.touch_drag, &mut map) {
+                                continue;
+                            }
+                            Event::TouchesMove(map)
+                        }
+                        E::FingerDown { .. } => {
+                            touch_slop_down(&mut self.touch_drag, &map);
+                            Event::TouchesDown(map)
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1724,6 +1832,8 @@ impl Window {
         // [2026-09-24 第四轮 K15 I1-8] 游戏里的鼠标手指由调用方随后的 cancel_tracked_touches 以取消结束,
         // 窗口侧的起拖状态在这里一并清掉(回来后第一次按下重新开始判定)。
         self.mouse_drag = None;
+        // [2026-10-05 第九轮 R9-B8] 触屏手指的起拖状态一并清掉(游戏里仍按着的手指由 cancel_tracked_touches 取消)。
+        self.touch_drag.clear();
         self.dpad_state.left = false;
         self.dpad_state.right = false;
         self.dpad_state.up = false;
