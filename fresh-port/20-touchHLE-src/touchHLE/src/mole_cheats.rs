@@ -7519,13 +7519,10 @@ fn mapextend_in_bottom_band(line: i32, col: i32) -> bool {
         && line >= if col & 1 == 0 { 26 } else { 27 }
 }
 
-/// 本移植的存档沙盒宿主目录:与 `Fs::new`(fs.rs 556~559)同构,
-/// `user_data_base_path()/touchHLE_sandbox/<bundle id>/Documents`。
+/// 本移植的存档沙盒宿主目录:与 `Fs::new` 同源(paths::sandbox_dir),单机 `<沙盒>/com.taomee.MoleWorld/Documents`,
+/// 联机 `<沙盒>/com.taomee.MoleWorld-online/Documents`——两边的存档修改时间与一次性对账标记各管各的。
 fn mapextend_save_dir() -> std::path::PathBuf {
-    crate::paths::user_data_base_path()
-        .join(crate::paths::SANDBOX_DIR)
-        .join("com.taomee.MoleWorld")
-        .join("Documents")
+    crate::paths::sandbox_dir("com.taomee.MoleWorld").join("Documents")
 }
 
 /// 带病 getter(对所有调用者强返 0x1F)的生效起点:启动时存档修改时间不早于此刻的存档才可能被污染。按平台分开:
@@ -8381,6 +8378,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "SharedInterfaceLayer"
             // [扫描修 2026-09-15] F12-10 左左右右(沙滩WC)开始前一次性操作提示
             | "WashRoomLevelChoose"
+            // [2026-10-05] 账号菜单模式:菜单没打开时不显示后台自动登录的通行证超时框(show 时按正文判断)
+            | "UIAlertView"
     ) || matches!(
         sel,
         "drawScene"
@@ -8417,6 +8416,11 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "sendAllBuffDataInNewSceneLoading"
             | "generateRandomRewardId"
             | "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:"
+            // [2026-10-05 官网账号中心] 原版账号菜单的改密 / 找回 / 申请米米号按钮(接收者是 TMA 系视图类,不在 CLASSES)
+            | "passwordModButtonSelected"
+            | "passwordForgotButtonSelected"
+            | "passwordRetrieveButtonSelected"
+            | "applyIDButtonSelected"
             // [P3 商店空白真因] -[SceneMannager curSceneId]:离线进岛后常卡在过场态 2(非10),
             //   loadObjectsDataByType: 据它选数据源→返回空→建设庄园/食材店空格。在岛上强制 10。
             | "curSceneId"
@@ -9478,6 +9482,56 @@ fn show_game_message_box(
     true
 }
 
+/// 淘米通行证组件的超时提示(TMALocalizable.strings 的 REQUEST_TIME_OUT,感叹号是半角)。
+const TMA_REQUEST_TIME_OUT: &str = "请求超时，请稍后重试!";
+
+/// [2026-10-05 官网账号中心] 原版账号菜单里交给官网办的按钮 → (标题, 提示)。
+fn account_menu_web_hint(sel: &str) -> Option<(&'static str, &'static str)> {
+    match sel {
+        "passwordModButtonSelected" => Some((
+            "修改密码",
+            "游戏里不能改密码了,请到官网 moleworld.net/account 的「修改密码」里改。新密码是 6~15 位英文字母或数字,官网、2016 联机版和摩尔庄园HD 同时生效。",
+        )),
+        "passwordForgotButtonSelected" | "passwordRetrieveButtonSelected" => Some((
+            "找回密码",
+            "请到官网 moleworld.net/account 的「找回密码」,填你的米米号(就是 QQ 号),到这个 QQ 的邮箱里点链接重置密码。",
+        )),
+        "applyIDButtonSelected" => Some((
+            "申请米米号",
+            "请到官网 moleworld.net/account 注册:填 QQ 号和注册口令(看 QQ 群公告)。米米号就是你的 QQ 号,密码注册后在网页上显示。",
+        )),
+        _ => None,
+    }
+}
+
+/// 弹一个只有「知道了」的系统提示框(UIAlertView;touchHLE 的实现排队挂在 keyWindow 最上层,原版账号菜单之上也看得见)。
+fn show_system_alert(env: &mut Environment, title: &'static str, text: &'static str) {
+    let cls = env.objc.get_known_class("UIAlertView", &mut env.mem);
+    if cls == nil {
+        return;
+    }
+    // 不能用 initWithTitle:message:delegate:cancelButtonTitle:otherButtonTitles:——它带可变参数,
+    // touchHLE 不支持宿主调宿主的可变参数消息(methods.rs 直接 panic)。改成 init 后逐项设置。
+    let alloc = island_sel(env, "alloc");
+    let init = island_sel(env, "init");
+    let set_title = island_sel(env, "setTitle:");
+    let set_message = island_sel(env, "setMessage:");
+    let add_button = island_sel(env, "addButtonWithTitle:");
+    let set_cancel = island_sel(env, "setCancelButtonIndex:");
+    let show = island_sel(env, "show");
+    let t = crate::frameworks::foundation::ns_string::get_static_str(env, title);
+    let m = crate::frameworks::foundation::ns_string::get_static_str(env, text);
+    let ok = crate::frameworks::foundation::ns_string::get_static_str(env, "知道了");
+    let a: id = msg_send(env, (cls, alloc));
+    let a: id = msg_send(env, (a, init));
+    let _: () = msg_send(env, (a, set_title, t));
+    let _: () = msg_send(env, (a, set_message, m));
+    let idx: i32 = msg_send(env, (a, add_button, ok));
+    let _: () = msg_send(env, (a, set_cancel, idx));
+    let _: () = msg_send(env, (a, show));
+    release(env, a);
+}
+
 /// [扫描修 2026-09-15] F11-1 照搬 -[MainMenuScene onButtonChangeIDSelected:]@0xb523c 开头的守卫:
 ///   0xb5282 isEnable(+235,槽 0xb03fa0)==0 → 返回;0xb5298 isClickingMenu(+268,槽 0xb03fac)!=0 → 返回。
 ///   偏移从 guest 的 _OBJC_IVAR 槽现读(兼容 touchHLE 非脆弱 ivar 修正写回),不写死。只读内存、不发消息、不碰寄存器。
@@ -10365,6 +10419,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
         // ===== 账号菜单模式 passport 代理(让 touchHLE 也弹原版账号菜单)=====
         if account_menu_mode() {
+            // [2026-10-05 官网账号中心] 「修改密码」「找回密码」「申请米米号」改到官网办:游戏内改密(passport 1002)
+            //   服务端拿不到明文,改了会让官网 / 2016 联机版 / HD 三处密码分叉,已停用;找回(1010)要靠 QQ 邮箱验证;
+            //   注册要凭注册口令。点这三个按钮不再打开原版子界面,只弹提示。
+            if class.starts_with("TMA") {
+                if let Some((title, text)) = account_menu_web_hint(sel) {
+                    log!("[MOLECHEAT] 账号菜单:{} → 提示去官网办理", sel);
+                    show_system_alert(env, title, text);
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
+            }
             // 玩家点"切换账号"= showAccountManagerViewWithDelegate:andUserID:,激活 passport 代理。
             // 只代理这之后的 passport;之前进村自动发的 autoLogin 不碰(它走会崩的静默登录分支)。
             if sel == "showAccountManagerViewWithDelegate:andUserID:" {
@@ -10417,6 +10482,31 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 let lr = env.cpu.regs()[14] & !1;
                 if (0x4aebcc..0x4b036c).contains(&lr) {
                     log!("[MOLECHEAT] 账号菜单模式:已弹过具体错误提示,略过 requestFinish: 收尾的系统超时框");
+                    return true;
+                }
+            }
+            // (P5) [2026-10-05] 账号菜单还没打开过时(用记住的账号直接进村),原版进村后会在后台发自动登录 1012;这时
+            //      代理没开(代理它会走静默登录的崩溃分支),请求打到早已不存在的淘米服务器,超时后弹淘米组件的
+            //      「请求超时,请稍后重试!」(TMALocalizable REQUEST_TIME_OUT)——玩家什么也没做却看到报错。
+            //      菜单没激活时不显示这一句;菜单里的请求都走代理,照常提示。
+            if class == "UIAlertView" && sel == "show" && !MENU_ACTIVE.load(O) {
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let this: id = Ptr::from_bits(saved[0]);
+                let msg_sel = island_sel(env, "message");
+                let m: id = msg_send(env, (this, msg_sel));
+                let text = if m == nil {
+                    String::new()
+                } else {
+                    crate::frameworks::foundation::ns_string::to_rust_string(env, m).into_owned()
+                };
+                env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+                if text == TMA_REQUEST_TIME_OUT {
+                    log!("[MOLECHEAT] 账号菜单模式:菜单未打开,后台自动登录的通行证请求超时,不弹「{}」", text);
                     return true;
                 }
             }
