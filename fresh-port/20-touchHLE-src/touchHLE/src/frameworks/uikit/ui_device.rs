@@ -16,6 +16,105 @@ use crate::objc::{
 };
 use crate::window::{get_battery_status, BatteryState, DeviceFamily, DeviceOrientation};
 
+/// [2026-10-06 第九轮 R9-A2] 离线时 [UIDevice name] 返回的宿主设备名(只取一次)。拿不到就用「iPad」(游戏按 iPad 跑,
+/// 也是出厂未改名 iPad 的默认名)。去掉首尾空白与控制字符,最长 40 个字符。
+/// - macOS:系统设置里的「电脑名称」(scutil --get ComputerName,如「某某的 MacBook Pro」);
+/// - Windows:COMPUTERNAME;Linux:主机名;
+/// - 安卓:用户在「关于手机」里设的设备名(persist.sys.device_name,部分 ROM 有),否则市场名(ro.product.marketname),
+///   否则型号(ro.product.model);没有 JNI,只读系统属性;
+/// - iOS:iOS 16 起普通应用拿到的设备名本来就只是「iPhone」/「iPad」,这里按 hw.machine 的机型族给出同样的结果。
+fn offline_device_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let raw = host_device_name().unwrap_or_default();
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(40)
+            .collect();
+        let name = if cleaned.trim().is_empty() {
+            "iPad".to_string()
+        } else {
+            cleaned.trim().to_string()
+        };
+        log!("[设备名] 离线 [UIDevice name] = 「{}」(新号默认昵称)", name);
+        name
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn host_device_name() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+#[cfg(windows)]
+fn host_device_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
+#[cfg(target_os = "linux")]
+fn host_device_name() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname").ok()
+}
+
+#[cfg(target_os = "android")]
+fn host_device_name() -> Option<String> {
+    fn prop(key: &str) -> Option<String> {
+        let key = std::ffi::CString::new(key).ok()?;
+        // PROP_VALUE_MAX = 92
+        let mut buf = [0 as std::ffi::c_char; 92];
+        let n = unsafe { ::libc::__system_property_get(key.as_ptr(), buf.as_mut_ptr()) };
+        if n <= 0 {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        Some(s.to_string_lossy().into_owned()).filter(|s| !s.trim().is_empty())
+    }
+    prop("persist.sys.device_name")
+        .or_else(|| prop("ro.product.marketname"))
+        .or_else(|| prop("ro.product.model"))
+}
+
+#[cfg(target_os = "ios")]
+fn host_device_name() -> Option<String> {
+    let key = std::ffi::CString::new("hw.machine").ok()?;
+    let mut buf = [0u8; 64];
+    let mut len: ::libc::size_t = buf.len();
+    let r = unsafe {
+        ::libc::sysctlbyname(
+            key.as_ptr(),
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let machine = String::from_utf8_lossy(&buf[..len.min(buf.len())]);
+    Some(if machine.starts_with("iPhone") { "iPhone" } else { "iPad" }.to_string())
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "ios"
+)))]
+fn host_device_name() -> Option<String> {
+    None
+}
+
 pub const UIDeviceOrientationDidChangeNotification: &str =
     "UIDeviceOrientationDidChangeNotification";
 
@@ -99,8 +198,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)name {
-    // TODO: Hardcoded to iPhone for now
-    ns_string::get_static_str(env, "iPhone")
+    // [2026-10-06 第九轮 R9-A2] 原版离线新号的昵称来自这里:-[UserInfoData init] 0xb90c6 [UIDevice currentDevice] →
+    // 0xb90d6 name → 0xb90fe 写 name_(+4),即真机设备名(如「某某的 iPad」)。以前写死「iPhone」,而游戏按 iPad 跑。
+    // 用户拍板:离线用真实设备名(见 offline_device_name);联机保持原样,不改变登录上报的设备信息。只影响之后新建的号,
+    // 已有存档里的昵称不动,仍可在换头像面板改名。
+    if env.options.network_access {
+        return ns_string::get_static_str(env, "iPhone");
+    }
+    let name = offline_device_name();
+    ns_string::get_static_str(env, name)
 }
 
 - (id)systemName {

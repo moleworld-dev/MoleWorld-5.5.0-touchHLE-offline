@@ -278,6 +278,9 @@ pub enum Inject {
     /// A touch-move step (for synthesising a drag/pan gesture).
     Move(f32, f32),
     Up(f32, f32),
+    /// [2026-10-05] `pinch` 两指捏合的一步:phase 0 按下 / 1 移动 / 2 抬起,a、b 是两根手指的游戏坐标。
+    /// 两根手指用 FingerId::Touch(1001/1002),与真机手指经窗口换算后走同一条触摸分发路径(含系统弹框、UI43 换算)。
+    Pinch(u8, (f32, f32), (f32, f32)),
     /// Toggle the debug menu (same as pressing T) — lets the harness drive the
     /// menu without synthesising a keyboard event.
     Menu,
@@ -289,6 +292,51 @@ pub enum Inject {
     /// 整行原样交给 frameworks/uikit.rs,在菜单点击同一上下文里调 mole_dev::run_text_command,
     /// 结果写一行 `[DEVCMD] ok|err`,脚本 grep 这一行判断成败,不再按菜单格子坐标点。
     Dev(String),
+}
+
+const FINGER_DOWN: u32 = sdl2::sys::SDL_EventType::SDL_FINGERDOWN as u32;
+const FINGER_MOTION: u32 = sdl2::sys::SDL_EventType::SDL_FINGERMOTION as u32;
+const FINGER_UP: u32 = sdl2::sys::SDL_EventType::SDL_FINGERUP as u32;
+
+/// [2026-10-05 第九轮] fdrag/fpinch 用:把 (事件类型, 手指号, 归一化 x, 归一化 y) 序列推进 SDL 事件队列。
+/// 注意 SDL_PushEvent 会把时间戳改写成推送时刻的 SDL_GetTicks()(毫秒),所以时间戳靠真实间隔来区分:
+/// 每条之间睡 3 毫秒(下一步/下一类事件,窗口层不会把它们误当成同一帧);pair_same_ts = true 时同类、相邻两条
+/// (两指同一步)紧挨着推、共用同一毫秒;为 false 时两指之间睡 2 毫秒,模拟安卓逐指上报跨毫秒。
+/// rust-sdl2 的 push_event 不支持手指事件(event.rs to_ll 对 Finger* 返回 None),所以直接调 SDL_PushEvent;
+/// 它是线程安全的。只在注入通道打开时可达;整串最多睡约 1 秒(240 步),只用于测试。
+fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool) {
+    for (i, &(type_, finger, x, y)) in seq.iter().enumerate() {
+        if i > 0 {
+            let pair = seq[i - 1].0 == type_ && seq[i - 1].1 != finger;
+            let gap_ms = match (pair, pair_same_ts) {
+                (true, true) => 0,
+                (true, false) => 2,
+                (false, _) => 3,
+            };
+            if gap_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+            }
+        }
+        let ev = sdl2::sys::SDL_TouchFingerEvent {
+            type_,
+            timestamp: 0, // SDL_PushEvent 会改写
+            // 与真机设备号、SDL_MOUSE_TOUCHID(-1)都不冲突的测试设备号。
+            touchId: 0x4d4f4c45,
+            fingerId: finger,
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+            dx: 0.0,
+            dy: 0.0,
+            pressure: 1.0,
+            windowID: 0,
+        };
+        let mut raw: sdl2::sys::SDL_Event = unsafe { std::mem::zeroed() };
+        raw.tfinger = ev;
+        let ok = unsafe { sdl2::sys::SDL_PushEvent(&mut raw) };
+        if ok != 1 {
+            log_line(&format!("INJECT 手指事件推送失败(SDL_PushEvent 返回 {})", ok));
+        }
+    }
 }
 
 static PENDING_UP: Mutex<Option<(f32, f32)>> = Mutex::new(None);
@@ -385,6 +433,100 @@ pub fn next_inject() -> Option<Inject> {
                 x1, y1, x2, y2, steps
             ));
             Some(Inject::Down(x1, y1))
+        }
+        // [2026-10-05] `pinch <cx> <cy> <起始间距> <结束间距> [步数]`:两指以 (cx,cy) 为中点、沿游戏坐标 x 轴对称,
+        // 间距从起始线性变到结束(结束 < 起始 = 捏合缩小,> = 张开放大),逐步排队,最后两指同时抬起。
+        Some("pinch") => {
+            let cx: f32 = it.next()?.parse().ok()?;
+            let cy: f32 = it.next()?.parse().ok()?;
+            let d0: f32 = it.next()?.parse().ok()?;
+            let d1: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24)
+                .clamp(2, 240);
+            let at = |d: f32| ((cx - d / 2.0, cy), (cx + d / 2.0, cy));
+            let mut q = INJECT_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+            for i in 1..=steps {
+                let d = d0 + (d1 - d0) * (i as f32 / steps as f32);
+                let (a, b) = at(d);
+                q.push_back(Inject::Pinch(1, a, b));
+            }
+            let (a, b) = at(d1);
+            q.push_back(Inject::Pinch(2, a, b));
+            log_line(&format!(
+                "INJECT pinch ({}, {}) 间距 {} -> {} ({} steps)",
+                cx, cy, d0, d1, steps
+            ));
+            let (a, b) = at(d0);
+            Some(Inject::Pinch(0, a, b))
+        }
+        // [2026-10-05 第九轮 R9-B8] `fdrag <nx1> <ny1> <nx2> <ny2> [步数]`:往 SDL 事件队列推一组【原始手指事件】
+        // (按下 → 若干移动 → 抬起),坐标是窗口归一化 0..1(左上角为原点,按画面所见方向)。和上面 tap/drag 直接把
+        // 游戏坐标交给 UIKit 不同,这组事件走真机触屏同一条 window.rs Finger* 分支(坐标换算、起拖阈值都生效),
+        // 用来在桌面上验证手指相关的输入层修复。步数 0 = 只按下/抬起,不移动。
+        Some("fdrag") => {
+            let nx1: f32 = it.next()?.parse().ok()?;
+            let ny1: f32 = it.next()?.parse().ok()?;
+            let nx2: f32 = it.next()?.parse().ok()?;
+            let ny2: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4)
+                .min(240);
+            let mut seq = vec![(FINGER_DOWN, 0, nx1, ny1)];
+            for i in 1..=steps {
+                let t = i as f32 / steps as f32;
+                seq.push((FINGER_MOTION, 0, nx1 + (nx2 - nx1) * t, ny1 + (ny2 - ny1) * t));
+            }
+            seq.push((FINGER_UP, 0, nx2, ny2));
+            push_sdl_finger_events(&seq, false);
+            log_line(&format!(
+                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps)",
+                nx1, ny1, nx2, ny2, steps
+            ));
+            None
+        }
+        // [2026-10-05 第九轮] `fpinch <ncx> <ncy> <起始间距> <结束间距> [步数] [split]`:两根原始手指(0/1)以归一化
+        // (ncx,ncy) 为中点、沿画面水平方向对称,间距(归一化宽度)线性变化。split=1 时同一步两根手指的移动用不同
+        // 时间戳(两指之间真实间隔 2 毫秒,模拟安卓逐指上报跨毫秒),缺省 0 = 同一毫秒。
+        Some("fpinch") => {
+            let cx: f32 = it.next()?.parse().ok()?;
+            let cy: f32 = it.next()?.parse().ok()?;
+            let d0: f32 = it.next()?.parse().ok()?;
+            let d1: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24)
+                .clamp(1, 240);
+            let split = it.next() == Some("1");
+            let mut seq = vec![
+                (FINGER_DOWN, 0, cx - d0 / 2.0, cy),
+                (FINGER_DOWN, 1, cx + d0 / 2.0, cy),
+            ];
+            for i in 1..=steps {
+                let d = d0 + (d1 - d0) * (i as f32 / steps as f32);
+                seq.push((FINGER_MOTION, 0, cx - d / 2.0, cy));
+                seq.push((FINGER_MOTION, 1, cx + d / 2.0, cy));
+            }
+            seq.push((FINGER_UP, 0, cx - d1 / 2.0, cy));
+            seq.push((FINGER_UP, 1, cx + d1 / 2.0, cy));
+            push_sdl_finger_events(&seq, !split);
+            log_line(&format!(
+                "INJECT fpinch ({}, {}) 间距 {} -> {} ({} steps, split={})",
+                cx, cy, d0, d1, steps, split
+            ));
+            None
+        }
+        // [2026-10-06 第九轮 R9-B1] `kbhide`:模拟安卓返回键 / iPad 收起键——系统直接 SDL_StopTextInput,不经过 touchHLE、
+        // 不碰文本输入标志,用来在桌面上验证窗口层的单向同步与输入框重新弹键盘。
+        Some("kbhide") => {
+            unsafe { sdl2::sys::SDL_StopTextInput() };
+            log_line("INJECT kbhide(SDL_StopTextInput)");
+            None
         }
         Some("suspend") => {
             // [补完 2026-09-15] 缺省 3 秒;解析失败或非有限值(如 NaN/inf)按缺省处理;
