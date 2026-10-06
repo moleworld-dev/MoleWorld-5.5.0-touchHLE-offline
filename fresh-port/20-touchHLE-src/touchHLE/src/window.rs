@@ -944,6 +944,19 @@ impl Window {
             // 尺寸,viewport()/present/touch 都基于 drawable_size 一致,无需额外改。桌面不开。
             #[cfg(target_os = "ios")]
             builder.allow_highdpi();
+            // [2026-10-06] iPad 隐藏状态栏:iOS 不走 rotatable_fullscreen,走这条普通窗口分支,窗口既不是全屏也不是无边框。
+            // SDL 的 -[SDL_uikitviewcontroller prefersStatusBarHidden](SDL_uikitviewcontroller.m:207-211)只在
+            // FULLSCREEN|BORDERLESS 时返回 YES,UIKit_CreateWindow(SDL_uikitwindow.m:206-211)也按同一标志设 statusBarHidden;
+            // iPhone 横屏时系统默认不显示状态栏所以没露馅,iPad 横屏照常显示,时间/电量叠在游戏画面顶上。
+            // 加无边框标志即可隐藏;iOS 上 SDL 的视图帧本来就是整块 UIWindow(UIKit_ComputeViewFrame 不扣状态栏),画面与触摸
+            // 换算不变。原版 iPad 也不显示状态栏(游戏 Info.plist UIStatusBarHidden = true)。
+            // 无边框在 SDL 默认还会把屏幕边缘系统手势全部延迟(preferredScreenEdgesDeferringSystemGestures 返回 UIRectEdgeAll,
+            // 回主屏、控制中心都要划两次);设 SDL_IOS_HIDE_HOME_INDICATOR=1:主屏指示条闲置时自动隐藏,手势照常一次生效。
+            #[cfg(target_os = "ios")]
+            {
+                builder.borderless();
+                sdl2::hint::set("SDL_IOS_HIDE_HOME_INDICATOR", "1");
+            }
             let mut window = builder.build().unwrap();
             window.set_minimum_size(256, 192).ok();
             window

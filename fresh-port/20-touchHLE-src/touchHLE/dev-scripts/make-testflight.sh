@@ -155,6 +155,7 @@ cat > "$APP/Info.plist" <<PLIST
 	<key>LSRequiresIPhoneOS</key>          <true/>
 	<key>MinimumOSVersion</key>            <string>15.0</string>
 	<key>UIRequiresFullScreen</key>        <true/>
+	<key>UIStatusBarHidden</key>           <true/>
 	<key>UIFileSharingEnabled</key>        <true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key> <true/>
 	<key>LSApplicationCategoryType</key>   <string>public.app-category.games</string>
