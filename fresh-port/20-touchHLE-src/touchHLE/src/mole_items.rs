@@ -1787,6 +1787,48 @@ fn place_item_main(env: &mut Environment, item: u32) -> Result<String, String> {
             mode
         ));
     }
+    // [2026-10-06 第十轮 R10-C2] 原版放下 gameMode 15 的奖励物时(-[EditMenuLayer onButtonOkSelected:]
+    // 0x4f586~0x4f6b4)先看 GameData 这十个活动兑换标志,任一为真就当作「活动兑换领奖」去连服务器确认,
+    // 离线 isConnected 为假 → 0x509a8 报错并 onCancelExchange 取消放置(还会重发一次兑换确认)。
+    // 修改器走的也是 gameMode 15,所以标志没清时先拦下并说明,不去碰原版标志——能清它们的只有
+    // resetObjectInfoUnaddedInMap(好友村回家、重新开始)和重启游戏。
+    let gd = shared(env, "GameData", "sharedInstance");
+    if gd != nil {
+        let mut pending: Option<&str> = None;
+        for (getter, positive_only) in [
+            ("iceCreamExchangeIndex", true),
+            ("foodPrintExchangeIndex", true),
+            ("selectedTotoroGiftData", false),
+            ("getShrekReward", false),
+            ("getAnniversaryReward", false),
+            ("getAutumnFinalReward", false),
+            ("getHalloweenReward", false),
+            ("aliceRewardCost", true),
+            ("getXmasActivityReward", true),
+            ("getPopularItemReward", false),
+        ] {
+            let sel = sel_of(env, getter);
+            let v: i32 = msg_send(env, (gd, sel));
+            let set = if positive_only {
+                v > 0
+            } else if getter == "selectedTotoroGiftData" {
+                v != 0
+            } else {
+                (v & 0xff) != 0
+            };
+            if set {
+                pending = Some(getter);
+                break;
+            }
+        }
+        if let Some(getter) = pending {
+            log!("[MOLEITEMS] 主村放置拦下:活动兑换标志 {} 未清,原版放置会去连服务器确认而失败", getter);
+            return Err(
+                "刚做过活动兑换,原版要联网确认才能放下这件物品:去好友村逛一圈回家或重启游戏后再放置"
+                    .to_string(),
+            );
+        }
+    }
     let od = object_data(env, false, item);
     if od == nil {
         return Err(format!("主村物品表里没有 ID {}", item));
