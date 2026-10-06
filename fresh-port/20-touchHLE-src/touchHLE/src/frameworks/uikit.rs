@@ -219,6 +219,21 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     );
                 }
             }
+            crate::mole_diag::Inject::Pinch(phase, a, b) => {
+                // [2026-10-05] 两指捏合注入(见 mole_diag 的 pinch 命令)。菜单开着时不发,与单指注入一致。
+                if !crate::mole_menu::is_open() {
+                    let map = std::collections::HashMap::from([
+                        (crate::window::FingerId::Touch(1001), a),
+                        (crate::window::FingerId::Touch(1002), b),
+                    ]);
+                    let event = match phase {
+                        0 => Event::TouchesDown(map),
+                        1 => Event::TouchesMove(map),
+                        _ => Event::TouchesUp(map),
+                    };
+                    route_touch(env, event);
+                }
+            }
             crate::mole_diag::Inject::Up(x, y) => {
                 if !crate::mole_menu::is_open() {
                     route_touch(
