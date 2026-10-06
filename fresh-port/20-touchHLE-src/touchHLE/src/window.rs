@@ -236,6 +236,20 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
         DeviceOrientation::LandscapeLeft => "LandscapeRight",
         DeviceOrientation::LandscapeRight => "LandscapeLeft",
     };
+    // [2026-10-06 第九轮 R9-B7] 安卓横屏时两个横屏方向都放开,与原版 iPad 一致:Info.plist
+    // UISupportedInterfaceOrientations~ipad = [LandscapeRight, LandscapeLeft],-[RootViewController
+    // shouldAutorotateToInterfaceOrientation:]@0x142a4 对方向 3、4 都返回 YES(0x142dc..0x142e4)。以前只给一个方向,
+    // 手机倒过来横拿画面不跟着翻。SDLActivity 见到两个横屏会选 SENSOR_LANDSCAPE(无视系统方向锁),
+    // MainActivity.setOrientationBis 改成 USER_LANDSCAPE(遵守方向锁,与 iPad 一致)。AndroidManifest 的 configChanges
+    // 含 orientation|screenSize,180° 翻转不重建 Activity、画布尺寸不变,渲染与触摸换算不受影响。
+    // 重力感应照原版按机身坐标、不跟画面翻转,见 android_accel_to_ipad_body。iOS 本来就两个横屏都支持,不走这里。
+    #[cfg(target_os = "android")]
+    let hint = match orientation {
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+            "LandscapeLeft LandscapeRight"
+        }
+        _ => hint,
+    };
     sdl2::hint::set("SDL_IOS_ORIENTATIONS", hint);
 }
 
