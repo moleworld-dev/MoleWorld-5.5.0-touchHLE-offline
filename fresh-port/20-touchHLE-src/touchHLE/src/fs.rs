@@ -632,22 +632,20 @@ impl Fs {
 
         let bundle_guest_path = home_directory.join(&bundle_dir_name);
 
+        // [2026-10-05] 联机模式用单独的沙盒 `<bundle id>-online`(见 paths::sandbox_dir),在这里定一次。
+        if !read_only_mode && paths::decide_online_sandbox(bundle_id) {
+            log!("[fs] 联机模式:存档放在单独的联机沙盒 {:?},不碰单机存档", paths::sandbox_dir(bundle_id));
+        }
+
         // [2026-10-04 第八轮 R8-D2] 单实例锁:必须在建目录、清 tmp、删原子写残留之前取到(见 acquire_instance_lock)。
         if !read_only_mode {
-            acquire_instance_lock(
-                &paths::user_data_base_path()
-                    .join(paths::SANDBOX_DIR)
-                    .join(bundle_id),
-            );
+            acquire_instance_lock(&paths::sandbox_dir(bundle_id));
         }
 
         let directories = ["Documents", "Library", "tmp"];
         let host_path_directories = directories.map(|dir| {
             if !read_only_mode {
-                let path = paths::user_data_base_path()
-                    .join(paths::SANDBOX_DIR)
-                    .join(bundle_id)
-                    .join(dir);
+                let path = paths::sandbox_dir(bundle_id).join(dir);
                 if dir == "tmp" {
                     // We clean temporary directory for current app at startup.
                     // This is no-op if directory doesn't exist.
@@ -682,11 +680,7 @@ impl Fs {
             // (以后想办法清理缓存目录)照搬在此:
             // TODO: figure out a way to clean caches
             for sub in ["Preferences", "Caches"] {
-                let path = paths::user_data_base_path()
-                    .join(paths::SANDBOX_DIR)
-                    .join(bundle_id)
-                    .join("Library")
-                    .join(sub);
+                let path = paths::sandbox_dir(bundle_id).join("Library").join(sub);
                 if let Err(e) = std::fs::create_dir_all(&path) {
                     panic!("Could not create documents sub-directory for app at {path:?}: {e:?}");
                 }
