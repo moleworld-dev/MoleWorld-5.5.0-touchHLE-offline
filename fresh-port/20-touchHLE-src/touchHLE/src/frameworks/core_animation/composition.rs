@@ -403,26 +403,66 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         assert_eq!(gles.GetError(), 0);
     }
 
-    // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
-    // window's default framebuffer (0 on desktop/Android, the CAEAGLLayer FBO on
-    // iOS) before drawing, so we no longer hardcode-bind framebuffer 0 here.
-    unsafe {
-        gles.BindTexture(gles11::TEXTURE_2D, texture);
-        present_frame(
-            gles.as_mut(),
-            present_frame_args.0,
-            present_frame_args.3, // full_size
-            present_frame_args.1,
-            present_frame_args.2,
-            window_default_fbo,
-        );
-        // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer
-        // 契约:呈现当前绑定的 renderbuffer;present_frame 期间可能绑了别的)。
-        #[cfg(target_os = "ios")]
-        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
+    // [2026-10-06] iOS:合成画布改在【游戏 EAGL 上下文的视图】里呈现。SDL 在 iOS 上给每个 GL 上下文各配一个视图、
+    // 设为当前时挂到窗口上;在内部上下文里换帧的画面,下一帧游戏切回自己的上下文就被换掉,弹框等覆盖层永远看不到。
+    // 内部上下文与游戏上下文不共享纹理,所以读回画布像素交给游戏上下文上传后呈现,
+    // 见 eagl::present_composited_pixels_in_guest_view。
+    #[cfg(target_os = "ios")]
+    let presented_in_guest_view = {
+        // 画布仍绑在合成 FBO 上:读回整张画布像素(RGBA,自下而上的行序与纹理一致)。
+        let mut pixels = vec![0u8; (fb_width * fb_height * 4) as usize];
+        unsafe {
+            gles.PixelStorei(gles11::PACK_ALIGNMENT, 4);
+            gles.ReadPixels(
+                0,
+                0,
+                fb_width as _,
+                fb_height as _,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                pixels.as_mut_ptr() as *mut _,
+            );
+        }
+        std::mem::drop(gles);
+        unsafe {
+            crate::frameworks::opengles::present_composited_pixels_in_guest_view(
+                env,
+                &pixels,
+                fb_width,
+                fb_height,
+                present_frame_args.1,
+            )
+        }
+    };
+    #[cfg(not(target_os = "ios"))]
+    let presented_in_guest_view = {
+        std::mem::drop(gles);
+        false
+    };
+    if !presented_in_guest_view {
+        let window = env.window.as_mut().unwrap();
+        let mut gles = window.make_internal_gl_ctx_current();
+        // Present our rendered frame (bound to TEXTURE_2D). present_frame binds the
+        // window's default framebuffer (0 on desktop/Android, the CAEAGLLayer FBO on
+        // iOS) before drawing, so we no longer hardcode-bind framebuffer 0 here.
+        unsafe {
+            gles.BindTexture(gles11::TEXTURE_2D, texture);
+            present_frame(
+                gles.as_mut(),
+                present_frame_args.0,
+                present_frame_args.3, // full_size
+                present_frame_args.1,
+                present_frame_args.2,
+                window_default_fbo,
+            );
+            // [MoleWorld iOS] swap 前把 viewRenderbuffer 绑回 GL_RENDERBUFFER(SDL presentRenderbuffer
+            // 契约:呈现当前绑定的 renderbuffer;present_frame 期间可能绑了别的)。
+            #[cfg(target_os = "ios")]
+            gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, window_default_rbo);
+        }
+        std::mem::drop(gles);
+        window.swap_window();
     }
-    std::mem::drop(gles);
-    window.swap_window();
 
     // [同步上游 0.3.0 2026-10-03] 动画委托回调外包一个自动释放池。UIView 旧式动画改走
     // 上游 CATransaction 实现后,这里第一次真正回调 animationDidStart:/animationDidStop:finished:
