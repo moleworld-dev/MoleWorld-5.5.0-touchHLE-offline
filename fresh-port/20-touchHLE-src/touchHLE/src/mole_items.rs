@@ -1051,6 +1051,14 @@ fn stats_getter(env: &mut Environment, sel: &str) -> Option<bool> {
     Some(true)
 }
 
+/// [2026-10-06 第九轮 R9-D1] 离线回环 1051/1050 回包用:(连续登录天数, 累计在线秒),与 stats_getter 的返回值同源。
+/// 进村补发在 startGame: 臂(on_enter_village 已先记好当天)之后的受理点执行,这里只读侧档,不改、不落盘。
+pub(crate) fn offline_login_stats(env: &mut Environment) -> (u32, u32) {
+    side_ensure_loaded(env);
+    let s = side();
+    (s.streak, online_total_secs(&s).min(u32::MAX as u64) as u32)
+}
+
 /// 应用切后台/退出:在线计时暂停并落盘;回前台:进过村才恢复计时。只做宿主状态,不发消息。
 fn app_lifecycle(env: &mut Environment, sel: &str) -> Option<bool> {
     if env.options.network_access || !side().loaded {
@@ -1907,6 +1915,9 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
         "GameManager" if sel == "startGame:" => {
             if !env.options.network_access {
                 on_enter_village(env);
+                // [2026-10-06 第九轮 R9-C1b] 对应原版每次进村重新排 60 秒定时器(0x198be);只写原子量。
+                PERIODIC_SAVE_NEXT_MS.store(process_ms() + PERIODIC_SAVE_INTERVAL_MS, Ordering::Relaxed);
+                PERIODIC_SAVE_ON.store(true, Ordering::Relaxed);
             }
             // [2026-10-03] 负数摩尔豆检查:在线离线都排,只写一个原子(见 NEG_GOLD_CHECK_PENDING)。
             NEG_GOLD_CHECK_PENDING.store(true, Ordering::Relaxed);
@@ -1944,6 +1955,18 @@ static FIRST_CHARGE_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
 static RECHARGE_UNLOCK_PENDING: AtomicBool = AtomicBool::new(false);
 static RECHARGE_UNLOCK_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// [2026-10-06 第九轮 R9-C1b] 离线补原版联网时每 60 秒一次的本地定时落盘。原版 -[GameManager startGame:] 0x198be..0x198ce
+/// 排 scheduleSelector:sendGameData2Server: interval:60.0;-[GameManager sendGameData2Server:]@0x20f00 过了各门槛后
+/// sendInfoToServer → -[GameData encodeLocalMapData]@0x85300 先 saveUserInfoData(0x85340)、saveMapData(0x85352) 再组包上传。
+/// 离线卡在 0x20f7c 的 isReachable 门,这套每分钟的本地落盘整段没了,异常退出(崩溃、被系统杀)时丢失窗口比联网长。
+/// 这里只补「本地落盘」那一半:进村(startGame: 臂,离线)置 ON 并把下次时刻排到 60 秒后,运行循环受理点到点后
+/// 照原版门槛逐项判,满足就按原版顺序调两个存档方法;不组包、不上传。原版 sendGameData2Server: 是 CCScheduler 回调
+/// (帧栈上),所以不在帧里做,只在受理点做。
+static PERIODIC_SAVE_ON: AtomicBool = AtomicBool::new(false);
+static PERIODIC_SAVE_NEXT_MS: AtomicU64 = AtomicU64::new(0);
+static PERIODIC_SAVE_COUNT: AtomicU64 = AtomicU64::new(0);
+const PERIODIC_SAVE_INTERVAL_MS: u64 = 60_000;
+
 fn process_ms() -> u64 {
     static T0: OnceLock<Instant> = OnceLock::new();
     T0.get_or_init(Instant::now).elapsed().as_millis() as u64
@@ -1959,6 +1982,7 @@ pub fn run_loop_pending() -> bool {
     NEG_GOLD_CHECK_PENDING.load(Ordering::Relaxed)
         || due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS)
         || due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS)
+        || due(&PERIODIC_SAVE_ON, &PERIODIC_SAVE_NEXT_MS)
 }
 
 /// 运行循环受理点(ns_run_loop,perform 相位之后):栈上没有游戏方法体,可以自由发宿主消息;不在 intercept 里,不碰寄存器。
@@ -1967,7 +1991,8 @@ pub fn run_loop_poll(env: &mut Environment) {
     let neg_gold = NEG_GOLD_CHECK_PENDING.swap(false, Ordering::Relaxed);
     let gift = due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS);
     let unlock = due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS);
-    if !neg_gold && !gift && !unlock {
+    let periodic = due(&PERIODIC_SAVE_ON, &PERIODIC_SAVE_NEXT_MS);
+    if !neg_gold && !gift && !unlock && !periodic {
         return;
     }
     let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
@@ -1982,8 +2007,103 @@ pub fn run_loop_poll(env: &mut Environment) {
     if gift {
         first_charge_gift_poll(env);
     }
+    if periodic {
+        periodic_local_save_poll(env);
+    }
     let drain_s = sel_of(env, "drain");
     let _: () = msg_send(env, (pool, drain_s));
+}
+
+/// [2026-10-06 第九轮 R9-C1b] 定时本地落盘(见 PERIODIC_SAVE_ON)。先把下次时刻推后 60 秒,再照 -[GameManager sendGameData2Server:]
+/// 的门槛顺序逐项判:[ActorManager Instance].m_isLoadMap == 0(0x20f42)、(离线没有 isReachable,改判「离线」)、
+/// [GameManager gameMode] == 1(0x20f92)、villageLayer 有子节点(0x20fa6/0x20fd0)、[GameData mapdata] 非空(0x20ffe),
+/// 另加 curSceneId == 1(岛上、好友村不做);再要求 CFAbsoluteTime 现在 − userInfoData.updateTime < 240
+/// (0x2127a..0x21286,常量 0x21308,同一时钟含时间旅行偏移)。注意 -[GameData saveUserInfoData] 自己在 0x75562..0x75578
+/// 把 updateTime 刷成当前时刻,所以只要最近 4 分钟内存过一次档(进村、切后台、各事件存档点、上一次定时落盘),之后就是
+/// 每 60 秒存一次——原版联网在主村时同样如此(实测挂机 5 分钟每分钟一次);240 秒门只在长时间没存过档时拦一下。
+/// 满足后照 -[GameData encodeLocalMapData] 的本地部分:mapdata 条数 ≥ 2(0x8532e)才 saveUserInfoData、saveMapData
+/// (新号物件不足 14 件时 saveMapData: 0x76934 由原版自己跳过)。运行循环受理点、自动释放池内调用,不在帧栈上。
+fn periodic_local_save_poll(env: &mut Environment) {
+    PERIODIC_SAVE_NEXT_MS.store(process_ms() + PERIODIC_SAVE_INTERVAL_MS, Ordering::Relaxed);
+    if env.options.network_access {
+        PERIODIC_SAVE_ON.store(false, Ordering::Relaxed);
+        return;
+    }
+    let Some((scene, _)) = scene_and_mode(env) else {
+        return;
+    };
+    if scene != 1 {
+        return;
+    }
+    let am = shared(env, "ActorManager", "Instance");
+    if am == nil {
+        return;
+    }
+    let s = sel_of(env, "m_isLoadMap");
+    let loading: u8 = msg_send(env, (am, s));
+    if loading != 0 {
+        return;
+    }
+    let gm = shared(env, "GameManager", "sharedManager");
+    if gm == nil {
+        return;
+    }
+    let s = sel_of(env, "gameMode");
+    let mode: i32 = msg_send(env, (gm, s));
+    if mode != 1 {
+        return;
+    }
+    let s = sel_of(env, "villageLayer");
+    let village: id = msg_send(env, (gm, s));
+    if village == nil {
+        return;
+    }
+    let s = sel_of(env, "children");
+    let children: id = msg_send(env, (village, s));
+    if children == nil {
+        return;
+    }
+    let count_s = sel_of(env, "count");
+    let n: u32 = msg_send(env, (children, count_s));
+    if n == 0 {
+        return;
+    }
+    let gd = shared(env, "GameData", "sharedInstance");
+    if gd == nil {
+        return;
+    }
+    let s = sel_of(env, "mapdata");
+    let mapdata: id = msg_send(env, (gd, s));
+    if mapdata == nil {
+        return;
+    }
+    let entries: u32 = msg_send(env, (mapdata, count_s));
+    let s = sel_of(env, "userInfoData");
+    let ui: id = msg_send(env, (gd, s));
+    if ui == nil {
+        return;
+    }
+    let s = sel_of(env, "updateTime");
+    let updated: f64 = msg_send(env, (ui, s));
+    let idle = crate::frameworks::core_foundation::time::cf_absolute_time_now() - updated;
+    if idle >= 240.0 {
+        return;
+    }
+    if entries < 2 {
+        return;
+    }
+    let s = sel_of(env, "saveUserInfoData");
+    let _: () = msg_send(env, (gd, s));
+    let s = sel_of(env, "saveMapData");
+    let _: () = msg_send(env, (gd, s));
+    let k = PERIODIC_SAVE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if k == 1 || k % 10 == 0 {
+        log!(
+            "[存档] 离线定时落盘(原版 sendGameData2Server: 的本地部分)第 {} 次:距上次改数据 {:.0} 秒",
+            k,
+            idle
+        );
+    }
 }
 
 /// [SceneMannager curSceneId] 与 [WrapperManager currentGameMode](岛上读 NewGameManager.gameMode,-[WrapperManager

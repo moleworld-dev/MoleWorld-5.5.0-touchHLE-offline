@@ -228,17 +228,58 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
 /// Tell SDL2 what orientation we want. Only useful on Android.
 fn set_sdl2_orientation(orientation: DeviceOrientation) {
     // Despite the name, this hint works on Android too.
-    sdl2::hint::set(
-        "SDL_IOS_ORIENTATIONS",
-        match orientation {
-            DeviceOrientation::Portrait => "Portrait",
-            // The inversion is deliberate. These probably correspond to
-            // iPhone OS content orientations?
-            DeviceOrientation::PortraitUpsideDown => "PortraitUpsideDown",
-            DeviceOrientation::LandscapeLeft => "LandscapeRight",
-            DeviceOrientation::LandscapeRight => "LandscapeLeft",
-        },
-    );
+    let hint = match orientation {
+        DeviceOrientation::Portrait => "Portrait",
+        // The inversion is deliberate. These probably correspond to
+        // iPhone OS content orientations?
+        DeviceOrientation::PortraitUpsideDown => "PortraitUpsideDown",
+        DeviceOrientation::LandscapeLeft => "LandscapeRight",
+        DeviceOrientation::LandscapeRight => "LandscapeLeft",
+    };
+    // [2026-10-06 第九轮 R9-B7] 安卓横屏时两个横屏方向都放开,与原版 iPad 一致:Info.plist
+    // UISupportedInterfaceOrientations~ipad = [LandscapeRight, LandscapeLeft],-[RootViewController
+    // shouldAutorotateToInterfaceOrientation:]@0x142a4 对方向 3、4 都返回 YES(0x142dc..0x142e4)。以前只给一个方向,
+    // 手机倒过来横拿画面不跟着翻。SDLActivity 见到两个横屏会选 SENSOR_LANDSCAPE(无视系统方向锁),
+    // MainActivity.setOrientationBis 改成 USER_LANDSCAPE(遵守方向锁,与 iPad 一致)。AndroidManifest 的 configChanges
+    // 含 orientation|screenSize,180° 翻转不重建 Activity、画布尺寸不变,渲染与触摸换算不受影响。
+    // 重力感应照原版按机身坐标、不跟画面翻转,见 android_accel_to_ipad_body。iOS 本来就两个横屏都支持,不走这里。
+    #[cfg(target_os = "android")]
+    let hint = match orientation {
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+            "LandscapeLeft LandscapeRight"
+        }
+        _ => hint,
+    };
+    sdl2::hint::set("SDL_IOS_ORIENTATIONS", hint);
+}
+
+/// [2026-10-06 第九轮 R9-B2] 安卓加速度 → 原版 iPad 的 UIAcceleration 机身坐标(x 沿竖屏短边、y 沿竖屏长边)。
+/// SDL 传感器(SDL_androidsensor.c:168-178)原样交出 ASensorEvent.data,轴以【设备自然方向】为准,不按屏幕旋转。
+/// 自然竖屏的手机:原始轴就是竖屏机身坐标,与 iPad 一致,原样用(现状)。自然横屏的平板(多数三星 Tab、联想平板):
+/// 原始 x 沿长边,差 90°。换算口径:平板在游戏的主横屏方向(REVERSE_LANDSCAPE,旋转码 180)时,要和手机在同一方向
+/// (旋转码 270)给出同样的值。按 SDLSurface.onSensorChanged 的屏幕坐标规则 M(r)(90°:(-y,x),180°:(-x,-y),
+/// 270°:(y,-x)),guest = M(270)⁻¹·M(180)·raw = (raw_y, -raw_x)。用户拍板「照原版」:固定按机身换算,手机/平板翻转 180°
+/// 后倾斜方向跟原版 iPad、我们的 iOS 版一样反过来,不跟画面走。
+/// `rotation`:当前显示旋转码(0/90/180/270,来自 SDL_GetDisplayOrientation;安卓上它把旋转 0 一律叫 PORTRAIT,
+/// 只当旋转码用)。窗口永远是横屏,所以旋转码 0/180 = 设备自然方向是横屏;None(拿不到)按原样。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn android_accel_to_ipad_body(x: f32, y: f32, rotation: Option<u32>) -> (f32, f32) {
+    match rotation {
+        Some(0) | Some(180) => (y, -x),
+        _ => (x, y),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_display_rotation() -> Option<u32> {
+    use sdl2_sys::SDL_DisplayOrientation as O;
+    match unsafe { sdl2_sys::SDL_GetDisplayOrientation(0) } {
+        O::SDL_ORIENTATION_PORTRAIT => Some(0),
+        O::SDL_ORIENTATION_LANDSCAPE => Some(90),
+        O::SDL_ORIENTATION_PORTRAIT_FLIPPED => Some(180),
+        O::SDL_ORIENTATION_LANDSCAPE_FLIPPED => Some(270),
+        _ => None,
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -339,7 +380,101 @@ fn mouse_drag_slop() -> f32 {
     })
 }
 
-/// [2026-09-24 第四轮 K15 I1-8] 鼠标左键一次按下的起拖状态(只用于 FingerId::Mouse)。
+/// [2026-10-06 第九轮 R9-B3] 同类手指事件合并成一次多指事件的时间窗口(毫秒)。见 poll_for_events 的 Finger* 臂。
+const MULTI_TOUCH_MERGE_MS: u32 = 4;
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指的一次性起拖阈值(guest 点),默认与鼠标相同 8 点。
+/// 根因同上(-[ObjSelector touchMove:]@0x4b270 无阈值置 isMoved,touchEnd: 0x4b2c8 见到就不处理点击)。
+/// 第四轮只给鼠标加了阈值,触屏手指保持零容差;但安卓触屏按下到抬起之间几乎必然有几像素抖动,
+/// 4:3 下 1 个 guest 点只有约 1.4 物理像素(1080 高的屏),坐标取整到点后照样发出 TouchesMove,
+/// 于是村里点建筑/作物/摩尔大多被吞掉(HUD 的 CCMenu 按钮不受影响)——玩家反馈的「点不动」。
+/// 桌面注入「按下→移动 1 点→抬起」点房子实测面板不弹,原地点击才弹。
+/// 只对单指生效:同时按下两根及以上手指时全部立即放行(捏合缩放照原样逐帧下发)。
+/// 环境变量 MOLE_TOUCH_DRAG_SLOP 可改阈值(点),0 = 关闭(恢复为任何移动都下发)。
+const TOUCH_DRAG_SLOP_DEFAULT: f32 = 8.0;
+fn touch_drag_slop() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_TOUCH_DRAG_SLOP")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOUCH_DRAG_SLOP_DEFAULT)
+    })
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
+/// (多指手势不抑制移动、抬起也按真实坐标上报)。同一手指号重复按下(漏了抬起)直接覆盖。
+fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<FingerId, Coords>) {
+    for (finger, &coords) in map {
+        if let FingerId::Touch(id) = *finger {
+            state.insert(
+                id,
+                MouseDragState {
+                    down: coords,
+                    broke: false,
+                },
+            );
+        }
+    }
+    if state.len() > 1 {
+        for drag in state.values_mut() {
+            drag.broke = true;
+        }
+    }
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指移动:还没越过阈值、离按下点不足阈值的手指从本次事件里去掉
+/// (不更新按下点);越过时把本帧真实坐标作为第一个移动下发(ui_touch 的上一位置仍是按下点,位移不丢)。
+/// 返回 false = 本次事件里的手指全被抑制,不入队。没有记录的手指(例如挂起前按下)原样下发。
+fn touch_slop_move(
+    state: &mut HashMap<i64, MouseDragState>,
+    map: &mut HashMap<FingerId, Coords>,
+) -> bool {
+    let slop = touch_drag_slop();
+    map.retain(|finger, coords| {
+        let FingerId::Touch(id) = *finger else {
+            return true;
+        };
+        let Some(drag) = state.get_mut(&id) else {
+            return true;
+        };
+        if drag.broke {
+            return true;
+        }
+        let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
+        if (dx * dx + dy * dy).sqrt() < slop {
+            return false;
+        }
+        drag.broke = true;
+        log_dbg!(
+            "[触屏起拖] 手指 {} 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
+            id,
+            slop,
+            drag.down,
+            coords
+        );
+        true
+    });
+    !map.is_empty()
+}
+
+/// [2026-10-05 第九轮 R9-B8] 触屏手指抬起:没越过阈值(游戏一个移动也没收到)的手指按【按下点】上报,
+/// 游戏看到的是原地点击,与鼠标 K15 的处理一致;越过的按真实坐标。
+fn touch_slop_up(state: &mut HashMap<i64, MouseDragState>, map: &mut HashMap<FingerId, Coords>) {
+    for (finger, coords) in map.iter_mut() {
+        if let FingerId::Touch(id) = *finger {
+            if let Some(drag) = state.remove(&id) {
+                if !drag.broke {
+                    *coords = drag.down;
+                }
+            }
+        }
+    }
+}
+
+/// [2026-09-24 第四轮 K15 I1-8] 鼠标左键一次按下的起拖状态(只用于 FingerId::Mouse;
+/// 第九轮 R9-B8 起也用于触屏手指,见 touch_slop_down)。
 struct MouseDragState {
     /// 按下点(transform_input_coords 之后的 guest 整数点,与发给游戏的 TouchesDown 坐标相同)。
     down: Coords,
@@ -628,6 +763,8 @@ pub struct Window {
     /// [2026-09-24 第四轮 K15 I1-8] 鼠标左键本次按下的起拖状态;None = 没有在跟踪的按下
     /// (此时左键移动按原样下发)。见 [MouseDragState]、mouse_drag_slop。
     mouse_drag: Option<MouseDragState>,
+    /// [2026-10-05 第九轮 R9-B8] 触屏各手指(SDL 手指号)本次按下的起拖状态。见 touch_drag_slop。
+    touch_drag: HashMap<i64, MouseDragState>,
     /// [扫描修 2026-09-15] F12-3:上一次发出的窗口最小化状态,用来给 WindowMinimized/WindowRestored 去重。
     window_minimized: bool,
     /// Whether or not we are on the "main" environment stack (rather than
@@ -755,7 +892,34 @@ impl Window {
                 wb.allow_highdpi();
                 log!("[MOLE-RES] HiDPI 开启(allow_highdpi):drawable=设备原生像素");
             }
-            wb.build().unwrap()
+            let built = wb.build().unwrap();
+            // [2026-10-06 第九轮 R9-B4 第一步:诊断] 安卓铺满时逻辑屏比例(AUTO_PORTRAIT)按 display_bounds(0) = 整块物理屏
+            // (SDLSurface getRealMetrics)算;带刘海/挖孔的手机若系统让开刘海,实际画布更窄,而定制逻辑屏时 viewport 直接铺满
+            // drawable、不做等比,画面会横向压扁「让位宽 / 屏宽」。是否让位因机型与 ROM 设置而异,先只记一行三组尺寸,
+            // 请刘海屏玩家回传 touchHLE_log.txt 确认后再改成按画布尺寸算。不改任何行为。
+            #[cfg(target_os = "android")]
+            {
+                let phys = screen_size;
+                let win = built.size();
+                let draw = built.drawable_size();
+                let phys_l = (phys.0.max(phys.1), phys.0.min(phys.1));
+                let draw_l = (draw.0.max(draw.1), draw.0.min(draw.1));
+                let squash = if draw_l.0 > 0 && draw_l.1 > 0 && phys_l.1 > 0 {
+                    (phys_l.0 as f64 / phys_l.1 as f64) / (draw_l.0 as f64 / draw_l.1 as f64)
+                } else {
+                    1.0
+                };
+                log!(
+                    "[MOLE-RES] 安卓 物理屏 {}x{},画布 window.size() {}x{} / drawable_size() {}x{};物理屏宽高比 ÷ 画布宽高比 = {:.4}{}",
+                    phys.0, phys.1, win.0, win.1, draw.0, draw.1, squash,
+                    if (squash - 1.0).abs() > 0.005 {
+                        "(画布比物理屏窄:铺满时横向会压扁这个比例,刘海让位?请回传本日志)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            built
         } else if fullscreen {
             let (width, height) = video_ctx.display_bounds(0).unwrap().size();
             let window = video_ctx
@@ -858,6 +1022,7 @@ impl Window {
             pinch: None,
             mouse_left_down: false,
             mouse_drag: None,
+            touch_drag: HashMap::new(),
             window_minimized: false,
             on_main_stack: true,
         };
@@ -920,6 +1085,19 @@ impl Window {
             return;
         }
         self.last_polled = now;
+
+        // [2026-10-06 第九轮 R9-B1] 系统自己收起了屏幕键盘(安卓返回键 → SDLActivity DummyEdit.onKeyPreIme →
+        // onNativeKeyboardFocusLost → SDL_StopTextInput;iPad 键盘右下角收起键 → keyboardWillHide: → SDL_StopTextInput),
+        // touchHLE 不知情,文本输入标志会一直停在 true(物理 T 键被当字符、滚轮捏合被挡)。这里只做单向同步:标志为 true
+        // 而 SDL 已不在文本输入时把标志清掉。绝不能直接用 SDL_IsTextInputActive() 赋值——桌面 SDL_VideoInit 在没有屏幕
+        // 键盘时默认开着文本输入(SDL_video.c:555-556),直接赋值会让桌面标志恒为 true。输入框本身的第一响应者不动,
+        // 再点同一个框时由 -[UITextField becomeFirstResponder] 的早退分支重新 start_text_input 弹出键盘。
+        if MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            && unsafe { sdl2_sys::SDL_IsTextInputActive() } == sdl2_sys::SDL_bool::SDL_FALSE
+        {
+            MOLE_TEXT_INPUT_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            log!("[文本输入] 系统收起了键盘(返回键 / 收起键),同步清掉文本输入标志");
+        }
 
         // [2026-10-04 第八轮 R8-D4] 终端关掉(SIGHUP)、Windows 注销/关机置的退出请求,见 HOST_QUIT_REQUESTED。
         if HOST_QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1308,6 +1486,8 @@ impl Window {
                     ..
                 } => {
                     self.mouse_drag = None;
+                    // [2026-10-05 第九轮 R9-B8] 触屏起拖状态同理清掉:之后仍按着的手指移动/抬起按原样下发。
+                    self.touch_drag.clear();
                     continue;
                 }
                 _ => {}
@@ -1682,7 +1862,16 @@ impl Window {
                                 x,
                                 y,
                                 ..
-                            } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
+                            } if timestamp.wrapping_sub(curr_timestamp) <= MULTI_TOUCH_MERGE_MS
+                                && next.is_same_kind_as(&event)
+                                && !map.contains_key(&FingerId::Touch(finger_id)) =>
+                            {
+                                // [2026-10-06 第九轮 R9-B3] 合并窗口从「毫秒时间戳完全相等」放宽到「与首条相差不超过
+                                // MULTI_TOUCH_MERGE_MS 毫秒、且该手指还不在本组里」。安卓 SDLSurface.onTouch 对一次 ACTION_MOVE
+                                // 逐个 pointer 调 onNativeTouch,每条的时间戳是各自入队时的 SDL_GetTicks(),跨毫秒就被拆成
+                                // 两次单指 TouchesMove:-[GameManager processTouch:withType:] 0x1a6f8 见 count==1 走单指平移
+                                // (地图被拖走一截、ObjSelector 置 isMoved),count≥2 才 0x1a7ce zoom:touch2:,缩放一顿一顿。
+                                // 同一手指的第二条一出现就停止合并,单指连续移动仍逐条下发(切水果轨迹不变);不跨 Down/Up/Cancel。
                                 let abs_coords = finger_absolute_coords(self, (x, y));
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 map.insert(FingerId::Touch(finger_id), coords);
@@ -1702,10 +1891,22 @@ impl Window {
                         }
                     }
                     log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
+                    // [2026-10-05 第九轮 R9-B8] 单指起拖阈值(见 touch_drag_slop)。
                     match event {
-                        E::FingerUp { .. } => Event::TouchesUp(map),
-                        E::FingerMotion { .. } => Event::TouchesMove(map),
-                        E::FingerDown { .. } => Event::TouchesDown(map),
+                        E::FingerUp { .. } => {
+                            touch_slop_up(&mut self.touch_drag, &mut map);
+                            Event::TouchesUp(map)
+                        }
+                        E::FingerMotion { .. } => {
+                            if !touch_slop_move(&mut self.touch_drag, &mut map) {
+                                continue;
+                            }
+                            Event::TouchesMove(map)
+                        }
+                        E::FingerDown { .. } => {
+                            touch_slop_down(&mut self.touch_drag, &map);
+                            Event::TouchesDown(map)
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -1834,6 +2035,8 @@ impl Window {
         // [2026-09-24 第四轮 K15 I1-8] 游戏里的鼠标手指由调用方随后的 cancel_tracked_touches 以取消结束,
         // 窗口侧的起拖状态在这里一并清掉(回来后第一次按下重新开始判定)。
         self.mouse_drag = None;
+        // [2026-10-05 第九轮 R9-B8] 触屏手指的起拖状态一并清掉(游戏里仍按着的手指由 cancel_tracked_touches 取消)。
+        self.touch_drag.clear();
         self.dpad_state.left = false;
         self.dpad_state.right = false;
         self.dpad_state.up = false;
@@ -2103,6 +2306,26 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
+                // [2026-10-06 第九轮 R9-B2] 自然横屏的安卓平板换算到 iPad 机身坐标(见 android_accel_to_ipad_body)。
+                #[cfg(target_os = "android")]
+                let (x, y) = {
+                    let rotation = android_display_rotation();
+                    static LOGGED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(u32::MAX);
+                    let code = rotation.unwrap_or(999);
+                    if LOGGED.swap(code, std::sync::atomic::Ordering::Relaxed) != code {
+                        log!(
+                            "[重力] 显示旋转码 {:?}:{}",
+                            rotation,
+                            if matches!(rotation, Some(0) | Some(180)) {
+                                "设备自然方向是横屏,加速度按 iPad 竖屏机身坐标换算 (y, -x)"
+                            } else {
+                                "设备自然方向是竖屏,原始轴即机身坐标,原样使用"
+                            }
+                        );
+                    }
+                    android_accel_to_ipad_body(x, y, rotation)
+                };
                 return (x, y, z);
             }
         }
@@ -2877,4 +3100,34 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
             .filter_map(|loc| loc.country)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod accel_remap_tests {
+    use super::android_accel_to_ipad_body as remap;
+
+    #[test]
+    fn natural_portrait_phone_unchanged() {
+        // 自然竖屏手机在横屏窗口里旋转码是 90/270,原样(与改动前一致)。
+        assert_eq!(remap(0.3, -0.7, Some(270)), (0.3, -0.7));
+        assert_eq!(remap(0.3, -0.7, Some(90)), (0.3, -0.7));
+        assert_eq!(remap(0.3, -0.7, None), (0.3, -0.7));
+    }
+
+    #[test]
+    fn natural_landscape_tablet_rotated() {
+        // 自然横屏平板(旋转码 0/180):M(270)⁻¹·M(180)·raw = (y, -x),翻转 180° 后同一机身换算不变(照原版)。
+        assert_eq!(remap(0.3, -0.7, Some(180)), (-0.7, -0.3));
+        assert_eq!(remap(0.3, -0.7, Some(0)), (-0.7, -0.3));
+    }
+
+    #[test]
+    fn tablet_matches_phone_in_same_screen_orientation() {
+        // 同一个「屏幕坐标系里的重力」(sx, sy):手机 r=270 时 raw = M(270)⁻¹·S = (-sy, sx);
+        // 平板 r=180 时 raw = M(180)⁻¹·S = (-sx, -sy)。两者换算后应相同。
+        let (sx, sy) = (0.25_f32, 0.6_f32);
+        let phone = remap(-sy, sx, Some(270));
+        let tablet = remap(-sx, -sy, Some(180));
+        assert_eq!(phone, tablet);
+    }
 }

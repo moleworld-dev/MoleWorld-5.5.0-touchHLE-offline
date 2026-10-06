@@ -7519,13 +7519,10 @@ fn mapextend_in_bottom_band(line: i32, col: i32) -> bool {
         && line >= if col & 1 == 0 { 26 } else { 27 }
 }
 
-/// 本移植的存档沙盒宿主目录:与 `Fs::new`(fs.rs 556~559)同构,
-/// `user_data_base_path()/touchHLE_sandbox/<bundle id>/Documents`。
+/// 本移植的存档沙盒宿主目录:与 `Fs::new` 同源(paths::sandbox_dir),单机 `<沙盒>/com.taomee.MoleWorld/Documents`,
+/// 联机 `<沙盒>/com.taomee.MoleWorld-online/Documents`——两边的存档修改时间与一次性对账标记各管各的。
 fn mapextend_save_dir() -> std::path::PathBuf {
-    crate::paths::user_data_base_path()
-        .join(crate::paths::SANDBOX_DIR)
-        .join("com.taomee.MoleWorld")
-        .join("Documents")
+    crate::paths::sandbox_dir("com.taomee.MoleWorld").join("Documents")
 }
 
 /// 带病 getter(对所有调用者强返 0x1F)的生效起点:启动时存档修改时间不早于此刻的存档才可能被污染。按平台分开:
@@ -8381,6 +8378,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "SharedInterfaceLayer"
             // [扫描修 2026-09-15] F12-10 左左右右(沙滩WC)开始前一次性操作提示
             | "WashRoomLevelChoose"
+            // [2026-10-05] 账号菜单模式:菜单没打开时不显示后台自动登录的通行证超时框(show 时按正文判断)
+            | "UIAlertView"
     ) || matches!(
         sel,
         "drawScene"
@@ -8417,6 +8416,11 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "sendAllBuffDataInNewSceneLoading"
             | "generateRandomRewardId"
             | "onTaomeeLoginViewDidUnloadWithUserID:password:returnCode:"
+            // [2026-10-05 官网账号中心] 原版账号菜单的改密 / 找回 / 申请米米号按钮(接收者是 TMA 系视图类,不在 CLASSES)
+            | "passwordModButtonSelected"
+            | "passwordForgotButtonSelected"
+            | "passwordRetrieveButtonSelected"
+            | "applyIDButtonSelected"
             // [P3 商店空白真因] -[SceneMannager curSceneId]:离线进岛后常卡在过场态 2(非10),
             //   loadObjectsDataByType: 据它选数据源→返回空→建设庄园/食材店空格。在岛上强制 10。
             | "curSceneId"
@@ -8643,21 +8647,22 @@ const UI43_CALLSITES: &[u32] = &[
     0x110754, 0x110c42, 0x111952, 0x123932, 0x129e0a, 0x12d7c2, 0x134144, 0x134a86,
     0x13577e, 0x1358b6, 0x135bae, 0x136024, 0x137042, 0x1371d2, 0x1381d2, 0x13836e,
     0x138e24, 0x139e34, 0x13aab2, 0x13c338, 0x13c6e0, 0x13e318, 0x13f52e, 0x13f82a,
-    0x140d86, 0x144532, 0x147280, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0, 0x156604,
-    0x156916, 0x156ab2, 0x156da6, 0x158354, 0x159486, 0x159ac0, 0x164fa6, 0x165146,
-    0x16641e, 0x1676d6, 0x168adc, 0x168fa0, 0x169eda, 0x16a06a, 0x16a3d2, 0x16ba8c,
-    0x17176a, 0x174ade, 0x177ea2, 0x17b8ba, 0x17e12c, 0x17e51e, 0x17ea02, 0x17ec6c,
-    0x17ed3a, 0x17f1ea, 0x17f37a, 0x17f66c, 0x1806c8, 0x180d98, 0x18667c, 0x188bc2,
-    0x18a138, 0x18c2bc, 0x18c3e8, 0x18cc24, 0x18d1fa, 0x18e790, 0x190a2e, 0x192de0,
-    0x193704, 0x193b36, 0x19c3d0, 0x1a24ec, 0x1a3f84, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e,
-    0x1af8c2, 0x1b11ec, 0x1b1c74, 0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c,
-    0x1d2274, 0x1d33b4, 0x1d40ee, 0x1e299e, 0x1e50aa, 0x1e6206, 0x1e73d4, 0x1eb2c8,
-    0x1f00a2, 0x1f21fc, 0x1f2c3c, 0x1fea1e, 0x1fffb6, 0x1fffd6, 0x1fffec, 0x200314,
-    0x210a9a, 0x2126f0, 0x213060, 0x217e7e, 0x233188, 0x235e68, 0x23687a, 0x23f17e,
-    0x246ce6, 0x24a802, 0x24d4b2, 0x2553ae, 0x27abfe, 0x2c0942, 0x2d9d7a, 0x2ec99a,
-    0x2f68d0, 0x2f8190, 0x301562, 0x30ba98, 0x30f5d2, 0x310186, 0x3107ec, 0x318ef2,
-    0x323c0c, 0x32d78e, 0x32ffea, 0x3319a2, 0x3335fe, 0x336bc4, 0x339d5a, 0x345a52,
-    0x352f00, 0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x35e6ac, 0x36a260, 0x36e3c6, 0x370270,
+    0x140d86, 0x144532, 0x147280, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0,
+    0x156604, 0x156916, 0x156ab2, 0x156da6, 0x158354, 0x159486, 0x159ac0, 0x164fa6,
+    0x165146, 0x16641e, 0x1676d6, 0x168adc, 0x168fa0, 0x169eda, 0x16a06a, 0x16a3d2,
+    0x16ba8c, 0x17176a, 0x174ade, 0x177ea2, 0x17b8ba, 0x17e12c, 0x17e51e, 0x17ea02,
+    0x17ec6c, 0x17ed3a, 0x17f1ea, 0x17f37a, 0x17f66c, 0x1806c8, 0x180d98, 0x18667c,
+    0x188bc2, 0x18a138, 0x18c2bc, 0x18c3e8, 0x18cc24, 0x18d1fa, 0x18e790, 0x190a2e,
+    0x192de0, 0x193704, 0x193b36, 0x1940d0, 0x194194, 0x19425c, 0x19432a, 0x19c3d0,
+    0x1a24ec, 0x1a3f84, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e, 0x1af8c2, 0x1b11ec,
+    0x1b1c74, 0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c, 0x1d2274,
+    0x1d33b4, 0x1d40ee, 0x1e299e, 0x1e50aa, 0x1e6206, 0x1e73d4, 0x1eb2c8, 0x1f00a2,
+    0x1f21fc, 0x1f2c3c, 0x1fea1e, 0x1fffb6, 0x1fffd6, 0x1fffec, 0x200314, 0x210a9a,
+    0x2126f0, 0x213060, 0x217e7e, 0x233188, 0x235e68, 0x23687a, 0x23f17e, 0x246ce6,
+    0x24a802, 0x24d4b2, 0x2553ae, 0x27abfe, 0x2c0942, 0x2d9d7a, 0x2ec99a, 0x2f68d0,
+    0x2f8190, 0x301562, 0x30ba98, 0x30f5d2, 0x310186, 0x3107ec, 0x318ef2, 0x323c0c,
+    0x32d78e, 0x32ffea, 0x3319a2, 0x3335fe, 0x336bc4, 0x339d5a, 0x345a52, 0x352f00,
+    0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x35e6ac, 0x36a260, 0x36e3c6, 0x370270,
     0x370c80, 0x371140, 0x375fb6, 0x37794a, 0x3796b4, 0x37af1c, 0x37cb66, 0x37de44,
     0x37fb0a, 0x381434, 0x392f4a, 0x396402, 0x3969a8, 0x397618, 0x39ac00, 0x39ca68,
     0x3a035a, 0x3a3ef8, 0x3a8ddc, 0x3ae616, 0x3af228, 0x3afb16, 0x3b5230, 0x3b770c,
@@ -8715,22 +8720,23 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
     "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase",
     "MusicHallLayer", "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
-    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneStoryLayer", "NewSceneTestLayer",
-    "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView", "NoticeBoardLayer",
-    "OpenTreasureChestMainLayer", "OptionLayer", "OscarDialogueLayer", "PaintingAchivement",
-    "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer", "PersonalTargetLayer",
-    "Plow", "PlowAchivement", "PlowLevelChoose", "PopularItemsPKAdvanceLayer",
-    "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer", "PromoteSalesMainLayer", "PromoteShowItemsLayer",
-    "QiXiAdvanceLayer", "QuestLayer", "QuestionnaireLayer", "ReceiveGiftLayer",
-    "RegisterView", "RequestCodeLayer", "RestaurantView", "RewardLayer",
-    "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer", "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer",
-    "SeekViewController", "ShopItemsLayer", "ShoppingView", "ShowActivityRuleLayer",
-    "ShowFreeShellsLayer", "ShowMoreFriendsLayer", "ShowRuleLayer", "SpringPoemGetRewardLayer",
-    "SpringPoemIntroduceLayer", "SpringPoemMainLayer", "SpringPoemPageLayer", "StoryLayer", "TeamTargetLayer",
-    "TestLayer", "TimeQuestLayer", "TimeStoryLayer", "TourLineLayer", "TreasureHuntPopLayer",
+    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneStoryLayer",
+    "NewSceneTestLayer", "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView",
+    "NoticeBoardLayer", "OpenTreasureChestMainLayer", "OptionLayer", "OscarDialogueLayer",
+    "PaintingAchivement", "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer",
+    "PersonalTargetLayer", "Plow", "PlowAchivement", "PlowLevelChoose",
+    "PopularItemsPKAdvanceLayer", "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer", "PromoteSalesMainLayer",
+    "PromoteShowItemsLayer", "QiXiAdvanceLayer", "QuestLayer", "QuestionnaireLayer",
+    "ReceiveGiftLayer", "RegisterView", "RequestCodeLayer", "RestaurantView",
+    "RewardLayer", "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer", "SeabedSeekingTreasureRuleLayer",
+    "SealExchangeLayer", "SeekViewController", "SharedInterfaceLayer", "ShopItemsLayer",
+    "ShoppingView", "ShowActivityRuleLayer", "ShowFreeShellsLayer", "ShowMoreFriendsLayer",
+    "ShowRuleLayer", "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer",
+    "SpringPoemPageLayer", "StoryLayer", "TeamTargetLayer", "TestLayer",
+    "TimeQuestLayer", "TimeStoryLayer", "TourLineLayer", "TreasureHuntPopLayer",
     "TreasureRewardLayer", "VIPFunctionsLayer", "VIPLayer", "VerifyInviteCodeLayer",
-    "VipQuestLayer", "VipStoryLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
-    "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
+    "VipQuestLayer", "VipStoryLayer", "WashRoomAchievement", "WashRoomGame",
+    "WashRoomLevelChoose", "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
 ];
 
 /// [MoleWorld 宽屏适配·虚拟世界换算] 白名单 UI 类(含其子类,按父类链 ≤6 层)全部方法的代码地址区间
@@ -8764,7 +8770,7 @@ const UI43_CODE_RANGES: &[(u32, u32)] = &[
     (0x12d698, 0x12dda0), (0x133e4c, 0x1430c0), (0x143b6c, 0x147050), (0x14ce50, 0x151580),
     (0x152b50, 0x1596f8), (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17d6e8, 0x180b54),
     (0x180c6c, 0x182f90), (0x186500, 0x18c7e8), (0x18cb90, 0x1900f8), (0x190998, 0x193e24),
-    (0x19c330, 0x19cf10), (0x1a2448, 0x1a3ef8), (0x1a66a8, 0x1a8e58), (0x1ab468, 0x1ae628),
+    (0x19c330, 0x19cf10), (0x1a2448, 0x1a3ef8), (0x1a47b4, 0x1a8e58), (0x1ab468, 0x1ae628),
     (0x1ae6d8, 0x1af850), (0x1b10e4, 0x1b35ec), (0x1b3f58, 0x1b89dc), (0x1baef0, 0x1bd7fc),
     (0x1cce58, 0x1d4480), (0x1e60b0, 0x1e7814), (0x1eb158, 0x1ef3c4), (0x1efd78, 0x1f49ac),
     (0x1fe968, 0x203124), (0x210a10, 0x212ec8), (0x212f7c, 0x218dec), (0x233040, 0x23669c),
@@ -9476,6 +9482,56 @@ fn show_game_message_box(
     let type_and_vipgold: u64 = box_type as u64; // 低 32 位 = type,高 32 位 = vipgold(0)
     let _: () = msg_send(env, (mb, show_s, target, callback, nil, message, type_and_vipgold));
     true
+}
+
+/// 淘米通行证组件的超时提示(TMALocalizable.strings 的 REQUEST_TIME_OUT,感叹号是半角)。
+const TMA_REQUEST_TIME_OUT: &str = "请求超时，请稍后重试!";
+
+/// [2026-10-05 官网账号中心] 原版账号菜单里交给官网办的按钮 → (标题, 提示)。
+fn account_menu_web_hint(sel: &str) -> Option<(&'static str, &'static str)> {
+    match sel {
+        "passwordModButtonSelected" => Some((
+            "修改密码",
+            "游戏里不能改密码了,请到官网 moleworld.net/account 的「修改密码」里改。新密码是 6~15 位英文字母或数字,官网、2016 联机版和摩尔庄园HD 同时生效。",
+        )),
+        "passwordForgotButtonSelected" | "passwordRetrieveButtonSelected" => Some((
+            "找回密码",
+            "请到官网 moleworld.net/account 的「找回密码」,填你的米米号(就是 QQ 号),到这个 QQ 的邮箱里点链接重置密码。",
+        )),
+        "applyIDButtonSelected" => Some((
+            "申请米米号",
+            "请到官网 moleworld.net/account 注册:填 QQ 号和注册口令(看 QQ 群公告)。米米号就是你的 QQ 号,密码注册后在网页上显示。",
+        )),
+        _ => None,
+    }
+}
+
+/// 弹一个只有「知道了」的系统提示框(UIAlertView;touchHLE 的实现排队挂在 keyWindow 最上层,原版账号菜单之上也看得见)。
+fn show_system_alert(env: &mut Environment, title: &'static str, text: &'static str) {
+    let cls = env.objc.get_known_class("UIAlertView", &mut env.mem);
+    if cls == nil {
+        return;
+    }
+    // 不能用 initWithTitle:message:delegate:cancelButtonTitle:otherButtonTitles:——它带可变参数,
+    // touchHLE 不支持宿主调宿主的可变参数消息(methods.rs 直接 panic)。改成 init 后逐项设置。
+    let alloc = island_sel(env, "alloc");
+    let init = island_sel(env, "init");
+    let set_title = island_sel(env, "setTitle:");
+    let set_message = island_sel(env, "setMessage:");
+    let add_button = island_sel(env, "addButtonWithTitle:");
+    let set_cancel = island_sel(env, "setCancelButtonIndex:");
+    let show = island_sel(env, "show");
+    let t = crate::frameworks::foundation::ns_string::get_static_str(env, title);
+    let m = crate::frameworks::foundation::ns_string::get_static_str(env, text);
+    let ok = crate::frameworks::foundation::ns_string::get_static_str(env, "知道了");
+    let a: id = msg_send(env, (cls, alloc));
+    let a: id = msg_send(env, (a, init));
+    let _: () = msg_send(env, (a, set_title, t));
+    let _: () = msg_send(env, (a, set_message, m));
+    let idx: i32 = msg_send(env, (a, add_button, ok));
+    let _: () = msg_send(env, (a, set_cancel, idx));
+    let _: () = msg_send(env, (a, show));
+    release(env, a);
 }
 
 /// [扫描修 2026-09-15] F11-1 照搬 -[MainMenuScene onButtonChangeIDSelected:]@0xb523c 开头的守卫:
@@ -10365,6 +10421,17 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
         }
         // ===== 账号菜单模式 passport 代理(让 touchHLE 也弹原版账号菜单)=====
         if account_menu_mode() {
+            // [2026-10-05 官网账号中心] 「修改密码」「找回密码」「申请米米号」改到官网办:游戏内改密(passport 1002)
+            //   服务端拿不到明文,改了会让官网 / 2016 联机版 / HD 三处密码分叉,已停用;找回(1010)要靠 QQ 邮箱验证;
+            //   注册要凭注册口令。点这三个按钮不再打开原版子界面,只弹提示。
+            if class.starts_with("TMA") {
+                if let Some((title, text)) = account_menu_web_hint(sel) {
+                    log!("[MOLECHEAT] 账号菜单:{} → 提示去官网办理", sel);
+                    show_system_alert(env, title, text);
+                    env.cpu.regs_mut()[0] = 0;
+                    return true;
+                }
+            }
             // 玩家点"切换账号"= showAccountManagerViewWithDelegate:andUserID:,激活 passport 代理。
             // 只代理这之后的 passport;之前进村自动发的 autoLogin 不碰(它走会崩的静默登录分支)。
             if sel == "showAccountManagerViewWithDelegate:andUserID:" {
@@ -10417,6 +10484,31 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
                 let lr = env.cpu.regs()[14] & !1;
                 if (0x4aebcc..0x4b036c).contains(&lr) {
                     log!("[MOLECHEAT] 账号菜单模式:已弹过具体错误提示,略过 requestFinish: 收尾的系统超时框");
+                    return true;
+                }
+            }
+            // (P5) [2026-10-05] 账号菜单还没打开过时(用记住的账号直接进村),原版进村后会在后台发自动登录 1012;这时
+            //      代理没开(代理它会走静默登录的崩溃分支),请求打到早已不存在的淘米服务器,超时后弹淘米组件的
+            //      「请求超时,请稍后重试!」(TMALocalizable REQUEST_TIME_OUT)——玩家什么也没做却看到报错。
+            //      菜单没激活时不显示这一句;菜单里的请求都走代理,照常提示。
+            if class == "UIAlertView" && sel == "show" && !MENU_ACTIVE.load(O) {
+                let saved = [
+                    env.cpu.regs()[0],
+                    env.cpu.regs()[1],
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[3],
+                ];
+                let this: id = Ptr::from_bits(saved[0]);
+                let msg_sel = island_sel(env, "message");
+                let m: id = msg_send(env, (this, msg_sel));
+                let text = if m == nil {
+                    String::new()
+                } else {
+                    crate::frameworks::foundation::ns_string::to_rust_string(env, m).into_owned()
+                };
+                env.cpu.regs_mut()[0..4].copy_from_slice(&saved);
+                if text == TMA_REQUEST_TIME_OUT {
+                    log!("[MOLECHEAT] 账号菜单模式:菜单未打开,后台自动登录的通行证请求超时,不弹「{}」", text);
                     return true;
                 }
             }

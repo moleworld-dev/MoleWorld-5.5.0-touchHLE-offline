@@ -180,6 +180,17 @@ AUX_RANGE_CLASSES = frozenset([
     "BackgroundSprite",  # 捉虫 Level1-4:ccTouchEnded:withEvent: 0x17d9b0 取 locationInView: 摆拍打特效
 ])
 
+# 5b) 自带布局文件的根层:不调 winSize、坐标全来自自带的 1024 设计坐标 plist(不走 getPoint:),自己读触摸坐标做命中。
+#    挂在不右移的场景根上,宽屏下整块贴左。必须同时进 UI43_OFFSET_CLASSES(根层右移 off)和 UI43_CODE_RANGES
+#    (它的 locationInView: 按白名单代码减 off),只做一半按钮会全部点偏。
+SELF_LAYOUT_ROOT_CLASSES = frozenset([
+    # [2026-10-06 第九轮 R9-B6] 拍照分享面板:-[CameraLayer onImageSavedToPhotosAlbum:didFinishSavingWithError:contextInfo:]
+    # @0xac72c 把单例挂到 runningScene(0xac794..0xac7c6);子节点坐标来自 share-iPad.plist(mainmenuback posX=512、
+    # buttonreturn1 posX=950);命中 -[SharedInterfaceLayer ccTouchEnded:withEvent:] 0x1a5784 locationInView: →
+    # 0x1a57c4 convertToGL: → point:isInSpriteRect:withHeigthScale:@0x1a5f74 直接比子节点层内坐标。
+    "SharedInterfaceLayer",
+])
+
 # 6) 辅助调用点:类级保持真实宽度、但个别方法按所在白名单小游戏的 1024 虚拟坐标算方向/边界/出生点。
 #    (LR, 类, 实例方法选择子)。四个类都只由白名单小游戏创建。(310eeee)
 AUX_CALLSITES = (
@@ -187,6 +198,15 @@ AUX_CALLSITES = (
     (0x1a3f84, "FishObject", "setFishPosition:isLeft:"),
     (0x1af8c2, "BugObject", "initwithFile:"),
     (0x35e6ac, "WashRoomActor", "initWithIndex:type:parentNode:pathType:"),
+    # [2026-10-06 第九轮 R9-B5] 升级烟花:LevelUpEffectLayer 类级保持真实宽度,但它的三个挂载点
+    # (-[LevelUpLayer displayUI] 0x13abc2、-[NewSceneLevelUp displayUI] 0x331ac4、
+    # -[CommonChristmasFatherGiftLayer showTotalReward] 0xd164)都在已右移的居中根层下,且都传特效号 1,
+    # -[LevelUpEffectLayer initAllEffect:] 0x1943b4 走 alleffect1~4,各取一次 winSize 按「宽 × 系数」撒炸点;
+    # 拿真实宽又随根层再偏 off,烟花扎堆右侧。这四处按 1024 设计宽算,炸点落回居中 4:3 升级框的原版构图。
+    (0x1940d0, "LevelUpEffectLayer", "alleffect1"),
+    (0x194194, "LevelUpEffectLayer", "alleffect2"),
+    (0x19425c, "LevelUpEffectLayer", "alleffect3"),
+    (0x19432a, "LevelUpEffectLayer", "alleffect4"),
 )
 
 # 7) 历史死条目:已验收的 UI43_CALLSITES 里有、但并不是 winSize 调用点的地址。[2026-09-16]
@@ -950,15 +970,27 @@ def main():
     for c in sorted(AUX_RANGE_CLASSES):
         if c not in all_classes:
             errors.append("AUX_RANGE_CLASSES 里的类在二进制里不存在:%s" % c)
+    for c in sorted(SELF_LAYOUT_ROOT_CLASSES):
+        if c not in all_classes:
+            errors.append("SELF_LAYOUT_ROOT_CLASSES 里的类在二进制里不存在:%s" % c)
+            continue
+        if c in UI_LAYOUT_CLASSES or c in KEEP_REAL_WIDTH_CLASSES or c in LAYOUT_TABLE_CLASSES \
+                or c in AUX_RANGE_CLASSES:
+            errors.append("SELF_LAYOUT_ROOT_CLASSES 与其它分类表重复:%s" % c)
+        cnt = sends_by_class.get(c, {})
+        if cnt.get("winSize"):
+            errors.append("自带布局根层 %s 发了 winSize(%d 次),应改按调用点归类" % (c, cnt["winSize"]))
+        if NON_ROOT_RE.search(c):
+            errors.append("自带布局根层 %s 的类名像子节点/非节点(NON_ROOT_RE),不能当根层右移" % c)
 
     # --- 生成三张表 ---
     offset_base = set(c for c in UI_LAYOUT_CLASSES if not NON_ROOT_RE.search(c))
     non_root = sorted(UI_LAYOUT_CLASSES - offset_base)
     real_lrs = set(s[0] for c in UI_LAYOUT_CLASSES for s in ws_by_class.get(c, []))
     gen_cs = sorted(real_lrs | aux_lrs | dead_lrs)
-    gen_oc = sorted(offset_base | LAYOUT_TABLE_CLASSES, key=lambda x: x.encode())
+    gen_oc = sorted(offset_base | LAYOUT_TABLE_CLASSES | SELF_LAYOUT_ROOT_CLASSES, key=lambda x: x.encode())
 
-    range_roots = offset_base | AUX_RANGE_CLASSES
+    range_roots = offset_base | AUX_RANGE_CLASSES | SELF_LAYOUT_ROOT_CLASSES
 
     def chain_hits(c):
         for _ in range(CHAIN_DEPTH):

@@ -222,9 +222,8 @@ pub fn main_userinfo_exists(env: &Environment) -> bool {
 }
 
 fn sandbox_dir(env: &Environment) -> PathBuf {
-    crate::paths::user_data_base_path()
-        .join(crate::paths::SANDBOX_DIR)
-        .join(env.bundle.bundle_identifier())
+    // 联机模式是单独的 `<bundle id>-online` 沙盒(见 paths::sandbox_dir)。
+    crate::paths::sandbox_dir(env.bundle.bundle_identifier())
 }
 
 /// 启动自检:lib.rs 在 env.run() 之前调用(早于任何 guest 代码与读档)。在线模式不做。

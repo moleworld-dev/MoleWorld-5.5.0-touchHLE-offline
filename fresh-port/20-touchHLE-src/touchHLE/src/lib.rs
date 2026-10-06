@@ -510,6 +510,9 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
 
     let bundle_data = fs::BundleData::open_any(&bundle_path)
         .map_err(|e| format!("Could not open app bundle: {e}"))?;
+    // [2026-10-05] 联机模式的存档沙盒单独放(paths::sandbox_dir):建文件系统时就要知道是不是联机,
+    // 而应用专属选项要等读出 bundle id 才应用,所以先登记命令行,选项文件由 Fs::new 按 bundle id 自己读。
+    paths::note_cmdline_options(&option_args);
     let (bundle, fs) = match bundle::Bundle::new_bundle_and_fs_from_host_path(
         bundle_data,
         /* read_only_mode: */ false,
@@ -640,6 +643,14 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     for option_arg in option_args {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
+    }
+
+    if options.network_access != paths::online_sandbox() {
+        log!(
+            "Warning: 联网选项({})与建文件系统时判定的存档沙盒({})不一致",
+            options.network_access,
+            if paths::online_sandbox() { "联机" } else { "单机" }
+        );
     }
 
     // [2026-09-16] A1-03 选项文件和命令行都应用完了才初始化运行时 log_dbg! 模块表:--log-modules 可能写在

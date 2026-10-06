@@ -156,6 +156,60 @@ pub const WALLPAPER_FILES: &[&str] = &[
 /// the `Documents` directory.
 pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
 
+/// [2026-10-05 联机/单机存档分家] 联机模式(`--allow-network-access`)的存档沙盒放在 `<bundle id>-online`,
+/// 与单机沙盒 `<bundle id>` 互不覆盖:以前联机登录选「云端存档」会把单机进度整份盖掉;单机档还可能带作弊
+/// 进度,也不该在联机比对框里被选成「本机存档」传上服务器。目录在建文件系统时定一次([decide_online_sandbox]),
+/// 之后所有按宿主路径读写存档的地方(单实例锁、主档备份、扩地对账、新号补存默认地图)都经 [sandbox_dir] 取。
+static ONLINE_SANDBOX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 命令行(含应用选择器追加的参数)里有没有 `--allow-network-access`。lib.rs 在建文件系统前登记。
+static CMDLINE_ONLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const ONLINE_FLAG: &str = "--allow-network-access";
+const ONLINE_SANDBOX_SUFFIX: &str = "-online";
+
+/// lib.rs 在建文件系统之前登记命令行参数(应用专属选项文件此时还没读,由 [decide_online_sandbox] 自己读)。
+pub fn note_cmdline_options(args: &[String]) {
+    let on = args.iter().any(|a| a == ONLINE_FLAG);
+    CMDLINE_ONLINE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 建文件系统时调用:命令行或两份选项文件(与 lib.rs 应用选项同源)里给这个应用开了联网,就用联机沙盒。
+pub fn decide_online_sandbox(bundle_id: &str) -> bool {
+    let from_file = |file: Box<dyn Read + '_>| {
+        crate::options::get_options_from_file(file, bundle_id)
+            .ok()
+            .flatten()
+            .is_some_and(|o| o.split_ascii_whitespace().any(|a| a == ONLINE_FLAG))
+    };
+    let mut on = CMDLINE_ONLINE.load(std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        if let Ok(mut f) = ResourceFile::open(DEFAULT_OPTIONS_FILE) {
+            on = from_file(Box::new(f.get()));
+        }
+    }
+    if !on {
+        if let Ok(f) = std::fs::File::open(user_data_base_path().join(USER_OPTIONS_FILE)) {
+            on = from_file(Box::new(f));
+        }
+    }
+    ONLINE_SANDBOX.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// 当前用的是不是联机沙盒。
+pub fn online_sandbox() -> bool {
+    ONLINE_SANDBOX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 这个应用的宿主沙盒目录(下面是 Documents / Library / tmp):单机 `<bundle id>`,联机 `<bundle id>-online`。
+pub fn sandbox_dir(bundle_id: &str) -> PathBuf {
+    let name = if online_sandbox() {
+        format!("{bundle_id}{ONLINE_SANDBOX_SUFFIX}")
+    } else {
+        bundle_id.to_string()
+    };
+    user_data_base_path().join(SANDBOX_DIR).join(name)
+}
+
 /// Get a platform-specific base path needed for accessing touchHLE's
 /// user-modifiable files. This is empty on platforms other than Android.
 pub fn user_data_base_path() -> Cow<'static, Path> {

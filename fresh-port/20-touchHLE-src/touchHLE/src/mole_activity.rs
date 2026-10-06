@@ -109,6 +109,13 @@ const CMD_DISCOUNT_LIST: u32 = 1049;
 /// [2026-09-16] E-03 1074 getDailyTaskListFromServerWithSceneId:(0x1cb5cc,0x1cb60e `movw r3, #0x432`)→
 /// parseDailyTaskListWithSceneId:pos:len:(0x1c0398)。请求体 1 字节:参数 1 → 0(主村)、10 → 1(黄金岛),其它参数不发包。
 const CMD_DAILY_TASK_LIST: u32 = 1074;
+/// [2026-10-06 第九轮 R9-D1] 1051 getLoginCountFromServer(0x1cb1b0,0x1cb1bc `movw r3, #0x41b`)→ parseLoginCount:pos:len:@0x1bfca8
+/// (只 getBytes 1 字节 → [GameData setLoginTimesCounter:]);onCommandReceived: tbh@0x22ed8 → 0x23620
+/// [[AchievementControl shareInstance] checkConditions:0x20](全二进制唯一触发「连续登录」成就判定的地方)。
+const CMD_LOGIN_COUNT: u32 = 1051;
+/// [2026-10-06 第九轮 R9-D1] 1050 getOnlineTimeFormServer(0x1cb194,0x1cb1a0 `movw r3, #0x41a`)→ parseOnlineTime:pos:len:@0x1bfc30
+/// (getBytes 4 字节 → setOnlineTimer:,单位秒);分发 0x235f2 checkConditions:0x10(累计在线成就)。
+const CMD_ONLINE_TIME: u32 = 1050;
 /// [2026-10-04 第八轮 R8-C2] 1138 -[NetworkManager getDivineDataList]@0x1cbe6c(sendPacket 0x472)→ parseDivineDataList:pos:len:@0x1c4d80。
 /// 回包:[u32 今天已用过免费(非 0=已用,0x1c4eb6 → setHasFreeDivinedToday:)][u32 组数] + 每组 [u32 轮次][u32 件数]
 /// + 件数×[u32 objectId][u32 num][u32 posibility]。轮次 1..=5 进 divineDataArray[轮次-1](0x1c5044 cmp/bls → 0x1c5062),
@@ -1847,7 +1854,9 @@ fn loopback_accepts(cmd: u32) -> bool {
         | CMD_SEABED_REFRESH
         | CMD_DAILY_TASK_LIST
         | CMD_DIVINE_LIST
-        | CMD_FREE_DIVINE_TAG => true,
+        | CMD_FREE_DIVINE_TAG
+        | CMD_LOGIN_COUNT
+        | CMD_ONLINE_TIME => true,
         _ => false,
     }
 }
@@ -1981,6 +1990,20 @@ fn answer_request(env: &mut Environment, nm: id, cmd: u32, req: &[u8]) {
                     );
                 }
             }
+        }
+        // [2026-10-06 第九轮 R9-D1] 连续登录 1051 / 累计在线 1050:按离线侧档回包(数值与 GameData loginTimesCounter /
+        //   onlineTimer 两个 getter 的离线拦截同源),由原版 onCommandReceived: 自己发 checkConditions:0x20 / 0x10 判成就,
+        //   currentGameMode 门、已解锁去重、发奖与存档都走原版。连续天数只在本地日期 == 上次 + 1 时加 1(on_enter_village),
+        //   同一天重复进村不变,刷不出来。
+        CMD_LOGIN_COUNT => {
+            let (streak, _) = crate::mole_items::offline_login_stats(env);
+            log!("[ACTIVITY] 连续登录 1051 回包 {} 天", streak);
+            enqueue_reply(env, nm, cmd, vec![streak.min(255) as u8]);
+        }
+        CMD_ONLINE_TIME => {
+            let (_, secs) = crate::mole_items::offline_login_stats(env);
+            log!("[ACTIVITY] 在线时长 1050 回包 {} 秒", secs);
+            enqueue_reply(env, nm, cmd, secs.to_le_bytes().to_vec());
         }
         // [2026-10-04 第八轮 R8-C2] 占卜奖池 1138:照 parseDivineDataList 逐字段编码(奖池见 DIVINE_POOL,移植者自拟)。
         CMD_DIVINE_LIST => {
@@ -2825,6 +2848,13 @@ fn island_discount_apply(env: &mut Environment) {
 /// [2026-10-03] 只由运行循环受理点调用(startGame: 臂只置标志,见 startgame_resend_poll),不在 startGame: 的调用栈上,不碰寄存器。
 ///   三个发包方法照常走原版入口,在 sendPacket:commandId: 臂被截下,同一受理点紧接着算应答,回包下一轮喂。
 fn startgame_resend_offline(env: &mut Environment, nm: id) {
+    // [2026-10-06 第九轮 R9-D1] 原版 isConnected 门内 0x19aa8 [nm getLoginCountFromServer]、0x19ac2 [nm getOnlineTimeFormServer]
+    //   (排在公告 1058 之前;两者之间原版还有一次 sleep,离线无意义不照抄)。两方法体只有 sendPacket:nil commandId:,
+    //   被回环截下,回包里的连续天数/在线秒数由原版分发去判「衷心感谢」「超感动」成就。
+    let get_login = sel_named(env, "getLoginCountFromServer");
+    let _: () = msg_send(env, (nm, get_login));
+    let get_online = sel_named(env, "getOnlineTimeFormServer");
+    let _: () = msg_send(env, (nm, get_online));
     let gd = singleton(env, "GameData", "sharedInstance");
     if gd != nil {
         let set_flag = sel_named(env, "setIsUserSelectedNoticeBoardMenu:");
