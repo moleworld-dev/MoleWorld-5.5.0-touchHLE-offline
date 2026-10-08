@@ -8486,7 +8486,7 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
         || sel == "moleIslandTimeTravelNotice"
         // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
-        || (class == "Porter" && matches!(sel, "touchBegan:" | "touchMove:"))
+        || (matches!(class, "Porter" | "NewScenePorter") && matches!(sel, "touchBegan:" | "touchMove:"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -9835,9 +9835,36 @@ static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::M
 ///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、按下点落在
 ///     objSprite 的包围盒里,就照原版 setPutRefToCenter@0x2f6a4 的算法把 putRef 设到占地中心并置 state=2,
 ///     然后放行原 touchMove:,由它 moveTo: 跟手并置 state=3;GameManager 见 state>1 不再平移地图。
-/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响;岛上 NewScenePorter 是另一个类。
+/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响。
+/// [2026-10-08 第十三轮] 黄金岛的摆放类 NewScenePorter 与 Porter 逐条同构(touchBegan:@0x2714f0、touchMove:@0x2716b8 只在
+/// state 2/3 跟手、setPutRefToCenter@0x270820 同算法),只是成员偏移槽不同、分派调用点是 processTouch:withType:@0x2714dc
+/// (LR 0x2714e1),一并覆盖:岛上买店后按店的图身也能拖。
 /// 触摸在运行循环的事件分派里处理,不在绘制帧内,可以发宿主消息;发完恢复 r0–r3。
-fn porter_body_drag(env: &mut Environment, is_move: bool) {
+struct PorterSlots {
+    obj_sprite: u32,
+    size: u32,
+    put_ref_x: u32,
+    put_ref_y: u32,
+    state: u32,
+    prev_touch_type: u32,
+}
+const PORTER_SLOTS: PorterSlots = PorterSlots {
+    obj_sprite: 0xb03284,
+    size: 0xb032a8,
+    put_ref_x: 0xb032b8,
+    put_ref_y: 0xb032bc,
+    state: 0xb03290,
+    prev_touch_type: 0xb03294,
+};
+const NEW_SCENE_PORTER_SLOTS: PorterSlots = PorterSlots {
+    obj_sprite: 0xb062b4,
+    size: 0xb062d8,
+    put_ref_x: 0xb062e4,
+    put_ref_y: 0xb062e8,
+    state: 0xb062c0,
+    prev_touch_type: 0xb062c4,
+};
+fn porter_body_drag(env: &mut Environment, is_move: bool, slots: &PorterSlots) {
     let regs = *env.cpu.regs();
     let porter = regs[0];
     let p = CGPoint {
@@ -9854,12 +9881,12 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
     };
     drop(down);
     if down_porter != porter
-        || peek_ivar(env, porter, 0xb03290) != Some(1)
-        || peek_ivar(env, porter, 0xb03294) != Some(0)
+        || peek_ivar(env, porter, slots.state) != Some(1)
+        || peek_ivar(env, porter, slots.prev_touch_type) != Some(0)
     {
         return;
     }
-    let sprite = peek_ivar(env, porter, 0xb03284).unwrap_or(0);
+    let sprite = peek_ivar(env, porter, slots.obj_sprite).unwrap_or(0);
     if sprite == 0 {
         return;
     }
@@ -9869,24 +9896,54 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
         .objc
         .register_host_selector("convertToNodeSpace:".to_string(), &mut env.mem);
     let s_bbox = env.objc.register_host_selector("boundingBox".to_string(), &mut env.mem);
+    let s_children = env.objc.register_host_selector("children".to_string(), &mut env.mem);
+    let s_count = env.objc.register_host_selector("count".to_string(), &mut env.mem);
+    let s_oai = env
+        .objc
+        .register_host_selector("objectAtIndex:".to_string(), &mut env.mem);
+    let inside = |p: CGPoint, r: CGRect| {
+        r.size.width > 0.0
+            && r.size.height > 0.0
+            && p.x >= r.origin.x
+            && p.x <= r.origin.x + r.size.width
+            && p.y >= r.origin.y
+            && p.y <= r.origin.y + r.size.height
+    };
     let parent: id = msg_send(env, (spr, s_parent));
-    let hit = parent != nil && {
+    let mut hit = false;
+    if parent != nil {
         let local: CGPoint = msg_send(env, (parent, s_to_node, down_pt));
         let bb: CGRect = msg_send(env, (spr, s_bbox));
-        local.x >= bb.origin.x
-            && local.x <= bb.origin.x + bb.size.width
-            && local.y >= bb.origin.y
-            && local.y <= bb.origin.y + bb.size.height
-    };
+        hit = inside(local, bb);
+        // 岛上建筑是 StableAnimation 的静态动画精灵(-[NewScenePorter attachObject:] 0x26be08 getStaticImageWithData:):
+        // 本身是空容器、contentSize 为 0,图在直接子节点里;用子节点自己的图框(在精灵坐标系里)再判一次。
+        if !hit {
+            let in_spr: CGPoint = msg_send(env, (spr, s_to_node, down_pt));
+            let children: id = msg_send(env, (spr, s_children));
+            if children != nil {
+                let n: crate::mem::GuestUSize = msg_send(env, (children, s_count));
+                for i in 0..n.min(16) {
+                    let ch: id = msg_send(env, (children, s_oai, i));
+                    if ch != nil {
+                        let cb: CGRect = msg_send(env, (ch, s_bbox));
+                        if inside(in_spr, cb) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
     if !hit {
         return;
     }
     let (Some(state_off), Some(size_off), Some(rx_off), Some(ry_off)) = (
-        peek_u32(env, 0xb03290),
-        peek_u32(env, 0xb032a8),
-        peek_u32(env, 0xb032b8),
-        peek_u32(env, 0xb032bc),
+        peek_u32(env, slots.state),
+        peek_u32(env, slots.size),
+        peek_u32(env, slots.put_ref_x),
+        peek_u32(env, slots.put_ref_y),
     ) else {
         return;
     };
@@ -9903,9 +9960,12 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
 }
 
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
-    if class == "Porter" && (sel == "touchBegan:" || sel == "touchMove:") {
-        if env.cpu.regs()[14] & !1u32 == 0x30a78 {
-            porter_body_drag(env, sel == "touchMove:");
+    if (class == "Porter" || class == "NewScenePorter") && (sel == "touchBegan:" || sel == "touchMove:") {
+        let lr = env.cpu.regs()[14] & !1u32;
+        if class == "Porter" && lr == 0x30a78 {
+            porter_body_drag(env, sel == "touchMove:", &PORTER_SLOTS);
+        } else if class == "NewScenePorter" && lr == 0x2714e0 {
+            porter_body_drag(env, sel == "touchMove:", &NEW_SCENE_PORTER_SLOTS);
         }
         return false;
     }
