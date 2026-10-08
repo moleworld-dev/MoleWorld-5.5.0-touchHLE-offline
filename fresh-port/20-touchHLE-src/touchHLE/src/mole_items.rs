@@ -2021,10 +2021,16 @@ fn due(pending: &AtomicBool, next_try_ms: &AtomicU64) -> bool {
 
 /// ns_run_loop::run_run_loop 主线程每轮都调,平时只有三次原子读。
 pub fn run_loop_pending() -> bool {
+    // [2026-10-07 第十一轮 R11-F-4] 墙钟跳变检测每轮做一次(只读两个时钟),跳了就排一次昼夜对钟。
+    if day_night_clock_jumped() {
+        DAY_NIGHT_RESYNC_PENDING.store(true, Ordering::Relaxed);
+        DAY_NIGHT_NEXT_TRY_MS.store(0, Ordering::Relaxed);
+    }
     NEG_GOLD_CHECK_PENDING.load(Ordering::Relaxed)
         || due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS)
         || due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS)
         || due(&PERIODIC_SAVE_ON, &PERIODIC_SAVE_NEXT_MS)
+        || due(&DAY_NIGHT_RESYNC_PENDING, &DAY_NIGHT_NEXT_TRY_MS)
 }
 
 /// 运行循环受理点(ns_run_loop,perform 相位之后):栈上没有游戏方法体,可以自由发宿主消息;不在 intercept 里,不碰寄存器。
@@ -2034,7 +2040,8 @@ pub fn run_loop_poll(env: &mut Environment) {
     let gift = due(&FIRST_CHARGE_PENDING, &FIRST_CHARGE_NEXT_TRY_MS);
     let unlock = due(&RECHARGE_UNLOCK_PENDING, &RECHARGE_UNLOCK_NEXT_TRY_MS);
     let periodic = due(&PERIODIC_SAVE_ON, &PERIODIC_SAVE_NEXT_MS);
-    if !neg_gold && !gift && !unlock && !periodic {
+    let day_night = due(&DAY_NIGHT_RESYNC_PENDING, &DAY_NIGHT_NEXT_TRY_MS);
+    if !neg_gold && !gift && !unlock && !periodic && !day_night {
         return;
     }
     let pool_cls = env.objc.get_known_class("NSAutoreleasePool", &mut env.mem);
@@ -2052,8 +2059,81 @@ pub fn run_loop_poll(env: &mut Environment) {
     if periodic {
         periodic_local_save_poll(env);
     }
+    if day_night {
+        day_night_resync(env);
+    }
     let drain_s = sel_of(env, "drain");
     let _: () = msg_send(env, (pool, drain_s));
+}
+
+/// [2026-10-07 第十一轮 R11-F-4] 昼夜要重新对钟(见 day_night_resync)。不在主村时每 2 秒再试一次。
+static DAY_NIGHT_RESYNC_PENDING: AtomicBool = AtomicBool::new(false);
+static DAY_NIGHT_NEXT_TRY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// [2026-10-07 第十一轮 R11-F-4] 自上一轮以来墙钟有没有跳变:时间旅行(time_jump_generation 变了),或宿主墙钟相对
+/// 单调钟前跳/后退超过 2 分钟(电脑睡眠唤醒——macOS 的 Instant 走 CLOCK_UPTIME_RAW,睡眠期间不走;或改了系统时间)。
+/// 每轮运行循环一次,只读两个时钟。
+fn day_night_clock_jumped() -> bool {
+    use std::cell::Cell;
+    use std::time::{Duration, SystemTime};
+    thread_local! {
+        static LAST: Cell<Option<(SystemTime, Instant, u64)>> = const { Cell::new(None) };
+    }
+    let now_wall = SystemTime::now();
+    let now_mono = Instant::now();
+    let generation = crate::libc::time::time_jump_generation();
+    let threshold = Duration::from_secs(120);
+    LAST.with(|last| {
+        let jumped = match last.get() {
+            None => false,
+            Some((wall, mono, gen)) => {
+                let mono_delta = now_mono.duration_since(mono);
+                gen != generation
+                    || match now_wall.duration_since(wall) {
+                        Ok(wall_delta) => wall_delta > mono_delta + threshold,
+                        Err(back) => back.duration() > threshold,
+                    }
+            }
+        };
+        last.set(Some((now_wall, now_mono, generation)));
+        jumped
+    })
+}
+
+/// [2026-10-07 第十一轮 R11-F-4] 昼夜重新对钟。-[CommonEffectController innerupdate4DayNight:]@0x321f00 每次只把
+/// secondsInTaday_ 加 1(按 1 秒排程,一帧最多触发一次,长停顿后只补 1 秒),按 NSCalendar 重新取钟点的
+/// resetSecondsInToday 全二进制只有 applicationDidBecomeActive: 调(0x10da4/0x10eac)。真机睡眠/改时间都会经历
+/// 失活→激活;桌面电脑睡眠唤醒不发,时间旅行只补发 applicationSignificantTimeChange:(游戏只 setNextDeltaTimeZero:),
+/// 于是白天黑夜与真实钟点错开,要最小化再还原或重启才恢复。这里照原版 didBecomeActive 的做法补调
+/// resetSecondsInToday 与 checkIsNightComing(重复排程只会更新间隔),只在主村加载完成后做,否则留到之后。
+/// 运行循环受理点,不在帧栈上。
+fn day_night_resync(env: &mut Environment) {
+    DAY_NIGHT_NEXT_TRY_MS.store(process_ms() + 2000, Ordering::Relaxed);
+    let Some((scene, _)) = scene_and_mode(env) else {
+        return;
+    };
+    if scene != 1 {
+        return;
+    }
+    let am = shared(env, "ActorManager", "Instance");
+    if am == nil {
+        return;
+    }
+    let s = sel_of(env, "m_isLoadMap");
+    let loading: u8 = msg_send(env, (am, s));
+    if loading != 0 {
+        return;
+    }
+    let cec = shared(env, "CommonEffectController", "sharedManager");
+    DAY_NIGHT_RESYNC_PENDING.store(false, Ordering::Relaxed);
+    if cec == nil {
+        return;
+    }
+    let s = sel_of(env, "resetSecondsInToday");
+    let _: () = msg_send(env, (cec, s));
+    let s = sel_of(env, "checkIsNightComing");
+    let _: () = msg_send(env, (cec, s));
+    log!("[时间] 墙钟跳变(时间旅行或电脑睡眠唤醒):已照 applicationDidBecomeActive: 重新对昼夜钟点");
 }
 
 /// [2026-10-06 第九轮 R9-C1b] 定时本地落盘(见 PERIODIC_SAVE_ON)。先把下次时刻推后 60 秒,再照 -[GameManager sendGameData2Server:]

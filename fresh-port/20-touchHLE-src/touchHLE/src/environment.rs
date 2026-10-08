@@ -414,7 +414,8 @@ impl Environment {
             )))
         };
 
-        let mut mem = mem::Mem::new();
+        // [2026-10-07 第十一轮 R11-P2-1] 地址空间保留失败作为普通错误返回(中文说明),不再 panic。
+        let mut mem = mem::Mem::try_new()?;
 
         let is_spore = bundle.bundle_identifier().starts_with("com.ea.spore");
         let is_critter_crunch = bundle

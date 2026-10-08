@@ -148,7 +148,56 @@ fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
     };
     let aspect = raw.clamp(4.0 / 3.0, fill_max_aspect());
     let landscape_long = ((base_short as f32) * aspect).round() as u32;
+    // [2026-10-07 第十一轮 R11-P2-6] 只比 4:3 多不到 1 个逻辑点的屏幕按 4:3 处理:12.9 英寸 iPad Pro(1366×1024)
+    // 的比例 1.333984375 × 768 = 1024.5 → 1025,被 is_widescreen 当成宽屏,4:3 设备走了 UI43 虚拟化(偏移 0.5 点、
+    // 居中直接跳过)和宽版底图重定向那套。贴回 4:3 后走原版 1024×768 路径。
+    let four_three_long = ((base_short as f32) * 4.0 / 3.0).round() as u32;
+    let landscape_long = if landscape_long <= four_three_long + 1 {
+        four_three_long
+    } else {
+        landscape_long
+    };
     (base_short, landscape_long)
+}
+
+/// [2026-10-07 第十一轮 R11-H-1] 桌面窗口模式:窗口按 1024×768 客户区建、按整块屏幕(含任务栏)居中,程序也不声明高分屏感知。
+/// Windows 笔记本常见的 1920×1080@150% 缩放下逻辑屏只有 1280×720,比 768 的客户区还矮,标题栏跑到屏幕外,顶部或底部
+/// 一条被屏幕边缘/任务栏挡住(拖不动窗口、看不到底部按钮)。这里建窗后取窗口所在屏的可用区域(扣任务栏/菜单栏)与边框
+/// 尺寸:放得下就不动;放不下就按原比例把客户区缩到放得下,再在可用区域内居中。画面缩放与触摸换算本来就按 drawable_size
+/// 跟随窗口大小,不受影响。iOS/安卓不走窗口模式分支。
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn fit_window_into_usable_area(video_ctx: &sdl2::VideoSubsystem, window: &mut sdl2::video::Window) {
+    let Ok(display) = window.display_index() else {
+        return;
+    };
+    let Ok(usable) = video_ctx.display_usable_bounds(display) else {
+        return;
+    };
+    let (top, left, bottom, right) = window.border_size().unwrap_or((0, 0, 0, 0));
+    let (w, h) = window.size();
+    let border_w = u32::from(left) + u32::from(right);
+    let border_h = u32::from(top) + u32::from(bottom);
+    let avail_w = usable.width().saturating_sub(border_w);
+    let avail_h = usable.height().saturating_sub(border_h);
+    if w == 0 || h == 0 || avail_w == 0 || avail_h == 0 || (w <= avail_w && h <= avail_h) {
+        return;
+    }
+    let scale = (avail_w as f64 / w as f64).min(avail_h as f64 / h as f64);
+    let new_w = ((w as f64 * scale).floor() as u32).max(256);
+    let new_h = ((h as f64 * scale).floor() as u32).max(192);
+    if window.set_size(new_w, new_h).is_err() {
+        return;
+    }
+    let x = usable.x() + (usable.width().saturating_sub(new_w + border_w) / 2) as i32 + i32::from(left);
+    let y = usable.y() + (usable.height().saturating_sub(new_h + border_h) / 2) as i32 + i32::from(top);
+    window.set_position(
+        sdl2::video::WindowPos::Positioned(x),
+        sdl2::video::WindowPos::Positioned(y),
+    );
+    log!(
+        "[MOLE-RES] 窗口 {}x{} 放不进屏幕可用区域 {}x{}(边框 上{} 左{} 下{} 右{}),缩到 {}x{} 并居中",
+        w, h, usable.width(), usable.height(), top, left, bottom, right, new_w, new_h
+    );
 }
 
 /// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size,或 --fill-screen 已自动算出)。
@@ -962,6 +1011,8 @@ impl Window {
             }
             let mut window = builder.build().unwrap();
             window.set_minimum_size(256, 192).ok();
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            fit_window_into_usable_area(&video_ctx, &mut window);
             window
         };
 
@@ -3023,35 +3074,54 @@ pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
 }
 
+/// [2026-10-07 第十一轮 R11-H-2] 本次运行是否已经弹过错误框(桌面入口据此决定是否对 main 返回的错误补弹)。
+static ERROR_MESSAGEBOX_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [2026-10-07 第十一轮 R11-H-2] 见 ERROR_MESSAGEBOX_SHOWN。
+pub fn error_messagebox_shown() -> bool {
+    ERROR_MESSAGEBOX_SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Show an SDL messagebox for an error (typically after a panic).
 ///
 /// The window argument allows for passing in the parent window for the
 /// messagebox, which is not required but should be done if possible.
+///
+/// [2026-10-07 第十一轮 R11-P2-2 / R11-H-2] 文案改成中文,并写明请玩家把日志发回来;记下已经弹过
+/// (error_messagebox_shown),桌面入口对 main 返回的错误补弹时不重复弹。弹框本身失败只记日志,
+/// 不再 panic(以前在 panic 处理途中再 panic 会直接终止)。
 pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
     assert!(window.is_none_or(|win| win.on_main_stack));
+    ERROR_MESSAGEBOX_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     use sdl2::messagebox;
     let mbox = [
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 0,
-            text: "Open touchHLE directory",
+            text: "打开日志所在文件夹",
         },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 1,
-            text: "Close",
+            text: "关闭",
         },
     ];
 
+    let log_hint = if cfg!(any(target_os = "ios", target_os = "android")) {
+        "请在「文件」App 里找到摩尔庄园HD 文件夹,把 touchHLE_log.txt(重开游戏后是 touchHLE_log.prev.txt)发给开发者。"
+    } else {
+        "请把游戏文件夹里的 touchHLE_log.txt(重开游戏后是 touchHLE_log.prev.txt)发给开发者。"
+    };
     let Ok(clicked_button) = messagebox::show_message_box(
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
-        "touchHLE crashed!",
-        &format!("touchHLE crashed with the following error: {error_message}"),
+        "摩尔庄园出错了",
+        &format!("游戏遇到错误,需要退出。\n\n{error_message}\n\n{log_hint}"),
         window.map(|win| &win.window),
         None,
     ) else {
-        panic!("Failed to show message box!");
+        echo!("错误弹框显示失败;错误内容:{}", error_message);
+        return;
     };
 
     match clicked_button {
