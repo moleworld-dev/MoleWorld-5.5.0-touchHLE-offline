@@ -8485,6 +8485,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // [2026-09-25 第五轮遗留 C] 时间旅行拦岛的延迟提示:宿主自排的裸 sel(接收者 GameManager 已在 CLASSES,
         //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
         || sel == "moleIslandTimeTravelNotice"
+        // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
+        || (class == "Porter" && matches!(sel, "touchBegan:" | "touchMove:"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -8514,7 +8516,9 @@ static WINSIZE_STALE: AtomicBool = AtomicBool::new(true);
 ///   · 根层自身 position/setPosition:(任何 guest 调用者,含 CCMoveTo 等动作)getter −off / setter +off,
 ///     游戏侧永远看到虚拟坐标,cocos2d 内部变换直读 position_ ivar 拿真实值;
 ///   · 挂到 EAGLView 上的 UIKit 子视图(输入框/网页/好友表)见 [UI43_VIEWS]。
-/// cocos2d 自己的命中(CCMenu itemForTouch / convertTouchToNodeSpace / 表格)走真实坐标 + 真实变换,天然正确。
+/// cocos2d 自己的命中(CCMenu itemForTouch / convertTouchToNodeSpace)走真实坐标 + 真实变换,天然正确。
+/// ★例外是滚动表格 CCScrollView/CCTableView 的按下/移动判定:拿【父层坐标】的 {position, viewSize} 去比
+/// 【世界坐标】触点,原版根层在 (0,0) 两者重合,根层右移后差 off,见 [UI43_SCROLL_HIT_LRS]。
 ///
 /// ★宿主发起的消息一律不换算(`from_host`):touchHLE 的宿主 `msg_send` 走 CallFromHost,同样把参数写进
 /// r0–r3(所以读寄存器对两种来源都成立),但**不会更新 LR**——run loop 里 LR 是陈旧的 main 返回地址
@@ -8788,6 +8792,18 @@ fn ui43_lr_in_wl(lr: u32) -> bool {
     let i = UI43_CODE_RANGES.partition_point(|&(s, _)| s <= lr);
     i > 0 && lr < UI43_CODE_RANGES[i - 1].1
 }
+
+/// [2026-10-08 第十二轮] 滚动表格命中判定里 convertToWorldSpace: 的返回地址(LR,已去 Thumb 位)。
+/// -[CCScrollView ccTouchBegan:withEvent:]@0x8fb5c 与 -[CCScrollView ccTouchMoved:withEvent:]@0x8fd70 都是:
+/// 触点 convertTouchToNodeSpace: 再 convertToWorldSpace: 得世界坐标,然后 CGRectContainsPoint({position, viewSize}, 世界点)。
+/// position 是【父层坐标】,原版根层在 (0,0),父层坐标 = 世界坐标;UI43 v2 把根层整体右移 off 后,同一个点的世界坐标
+/// 比父层坐标大 off,判定框等于左移了 off:
+///   · 选关表格(矿洞/切水果/耕地/拍虫子/画画)右边超出 1024−off 的格子按下被拒 → iPhone(off=323)矿洞第 4 关点不了;
+///   · 商店商品表格的假判定框左移 323,盖住左边详情区的「立即购买」,表格(按下即吞)把触摸截走 → 黄金岛买不了东西。
+/// 1188 宽(off=82)下错位小,按钮和格子大多还在判定框内,所以以前没暴露。
+/// 修法:这两处的世界坐标在表格挂在已右移根层下时 x−off,换回原版的设计世界坐标,与 position 同一坐标系。
+/// CCScrollView 不在白名单代码段(cocos2d 类),所以单列;不在右移根层下的表格(世界场景等)不动。
+const UI43_SCROLL_HIT_LRS: [u32; 2] = [0x8fb60, 0x8fd74];
 
 /// [MoleWorld 宽屏适配·居中偏移] 4:3 虚拟窗口整体右移量 = (真实 landscape 宽 − 1024) / 2。
 /// 1188 宽 → 82pt;原生 4:3(1024)→ 0(不偏移)。
@@ -9368,10 +9384,32 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
         }
         // 坐标换算:只在【白名单代码在问】且确实有根层被右移过时才动
         _ => {
-            if UI43_ROOTS_LEN.load(O) == 0 || !ui43_lr_in_wl(env.cpu.regs()[14] & !1u32) {
+            if UI43_ROOTS_LEN.load(O) == 0 {
                 return false;
             }
             let recv: id = Ptr::from_bits(regs[1]);
+            let lr = regs[14] & !1u32;
+            if !ui43_lr_in_wl(lr) {
+                // [2026-10-08 第十二轮] 滚动表格的两处命中判定(见 [UI43_SCROLL_HIT_LRS]):表格挂在已右移根层下才换算。
+                if kind != 6 || !UI43_SCROLL_HIT_LRS.contains(&lr) {
+                    return false;
+                }
+                let p = ui43_point_arg(env, &regs);
+                let s = ui43_sels(env);
+                if !ui43_has_shifted_ancestor(env, recv, &s) {
+                    // 查祖先发的宿主消息会改写 r0–r3,放行真方法前恢复入参。
+                    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
+                    return false;
+                }
+                let mut q: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, p)));
+                q.x -= off;
+                env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), q);
+                if ui43_debug() {
+                    let (qx, qy) = (q.x, q.y);
+                    log!("[UI43] 滚动表格命中 lr={:#x} 世界点 → 设计 ({:.0},{:.0})", lr, qx, qy);
+                }
+                return true;
+            }
             let out: CGPoint = match kind {
                 5 => {
                     let view: id = Ptr::from_bits(regs[3]);
@@ -9787,7 +9825,92 @@ fn porter_reattach_diag(env: &Environment) {
     );
 }
 
+/// [2026-10-08 第十二轮] 摆放时按住建筑图身也能拖:本次手势按下点(Porter 指针, 触点)。
+static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::Mutex::new(None);
+
+/// [2026-10-08 第十二轮,用户拍板的交互放宽] 摆放中从建筑图身起拖也能拖动正在摆放的物件。
+/// 原版 -[Porter touchBegan:]@0x30a88 只在按下点落在占地菱形格(1×1 奖池物件只有 60×30 的底座)上时置 state=2;
+/// -[Porter touchMove:]@0x30c50 只在 state 为 2/3 时跟手;-[GameManager processTouch:withType:] 随后见 state≤1 就平移地图。
+/// 高大的占卜奖品/建筑图身占绝大部分面积,玩家按图身拖只会平移地图,10-07 反馈「卡在红区移不动」。
+/// 做法:两个前置钩子都只认 -[Porter processTouch:withType:]@0x30a74 这一个调用点(LR 0x30a79)。
+///   · touchBegan: 记下按下点;
+///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、按下点落在
+///     objSprite 的包围盒里,就照原版 setPutRefToCenter@0x2f6a4 的算法把 putRef 设到占地中心并置 state=2,
+///     然后放行原 touchMove:,由它 moveTo: 跟手并置 state=3;GameManager 见 state>1 不再平移地图。
+/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响;岛上 NewScenePorter 是另一个类。
+/// 触摸在运行循环的事件分派里处理,不在绘制帧内,可以发宿主消息;发完恢复 r0–r3。
+fn porter_body_drag(env: &mut Environment, is_move: bool) {
+    let regs = *env.cpu.regs();
+    let porter = regs[0];
+    let p = CGPoint {
+        x: f32::from_bits(regs[2]),
+        y: f32::from_bits(regs[3]),
+    };
+    let mut down = PORTER_BODY_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if !is_move {
+        *down = Some((porter, p));
+        return;
+    }
+    let Some((down_porter, down_pt)) = down.take() else {
+        return;
+    };
+    drop(down);
+    if down_porter != porter
+        || peek_ivar(env, porter, 0xb03290) != Some(1)
+        || peek_ivar(env, porter, 0xb03294) != Some(0)
+    {
+        return;
+    }
+    let sprite = peek_ivar(env, porter, 0xb03284).unwrap_or(0);
+    if sprite == 0 {
+        return;
+    }
+    let spr: id = Ptr::from_bits(sprite);
+    let s_parent = env.objc.register_host_selector("parent".to_string(), &mut env.mem);
+    let s_to_node = env
+        .objc
+        .register_host_selector("convertToNodeSpace:".to_string(), &mut env.mem);
+    let s_bbox = env.objc.register_host_selector("boundingBox".to_string(), &mut env.mem);
+    let parent: id = msg_send(env, (spr, s_parent));
+    let hit = parent != nil && {
+        let local: CGPoint = msg_send(env, (parent, s_to_node, down_pt));
+        let bb: CGRect = msg_send(env, (spr, s_bbox));
+        local.x >= bb.origin.x
+            && local.x <= bb.origin.x + bb.size.width
+            && local.y >= bb.origin.y
+            && local.y <= bb.origin.y + bb.size.height
+    };
+    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
+    if !hit {
+        return;
+    }
+    let (Some(state_off), Some(size_off), Some(rx_off), Some(ry_off)) = (
+        peek_u32(env, 0xb03290),
+        peek_u32(env, 0xb032a8),
+        peek_u32(env, 0xb032b8),
+        peek_u32(env, 0xb032bc),
+    ) else {
+        return;
+    };
+    let size: CGSize = env.mem.read(ConstPtr::<CGSize>::from_bits(porter + size_off));
+    let (rx, ry) = ((size.width * 0.5) as i32, (size.height * 0.5) as i32);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + rx_off), rx);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + ry_off), ry);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + state_off), 2);
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, O) < 20 {
+        let (dx, dy) = (down_pt.x, down_pt.y);
+        log!("[摆放] 从图身起拖:按下点 ({:.0},{:.0}) 在摆放物件图上,改为拖动物件(占地中心对手指)", dx, dy);
+    }
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
+    if class == "Porter" && (sel == "touchBegan:" || sel == "touchMove:") {
+        if env.cpu.regs()[14] & !1u32 == 0x30a78 {
+            porter_body_drag(env, sel == "touchMove:");
+        }
+        return false;
+    }
     if sel == "attachObjectWithHouseLevel:data:" {
         if class == "Porter" {
             porter_reattach_diag(env);
