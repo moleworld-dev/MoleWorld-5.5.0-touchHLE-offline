@@ -57,8 +57,11 @@
     <!-- if you want to capture audio, uncomment this. -->
     <!-- <uses-permission android:name="android.permission.RECORD_AUDIO" /> -->
 
+    <!-- [2026-10-07 第十一轮 R11-H-8] hasFragileUserData:存档只在应用专属外部目录(离线版没有服务器端账号可以找回),
+         卸载时让系统询问是否保留数据(Android 10+ 原生卸载对话框),免得「卸载重装排查问题」时唯一一份存档被静默删除。 -->
     <application
         android:allowBackup="true"
+        android:hasFragileUserData="true"
         android:hardwareAccelerated="true"
         android:icon="${icon}"
         android:label="@string/app_name"
