@@ -14,8 +14,9 @@
 //!
 //! - 轮换(before_replace):Fs::write_atomic 写好临时文件、rename 覆盖之前调用。目标是沙盒 Documents 下的这两份档、
 //!   且「当前盘上那份」按原版判据合格,就把它复制到备份目录;当前那份不合格就不轮换(坏档永远盖不掉好备份)。
-//!   不加 fsync(saveUserInfoData 调用点很多,每次加减贝壳都存,Apple 上 sync 是 F_FULLFSYNC 会卡模拟线程);
-//!   断电时上一代备份早已落盘,足以恢复。
+//!   [2026-10-06 第十轮 R10-B1] 更正:备份并不「早已落盘」——每次存档都先轮换备份再改名主档,两份是同一时刻
+//!   写的。现在主档与备份的临时文件都先落盘再改名(fs::sync_before_rename:Apple 用 F_BARRIERFSYNC 只加写入
+//!   屏障,不等磁盘缓存清空,不卡模拟线程),断电时主档不会变成 0 字节或半截,备份同理;「上一代」语义不变。
 //! - 启动自检(startup_check):lib.rs 在 env.run() 之前调用,早于任何 guest 代码与读档。两份档各自判:存在但不合格、
 //!   且备份合格 → 坏档改名 <名>.corrupt(已存在加时间戳)留底,备份内容原子写回;两份不一起回滚(本来就不是同一次写入);
 //!   档不存在(新号/删档后)不动;备份也不合格就不动,交原版处理。在线模式不自检(存档以服务器为准)。
@@ -161,7 +162,7 @@ pub fn before_replace(target: &Path) {
         return;
     }
     let tmp = dir.join(format!(".{}.tmp", name));
-    let result = std::fs::write(&tmp, &cur).and_then(|_| std::fs::rename(&tmp, dir.join(name)));
+    let result = crate::fs::write_tmp_durable(&tmp, &cur).and_then(|_| std::fs::rename(&tmp, dir.join(name)));
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);
         log!("[SAVEBAK] 备份 {} 失败:{}(不影响本次存档)", name, e);
@@ -281,7 +282,7 @@ fn check_one(docs: &Path, dir: &Path, name: &str) {
         return;
     }
     let tmp = docs.join(format!(".{}.savebak-tmp", name));
-    let result = std::fs::write(&tmp, &bak).and_then(|_| std::fs::rename(&tmp, &cur_path));
+    let result = crate::fs::write_tmp_durable(&tmp, &bak).and_then(|_| std::fs::rename(&tmp, &cur_path));
     match result {
         Ok(()) => {
             log!(
