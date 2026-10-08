@@ -96,6 +96,36 @@ fn acquire_instance_lock(sandbox: &Path) {
 
 /// [深扫修 2026-09-11] 原子写([Fs::write_atomic])在宿主同目录使用的隐藏临时文件后缀。
 /// 完整文件名形如 `.<目标文件名>.touchhle-tmp`。
+
+/// [2026-10-06 第十轮 R10-B1] 改名覆盖之前先让临时文件的数据落盘——只要求「数据先于改名」这个顺序。
+/// 不保证的话,断电/内核崩溃时可能「改名已生效、数据还在缓存里」,目标变成 0 字节或半截;而上一代备份
+/// (mole_savebak)恰好是同一时刻刚写的,两份会一起坏。Apple 用 F_BARRIERFSYNC:只插一道写入屏障,
+/// 不像 F_FULLFSYNC 那样等磁盘缓存清空,每次存档都做也不卡模拟线程;文件系统不支持时退回 fsync。
+/// 其它平台用 fdatasync。
+pub(crate) fn sync_before_rename(file: &File) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        if unsafe { libc::fcntl(fd, libc::F_BARRIERFSYNC) } != -1 {
+            return Ok(());
+        }
+        if unsafe { libc::fsync(fd) } == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    file.sync_data()
+}
+
+/// [2026-10-06 第十轮 R10-B1] 宿主侧写一个(准备随后改名就位的)临时文件:写完先按 sync_before_rename 落盘。
+pub(crate) fn write_tmp_durable(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(data)?;
+    sync_before_rename(&f)
+}
+
 const ATOMIC_WRITE_TMP_SUFFIX: &str = ".touchhle-tmp";
 
 /// The actual location of a file outside the virtual filesystem, e.g. a host
@@ -1144,12 +1174,8 @@ impl Fs {
             target_host_path.with_file_name(format!(".{}{}", file_name, ATOMIC_WRITE_TMP_SUFFIX));
 
         // 1) 写临时文件(create+truncate 的是临时文件,目标完全不动)。
-        let tmp_result = (|| -> std::io::Result<()> {
-            let mut tmp = File::create(&tmp_host_path)?;
-            tmp.write_all(data)?;
-            tmp.flush()?;
-            Ok(())
-        })();
+        // [2026-10-06 第十轮 R10-B1] 写完先落盘再改名(见 sync_before_rename)。
+        let tmp_result = write_tmp_durable(&tmp_host_path, data);
 
         let final_result = match tmp_result {
             Ok(()) => {
