@@ -306,7 +306,11 @@ unsafe extern "system" fn native_exception_filter(
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
+        .open(
+            crate::log::log_file_path()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| crate::paths::user_data_base_path().join("touchHLE_log.txt")),
+        )
     {
         // [2026-09-16] B-08 文案里的定位标记要与日志里实际输出的一致:早期的 [marker] 已被
         // mole_sysinfo::milestone 输出的 [足迹] 取代,并补上 environment.rs 加载主程序前后的 [boot]。
@@ -359,6 +363,19 @@ fn install_sighup_handler() {
             );
         }
     }
+}
+
+/// [2026-10-07 第十一轮 R11-H-2] 命令行是否允许错误弹框(--no-error-popup 关掉;无头测试脚本都带它)。
+static POPUP_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// [2026-10-07 第十一轮 R11-H-2] 桌面入口(bin.rs)在 main 返回错误后调用:本次还没弹过错误框、命令行也没关弹框时,
+/// 用中文错误框告诉玩家。Windows 发行版是图形程序,没有控制台,以前建窗之前的错误(找不到游戏包、选项错误等)
+/// 只写进看不见的 stderr,玩家双击后什么都没发生。
+pub fn report_startup_error(error: &str) {
+    if !POPUP_ERRORS.load(std::sync::atomic::Ordering::Relaxed) || window::error_messagebox_shown() {
+        return;
+    }
+    window::show_error_messagebox(None, error);
 }
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
@@ -456,6 +473,24 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
             return Err(format!("Unexpected argument: {arg:?}"));
+        }
+    }
+
+    POPUP_ERRORS.store(options.popup_errors, std::sync::atomic::Ordering::Relaxed);
+
+    // [2026-10-07 第十一轮 R11-H-2] Windows 发行版把日志和存档写在游戏所在文件夹(user_data_base_path 为「.」)。
+    // 解压到只读位置时存档根本写不进去,继续跑只会在第一次存档时出错,先给中文说明再退出。
+    #[cfg(windows)]
+    {
+        let dir = paths::user_data_base_path();
+        let probe = dir.join(".touchhle_write_test");
+        let writable = std::fs::write(&probe, b"ok").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if !writable {
+            return Err(format!(
+                "游戏所在的文件夹({})不能写入,存档也存不进去。请把整个游戏文件夹解压或移动到桌面、D 盘等可以写入的位置后再运行。",
+                std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.to_path_buf()).display()
+            ));
         }
     }
 
