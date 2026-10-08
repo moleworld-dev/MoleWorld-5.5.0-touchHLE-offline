@@ -1740,6 +1740,9 @@ impl Window {
                     // means "pause". The TRUE background is a separate event
                     // (AppDidEnterBackground) below.
                     log!("Received app-will-resign-active event.");
+                    // [2026-10-07 第十一轮 R11-P2-3] 先向系统申请后台执行时间,让随后在运行循环里才跑的原版失活/进后台存档
+                    // 能跑完(见 ios_save_task)。
+                    ios_save_task::begin();
                     // [MoleWorld iOS] 不再 assert:重负载帧(好友村等)单帧 drawScene 跑很久会饿死
                     // 事件循环,iOS 的 resign→background 会在 pop_event 消费前接连到达;旧 assert 在
                     // 第二个事件上 panic = 画面定格的"彻底冻死"。改为优先级语义:resign 不覆盖已挂起
@@ -3151,5 +3154,117 @@ mod accel_remap_tests {
         let phone = remap(-sy, sx, Some(270));
         let tablet = remap(-sx, -sy, Some(180));
         assert_eq!(phone, tablet);
+    }
+}
+
+/// [2026-10-07 第十一轮 R11-P2-3] iOS 切后台存档的后台执行时间。
+///
+/// 根因:原版在 -[iMoleVillageAppDelegate applicationWillResignActive:] 里同步 saveToLocal:(0x1009e)后才返回;
+/// touchHLE 里 SDL 的 UIKit 回调只把事件记进队列就返回,游戏的失活/进后台处理(主村存档、岛档落盘)要等运行循环
+/// 取到事件后才跑(ui_application::resign_active / did_enter_background)。没有申请后台执行时间时,iOS 在
+/// applicationDidEnterBackground 返回后很快就挂起进程,存档可能跑到一半被挂起,之后被系统杀掉 / 上滑强退就回滚,
+/// 两份主档之间被截断还会出现「钱扣了东西没到」。SDL 文档也写明 iOS 在事件送达后可能不再给任何处理时间。
+///
+/// 做法:SDL 把失活事件交给我们时(与 UIKit 真正进后台不在同一轮泵事件里)调 -[UIApplication
+/// beginBackgroundTaskWithExpirationHandler:] 开始一个后台任务;ui_application 在进后台的原版回调与岛档落盘跑完、
+/// 或只是失活又回到激活(控制中心、来电横幅)时调 [end] 结束;到期回调也结束,不会因为没结束被系统杀。
+/// 到期回调是一个静态全局块(_NSConcreteGlobalBlock),不需要额外依赖。全部在主线程调用;只在 iOS。
+#[cfg(target_os = "ios")]
+pub(crate) mod ios_save_task {
+    use std::ffi::{c_char, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+        static _NSConcreteGlobalBlock: [*const c_void; 32];
+    }
+
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: usize,
+        size: usize,
+    }
+
+    #[repr(C)]
+    struct GlobalBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const GlobalBlock),
+        descriptor: *const BlockDescriptor,
+    }
+    unsafe impl Sync for GlobalBlock {}
+
+    const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<GlobalBlock>(),
+    };
+    static EXPIRATION_HANDLER: GlobalBlock = GlobalBlock {
+        isa: unsafe { std::ptr::addr_of!(_NSConcreteGlobalBlock) as *const c_void },
+        flags: BLOCK_IS_GLOBAL,
+        reserved: 0,
+        invoke: on_expire,
+        descriptor: &DESCRIPTOR,
+    };
+
+    /// 当前后台任务号;0 = UIBackgroundTaskInvalid。
+    static TASK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn shared_application() -> *mut c_void {
+        let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        send(
+            objc_getClass(c"UIApplication".as_ptr()),
+            sel_registerName(c"sharedApplication".as_ptr()),
+        )
+    }
+
+    unsafe extern "C" fn on_expire(_block: *const GlobalBlock) {
+        end("系统给的后台时间到期");
+    }
+
+    /// 开始一个后台任务(已有就不重复开)。
+    pub(crate) fn begin() {
+        if TASK.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let task = unsafe {
+            let app = shared_application();
+            if app.is_null() {
+                return;
+            }
+            let send: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> usize =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            send(
+                app,
+                sel_registerName(c"beginBackgroundTaskWithExpirationHandler:".as_ptr()),
+                std::ptr::addr_of!(EXPIRATION_HANDLER) as *const c_void,
+            )
+        };
+        if task != 0 {
+            TASK.store(task, Ordering::Relaxed);
+            log!("[生命周期] iOS 失活:已申请后台执行时间,原版失活/进后台存档跑完后再交还");
+        }
+    }
+
+    /// 结束后台任务(没有就什么都不做)。
+    pub(crate) fn end(reason: &str) {
+        let task = TASK.swap(0, Ordering::Relaxed);
+        if task == 0 {
+            return;
+        }
+        unsafe {
+            let app = shared_application();
+            if app.is_null() {
+                return;
+            }
+            let send: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            send(app, sel_registerName(c"endBackgroundTask:".as_ptr()), task);
+        }
+        log!("[生命周期] iOS 交还后台执行时间({})", reason);
     }
 }
