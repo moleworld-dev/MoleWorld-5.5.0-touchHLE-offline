@@ -8485,6 +8485,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         // [2026-09-25 第五轮遗留 C] 时间旅行拦岛的延迟提示:宿主自排的裸 sel(接收者 GameManager 已在 CLASSES,
         //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
         || sel == "moleIslandTimeTravelNotice"
+        // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
+        || (class == "Porter" && matches!(sel, "touchBegan:" | "touchMove:"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -9823,7 +9825,92 @@ fn porter_reattach_diag(env: &Environment) {
     );
 }
 
+/// [2026-10-08 第十二轮] 摆放时按住建筑图身也能拖:本次手势按下点(Porter 指针, 触点)。
+static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::Mutex::new(None);
+
+/// [2026-10-08 第十二轮,用户拍板的交互放宽] 摆放中从建筑图身起拖也能拖动正在摆放的物件。
+/// 原版 -[Porter touchBegan:]@0x30a88 只在按下点落在占地菱形格(1×1 奖池物件只有 60×30 的底座)上时置 state=2;
+/// -[Porter touchMove:]@0x30c50 只在 state 为 2/3 时跟手;-[GameManager processTouch:withType:] 随后见 state≤1 就平移地图。
+/// 高大的占卜奖品/建筑图身占绝大部分面积,玩家按图身拖只会平移地图,10-07 反馈「卡在红区移不动」。
+/// 做法:两个前置钩子都只认 -[Porter processTouch:withType:]@0x30a74 这一个调用点(LR 0x30a79)。
+///   · touchBegan: 记下按下点;
+///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、按下点落在
+///     objSprite 的包围盒里,就照原版 setPutRefToCenter@0x2f6a4 的算法把 putRef 设到占地中心并置 state=2,
+///     然后放行原 touchMove:,由它 moveTo: 跟手并置 state=3;GameManager 见 state>1 不再平移地图。
+/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响;岛上 NewScenePorter 是另一个类。
+/// 触摸在运行循环的事件分派里处理,不在绘制帧内,可以发宿主消息;发完恢复 r0–r3。
+fn porter_body_drag(env: &mut Environment, is_move: bool) {
+    let regs = *env.cpu.regs();
+    let porter = regs[0];
+    let p = CGPoint {
+        x: f32::from_bits(regs[2]),
+        y: f32::from_bits(regs[3]),
+    };
+    let mut down = PORTER_BODY_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if !is_move {
+        *down = Some((porter, p));
+        return;
+    }
+    let Some((down_porter, down_pt)) = down.take() else {
+        return;
+    };
+    drop(down);
+    if down_porter != porter
+        || peek_ivar(env, porter, 0xb03290) != Some(1)
+        || peek_ivar(env, porter, 0xb03294) != Some(0)
+    {
+        return;
+    }
+    let sprite = peek_ivar(env, porter, 0xb03284).unwrap_or(0);
+    if sprite == 0 {
+        return;
+    }
+    let spr: id = Ptr::from_bits(sprite);
+    let s_parent = env.objc.register_host_selector("parent".to_string(), &mut env.mem);
+    let s_to_node = env
+        .objc
+        .register_host_selector("convertToNodeSpace:".to_string(), &mut env.mem);
+    let s_bbox = env.objc.register_host_selector("boundingBox".to_string(), &mut env.mem);
+    let parent: id = msg_send(env, (spr, s_parent));
+    let hit = parent != nil && {
+        let local: CGPoint = msg_send(env, (parent, s_to_node, down_pt));
+        let bb: CGRect = msg_send(env, (spr, s_bbox));
+        local.x >= bb.origin.x
+            && local.x <= bb.origin.x + bb.size.width
+            && local.y >= bb.origin.y
+            && local.y <= bb.origin.y + bb.size.height
+    };
+    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
+    if !hit {
+        return;
+    }
+    let (Some(state_off), Some(size_off), Some(rx_off), Some(ry_off)) = (
+        peek_u32(env, 0xb03290),
+        peek_u32(env, 0xb032a8),
+        peek_u32(env, 0xb032b8),
+        peek_u32(env, 0xb032bc),
+    ) else {
+        return;
+    };
+    let size: CGSize = env.mem.read(ConstPtr::<CGSize>::from_bits(porter + size_off));
+    let (rx, ry) = ((size.width * 0.5) as i32, (size.height * 0.5) as i32);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + rx_off), rx);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + ry_off), ry);
+    env.mem.write(MutPtr::<i32>::from_bits(porter + state_off), 2);
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, O) < 20 {
+        let (dx, dy) = (down_pt.x, down_pt.y);
+        log!("[摆放] 从图身起拖:按下点 ({:.0},{:.0}) 在摆放物件图上,改为拖动物件(占地中心对手指)", dx, dy);
+    }
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
+    if class == "Porter" && (sel == "touchBegan:" || sel == "touchMove:") {
+        if env.cpu.regs()[14] & !1u32 == 0x30a78 {
+            porter_body_drag(env, sel == "touchMove:");
+        }
+        return false;
+    }
     if sel == "attachObjectWithHouseLevel:data:" {
         if class == "Porter" {
             porter_reattach_diag(env);
