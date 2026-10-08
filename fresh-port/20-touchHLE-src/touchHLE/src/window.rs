@@ -3273,7 +3273,7 @@ pub(crate) mod ios_save_task {
         size: std::mem::size_of::<GlobalBlock>(),
     };
     static EXPIRATION_HANDLER: GlobalBlock = GlobalBlock {
-        isa: unsafe { std::ptr::addr_of!(_NSConcreteGlobalBlock) as *const c_void },
+        isa: std::ptr::addr_of!(_NSConcreteGlobalBlock) as *const c_void,
         flags: BLOCK_IS_GLOBAL,
         reserved: 0,
         invoke: on_expire,

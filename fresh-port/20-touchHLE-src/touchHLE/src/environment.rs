@@ -1387,7 +1387,8 @@ impl Environment {
         #[cfg(target_os = "ios")]
         {
             use std::os::unix::io::AsRawFd;
-            crate::mole_watchdog::start(crate::log::get_log_file().as_raw_fd());
+            // [2026-10-07 第十一轮] 日志文件可能打不开(get_log_file 返回 None),这时看门狗写 stderr(fd 2)。
+            crate::mole_watchdog::start(crate::log::get_log_file().map_or(2, |f| f.as_raw_fd()));
         }
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();

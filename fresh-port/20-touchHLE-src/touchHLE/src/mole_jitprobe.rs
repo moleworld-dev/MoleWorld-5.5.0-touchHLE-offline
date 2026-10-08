@@ -216,7 +216,7 @@ pub fn probe() {
     }
     let _ = std::fs::remove_file(&trig);
     log!("[JITPROBE] ⑤ 开始执行终判:写一条 ret 然后跳进去……(若日志到此为止 = 被内核杀了 = JIT 不可用)");
-    { use std::io::Write; let mut f = crate::log::get_log_file(); let _ = f.flush(); let _ = f.sync_data(); }
+    if let Some(mut f) = crate::log::get_log_file() { use std::io::Write; let _ = f.flush(); let _ = f.sync_data(); }
     unsafe {
         let rx = mmap(
             std::ptr::null_mut(),
