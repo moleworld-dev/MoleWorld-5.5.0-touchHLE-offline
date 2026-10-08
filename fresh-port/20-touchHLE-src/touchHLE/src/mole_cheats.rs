@@ -8514,7 +8514,9 @@ static WINSIZE_STALE: AtomicBool = AtomicBool::new(true);
 ///   · 根层自身 position/setPosition:(任何 guest 调用者,含 CCMoveTo 等动作)getter −off / setter +off,
 ///     游戏侧永远看到虚拟坐标,cocos2d 内部变换直读 position_ ivar 拿真实值;
 ///   · 挂到 EAGLView 上的 UIKit 子视图(输入框/网页/好友表)见 [UI43_VIEWS]。
-/// cocos2d 自己的命中(CCMenu itemForTouch / convertTouchToNodeSpace / 表格)走真实坐标 + 真实变换,天然正确。
+/// cocos2d 自己的命中(CCMenu itemForTouch / convertTouchToNodeSpace)走真实坐标 + 真实变换,天然正确。
+/// ★例外是滚动表格 CCScrollView/CCTableView 的按下/移动判定:拿【父层坐标】的 {position, viewSize} 去比
+/// 【世界坐标】触点,原版根层在 (0,0) 两者重合,根层右移后差 off,见 [UI43_SCROLL_HIT_LRS]。
 ///
 /// ★宿主发起的消息一律不换算(`from_host`):touchHLE 的宿主 `msg_send` 走 CallFromHost,同样把参数写进
 /// r0–r3(所以读寄存器对两种来源都成立),但**不会更新 LR**——run loop 里 LR 是陈旧的 main 返回地址
@@ -8788,6 +8790,18 @@ fn ui43_lr_in_wl(lr: u32) -> bool {
     let i = UI43_CODE_RANGES.partition_point(|&(s, _)| s <= lr);
     i > 0 && lr < UI43_CODE_RANGES[i - 1].1
 }
+
+/// [2026-10-08 第十二轮] 滚动表格命中判定里 convertToWorldSpace: 的返回地址(LR,已去 Thumb 位)。
+/// -[CCScrollView ccTouchBegan:withEvent:]@0x8fb5c 与 -[CCScrollView ccTouchMoved:withEvent:]@0x8fd70 都是:
+/// 触点 convertTouchToNodeSpace: 再 convertToWorldSpace: 得世界坐标,然后 CGRectContainsPoint({position, viewSize}, 世界点)。
+/// position 是【父层坐标】,原版根层在 (0,0),父层坐标 = 世界坐标;UI43 v2 把根层整体右移 off 后,同一个点的世界坐标
+/// 比父层坐标大 off,判定框等于左移了 off:
+///   · 选关表格(矿洞/切水果/耕地/拍虫子/画画)右边超出 1024−off 的格子按下被拒 → iPhone(off=323)矿洞第 4 关点不了;
+///   · 商店商品表格的假判定框左移 323,盖住左边详情区的「立即购买」,表格(按下即吞)把触摸截走 → 黄金岛买不了东西。
+/// 1188 宽(off=82)下错位小,按钮和格子大多还在判定框内,所以以前没暴露。
+/// 修法:这两处的世界坐标在表格挂在已右移根层下时 x−off,换回原版的设计世界坐标,与 position 同一坐标系。
+/// CCScrollView 不在白名单代码段(cocos2d 类),所以单列;不在右移根层下的表格(世界场景等)不动。
+const UI43_SCROLL_HIT_LRS: [u32; 2] = [0x8fb60, 0x8fd74];
 
 /// [MoleWorld 宽屏适配·居中偏移] 4:3 虚拟窗口整体右移量 = (真实 landscape 宽 − 1024) / 2。
 /// 1188 宽 → 82pt;原生 4:3(1024)→ 0(不偏移)。
@@ -9368,10 +9382,32 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
         }
         // 坐标换算:只在【白名单代码在问】且确实有根层被右移过时才动
         _ => {
-            if UI43_ROOTS_LEN.load(O) == 0 || !ui43_lr_in_wl(env.cpu.regs()[14] & !1u32) {
+            if UI43_ROOTS_LEN.load(O) == 0 {
                 return false;
             }
             let recv: id = Ptr::from_bits(regs[1]);
+            let lr = regs[14] & !1u32;
+            if !ui43_lr_in_wl(lr) {
+                // [2026-10-08 第十二轮] 滚动表格的两处命中判定(见 [UI43_SCROLL_HIT_LRS]):表格挂在已右移根层下才换算。
+                if kind != 6 || !UI43_SCROLL_HIT_LRS.contains(&lr) {
+                    return false;
+                }
+                let p = ui43_point_arg(env, &regs);
+                let s = ui43_sels(env);
+                if !ui43_has_shifted_ancestor(env, recv, &s) {
+                    // 查祖先发的宿主消息会改写 r0–r3,放行真方法前恢复入参。
+                    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
+                    return false;
+                }
+                let mut q: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, p)));
+                q.x -= off;
+                env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), q);
+                if ui43_debug() {
+                    let (qx, qy) = (q.x, q.y);
+                    log!("[UI43] 滚动表格命中 lr={:#x} 世界点 → 设计 ({:.0},{:.0})", lr, qx, qy);
+                }
+                return true;
+            }
             let out: CGPoint = match kind {
                 5 => {
                     let view: id = Ptr::from_bits(regs[3]);
