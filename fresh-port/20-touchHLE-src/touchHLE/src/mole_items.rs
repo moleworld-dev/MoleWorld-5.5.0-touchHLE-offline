@@ -1723,11 +1723,34 @@ fn give_goods_inner(env: &mut Environment, item: u32, count: u32) -> Result<Stri
     Ok(format!("已放入仓库:{} ×{}(打开仓库取出摆放)", name, count))
 }
 
+/// [2026-10-08 第十三轮] 建造商店(主村与黄金岛共用 NewStyleStoreMainLayer 单例)是否开着。
+/// 单例缓存在静态变量 0xb40ff4(+sharedInstance@0x3ae4e0);关闭走 -[NewStyleStoreMainLayer detach]@0x3afb78
+/// removeFromParentAndCleanup:,所以「开着」= 单例存在且有父节点。不存在就不调 +sharedInstance,免得凭空建一个。
+/// 开商店不改 gameMode(仍为 1),而原版 -[Porter attachObjectWithHouseLevel:data:] 的 isLogicLayersOpen 检查也不含商店
+/// (商店只能从「建造」按钮进,那个按钮先问过 isLogicLayersOpen),原版买东西时先 detach 关商店再摆放。
+/// 修改器绕过了这一步:商店开着时发物品/召唤,摆放会把 HUD 连同商店一起隐藏,但商店菜单仍在触摸分发器里按下即吞,
+/// 之后摆放的建筑拖不动、✓ 点不到、地图也拖不动,只能重启。调用方须在运行循环上下文(可以发消息)。
+pub fn store_open(env: &mut Environment) -> bool {
+    let store: u32 = env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(0xb40ff4));
+    if store == 0 {
+        return false;
+    }
+    let saved = save_regs(env);
+    let parent_s = sel_of(env, "parent");
+    let parent: id = msg_send(env, (id::from_bits(store), parent_s));
+    restore_regs(env, saved);
+    parent != nil
+}
+
 /// 把物品 id 直接放到当前场景地图上(主村/黄金岛各走原版放置路径)。
-/// 不在可放置状态(gameMode≠1、菜单层为 nil)时返回 Err 文案。内部自己快照/恢复 r0-r3。
+/// 不在可放置状态(gameMode≠1、菜单层为 nil、商店开着)时返回 Err 文案。内部自己快照/恢复 r0-r3。
 pub fn place_item(env: &mut Environment, id: u32) -> Result<String, String> {
     if env.options.network_access {
         return Err("在线模式不提供直接放置(以私服数据为准)".to_string());
+    }
+    if store_open(env) {
+        log!("[MOLEITEMS] 拒绝放置 {}:建造商店开着", id);
+        return Err("建造商店开着:请先关闭商店再放置".to_string());
     }
     let saved = save_regs(env);
     let result = place_item_route(env, id);
