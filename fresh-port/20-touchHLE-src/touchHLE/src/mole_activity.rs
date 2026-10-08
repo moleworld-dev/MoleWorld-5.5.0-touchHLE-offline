@@ -188,6 +188,11 @@ const SITE_BULLETIN_CONNECTED: u32 = 0x3a8b8c;
 const SITE_SIGN_SHOW_REACHABLE: u32 = 0x397156;
 /// 同上 isConnected(LR 0x39717d)。
 const SITE_SIGN_SHOW_CONNECTED: u32 = 0x397178;
+/// [2026-10-07 第十一轮 R11-F-1] -[iMoleVillageAppDelegate applicationWillEnterForeground:]@0x1133c 的 isConnected
+/// (blx 0x1171c,LR 0x11721)。原版回前台时只有在线才 getServerTime(0x1174e)+ 按场景要当天的每日任务
+/// getDailyTaskListFromServerWithSceneId:(0x11780),这是跨天回来换日常列表的唯一入口;离线主村这道门恒假,
+/// 挂后台跨过零点回来日常任务还是昨天那组。放行后离线 getServerTime 发包空过,1074 由回环按当天应答。
+const SITE_FOREGROUND_DAILY_CONNECTED: u32 = 0x1171c;
 /// -[SealExchangeLayer initData] isReachable(LR 0x39aac7)。
 const SITE_SEAL_INIT_REACHABLE: u32 = 0x39aac2;
 /// 同上 isConnected(LR 0x39aae5)。
@@ -541,6 +546,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_UIL_CONNECTED)
                 || lr_is(env, SITE_BULLETIN_CONNECTED)
                 || lr_is(env, SITE_SIGN_SHOW_CONNECTED)
+                || lr_is(env, SITE_FOREGROUND_DAILY_CONNECTED)
                 || lr_is(env, SITE_SEAL_INIT_CONNECTED)
                 || lr_is(env, SITE_EDIT_SEABED_CONNECTED)
                 || lr_is(env, SITE_SEABED_INIT_CONNECTED)
