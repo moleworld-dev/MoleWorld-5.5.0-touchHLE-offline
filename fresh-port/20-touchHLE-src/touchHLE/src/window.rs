@@ -160,6 +160,46 @@ fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
     (base_short, landscape_long)
 }
 
+/// [2026-10-07 第十一轮 R11-H-1] 桌面窗口模式:窗口按 1024×768 客户区建、按整块屏幕(含任务栏)居中,程序也不声明高分屏感知。
+/// Windows 笔记本常见的 1920×1080@150% 缩放下逻辑屏只有 1280×720,比 768 的客户区还矮,标题栏跑到屏幕外,顶部或底部
+/// 一条被屏幕边缘/任务栏挡住(拖不动窗口、看不到底部按钮)。这里建窗后取窗口所在屏的可用区域(扣任务栏/菜单栏)与边框
+/// 尺寸:放得下就不动;放不下就按原比例把客户区缩到放得下,再在可用区域内居中。画面缩放与触摸换算本来就按 drawable_size
+/// 跟随窗口大小,不受影响。iOS/安卓不走窗口模式分支。
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn fit_window_into_usable_area(video_ctx: &sdl2::VideoSubsystem, window: &mut sdl2::video::Window) {
+    let Ok(display) = window.display_index() else {
+        return;
+    };
+    let Ok(usable) = video_ctx.display_usable_bounds(display) else {
+        return;
+    };
+    let (top, left, bottom, right) = window.border_size().unwrap_or((0, 0, 0, 0));
+    let (w, h) = window.size();
+    let border_w = u32::from(left) + u32::from(right);
+    let border_h = u32::from(top) + u32::from(bottom);
+    let avail_w = usable.width().saturating_sub(border_w);
+    let avail_h = usable.height().saturating_sub(border_h);
+    if w == 0 || h == 0 || avail_w == 0 || avail_h == 0 || (w <= avail_w && h <= avail_h) {
+        return;
+    }
+    let scale = (avail_w as f64 / w as f64).min(avail_h as f64 / h as f64);
+    let new_w = ((w as f64 * scale).floor() as u32).max(256);
+    let new_h = ((h as f64 * scale).floor() as u32).max(192);
+    if window.set_size(new_w, new_h).is_err() {
+        return;
+    }
+    let x = usable.x() + (usable.width().saturating_sub(new_w + border_w) / 2) as i32 + i32::from(left);
+    let y = usable.y() + (usable.height().saturating_sub(new_h + border_h) / 2) as i32 + i32::from(top);
+    window.set_position(
+        sdl2::video::WindowPos::Positioned(x),
+        sdl2::video::WindowPos::Positioned(y),
+    );
+    log!(
+        "[MOLE-RES] 窗口 {}x{} 放不进屏幕可用区域 {}x{}(边框 上{} 左{} 下{} 右{}),缩到 {}x{} 并居中",
+        w, h, usable.width(), usable.height(), top, left, bottom, right, new_w, new_h
+    );
+}
+
 /// [MoleWorld 智能分辨率] 是否有【定制】guest 逻辑屏(显式 --logical-size,或 --fill-screen 已自动算出)。
 /// [Window::viewport] 据此:定制时走【等比缩放】(不变形,且 guest 比例≈屏比例故无黑边);默认
 /// (无定制)保持窗口模式自由拉伸铺满(零回归)。
@@ -948,6 +988,8 @@ impl Window {
             }
             let mut window = builder.build().unwrap();
             window.set_minimum_size(256, 192).ok();
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            fit_window_into_usable_area(&video_ctx, &mut window);
             window
         };
 
