@@ -634,6 +634,8 @@ pub(super) fn did_enter_background(env: &mut Environment) {
     // [2026-09-25 第五轮遗留 IOS] 复用 send_did_enter_background:委托 applicationDidEnterBackground: → 进后台通知
     //   → 黄金岛「进后台落盘」(island_lifecycle_flush(...,true),失活落盘之后又变脏才写)→ pool drain。
     send_did_enter_background(env, ui_application);
+    // [2026-10-07 第十一轮 R11-P2-3] 失活存档(含岛档)与进后台回调都跑完了,交还后台执行时间。
+    crate::window::ios_save_task::end("进后台存档已完成");
 }
 
 /// [MoleWorld iOS] iOS `applicationWillEnterForeground:` — leaving the
@@ -673,6 +675,8 @@ pub(super) fn did_become_active(env: &mut Environment) {
     // [2026-09-25 第五轮遗留 IOS] 重新激活:下一次进后台前必须重新收到失活,否则由 did_enter_background 补发。
     // 进前台/激活走普通先进先出队列,不会被覆盖,所以只在这里清零。
     IOS_RESIGN_DELIVERED.store(false, std::sync::atomic::Ordering::Relaxed);
+    // [2026-10-07 第十一轮 R11-P2-3] 只失活没进后台(控制中心、来电横幅)又回来了:交还失活时申请的后台执行时间。
+    crate::window::ios_save_task::end("重新激活");
     if env.is_app_picker {
         return;
     }
