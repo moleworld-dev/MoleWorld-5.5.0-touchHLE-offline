@@ -15,7 +15,7 @@
 //! 只读线程局部状态,不改任何寄存器与游戏状态;关闭时每条消息只多一次原子读。
 //!
 //! 2026-10-03 首次全量扫描(全量回归六组 + 第五轮十组 + r8)共 5 个调用点:进岛 state1 布局注入已移到运行循环
-//! (mole_cheats::island_inject_poll);其余 4 个审查后保留,列在 REVIEWED 里,日志标「已审查例外」、不再展开明细。
+//! (mole_cheats::island_inject_poll);其余 4 个审查后保留,列在 REVIEWED 里(第十一轮又登记了 VIP 侧档首次读取注入的 2 个调用点),日志标「已审查例外」、不再展开明细。
 //! 新冒出来的调用点照常详细记录。
 use crate::objc::{id, SEL};
 use crate::Environment;
@@ -63,7 +63,7 @@ thread_local! {
 }
 
 /// 已审查、有意保留的调用点:(钩子类, 选择子, 调用方 LR, 理由)。
-const REVIEWED: [(&str, &str, u32, &str); 4] = [
+const REVIEWED: [(&str, &str, u32, &str); 6] = [
     (
         "GameData",
         "loadUserInfoData",
@@ -87,6 +87,21 @@ const REVIEWED: [(&str, &str, u32, &str); 4] = [
         "checkMapExtendError",
         0x1a319,
         "整体接管原版扩地自检,原版本身就在这个栈上读桥位、修 mapExtend",
+    ),
+    // [2026-10-07 第十一轮 R11-E-1] VIP 侧档首次读取注入(mole_items::vip_hook 的 getter 臂):读档时地里有枯萎作物、
+    // 或逛完好友村回家时,第一次读 VIP 等级落在分步加载地图的调度器回调里。只写 VIP 三值、不碰调度器、寄存器已恢复;
+    // 不能改成「只置标志、延后注入」:读档那一拍读到 0,VIP4 的作物会被判枯萎,偏离原版。
+    (
+        "UserVIPInfoData",
+        "vipLevelWithNewType",
+        0x49341,
+        "VIP 侧档首次读取注入:-[Farm createCropForMapData:] 0x4933c 读档时判枯萎(VIP≥4 不枯萎),必须当场注入",
+    ),
+    (
+        "UserVIPInfoData",
+        "vipLevelWithNewType",
+        0x4a117,
+        "VIP 侧档首次读取注入:-[Farm cropWitherHandler:] 0x4a112 运行中到枯萎点判 VIP,必须当场注入",
     ),
 ];
 
