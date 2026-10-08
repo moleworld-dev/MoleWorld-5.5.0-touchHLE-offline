@@ -2880,35 +2880,54 @@ pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
 }
 
+/// [2026-10-07 第十一轮 R11-H-2] 本次运行是否已经弹过错误框(桌面入口据此决定是否对 main 返回的错误补弹)。
+static ERROR_MESSAGEBOX_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [2026-10-07 第十一轮 R11-H-2] 见 ERROR_MESSAGEBOX_SHOWN。
+pub fn error_messagebox_shown() -> bool {
+    ERROR_MESSAGEBOX_SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Show an SDL messagebox for an error (typically after a panic).
 ///
 /// The window argument allows for passing in the parent window for the
 /// messagebox, which is not required but should be done if possible.
+///
+/// [2026-10-07 第十一轮 R11-P2-2 / R11-H-2] 文案改成中文,并写明请玩家把日志发回来;记下已经弹过
+/// (error_messagebox_shown),桌面入口对 main 返回的错误补弹时不重复弹。弹框本身失败只记日志,
+/// 不再 panic(以前在 panic 处理途中再 panic 会直接终止)。
 pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
     assert!(window.is_none_or(|win| win.on_main_stack));
+    ERROR_MESSAGEBOX_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     use sdl2::messagebox;
     let mbox = [
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 0,
-            text: "Open touchHLE directory",
+            text: "打开日志所在文件夹",
         },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 1,
-            text: "Close",
+            text: "关闭",
         },
     ];
 
+    let log_hint = if cfg!(any(target_os = "ios", target_os = "android")) {
+        "请在「文件」App 里找到摩尔庄园HD 文件夹,把 touchHLE_log.txt(重开游戏后是 touchHLE_log.prev.txt)发给开发者。"
+    } else {
+        "请把游戏文件夹里的 touchHLE_log.txt(重开游戏后是 touchHLE_log.prev.txt)发给开发者。"
+    };
     let Ok(clicked_button) = messagebox::show_message_box(
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
-        "touchHLE crashed!",
-        &format!("touchHLE crashed with the following error: {error_message}"),
+        "摩尔庄园出错了",
+        &format!("游戏遇到错误,需要退出。\n\n{error_message}\n\n{log_hint}"),
         window.map(|win| &win.window),
         None,
     ) else {
-        panic!("Failed to show message box!");
+        echo!("错误弹框显示失败;错误内容:{}", error_message);
+        return;
     };
 
     match clicked_button {
