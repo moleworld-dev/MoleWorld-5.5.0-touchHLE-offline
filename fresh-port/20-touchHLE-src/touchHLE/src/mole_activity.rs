@@ -2384,6 +2384,9 @@ fn seabed_ensure_shells(st: &mut ActState) -> bool {
 /// 1219 body(parseSeabedSeekingTreasureActivityInfo@0x1ca98c 核实):
 /// [flag][珍珠数][n] + n×[pearlPos][pearlType][lastTimestamp] + [bDigShellPlayers][bExchangeReward]。
 /// pearlPos 按 1..5(onDigShellClick: 发 1220 时传的是 tag+1,0x2c1d02)。
+/// [2026-10-07 第十一轮 R11-F-2] kCFAbsoluteTimeIntervalSince1970:2001-01-01 的 Unix 秒。
+const CF_EPOCH_UNIX_SECS: u32 = 978_307_200;
+
 fn encode_seabed_info(st: &ActState) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, 1); // 活动进行中
@@ -2392,7 +2395,16 @@ fn encode_seabed_info(st: &ActState) -> Vec<u8> {
     for (i, (t, ts)) in st.shells.iter().enumerate() {
         put_u32(&mut b, i as u32 + 1);
         put_u32(&mut b, *t);
-        put_u32(&mut b, *ts);
+        // [2026-10-07 第十一轮 R11-F-2] 「上次挖掘时间」按 Unix 秒下发:-[SeabedSeekingTreasureMainLayer displayUI]
+        // 在 0x2c1214 无条件减 kCFAbsoluteTimeIntervalSince1970(978307200)再与当前时间比 300 秒冷却。以前存发的是
+        // 2001 纪元秒,减成负数后截成 0,关掉页面再打开冷却全没了。旧档里存的 2001 纪元值(1000 < ts < 978307200)
+        // 在这里换算;0 = 刷新后无冷却,照旧。
+        let ts = if *ts > 1000 && *ts < CF_EPOCH_UNIX_SECS {
+            ts + CF_EPOCH_UNIX_SECS
+        } else {
+            *ts
+        };
+        put_u32(&mut b, ts);
     }
     put_u32(&mut b, u32::from(st.dug > 0));
     put_u32(&mut b, 0);
@@ -2415,8 +2427,9 @@ fn seabed_dig(env: &mut Environment, nm: id, pos: u32, shell_type: u32) {
     st.dug = st.dug.saturating_add(1);
     let new_type = roll_shell_type(st.dug);
     let idx = (pos.clamp(1, 5) - 1) as usize;
-    // 挖过的贝壳换成新类型并记下挖掘时间(CFAbsoluteTime 纪元),重开层时 displayUI 据此算 5 分钟冷却。
-    st.shells[idx] = (new_type, now_cf_u32());
+    // 挖过的贝壳换成新类型并记下挖掘时间(Unix 秒,见 encode_seabed_info:客户端会先减掉 1970→2001 的差值),
+    // 重开层时 displayUI 据此算 5 分钟冷却。
+    st.shells[idx] = (new_type, now_cf_u32().saturating_add(CF_EPOCH_UNIX_SECS));
     save_state(env, &st);
     log!(
         "[ACTIVITY] 海底寻宝挖贝 pos={} type={} 珍珠+{} → {} 新贝壳类型={}",
@@ -3800,6 +3813,20 @@ mod offline_server_tests {
             // 一局只扣 1 张券或 1 贝壳却能连开五轮,奖池里放贝壳就能无限刷贝壳。
             assert!(items.iter().all(|x| x.0 != 704), "轮次 {} 含贝壳", round);
         }
+    }
+
+    #[test]
+    fn seabed_timestamp_sent_as_unix_seconds() {
+        // [2026-10-07 第十一轮 R11-F-2] 客户端会减 978307200:新存的是 Unix 秒原样下发,旧档的 2001 纪元值换算,0 不变。
+        let mut st = ActState::default();
+        st.shells = vec![(1, 0), (2, 800_000_000), (3, 1_790_000_000), (1, 5), (2, 0)];
+        let b = encode_seabed_info(&st);
+        let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        // [1][pearl][5] 之后每个贝壳 3 个字:[序号][类型][时间]
+        assert_eq!(word(3 + 2), 0);
+        assert_eq!(word(3 + 5), 800_000_000 + CF_EPOCH_UNIX_SECS);
+        assert_eq!(word(3 + 8), 1_790_000_000);
+        assert_eq!(word(3 + 11), 5);
     }
 
     #[test]
