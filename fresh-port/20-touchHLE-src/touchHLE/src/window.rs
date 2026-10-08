@@ -148,6 +148,15 @@ fn compute_fill_portrait(base_short: u32, long: u32, short: u32) -> (u32, u32) {
     };
     let aspect = raw.clamp(4.0 / 3.0, fill_max_aspect());
     let landscape_long = ((base_short as f32) * aspect).round() as u32;
+    // [2026-10-07 第十一轮 R11-P2-6] 只比 4:3 多不到 1 个逻辑点的屏幕按 4:3 处理:12.9 英寸 iPad Pro(1366×1024)
+    // 的比例 1.333984375 × 768 = 1024.5 → 1025,被 is_widescreen 当成宽屏,4:3 设备走了 UI43 虚拟化(偏移 0.5 点、
+    // 居中直接跳过)和宽版底图重定向那套。贴回 4:3 后走原版 1024×768 路径。
+    let four_three_long = ((base_short as f32) * 4.0 / 3.0).round() as u32;
+    let landscape_long = if landscape_long <= four_three_long + 1 {
+        four_three_long
+    } else {
+        landscape_long
+    };
     (base_short, landscape_long)
 }
 
