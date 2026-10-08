@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>摩尔庄园 · 浏览器版(touchHLE WASM)</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🐹</text></svg>">
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3;
@@ -24,6 +23,9 @@
     padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--border);
     flex:0 0 auto;
   }
+  /* 2026-10-08 服主:顶栏(标题、状态、帧率、指令数、重启、日志)对玩家没用,整条隐藏;元素留着给脚本用,
+     重启由外层页面的「重新加载游戏」负责 */
+  header{display:none !important}
   header .title{font-weight:600; font-size:14px}
   header .badge{padding:2px 8px; border-radius:10px; background:#21262d; color:var(--dim); font-size:12px}
   header .badge.run{color:var(--accent)}
@@ -168,21 +170,19 @@
 </head>
 <body class="log-collapsed">
 <header>
-  <span class="title">🐹 摩尔庄园 · 浏览器版</span>
+  <span class="title">摩尔庄园 · 浏览器版</span>
   <span class="badge" id="status">准备中…</span>
   <span class="badge" id="fps">FPS —</span>
   <span class="badge" id="mips" title="解释器吞吐:每秒执行的 guest 指令数(百万)">— MIPS</span>
   <span class="spacer"></span>
-  <button id="reload" title="重新加载页面重启游戏">↻ 重启</button>
-  <button id="toggle">≡ 展开日志</button>
+  <button id="reload" title="重新加载页面重启游戏">重启</button>
+  <button id="toggle">展开日志</button>
 </header>
 <main>
   <div id="stage">
     <canvas id="canvas" width="1024" height="768" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
     <div class="hint" id="hint">下载游戏数据中…(首次约 100MB,请稍候)</div>
     <div id="splash">
-      <div class="sp-logo">🐹</div>
-      <div class="sp-title">摩尔庄园 · 浏览器版</div>
       <div class="sp-bar"><div class="sp-fill" id="sp-fill"></div></div>
       <div class="sp-pct" id="sp-pct">准备中…</div>
       <div class="sp-note" id="sp-note">正在下载游戏数据(已启用压缩;再次访问将走缓存,秒开)</div>
@@ -204,7 +204,7 @@
     <section id="savepane">
       <div class="shead" id="stoggle">
         <span class="caret">▶</span>
-        <span class="st">💾 存档管理</span>
+        <span class="st">存档管理</span>
         <span class="spacer"></span>
         <span class="sub" id="ssub">点击展开</span>
       </div>
@@ -213,7 +213,7 @@
         <div class="sgrid">
           <button class="sbtn primary" id="sb-export" title="把当前存档(进度)下载成一个文件备份">⬇ 导出存档</button>
           <button class="sbtn" id="sb-import" title="导入存档:可选原版 userinfo.dat / map.dat / plist(可多选)或 .molesave 备份;只传 map/userinfo 时其余沿用当前存档。会重启游戏">⬆ 导入存档</button>
-          <button class="sbtn" id="sb-save" title="立即把当前进度写入浏览器持久化(刷新不丢)">💾 立即保存</button>
+          <button class="sbtn" id="sb-save" title="立即把当前进度写入浏览器持久化(刷新不丢)">立即保存</button>
           <button class="sbtn danger" id="sb-reset" title="清除持久化存档,恢复默认初始存档(会重启游戏)">↺ 恢复默认</button>
           <button class="sbtn" id="sb-undo" title="从最近一次备份(重置/导入/覆盖前自动留存)恢复存档" disabled>↩ 撤销(恢复备份)</button>
         </div>
@@ -223,7 +223,7 @@
         <div class="ssection-t">存档浏览</div>
         <div class="srow">
           <span class="sw" id="sbrowse-hint">展开后点「刷新」查看沙盒内存档文件</span>
-          <button class="sbtn" id="sb-browse" style="flex:0 0 auto; padding:4px 10px">🔄 刷新</button>
+          <button class="sbtn" id="sb-browse" style="flex:0 0 auto; padding:4px 10px">刷新</button>
         </div>
         <div class="sfiles" id="sfiles"></div>
       </div>
@@ -285,7 +285,7 @@
   $('toggle').onclick = () => {
     document.body.classList.toggle('log-collapsed');
     $('toggle').textContent = document.body.classList.contains('log-collapsed')
-      ? '≡ 展开日志' : '≡ 折叠日志';
+      ? '展开日志' : '折叠日志';
   };
   $('reload').onclick = () => location.reload();
   $('clearlog').onclick = () => { lines = []; total = 0; render(); };
@@ -471,7 +471,7 @@
     const total = files.reduce((a, f) => a + f.data.length, 0);
     const src = window.__saveSource || (window.__seeds === undefined ? '读取中…' : '默认种子');
     el.innerHTML =
-      (saveFailed ? '<span class="warnv">⚠ 自动保存失败(存储被拒/配额满)— 请用「导出存档」手动备份!</span><br>' : '') +
+      (saveFailed ? '<span class="warnv">自动保存失败(存储被拒/配额满)— 请用「导出存档」手动备份!</span><br>' : '') +
       '存档来源:<b>' + src + '</b>　自动保存:' + (auto ? '<b>开</b>' : '<span class="warnv">关</span>') +
       '<br>当前沙盒:' + (files.length ? files.length + ' 文件 / ' + fmtSize(total) : '<span class="warnv">游戏未就绪</span>') +
       '　上次保存:' + t;
