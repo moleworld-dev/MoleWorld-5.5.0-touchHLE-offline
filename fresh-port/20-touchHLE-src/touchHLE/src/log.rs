@@ -14,12 +14,42 @@ use std::sync::{LazyLock, OnceLock};
 /// All the logging macros print to stderr or (on Android) logcat, but this
 /// is not convenient for users who aren't accustomed to command-line tools or
 /// who don't have access to ADB, so we also write to a log file.
-pub fn get_log_file() -> &'static File {
-    static LOG_FILE: LazyLock<File> = LazyLock::new(|| {
-        File::create(crate::paths::user_data_base_path().join("touchHLE_log.txt")).unwrap()
-    });
+///
+/// [2026-10-07 第十一轮 R11-H-2 / R11-P2-2] 打开日志文件绝不 panic:以前是 `File::create(...).unwrap()`,
+/// 游戏目录不可写(Windows 解压在只读位置)时第一行日志就在 LazyLock 初始化里 panic,panic 钩子再取同一个
+/// LazyLock 会重入卡死,图形程序没有任何窗口或提示。现在用户数据目录建不了就退到系统临时目录,再不行返回
+/// None(只写 stderr/系统日志)。另外先把上一次运行的日志改名为 touchHLE_log.prev.txt 再新建:崩溃后玩家
+/// 一重开,崩溃那次的日志不会被覆盖,还能从「文件」App 或游戏目录里发回来。
+pub fn get_log_file() -> Option<&'static File> {
+    static LOG_FILE: LazyLock<Option<File>> = LazyLock::new(open_log_file);
 
-    &LOG_FILE
+    LOG_FILE.as_ref()
+}
+
+/// [2026-10-07 第十一轮 R11-H-2] 实际打开的日志文件路径(Windows 原生崩溃过滤器往同一个文件追加)。
+/// 只读已记下的值,不会触发打开日志(异常过滤器里不能做初始化)。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn log_file_path() -> Option<&'static std::path::Path> {
+    LOG_FILE_PATH.get().map(|p| p.as_path())
+}
+
+static LOG_FILE_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+fn open_log_file() -> Option<File> {
+    let preferred = crate::paths::user_data_base_path().into_owned();
+    let fallback = std::env::temp_dir().join("MoleWorld");
+    for dir in [preferred, fallback] {
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("touchHLE_log.txt");
+        if path.is_file() {
+            let _ = std::fs::rename(&path, dir.join("touchHLE_log.prev.txt"));
+        }
+        if let Ok(file) = File::create(&path) {
+            let _ = LOG_FILE_PATH.set(path);
+            return Some(file);
+        }
+    }
+    None
 }
 
 /// Prints a log message unconditionally. Use this for errors or warnings.
@@ -102,7 +132,7 @@ macro_rules! echo {
             }
 
             use std::io::Write;
-            let mut log_file = $crate::log::get_log_file();
+            if let Some(mut log_file) = $crate::log::get_log_file() {
             let _ = log_file.write_all(formatted_str.as_bytes());
             let _ = log_file.write_all(b"\n");
             // [MoleWorld P0-C] 不再每行 fsync(sync_data)。write_all 已落到 OS 页缓存,进程崩溃
@@ -112,6 +142,7 @@ macro_rules! echo {
             // 需要抓硬崩(断电/内核崩)现场时设 MOLE_LOG_SYNC=1 恢复逐行 sync_data(),默认关。
             if $crate::log::log_sync_enabled() {
                 let _ = log_file.sync_data();
+            }
             }
         }
     };
@@ -128,10 +159,11 @@ macro_rules! echo {
             }
 
             use std::io::Write;
-            let mut log_file = $crate::log::get_log_file();
-            let _ = log_file.write_all(b"\n");
-            if $crate::log::log_sync_enabled() {
-                let _ = log_file.sync_data();
+            if let Some(mut log_file) = $crate::log::get_log_file() {
+                let _ = log_file.write_all(b"\n");
+                if $crate::log::log_sync_enabled() {
+                    let _ = log_file.sync_data();
+                }
             }
         }
     }

@@ -120,7 +120,17 @@ pub extern "C" fn SDL_main(
             // 全面屏铺满、不拉伸;以前安卓不传,宽屏手机两侧各留一条大黑边。4:3 平板算出来仍是 1024x768,与原来一样。
             String::from("--fill-screen"),
         ],
-        None => vec![String::new()],
+        // [2026-10-07 第十一轮 R11-H-4] 复制失败且没有旧拷贝:以前参数留空 → main 进英文应用选择器「No apps were found」,
+        //   玩家看不到真正原因。现在弹中文说明(需要多少空间、失败原因)后退出。
+        None => {
+            let reason = BUNDLED_COPY_ERROR
+                .lock()
+                .ok()
+                .and_then(|e| e.clone())
+                .unwrap_or_else(|| "未知原因".to_string());
+            window::show_error_messagebox(None, &reason);
+            return 0;
+        }
     };
     match main(args.into_iter()) {
         Ok(_) => echo!("touchHLE finished"),
@@ -137,9 +147,13 @@ pub extern "C" fn SDL_main(
 ///   版本串(用户版本 + CI 注入的提交短 hash + git describe)。戳与本构建一致才复用;缺戳(旧版本复制的)或不一致
 ///   (换了 APK)就重新复制。启动时只读几十字节的戳,不用每次都把几百 MB 的 asset 读一遍来比大小。
 ///   已知限制:本地同一提交反复出包时戳不变,不会重复复制(需要时删掉戳文件或清应用数据)。
+/// [2026-10-07 第十一轮 R11-H-4] 内置游戏包复制失败的中文原因(给玩家看的),SDL_main 在没有可用拷贝时弹出来。
+#[cfg(target_os = "android")]
+static BUNDLED_COPY_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 #[cfg(target_os = "android")]
 fn ensure_bundled_moleworld() -> Option<String> {
-    use std::io::{Read, Write};
+    use std::io::{Seek, SeekFrom, Write};
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
     let target = apps_dir.join("MoleWorld.ipa");
     // 戳文件和下面的临时文件扩展名都不是 .ipa/.app,应用选择器(app_picker.rs enumerate_apps)会跳过它们。
@@ -167,34 +181,51 @@ fn ensure_bundled_moleworld() -> Option<String> {
         echo!("[MoleWorld] 创建目录 {:?} 失败: {:?}", apps_dir, e);
         return fallback();
     }
-    // 从 APK assets 读取内置的 MoleWorld.ipa(经 SDL2 的 Android assets 封装)。
-    let mut data = Vec::new();
-    match paths::ResourceFile::open("MoleWorld.ipa") {
-        Ok(mut rf) => {
-            if let Err(e) = rf.get().read_to_end(&mut data) {
-                echo!("[MoleWorld] 读取内置 MoleWorld.ipa 失败: {:?}", e);
-                return fallback();
-            }
+    // [2026-10-07 第十一轮 R11-H-4] 失败原因记下来:没有旧拷贝时 SDL_main 用中文弹框告诉玩家,而不是进英文应用选择器。
+    let note_failure = |what: String, size: Option<u64>| {
+        let need = size
+            .map(|n| format!("约 {} MB", n.div_ceil(1024 * 1024) + 50))
+            .unwrap_or_else(|| "几百 MB".to_string());
+        if let Ok(mut slot) = BUNDLED_COPY_ERROR.lock() {
+            *slot = Some(format!(
+                "第一次打开游戏(或更新后)需要把内置的游戏包复制到手机存储里,但复制失败了:{what}\n\n\
+                 请确认手机至少还有{need}可用空间,然后重新打开游戏。"
+            ));
         }
+    };
+    // 从 APK assets 读取内置的 MoleWorld.ipa(经 SDL2 的 Android assets 封装)。
+    // [2026-10-07 第十一轮 R11-H-4] 改成流式复制(std::io::copy),不再 read_to_end 把整份一百多 MB 读进内存。
+    let mut rf = match paths::ResourceFile::open("MoleWorld.ipa") {
+        Ok(rf) => rf,
         Err(e) => {
             echo!("[MoleWorld] 打开内置 MoleWorld.ipa(APK asset)失败: {}", e);
+            note_failure(format!("打不开安装包里的游戏包({e})"), None);
             return fallback();
         }
+    };
+    let size = rf.get().seek(SeekFrom::End(0)).ok();
+    if let Err(e) = rf.get().seek(SeekFrom::Start(0)) {
+        echo!("[MoleWorld] 读取内置 MoleWorld.ipa 失败: {:?}", e);
+        note_failure(format!("读取安装包里的游戏包出错({e})"), size);
+        return fallback();
     }
     // 先写同目录的临时文件并落盘,再 rename 原子替换:中途被杀或空间不足,都不会留下半截的 MoleWorld.ipa。
     let tmp = apps_dir.join("MoleWorld.ipa.tmp");
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(&data)?;
+        std::io::copy(rf.get(), &mut f)?;
+        f.flush()?;
         f.sync_all()
     });
     if let Err(e) = written {
         echo!("[MoleWorld] 写入 {:?} 失败: {:?}", tmp, e);
         let _ = std::fs::remove_file(&tmp);
+        note_failure(format!("写入手机存储出错({e})"), size);
         return fallback();
     }
     if let Err(e) = std::fs::rename(&tmp, &target) {
         echo!("[MoleWorld] 替换 {:?} 失败: {:?}", target, e);
         let _ = std::fs::remove_file(&tmp);
+        note_failure(format!("替换游戏包出错({e})"), size);
         return fallback();
     }
     // 戳最后写:替换成功后才记下本构建。戳写失败只会让下次启动再复制一遍,不会误用旧包。
@@ -209,7 +240,7 @@ fn ensure_bundled_moleworld() -> Option<String> {
         "[MoleWorld] 已{}内置游戏到 {:?}({} 字节)",
         if have_old { "更新" } else { "复制" },
         target,
-        data.len()
+        size.unwrap_or(0)
     );
     Some(target.to_string_lossy().into_owned())
 }
@@ -319,7 +350,11 @@ unsafe extern "system" fn native_exception_filter(
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(crate::paths::user_data_base_path().join("touchHLE_log.txt"))
+        .open(
+            crate::log::log_file_path()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| crate::paths::user_data_base_path().join("touchHLE_log.txt")),
+        )
     {
         // [2026-09-16] B-08 文案里的定位标记要与日志里实际输出的一致:早期的 [marker] 已被
         // mole_sysinfo::milestone 输出的 [足迹] 取代,并补上 environment.rs 加载主程序前后的 [boot]。
@@ -372,6 +407,19 @@ fn install_sighup_handler() {
             );
         }
     }
+}
+
+/// [2026-10-07 第十一轮 R11-H-2] 命令行是否允许错误弹框(--no-error-popup 关掉;无头测试脚本都带它)。
+static POPUP_ERRORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// [2026-10-07 第十一轮 R11-H-2] 桌面入口(bin.rs)在 main 返回错误后调用:本次还没弹过错误框、命令行也没关弹框时,
+/// 用中文错误框告诉玩家。Windows 发行版是图形程序,没有控制台,以前建窗之前的错误(找不到游戏包、选项错误等)
+/// 只写进看不见的 stderr,玩家双击后什么都没发生。
+pub fn report_startup_error(error: &str) {
+    if !POPUP_ERRORS.load(std::sync::atomic::Ordering::Relaxed) || window::error_messagebox_shown() {
+        return;
+    }
+    window::show_error_messagebox(None, error);
 }
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
@@ -469,6 +517,24 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
             return Err(format!("Unexpected argument: {arg:?}"));
+        }
+    }
+
+    POPUP_ERRORS.store(options.popup_errors, std::sync::atomic::Ordering::Relaxed);
+
+    // [2026-10-07 第十一轮 R11-H-2] Windows 发行版把日志和存档写在游戏所在文件夹(user_data_base_path 为「.」)。
+    // 解压到只读位置时存档根本写不进去,继续跑只会在第一次存档时出错,先给中文说明再退出。
+    #[cfg(windows)]
+    {
+        let dir = paths::user_data_base_path();
+        let probe = dir.join(".touchhle_write_test");
+        let writable = std::fs::write(&probe, b"ok").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if !writable {
+            return Err(format!(
+                "游戏所在的文件夹({})不能写入,存档也存不进去。请把整个游戏文件夹解压或移动到桌面、D 盘等可以写入的位置后再运行。",
+                std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.to_path_buf()).display()
+            ));
         }
     }
 

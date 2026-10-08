@@ -13,7 +13,52 @@
 
 #[cfg(not(target_os = "ios"))]
 fn main() -> Result<(), String> {
-    touchHLE::main(std::env::args())
+    let result = touchHLE::main(bundled_game_args(std::env::args().collect()).into_iter());
+    // [2026-10-07 第十一轮 R11-H-2] 建窗之前就出错时(找不到游戏包、游戏文件夹不可写等)补一个中文错误框:
+    // 发行版是图形程序,stderr 玩家看不到。已经弹过框或命令行关了弹框就不弹。
+    if let Err(ref e) = result {
+        touchHLE::report_startup_error(e);
+    }
+    result
+}
+
+/// [2026-10-07 第十一轮 R11-H-3] Windows/Linux 发行包:游戏路径只由 Run-MoleWorld.bat 作为参数传入。玩家直接双击
+/// touchHLE.exe、或把运行中的游戏「固定到任务栏」后从任务栏启动(记下的是 exe 本身,不带参数),以前会进英文
+/// 应用选择器并提示找不到 touchHLE_apps,进不了游戏。现在没有游戏路径参数、且 exe 同目录有 MoleWorld.app 时,
+/// 先切到 exe 所在目录(存档和日志都按当前目录放,起始目录不同会像丢档),再按 bat 的参数加载游戏。
+/// macOS .app 与安卓/iOS 入口不受影响。
+#[cfg(not(any(target_os = "ios", target_os = "android", target_os = "macos")))]
+fn bundled_game_args(args: Vec<String>) -> Vec<String> {
+    let has_bundle = args
+        .iter()
+        .skip(1)
+        .take_while(|a| a.as_str() != "--args")
+        .any(|a| !a.starts_with("--"));
+    if has_bundle {
+        return args;
+    }
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+    else {
+        return args;
+    };
+    if !dir.join("MoleWorld.app").is_dir() || std::env::set_current_dir(&dir).is_err() {
+        return args;
+    }
+    let mut out = vec![
+        args.first().cloned().unwrap_or_default(),
+        "MoleWorld.app".to_string(),
+        "--landscape-right".to_string(),
+        "--device-family=ipad".to_string(),
+    ];
+    out.extend(args.into_iter().skip(1));
+    out
+}
+
+#[cfg(any(target_os = "android", target_os = "macos"))]
+fn bundled_game_args(args: Vec<String>) -> Vec<String> {
+    args
 }
 
 // On iOS the app's main executable must hand control to SDL's UIKit runner,

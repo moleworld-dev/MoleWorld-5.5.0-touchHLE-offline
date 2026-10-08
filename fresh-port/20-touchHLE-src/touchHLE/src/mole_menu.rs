@@ -1215,6 +1215,9 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] GameData {}", selector);
         }
         Action::GameManagerCall(selector) => {
+            if refuse_while_placing(env, &format!("GameManager {}", selector)) {
+                return;
+            }
             let gm = game_singleton(env, "GameManager", "sharedManager");
             if gm == nil {
                 log!("[MOLEMENU] GameManager sharedManager == nil");
@@ -1225,6 +1228,9 @@ fn run_action(env: &mut Environment, action: Action) {
             log!("[MOLEMENU] GameManager {}", selector);
         }
         Action::SingletonCall(class, shared, method) => {
+            if refuse_while_placing(env, &format!("{} {}", class, method)) {
+                return;
+            }
             let obj = game_singleton(env, class, shared);
             if obj == nil {
                 log!("[MOLEMENU] {} {} == nil", class, shared);
@@ -1613,6 +1619,9 @@ fn outside_main_village(env: &mut Environment) -> Option<(i32, bool)> {
 }
 
 fn summon_class(env: &mut Environment, name: &str, z: i32) {
+    if refuse_while_placing(env, &format!("召唤 {}", name)) {
+        return;
+    }
     let cls = env.objc.get_known_class(name, &mut env.mem);
     if cls == nil {
         log!("[MOLEMENU] class {} not found", name);
@@ -1709,6 +1718,41 @@ fn summon_class(env: &mut Environment, name: &str, z: i32) {
     log!("[MOLEMENU] summoned {} z={}", name, z);
 }
 
+/// [2026-10-07 第十一轮 R11-P1-1] 是否有物品正在摆放。原版判「手上有物件」用 -[Porter isRunning]@0x29210(objSprite 非空),
+/// -[ObjectSelector processTouch:withType:] 0x4af82 就靠它在摆放中挡住点建筑;各按钮入口另问 [EditMenuLayer isActive]
+/// (@0x4d4bc,parent 非空)。摆放中再发起一次放置,原版 -[Porter attachObjectWithHouseLevel:data:] 会直接覆盖 objSprite、
+/// 不摘旧精灵,旧的那件变成永久红色、选不中、不进存档的孤儿(10-04 修改器开占卜实测过)。两个都问;Porter 单例只读
+/// 静态变量 0xb40968(+instance@0x28f40 的缓存),不存在就不调 +instance,免得凭空建一个。菜单在运行循环里处理,可以发消息。
+fn placement_busy(env: &mut Environment) -> Option<&'static str> {
+    let eml = game_singleton(env, "EditMenuLayer", "sharedInstance");
+    if eml != nil {
+        let is_active = sel(env, "isActive");
+        let active: u8 = msg_send(env, (eml, is_active));
+        if active != 0 {
+            return Some("EditMenuLayer isActive");
+        }
+    }
+    let porter: u32 = env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(0xb40968));
+    if porter != 0 {
+        let is_running = sel(env, "isRunning");
+        let running: u8 = msg_send(env, (crate::objc::id::from_bits(porter), is_running));
+        if running != 0 {
+            return Some("Porter isRunning");
+        }
+    }
+    None
+}
+
+/// [2026-10-07 第十一轮 R11-P1-1] 有物品正在摆放时拒绝修改器入口并提示;返回是否拒绝。
+fn refuse_while_placing(env: &mut Environment, what: &str) -> bool {
+    let Some(why) = placement_busy(env) else {
+        return false;
+    };
+    log!("[MOLEMENU] 拒绝{}:正在摆放物品({})", what, why);
+    set_toast("正在摆放物品:请先摆好或收起,再用修改器".to_string());
+    true
+}
+
 fn mini_game(env: &mut Environment, id_: i32) {
     // [2026-09-24 第五轮补挖 M-M3-3] 左左右右在岛上(或进出岛过场中)不试玩:成绩会写进岛上沙滩WC的前三名并随 island_misc.dat 落盘。
     //   主村召唤不受影响(主村这份 NewSceneData 前三名回岛前会被 island_misc.dat 覆盖,不落盘)。
@@ -1722,18 +1766,8 @@ fn mini_game(env: &mut Environment, id_: i32) {
     //   并拒绝,菜单直接 startMiniGame: 绕过了这道门:占卜「拿走所有奖励」后还没摆完的奖品会被新开一局的
     //   -[DivineGame putAllGiftOnMap] 重设 setDivineRewardsList: 冲掉,其它小游戏也会叠在摆放界面上。
     //   菜单触摸在运行循环里处理,不在帧栈上,可以发消息;sharedInstance 原版各入口也是直接调的。
-    let eml = game_singleton(env, "EditMenuLayer", "sharedInstance");
-    if eml != nil {
-        let is_active = sel(env, "isActive");
-        let active: u8 = msg_send(env, (eml, is_active));
-        if active != 0 {
-            log!(
-                "[MOLEMENU] 拒绝召唤小游戏 {}:正在摆放物品(EditMenuLayer isActive)",
-                id_
-            );
-            set_toast("正在摆放物品:请先摆好或收起,再开小游戏".to_string());
-            return;
-        }
+    if refuse_while_placing(env, &format!("小游戏 {}", id_)) {
+        return;
     }
     let mgr = game_singleton(env, "MiniGameManager", "shareInstance");
     if mgr == nil {

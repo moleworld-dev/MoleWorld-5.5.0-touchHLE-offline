@@ -279,9 +279,24 @@ impl Mem {
 
     /// Create a fresh instance of guest memory.
     pub fn new() -> Mem {
+        Self::try_new().unwrap()
+    }
+
+    /// [2026-10-07 第十一轮 R11-P2-1] 同 [Mem::new],但一次性保留 4GiB 客体地址空间失败时返回中文说明而不是
+    /// panic。内存 3GB 及以下的 iOS 设备(iPad 第 7~9 代、iPad Air 3、iPhone XR 等)在没有「扩展虚拟地址空间」
+    /// 权限时,系统给进程的地址空间放不下连续 4GiB,mmap 失败;以前这里 unwrap → 英文崩溃框 → 闪退,
+    /// TestFlight 只收到看不出原因的 SIGABRT(测试者「无法打开」)。现在 Environment::new 把它作为普通错误返回,
+    /// 弹中文说明后正常退出。
+    pub fn try_new() -> Result<Mem, String> {
         let size = std::mem::size_of::<Bytes>();
 
-        let ptr = unsafe { crate::mem::host::allocate_memory(size).unwrap() };
+        let ptr = unsafe { crate::mem::host::allocate_memory(size) }.map_err(|e| {
+            format!(
+                "这台设备给每个应用的内存地址空间不够,游戏无法启动(模拟器需要一整块连续的 4GB 地址空间)。\
+                 内存 3GB 及以下的 iPhone / iPad(如 iPad 第 7~9 代、iPad Air 3、iPhone XR)目前会遇到这个问题,\
+                 开发者正在处理。系统返回:{e}"
+            )
+        })?;
 
         assert_eq!(
             ptr as usize & PAGE_SIZE_ALIGN_MASK as usize,
@@ -293,13 +308,13 @@ impl Mem {
 
         let vm_allocator = VMAllocator::new(0, Self::MAIN_THREAD_STACK_LOW_END);
 
-        Mem {
+        Ok(Mem {
             bytes,
             null_segment_size: 0,
             vm_allocator,
             heap_allocator: None,
             zero_memory_on_free: true,
-        }
+        })
     }
 
     pub fn create_heap(&mut self, size: GuestUSize) -> HeapAllocator {

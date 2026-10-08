@@ -8401,6 +8401,8 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
             | "getMatureTime"
             | "isReachable"
             | "sendPacket:commandId:"
+            // [2026-10-07 第十一轮 R11-P1-1] 摆放中又来一次放置(孤儿精灵)只读诊断,见 porter_reattach_diag
+            | "attachObjectWithHouseLevel:data:"
             // [2026-09-16 黄金岛审查修 I9-01] 岛上吞掉原版重发队列的入队(接收者 NewSceneNetworkBuffer 不在 CLASSES,
             //   不加进 SELS 这条臂就是死代码)
             | "pushOneObjectIn:withCommandId:andSendFlag:"
@@ -9717,7 +9719,81 @@ fn island_lr_in(env: &Environment, table: &[u32]) -> bool {
     table.binary_search(&(env.cpu.regs()[14] | 1)).is_ok()
 }
 
+/// [2026-10-07 第十一轮 R11-P1-1] 安全地读客体内存里的一个 u32(避开空页与未对齐地址);只读,不发消息。
+fn peek_u32(env: &Environment, addr: u32) -> Option<u32> {
+    if addr < 0x1000 || addr & 3 != 0 {
+        return None;
+    }
+    Some(env.mem.read(ConstPtr::<u32>::from_bits(addr)))
+}
+
+/// [2026-10-07 第十一轮 R11-P1-1] 按游戏自己的 ivar 偏移槽读对象字段(touchHLE 运行时会修正偏移并写回槽)。
+fn peek_ivar(env: &Environment, obj: u32, slot: u32) -> Option<u32> {
+    let off = peek_u32(env, slot)?;
+    peek_u32(env, obj.checked_add(off)?)
+}
+
+/// [2026-10-07 第十一轮 R11-P1-1] 摆放中又来一次放置的诊断(零行为改动)。原版 -[Porter attachObjectWithHouseLevel:data:]
+/// @0x298bc 直接覆盖 objSprite 不摘旧精灵,旧的那件变成永久红色、选不中、不进存档、重开就消失的「孤儿」——与测试者 10-07
+/// 「占卜屋建筑卡在红区、摆放模式下移不动、强退后消失」的三条症状对得上。正常收尾(finishBuild 0x2c08a、cancelOperation)都会
+/// 清 objSprite,所以 attach 入口时 objSprite≠0 就是孤儿的准确信号。这里只读 guest 内存记一行日志:r7 帧链上 6 层返回地址
+/// (看出是哪条入口触发)、新旧物件 ID、Porter.state/editObj、EditMenuLayer 是否挂着与 isDivineGoods,供测试者回传
+/// touchHLE_log.txt 定位来源。不发宿主消息、不改寄存器,在帧栈上也安全;返回后原方法照常执行。
+fn porter_reattach_diag(env: &Environment) {
+    let porter = env.cpu.regs()[0];
+    let Some(sprite) = peek_ivar(env, porter, 0xb03284) else {
+        return;
+    };
+    if sprite == 0 {
+        return;
+    }
+    let new_data = env.cpu.regs()[3];
+    let new_id = peek_ivar(env, new_data, 0xb03c2c);
+    let old_data = peek_ivar(env, porter, 0xb0327c).unwrap_or(0);
+    let old_id = peek_ivar(env, old_data, 0xb03c2c);
+    let state = peek_ivar(env, porter, 0xb03290);
+    let edit_obj = peek_ivar(env, porter, 0xb03280);
+    let mut chain = vec![env.cpu.regs()[14]];
+    let mut fp = env.cpu.regs()[7];
+    for _ in 0..6 {
+        let (Some(next), Some(lr)) = (peek_u32(env, fp), peek_u32(env, fp.wrapping_add(4))) else {
+            break;
+        };
+        chain.push(lr);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    let chain: Vec<String> = chain.iter().map(|a| format!("{:#x}", a)).collect();
+    let eml = peek_u32(env, 0xb4097c).unwrap_or(0);
+    let eml_parent = peek_ivar(env, eml, 0xb06eec);
+    let divine = peek_u32(env, 0xb03420)
+        .and_then(|off| eml.checked_add(off))
+        .filter(|&a| eml != 0 && a >= 0x1000)
+        .map(|a| env.mem.read(ConstPtr::<u8>::from_bits(a)));
+    log!(
+        "[摆放诊断] 摆放中又来一次放置:旧精灵 {:#x} 将成为孤儿(红色、选不中、不进存档);旧物件 {:?} → 新物件 {:?};\
+         Porter.state={:?} editObj={:?};EditMenuLayer={:#x} 挂着={:?} isDivineGoods={:?};返回地址链 {}",
+        sprite,
+        old_id,
+        new_id,
+        state,
+        edit_obj,
+        eml,
+        eml_parent.map(|p| p != 0),
+        divine,
+        chain.join(" ← ")
+    );
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
+    if sel == "attachObjectWithHouseLevel:data:" {
+        if class == "Porter" {
+            porter_reattach_diag(env);
+        }
+        return false;
+    }
     // ★[2026-06-22 飞机进岛卡死修复] 离线黄金岛总开关 ENABLE_NEWSCENE_ISLAND 默认 ON(飞机/作弊菜单
     // 两条进岛路径等价)。仅【在线模式】(--allow-network-access)强制 OFF——在线下岛 hook(网络门强制
     // 在线/吞包/解活锁)会干扰私服真连接,且在线岛非功能点;离线(默认)保持 ON,飞机点击即进岛。

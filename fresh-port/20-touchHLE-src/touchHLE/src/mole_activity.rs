@@ -188,6 +188,11 @@ const SITE_BULLETIN_CONNECTED: u32 = 0x3a8b8c;
 const SITE_SIGN_SHOW_REACHABLE: u32 = 0x397156;
 /// 同上 isConnected(LR 0x39717d)。
 const SITE_SIGN_SHOW_CONNECTED: u32 = 0x397178;
+/// [2026-10-07 第十一轮 R11-F-1] -[iMoleVillageAppDelegate applicationWillEnterForeground:]@0x1133c 的 isConnected
+/// (blx 0x1171c,LR 0x11721)。原版回前台时只有在线才 getServerTime(0x1174e)+ 按场景要当天的每日任务
+/// getDailyTaskListFromServerWithSceneId:(0x11780),这是跨天回来换日常列表的唯一入口;离线主村这道门恒假,
+/// 挂后台跨过零点回来日常任务还是昨天那组。放行后离线 getServerTime 发包空过,1074 由回环按当天应答。
+const SITE_FOREGROUND_DAILY_CONNECTED: u32 = 0x1171c;
 /// -[SealExchangeLayer initData] isReachable(LR 0x39aac7)。
 const SITE_SEAL_INIT_REACHABLE: u32 = 0x39aac2;
 /// 同上 isConnected(LR 0x39aae5)。
@@ -541,6 +546,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_UIL_CONNECTED)
                 || lr_is(env, SITE_BULLETIN_CONNECTED)
                 || lr_is(env, SITE_SIGN_SHOW_CONNECTED)
+                || lr_is(env, SITE_FOREGROUND_DAILY_CONNECTED)
                 || lr_is(env, SITE_SEAL_INIT_CONNECTED)
                 || lr_is(env, SITE_EDIT_SEABED_CONNECTED)
                 || lr_is(env, SITE_SEABED_INIT_CONNECTED)
@@ -1354,6 +1360,9 @@ struct ActState {
     hv_daily_vals: Vec<u32>,
     /// [2026-10-04 第八轮 R8-C2] 占卜今天已经免费过的日期 yyyymmdd(北京时间日界,与 daily_day_key 同口径);1139 时记账,1138 回包据此给首字段。
     divine_free_day: u32,
+    /// [2026-10-07 第十一轮 R11-F-3] 其它月份的签到记录(最近用过的在前,最多 SIGN_HIST_MAX 个月):
+    /// (yyyymm, 签到位图, 补签次数, 全勤已领, 脚印兑换位)。见 sign_roll_month。
+    sign_hist: Vec<(u32, u32, u32, u32, u32)>,
 }
 
 impl Default for ActState {
@@ -1375,6 +1384,7 @@ impl Default for ActState {
             hv_daily_day: 0,
             hv_daily_vals: Vec::new(),
             divine_free_day: 0,
+            sign_hist: Vec::new(),
         }
     }
 }
@@ -1406,6 +1416,13 @@ impl ActState {
             join_u32(&self.hv_daily_vals),
             self.divine_free_day
         );
+        // [2026-10-07 第十一轮 R11-F-3] 其它月份的签到记录;旧版本读到不认识的行会忽略,前后兼容。
+        let hist: Vec<String> = self
+            .sign_hist
+            .iter()
+            .map(|(ym, days, patch, reward, exch)| format!("{ym}:{days}:{patch}:{reward}:{exch}"))
+            .collect();
+        body.push_str(&format!("sign_hist={}\n", hist.join(";")));
         let sum = crate::mole_items::fnv1a(body.as_bytes());
         body.push_str(&format!("sum={:08x}\n", sum));
         body
@@ -1436,6 +1453,22 @@ impl ActState {
                 "hv_daily_day" => st.hv_daily_day = num().unwrap_or(0),
                 "hv_daily_vals" => st.hv_daily_vals = parse_u32_list(v),
                 "divine_free_day" => st.divine_free_day = num().unwrap_or(0),
+                "sign_hist" => {
+                    for item in v.split(';') {
+                        let f: Vec<u32> = item.split(':').filter_map(|x| x.trim().parse().ok()).collect();
+                        if let [ym, days, patch, reward, exch] = f[..] {
+                            if ym > 0 && st.sign_hist.len() < SIGN_HIST_MAX {
+                                st.sign_hist.push((
+                                    ym,
+                                    days & !1u32,
+                                    patch.min(31),
+                                    u32::from(reward != 0),
+                                    exch & 0xfff,
+                                ));
+                            }
+                        }
+                    }
+                }
                 "shells" => {
                     let mut shells = Vec::new();
                     for item in v.split(';') {
@@ -2126,21 +2159,54 @@ fn encode_activity_center() -> Vec<u8> {
 
 /// 跨月:签到位图、补签次数、全勤奖清零(脚印保留,文案 DAILY_SIGN_EXCHANGE_DESC_ONE「脚印可以累计到下月」);
 /// 兑换记录也按月清零。返回是否有改动。
+/// [2026-10-07 第十一轮 R11-F-3] 按月份保留的签到记录最多几个月(最近用过的优先)。
+const SIGN_HIST_MAX: usize = 4;
+
+/// 换到 ym 这个月的签到/兑换记录。
+/// [2026-10-07 第十一轮 R11-F-3] 以前只要月份不相等就清零并落盘,不分往前还是往后:系统日期改到别的月再改回来
+/// (或设备时钟被重置)、每次都重启游戏,本月已踩的格子、补签次数、全勤和脚印兑换记录都被抹掉;原版这些记录在服务器、
+/// 按服务器时间翻月,设备时间改动不会让它们回退。现在照「服务器按月保存」:离开的月份存进 sign_hist,
+/// 切到 sign_hist 里有的月份就恢复,没有才从零开始;脚印总数照旧跨月累计。
 fn sign_roll_month(st: &mut ActState, ym: u32) -> bool {
-    let mut changed = false;
+    if st.sign_month == ym && st.exch_month == ym {
+        return false;
+    }
+    fn upsert(hist: &mut Vec<(u32, u32, u32, u32, u32)>, ym: u32, f: impl FnOnce(&mut (u32, u32, u32, u32, u32))) {
+        let mut rec = match hist.iter().position(|r| r.0 == ym) {
+            Some(i) => hist.remove(i),
+            None => (ym, 0, 0, 0, 0),
+        };
+        f(&mut rec);
+        hist.insert(0, rec);
+    }
+    if st.sign_month != 0 && st.sign_month != ym {
+        let (days, patch, reward) = (st.sign_days, st.sign_patch, st.sign_reward);
+        upsert(&mut st.sign_hist, st.sign_month, |r| {
+            r.1 = days;
+            r.2 = patch;
+            r.3 = reward;
+        });
+    }
+    if st.exch_month != 0 && st.exch_month != ym {
+        let exch = st.exch_mask;
+        upsert(&mut st.sign_hist, st.exch_month, |r| r.4 = exch);
+    }
+    let restored = match st.sign_hist.iter().position(|r| r.0 == ym) {
+        Some(i) => st.sign_hist.remove(i),
+        None => (ym, 0, 0, 0, 0),
+    };
     if st.sign_month != ym {
         st.sign_month = ym;
-        st.sign_days = 0;
-        st.sign_patch = 0;
-        st.sign_reward = 0;
-        changed = true;
+        st.sign_days = restored.1;
+        st.sign_patch = restored.2;
+        st.sign_reward = restored.3;
     }
     if st.exch_month != ym {
         st.exch_month = ym;
-        st.exch_mask = 0;
-        changed = true;
+        st.exch_mask = restored.4;
     }
-    changed
+    st.sign_hist.truncate(SIGN_HIST_MAX);
+    true
 }
 
 /// 1117 body = 12 字节(parseDailySignDaysInfo@0x1c4080 逐字节核实):
@@ -2378,6 +2444,9 @@ fn seabed_ensure_shells(st: &mut ActState) -> bool {
 /// 1219 body(parseSeabedSeekingTreasureActivityInfo@0x1ca98c 核实):
 /// [flag][珍珠数][n] + n×[pearlPos][pearlType][lastTimestamp] + [bDigShellPlayers][bExchangeReward]。
 /// pearlPos 按 1..5(onDigShellClick: 发 1220 时传的是 tag+1,0x2c1d02)。
+/// [2026-10-07 第十一轮 R11-F-2] kCFAbsoluteTimeIntervalSince1970:2001-01-01 的 Unix 秒。
+const CF_EPOCH_UNIX_SECS: u32 = 978_307_200;
+
 fn encode_seabed_info(st: &ActState) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, 1); // 活动进行中
@@ -2386,7 +2455,16 @@ fn encode_seabed_info(st: &ActState) -> Vec<u8> {
     for (i, (t, ts)) in st.shells.iter().enumerate() {
         put_u32(&mut b, i as u32 + 1);
         put_u32(&mut b, *t);
-        put_u32(&mut b, *ts);
+        // [2026-10-07 第十一轮 R11-F-2] 「上次挖掘时间」按 Unix 秒下发:-[SeabedSeekingTreasureMainLayer displayUI]
+        // 在 0x2c1214 无条件减 kCFAbsoluteTimeIntervalSince1970(978307200)再与当前时间比 300 秒冷却。以前存发的是
+        // 2001 纪元秒,减成负数后截成 0,关掉页面再打开冷却全没了。旧档里存的 2001 纪元值(1000 < ts < 978307200)
+        // 在这里换算;0 = 刷新后无冷却,照旧。
+        let ts = if *ts > 1000 && *ts < CF_EPOCH_UNIX_SECS {
+            ts + CF_EPOCH_UNIX_SECS
+        } else {
+            *ts
+        };
+        put_u32(&mut b, ts);
     }
     put_u32(&mut b, u32::from(st.dug > 0));
     put_u32(&mut b, 0);
@@ -2409,8 +2487,9 @@ fn seabed_dig(env: &mut Environment, nm: id, pos: u32, shell_type: u32) {
     st.dug = st.dug.saturating_add(1);
     let new_type = roll_shell_type(st.dug);
     let idx = (pos.clamp(1, 5) - 1) as usize;
-    // 挖过的贝壳换成新类型并记下挖掘时间(CFAbsoluteTime 纪元),重开层时 displayUI 据此算 5 分钟冷却。
-    st.shells[idx] = (new_type, now_cf_u32());
+    // 挖过的贝壳换成新类型并记下挖掘时间(Unix 秒,见 encode_seabed_info:客户端会先减掉 1970→2001 的差值),
+    // 重开层时 displayUI 据此算 5 分钟冷却。
+    st.shells[idx] = (new_type, now_cf_u32().saturating_add(CF_EPOCH_UNIX_SECS));
     save_state(env, &st);
     log!(
         "[ACTIVITY] 海底寻宝挖贝 pos={} type={} 珍珠+{} → {} 新贝壳类型={}",
@@ -3794,6 +3873,50 @@ mod offline_server_tests {
             // 一局只扣 1 张券或 1 贝壳却能连开五轮,奖池里放贝壳就能无限刷贝壳。
             assert!(items.iter().all(|x| x.0 != 704), "轮次 {} 含贝壳", round);
         }
+    }
+
+    #[test]
+    fn sign_month_records_survive_clock_back_and_forth() {
+        // [2026-10-07 第十一轮 R11-F-3] 改到别的月再改回来,本月签到/补签/全勤/兑换记录不丢;往未来月份走一趟也能回来。
+        let mut st = ActState::default();
+        assert!(sign_roll_month(&mut st, 202610));
+        st.sign_days = 0b1110;
+        st.sign_patch = 1;
+        st.sign_reward = 1;
+        st.exch_mask = 0b11;
+        assert!(!sign_roll_month(&mut st, 202610));
+        assert!(sign_roll_month(&mut st, 203001));
+        assert_eq!((st.sign_days, st.sign_patch, st.sign_reward, st.exch_mask), (0, 0, 0, 0));
+        st.sign_days = 0b100;
+        assert!(sign_roll_month(&mut st, 202610));
+        assert_eq!((st.sign_days, st.sign_patch, st.sign_reward, st.exch_mask), (0b1110, 1, 1, 0b11));
+        assert!(sign_roll_month(&mut st, 203001));
+        assert_eq!(st.sign_days, 0b100);
+        // 存档往返后记录还在
+        let back = ActState::parse_checked(st.serialize().as_bytes()).unwrap();
+        assert_eq!(back.sign_hist, st.sign_hist);
+        let mut back = back;
+        assert!(sign_roll_month(&mut back, 202610));
+        assert_eq!((back.sign_days, back.exch_mask), (0b1110, 0b11));
+        // 只保留最近用过的几个月
+        for ym in 202001..202001 + 10 {
+            sign_roll_month(&mut back, ym);
+        }
+        assert!(back.sign_hist.len() <= SIGN_HIST_MAX);
+    }
+
+    #[test]
+    fn seabed_timestamp_sent_as_unix_seconds() {
+        // [2026-10-07 第十一轮 R11-F-2] 客户端会减 978307200:新存的是 Unix 秒原样下发,旧档的 2001 纪元值换算,0 不变。
+        let mut st = ActState::default();
+        st.shells = vec![(1, 0), (2, 800_000_000), (3, 1_790_000_000), (1, 5), (2, 0)];
+        let b = encode_seabed_info(&st);
+        let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        // [1][pearl][5] 之后每个贝壳 3 个字:[序号][类型][时间]
+        assert_eq!(word(3 + 2), 0);
+        assert_eq!(word(3 + 5), 800_000_000 + CF_EPOCH_UNIX_SECS);
+        assert_eq!(word(3 + 8), 1_790_000_000);
+        assert_eq!(word(3 + 11), 5);
     }
 
     #[test]
