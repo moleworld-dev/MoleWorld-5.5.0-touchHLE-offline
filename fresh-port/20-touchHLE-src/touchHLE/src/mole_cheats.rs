@@ -8486,7 +8486,7 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
         || sel == "moleIslandTimeTravelNotice"
         // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
-        || (class == "Porter" && matches!(sel, "touchBegan:" | "touchMove:"))
+        || (matches!(class, "Porter" | "NewScenePorter") && matches!(sel, "touchBegan:" | "touchMove:"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -8640,37 +8640,37 @@ fn ui43_inner<R>(env: &mut Environment, f: impl FnOnce(&mut Environment) -> R) -
 /// WashRoomActor←WashRoomGame),主村不受影响。ActorManager GenarateScreenPos:(主村全局对象)和
 /// GoldSprite/XPSprite/MovableIcon(世界飘字)仍保持真实宽度。★插入时必须保持升序,否则 binary_search 静默失效。
 const UI43_CALLSITES: &[u32] = &[
-    0xb468, 0xa71fe, 0xc07fa, 0xc93d0, 0xde600, 0xf2386, 0xf29fc, 0xf2b14,
-    0xf2f46, 0xfbbe2, 0xfc76a, 0xfdb48, 0xfe6f4, 0xfe91c, 0x10fe60, 0x1102fc,
-    0x110754, 0x110c42, 0x111952, 0x123932, 0x129e0a, 0x12d7c2, 0x134144, 0x134a86,
-    0x13577e, 0x1358b6, 0x135bae, 0x136024, 0x137042, 0x1371d2, 0x1381d2, 0x13836e,
-    0x138e24, 0x139e34, 0x13aab2, 0x13c338, 0x13c6e0, 0x13e318, 0x13f52e, 0x13f82a,
-    0x140d86, 0x144532, 0x147280, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0,
-    0x156604, 0x156916, 0x156ab2, 0x156da6, 0x158354, 0x159486, 0x159ac0, 0x164fa6,
-    0x165146, 0x16641e, 0x1676d6, 0x168adc, 0x168fa0, 0x169eda, 0x16a06a, 0x16a3d2,
-    0x16ba8c, 0x17176a, 0x174ade, 0x177ea2, 0x17b8ba, 0x17e12c, 0x17e51e, 0x17ea02,
-    0x17ec6c, 0x17ed3a, 0x17f1ea, 0x17f37a, 0x17f66c, 0x1806c8, 0x180d98, 0x18667c,
-    0x188bc2, 0x18a138, 0x18c2bc, 0x18c3e8, 0x18cc24, 0x18d1fa, 0x18e790, 0x190a2e,
-    0x192de0, 0x193704, 0x193b36, 0x1940d0, 0x194194, 0x19425c, 0x19432a, 0x19c3d0,
-    0x1a24ec, 0x1a3f84, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e, 0x1af8c2, 0x1b11ec,
-    0x1b1c74, 0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c, 0x1d2274,
-    0x1d33b4, 0x1d40ee, 0x1e299e, 0x1e50aa, 0x1e6206, 0x1e73d4, 0x1eb2c8, 0x1f00a2,
-    0x1f21fc, 0x1f2c3c, 0x1fea1e, 0x1fffb6, 0x1fffd6, 0x1fffec, 0x200314, 0x210a9a,
-    0x2126f0, 0x213060, 0x217e7e, 0x233188, 0x235e68, 0x23687a, 0x23f17e, 0x246ce6,
-    0x24a802, 0x24d4b2, 0x2553ae, 0x27abfe, 0x2c0942, 0x2d9d7a, 0x2ec99a, 0x2f68d0,
-    0x2f8190, 0x301562, 0x30ba98, 0x30f5d2, 0x310186, 0x3107ec, 0x318ef2, 0x323c0c,
-    0x32d78e, 0x32ffea, 0x3319a2, 0x3335fe, 0x336bc4, 0x339d5a, 0x345a52, 0x352f00,
-    0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x35e6ac, 0x36a260, 0x36e3c6, 0x370270,
-    0x370c80, 0x371140, 0x375fb6, 0x37794a, 0x3796b4, 0x37af1c, 0x37cb66, 0x37de44,
-    0x37fb0a, 0x381434, 0x392f4a, 0x396402, 0x3969a8, 0x397618, 0x39ac00, 0x39ca68,
-    0x3a035a, 0x3a3ef8, 0x3a8ddc, 0x3ae616, 0x3af228, 0x3afb16, 0x3b5230, 0x3b770c,
-    0x3b786c, 0x3b8864, 0x3bda94, 0x3c18ce, 0x3c3284, 0x3c359e, 0x3c3a0e, 0x3c63f4,
-    0x3c7d12, 0x3cae1c, 0x3cff0c, 0x3d8ffa, 0x3da4b0, 0x3dace4, 0x3dc2e0, 0x3df538,
-    0x3e12e8, 0x3e21a0, 0x3e3b10, 0x3eced0, 0x3ede0c, 0x3ef0a6, 0x3f032c, 0x3f22d4,
-    0x3f6f2e, 0x3f73f8, 0x3fa388, 0x3fa85c, 0x3fed4a, 0x40012a, 0x40088a, 0x401a52,
-    0x401b5a, 0x4021f6, 0x40566a, 0x406c8c, 0x40942c, 0x40e86a, 0x40f4a2, 0x410a44,
-    0x4147f0, 0x415254, 0x41664c, 0x41ddf4, 0x41ef5e, 0x41f566, 0x420112, 0x4212c4,
-    0x4291e4, 0x42a360, 0x42bd38, 0x4318f6, 0x4319aa, 0x434120, 0x43486c, 0x435a72,
+    0xb468, 0xa71fe, 0xc93d0, 0xde600, 0xf2386, 0xf29fc, 0xf2b14, 0xf2f46,
+    0xfbbe2, 0xfc76a, 0xfdb48, 0xfe6f4, 0xfe91c, 0x10fe60, 0x1102fc, 0x110754,
+    0x110c42, 0x111952, 0x123932, 0x129e0a, 0x12d7c2, 0x134144, 0x134a86, 0x13577e,
+    0x1358b6, 0x135bae, 0x136024, 0x137042, 0x1371d2, 0x1381d2, 0x13836e, 0x138e24,
+    0x139e34, 0x13aab2, 0x13c338, 0x13c6e0, 0x13e318, 0x13f52e, 0x13f82a, 0x140d86,
+    0x144532, 0x147280, 0x14cef4, 0x14e130, 0x14f94e, 0x150418, 0x152bd0, 0x156604,
+    0x156916, 0x156ab2, 0x156da6, 0x158354, 0x159486, 0x159ac0, 0x164fa6, 0x165146,
+    0x16641e, 0x1676d6, 0x168adc, 0x168fa0, 0x169eda, 0x16a06a, 0x16a3d2, 0x16ba8c,
+    0x17176a, 0x174ade, 0x177ea2, 0x17b8ba, 0x17e12c, 0x17e51e, 0x17ea02, 0x17ec6c,
+    0x17ed3a, 0x17f1ea, 0x17f37a, 0x17f66c, 0x1806c8, 0x180d98, 0x18667c, 0x188bc2,
+    0x18a138, 0x18c2bc, 0x18c3e8, 0x18cc24, 0x18d1fa, 0x18e790, 0x190a2e, 0x192de0,
+    0x193704, 0x193b36, 0x1940d0, 0x194194, 0x19425c, 0x19432a, 0x19c3d0, 0x1a24ec,
+    0x1a3f84, 0x1a6754, 0x1ac820, 0x1ae7e4, 0x1af46e, 0x1af8c2, 0x1b11ec, 0x1b1c74,
+    0x1b2898, 0x1b40da, 0x1bb4a0, 0x1ccf1c, 0x1cf50a, 0x1d0a5c, 0x1d2274, 0x1d33b4,
+    0x1d40ee, 0x1e299e, 0x1e50aa, 0x1e6206, 0x1e73d4, 0x1eb2c8, 0x1f00a2, 0x1f21fc,
+    0x1f2c3c, 0x1fea1e, 0x1fffb6, 0x1fffd6, 0x1fffec, 0x200314, 0x210a9a, 0x2126f0,
+    0x213060, 0x217e7e, 0x233188, 0x235e68, 0x23687a, 0x23f17e, 0x2553ae, 0x27abfe,
+    0x2c0942, 0x2d9d7a, 0x2ec99a, 0x2f68d0, 0x2f8190, 0x301562, 0x30ba98, 0x30f5d2,
+    0x310186, 0x3107ec, 0x318ef2, 0x32d78e, 0x32ffea, 0x3319a2, 0x3335fe, 0x336bc4,
+    0x339d5a, 0x345a52, 0x352f00, 0x3565c6, 0x358390, 0x359bae, 0x35cbfc, 0x35e6ac,
+    0x36a260, 0x36e3c6, 0x370270, 0x370c80, 0x371140, 0x375fb6, 0x37794a, 0x3796b4,
+    0x37af1c, 0x37cb66, 0x37de44, 0x37fb0a, 0x381434, 0x392f4a, 0x396402, 0x3969a8,
+    0x397618, 0x39ac00, 0x39ca68, 0x3a035a, 0x3a3ef8, 0x3a8ddc, 0x3ae616, 0x3af228,
+    0x3afb16, 0x3b5230, 0x3b770c, 0x3b786c, 0x3b8864, 0x3bda94, 0x3c18ce, 0x3c3284,
+    0x3c359e, 0x3c3a0e, 0x3c63f4, 0x3c7d12, 0x3cae1c, 0x3cff0c, 0x3d8ffa, 0x3da4b0,
+    0x3dace4, 0x3dc2e0, 0x3df538, 0x3e12e8, 0x3e21a0, 0x3e3b10, 0x3eced0, 0x3ede0c,
+    0x3ef0a6, 0x3f032c, 0x3f22d4, 0x3f6f2e, 0x3f73f8, 0x3fa388, 0x3fa85c, 0x3fed4a,
+    0x40012a, 0x40088a, 0x401a52, 0x401b5a, 0x4021f6, 0x40566a, 0x406c8c, 0x40942c,
+    0x40e86a, 0x40f4a2, 0x410a44, 0x4147f0, 0x415254, 0x41664c, 0x41ddf4, 0x41ef5e,
+    0x41f566, 0x420112, 0x4212c4, 0x4291e4, 0x42a360, 0x42bd38, 0x4318f6, 0x4319aa,
+    0x434120, 0x43486c, 0x435a72,
 ];
 
 /// [MoleWorld 宽屏适配·UI 4:3 虚拟化·居中偏移] 需要整体右移居中的 UI 根层(运行时类名,含父类链匹配)。
@@ -8697,44 +8697,43 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
     "ActivityCaribbeanBasePopLayer", "ActivityFlameWarsSelectLayer", "ActivityForecastLayer", "ActivityForecastSecondLayer",
     "ActivityHalloweenBasePopLayer", "ActivityXmasBasePopLayer", "Activity_Alice_BasePopLayer", "Activity_FlameWars_BasePopLayer",
     "Activity_FlameWars_MainLayer", "Activity_IceCream_BasePopLayer", "Activity_Shrek_BasePopLayer", "Activity_Totoro_BasePopLayer",
-    "AnimalsRecyclerView", "AnniversaryMainLayer", "AnniversarySubLayer", "ApartmentView",
-    "ApplyHongKongTourLayer", "AroundTheWorldMainLayer", "AutumnMainLayer", "AvatarLayer",
-    "BugAchivement", "BugGame", "BugLevelBase", "BugLevelChoose",
-    "CafeShopLayer", "CandyhouseLayer", "CaribbeanMainLayer", "ChangeRewardLayer",
-    "ChooseVillageHelp", "ChooseVillageLayer", "ChoosingPagesMainLayer", "CommonChristmasFatherGiftLayer",
-    "CropInfoView", "CrowPriestMessageLayer", "CustomerServiceLayer", "CutFruit",
-    "CutFruitAchivement", "CutFruitLevelChoose", "DailyQuestLayer", "DailySignLayer",
-    "DecorateRoomLayer", "DiscountInfoLayer", "DivineGame", "DriftBottleMessageLayer",
-    "EasterEggGetRewardLayer", "EasterEggMainLayer", "ExchangeCenterLayer", "FinalRewardAnimation",
-    "FirstChargeGiftsLayer", "FishingAchivement", "FishingGame", "FishingLevelChoose",
-    "FlyKiteGetRewardLayer", "FlyKiteIntroductionsLayer", "FlyKiteMainLayer", "FriendsViewController",
-    "FuncIntroLayer", "GameDataCompareLayer", "GamePlayGoView", "GetItemRewardFromHaiwangLayer",
-    "GetLastRewardLayer", "GiftAndMessageLayer", "GiftLayer", "GiftViewLayer",
-    "GoodsViewLayer", "GreenRiceBallMainLayer", "GreenhouseLayer", "GuessWorldCupMainLayer",
-    "HalloweenMainLayer", "HelpLayer", "HelpQuestLayer", "HouseRecyclerView",
-    "IceSummerMainLayer", "InviteFriendsLayer", "JunkShopLayer", "LeaveMessageLayer",
-    "LeoAdvanceLayer", "Level1", "Level2", "Level3",
-    "Level4", "LevelChooseLayer", "LevelUpLayer", "MagicNumberView",
-    "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
-    "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase",
-    "MusicHallLayer", "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
-    "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneStoryLayer",
-    "NewSceneTestLayer", "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView",
-    "NoticeBoardLayer", "OpenTreasureChestMainLayer", "OptionLayer", "OscarDialogueLayer",
-    "PaintingAchivement", "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer",
-    "PersonalTargetLayer", "Plow", "PlowAchivement", "PlowLevelChoose",
-    "PopularItemsPKAdvanceLayer", "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer", "PromoteSalesMainLayer",
-    "PromoteShowItemsLayer", "QiXiAdvanceLayer", "QuestLayer", "QuestionnaireLayer",
-    "ReceiveGiftLayer", "RegisterView", "RequestCodeLayer", "RestaurantView",
-    "RewardLayer", "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer", "SeabedSeekingTreasureRuleLayer",
-    "SealExchangeLayer", "SeekViewController", "SharedInterfaceLayer", "ShopItemsLayer",
-    "ShoppingView", "ShowActivityRuleLayer", "ShowFreeShellsLayer", "ShowMoreFriendsLayer",
-    "ShowRuleLayer", "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer",
-    "SpringPoemPageLayer", "StoryLayer", "TeamTargetLayer", "TestLayer",
-    "TimeQuestLayer", "TimeStoryLayer", "TourLineLayer", "TreasureHuntPopLayer",
-    "TreasureRewardLayer", "VIPFunctionsLayer", "VIPLayer", "VerifyInviteCodeLayer",
-    "VipQuestLayer", "VipStoryLayer", "WashRoomAchievement", "WashRoomGame",
-    "WashRoomLevelChoose", "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
+    "AnimalsRecyclerView", "AnniversaryMainLayer", "AnniversarySubLayer", "ApplyHongKongTourLayer",
+    "AroundTheWorldMainLayer", "AutumnMainLayer", "AvatarLayer", "BugAchivement",
+    "BugGame", "BugLevelBase", "BugLevelChoose", "CafeShopLayer",
+    "CandyhouseLayer", "CaribbeanMainLayer", "ChangeRewardLayer", "ChooseVillageHelp",
+    "ChooseVillageLayer", "ChoosingPagesMainLayer", "CommonChristmasFatherGiftLayer", "CrowPriestMessageLayer",
+    "CustomerServiceLayer", "CutFruit", "CutFruitAchivement", "CutFruitLevelChoose",
+    "DailyQuestLayer", "DailySignLayer", "DecorateRoomLayer", "DiscountInfoLayer",
+    "DivineGame", "DriftBottleMessageLayer", "EasterEggGetRewardLayer", "EasterEggMainLayer",
+    "ExchangeCenterLayer", "FinalRewardAnimation", "FirstChargeGiftsLayer", "FishingAchivement",
+    "FishingGame", "FishingLevelChoose", "FlyKiteGetRewardLayer", "FlyKiteIntroductionsLayer",
+    "FlyKiteMainLayer", "FriendsViewController", "FuncIntroLayer", "GameDataCompareLayer",
+    "GamePlayGoView", "GetItemRewardFromHaiwangLayer", "GetLastRewardLayer", "GiftAndMessageLayer",
+    "GiftLayer", "GiftViewLayer", "GoodsViewLayer", "GreenRiceBallMainLayer",
+    "GreenhouseLayer", "GuessWorldCupMainLayer", "HalloweenMainLayer", "HelpLayer",
+    "HelpQuestLayer", "HouseRecyclerView", "IceSummerMainLayer", "InviteFriendsLayer",
+    "JunkShopLayer", "LeaveMessageLayer", "LeoAdvanceLayer", "Level1",
+    "Level2", "Level3", "Level4", "LevelChooseLayer",
+    "LevelUpLayer", "MagicNumberView", "MessageBox", "MessageBoxGift",
+    "MessageViewController", "MessagesLayer", "MinerAchivement", "MinerGame",
+    "MinerLevelChoose", "MiniBase", "MusicHallLayer", "NaramGetTodayRewardLayer",
+    "NaramSpringIntroduceLayer", "NaramSpringMainLayer", "NewRewardsLayer", "NewSceneLevelUp",
+    "NewSceneQuestLayer", "NewSceneStoryLayer", "NewSceneTestLayer", "NewStyleStoreItemsView",
+    "NewStyleStoreMainLayer", "NewStyleStoreMenuView", "NoticeBoardLayer", "OpenTreasureChestMainLayer",
+    "OptionLayer", "OscarDialogueLayer", "PaintingAchivement", "PaintingGame",
+    "PaintingLevelChoose", "PaybackObjectsTableLayer", "PersonalTargetLayer", "Plow",
+    "PlowAchivement", "PlowLevelChoose", "PopularItemsPKAdvanceLayer", "PopularItemsPKMainLayer",
+    "PopularItemsPKVoteLayer", "PromoteSalesMainLayer", "PromoteShowItemsLayer", "QiXiAdvanceLayer",
+    "QuestLayer", "QuestionnaireLayer", "ReceiveGiftLayer", "RegisterView",
+    "RequestCodeLayer", "RewardLayer", "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer",
+    "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer", "SeekViewController", "SharedInterfaceLayer",
+    "ShowActivityRuleLayer", "ShowFreeShellsLayer", "ShowMoreFriendsLayer", "ShowRuleLayer",
+    "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer", "SpringPoemPageLayer",
+    "StoryLayer", "TeamTargetLayer", "TestLayer", "TimeQuestLayer",
+    "TimeStoryLayer", "TourLineLayer", "TreasureHuntPopLayer", "TreasureRewardLayer",
+    "VIPFunctionsLayer", "VIPLayer", "VerifyInviteCodeLayer", "VipQuestLayer",
+    "VipStoryLayer", "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose",
+    "WaterTowerRewardView", "WiltWarningLayer", "XmasMainLayer",
 ];
 
 /// [MoleWorld 宽屏适配·虚拟世界换算] 白名单 UI 类(含其子类,按父类链 ≤6 层)全部方法的代码地址区间
@@ -8762,20 +8761,19 @@ const UI43_OFFSET_CLASSES: &[&str] = &[
 /// 两段都已按 LC_FUNCTION_STARTS 核对,只含该类的函数起点(自检时把这两个类当白名单);段内没有
 /// convertToWorldSpace/convertToNodeSpace/convertToUI 调用,不会引入 +off 误伤;classref 只在 CutFruit、Level1-4。
 const UI43_CODE_RANGES: &[(u32, u32)] = &[
-    (0xb2c0, 0xe890), (0xa70fc, 0xa7eb8), (0xc06c8, 0xc5a30), (0xc92a4, 0xcbda8),
-    (0xde4cc, 0xdf040), (0xf2298, 0xf32b8), (0xfbb64, 0xfbd88), (0xfc628, 0x1001d4),
-    (0x10fdd0, 0x111858), (0x1118b0, 0x112234), (0x123804, 0x123d9c), (0x128844, 0x12ad80),
-    (0x12d698, 0x12dda0), (0x133e4c, 0x1430c0), (0x143b6c, 0x147050), (0x14ce50, 0x151580),
-    (0x152b50, 0x1596f8), (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17d6e8, 0x180b54),
-    (0x180c6c, 0x182f90), (0x186500, 0x18c7e8), (0x18cb90, 0x1900f8), (0x190998, 0x193e24),
-    (0x19c330, 0x19cf10), (0x1a2448, 0x1a3ef8), (0x1a47b4, 0x1a8e58), (0x1ab468, 0x1ae628),
-    (0x1ae6d8, 0x1af850), (0x1b10e4, 0x1b35ec), (0x1b3f58, 0x1b89dc), (0x1baef0, 0x1bd7fc),
-    (0x1cce58, 0x1d4480), (0x1e60b0, 0x1e7814), (0x1eb158, 0x1ef3c4), (0x1efd78, 0x1f49ac),
-    (0x1fe968, 0x203124), (0x210a10, 0x212ec8), (0x212f7c, 0x218dec), (0x233040, 0x23669c),
-    (0x23f050, 0x2401c8), (0x246be8, 0x24a58c), (0x24a618, 0x250a60), (0x2552a8, 0x2573b8),
-    (0x27a92c, 0x27dc40), (0x2c0640, 0x2c3394), (0x2d9ce0, 0x2da998), (0x2ec868, 0x2edf60),
-    (0x2f67b4, 0x2f6b90), (0x2f8058, 0x2f8a20), (0x3012d8, 0x3029d4), (0x30b920, 0x30cc74),
-    (0x30f3a8, 0x310548), (0x3105d4, 0x318c98), (0x323b08, 0x326828), (0x32b660, 0x32e130),
+    (0xb2c0, 0xe890), (0xa70fc, 0xa7eb8), (0xc92a4, 0xcbda8), (0xde4cc, 0xdf040),
+    (0xf2298, 0xf32b8), (0xfbb64, 0xfbd88), (0xfc628, 0x1001d4), (0x10fdd0, 0x111858),
+    (0x1118b0, 0x112234), (0x123804, 0x123d9c), (0x128844, 0x12ad80), (0x12d698, 0x12dda0),
+    (0x133e4c, 0x1430c0), (0x143b6c, 0x147050), (0x14ce50, 0x151580), (0x152b50, 0x1596f8),
+    (0x159a28, 0x165b38), (0x166388, 0x17d5d0), (0x17d6e8, 0x180b54), (0x180c6c, 0x182f90),
+    (0x186500, 0x18c7e8), (0x18cb90, 0x1900f8), (0x190998, 0x193e24), (0x19c330, 0x19cf10),
+    (0x1a2448, 0x1a3ef8), (0x1a47b4, 0x1a8e58), (0x1ab468, 0x1ae628), (0x1ae6d8, 0x1af850),
+    (0x1b10e4, 0x1b35ec), (0x1b3f58, 0x1b89dc), (0x1baef0, 0x1bd7fc), (0x1cce58, 0x1d4480),
+    (0x1e60b0, 0x1e7814), (0x1eb158, 0x1ef3c4), (0x1efd78, 0x1f49ac), (0x1fe968, 0x203124),
+    (0x210a10, 0x212ec8), (0x212f7c, 0x218dec), (0x233040, 0x23669c), (0x23f050, 0x2401c8),
+    (0x2552a8, 0x2573b8), (0x27a92c, 0x27dc40), (0x2c0640, 0x2c3394), (0x2d9ce0, 0x2da998),
+    (0x2ec868, 0x2edf60), (0x2f67b4, 0x2f6b90), (0x2f8058, 0x2f8a20), (0x3012d8, 0x3029d4),
+    (0x30b920, 0x30cc74), (0x30f3a8, 0x310548), (0x3105d4, 0x318c98), (0x32b660, 0x32e130),
     (0x32ff58, 0x331298), (0x331700, 0x332c88), (0x3334c0, 0x333f78), (0x336388, 0x339c00),
     (0x339c90, 0x33f69c), (0x3435f4, 0x345fcc), (0x352d60, 0x353fb0), (0x35645c, 0x3573f8),
     (0x358310, 0x35e040), (0x36a144, 0x36a584), (0x3700cc, 0x371028), (0x371088, 0x374028),
@@ -9837,9 +9835,36 @@ static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::M
 ///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、按下点落在
 ///     objSprite 的包围盒里,就照原版 setPutRefToCenter@0x2f6a4 的算法把 putRef 设到占地中心并置 state=2,
 ///     然后放行原 touchMove:,由它 moveTo: 跟手并置 state=3;GameManager 见 state>1 不再平移地图。
-/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响;岛上 NewScenePorter 是另一个类。
+/// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响。
+/// [2026-10-08 第十三轮] 黄金岛的摆放类 NewScenePorter 与 Porter 逐条同构(touchBegan:@0x2714f0、touchMove:@0x2716b8 只在
+/// state 2/3 跟手、setPutRefToCenter@0x270820 同算法),只是成员偏移槽不同、分派调用点是 processTouch:withType:@0x2714dc
+/// (LR 0x2714e1),一并覆盖:岛上买店后按店的图身也能拖。
 /// 触摸在运行循环的事件分派里处理,不在绘制帧内,可以发宿主消息;发完恢复 r0–r3。
-fn porter_body_drag(env: &mut Environment, is_move: bool) {
+struct PorterSlots {
+    obj_sprite: u32,
+    size: u32,
+    put_ref_x: u32,
+    put_ref_y: u32,
+    state: u32,
+    prev_touch_type: u32,
+}
+const PORTER_SLOTS: PorterSlots = PorterSlots {
+    obj_sprite: 0xb03284,
+    size: 0xb032a8,
+    put_ref_x: 0xb032b8,
+    put_ref_y: 0xb032bc,
+    state: 0xb03290,
+    prev_touch_type: 0xb03294,
+};
+const NEW_SCENE_PORTER_SLOTS: PorterSlots = PorterSlots {
+    obj_sprite: 0xb062b4,
+    size: 0xb062d8,
+    put_ref_x: 0xb062e4,
+    put_ref_y: 0xb062e8,
+    state: 0xb062c0,
+    prev_touch_type: 0xb062c4,
+};
+fn porter_body_drag(env: &mut Environment, is_move: bool, slots: &PorterSlots) {
     let regs = *env.cpu.regs();
     let porter = regs[0];
     let p = CGPoint {
@@ -9856,12 +9881,12 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
     };
     drop(down);
     if down_porter != porter
-        || peek_ivar(env, porter, 0xb03290) != Some(1)
-        || peek_ivar(env, porter, 0xb03294) != Some(0)
+        || peek_ivar(env, porter, slots.state) != Some(1)
+        || peek_ivar(env, porter, slots.prev_touch_type) != Some(0)
     {
         return;
     }
-    let sprite = peek_ivar(env, porter, 0xb03284).unwrap_or(0);
+    let sprite = peek_ivar(env, porter, slots.obj_sprite).unwrap_or(0);
     if sprite == 0 {
         return;
     }
@@ -9871,24 +9896,54 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
         .objc
         .register_host_selector("convertToNodeSpace:".to_string(), &mut env.mem);
     let s_bbox = env.objc.register_host_selector("boundingBox".to_string(), &mut env.mem);
+    let s_children = env.objc.register_host_selector("children".to_string(), &mut env.mem);
+    let s_count = env.objc.register_host_selector("count".to_string(), &mut env.mem);
+    let s_oai = env
+        .objc
+        .register_host_selector("objectAtIndex:".to_string(), &mut env.mem);
+    let inside = |p: CGPoint, r: CGRect| {
+        r.size.width > 0.0
+            && r.size.height > 0.0
+            && p.x >= r.origin.x
+            && p.x <= r.origin.x + r.size.width
+            && p.y >= r.origin.y
+            && p.y <= r.origin.y + r.size.height
+    };
     let parent: id = msg_send(env, (spr, s_parent));
-    let hit = parent != nil && {
+    let mut hit = false;
+    if parent != nil {
         let local: CGPoint = msg_send(env, (parent, s_to_node, down_pt));
         let bb: CGRect = msg_send(env, (spr, s_bbox));
-        local.x >= bb.origin.x
-            && local.x <= bb.origin.x + bb.size.width
-            && local.y >= bb.origin.y
-            && local.y <= bb.origin.y + bb.size.height
-    };
+        hit = inside(local, bb);
+        // 岛上建筑是 StableAnimation 的静态动画精灵(-[NewScenePorter attachObject:] 0x26be08 getStaticImageWithData:):
+        // 本身是空容器、contentSize 为 0,图在直接子节点里;用子节点自己的图框(在精灵坐标系里)再判一次。
+        if !hit {
+            let in_spr: CGPoint = msg_send(env, (spr, s_to_node, down_pt));
+            let children: id = msg_send(env, (spr, s_children));
+            if children != nil {
+                let n: crate::mem::GuestUSize = msg_send(env, (children, s_count));
+                for i in 0..n.min(16) {
+                    let ch: id = msg_send(env, (children, s_oai, i));
+                    if ch != nil {
+                        let cb: CGRect = msg_send(env, (ch, s_bbox));
+                        if inside(in_spr, cb) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
     if !hit {
         return;
     }
     let (Some(state_off), Some(size_off), Some(rx_off), Some(ry_off)) = (
-        peek_u32(env, 0xb03290),
-        peek_u32(env, 0xb032a8),
-        peek_u32(env, 0xb032b8),
-        peek_u32(env, 0xb032bc),
+        peek_u32(env, slots.state),
+        peek_u32(env, slots.size),
+        peek_u32(env, slots.put_ref_x),
+        peek_u32(env, slots.put_ref_y),
     ) else {
         return;
     };
@@ -9905,9 +9960,12 @@ fn porter_body_drag(env: &mut Environment, is_move: bool) {
 }
 
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
-    if class == "Porter" && (sel == "touchBegan:" || sel == "touchMove:") {
-        if env.cpu.regs()[14] & !1u32 == 0x30a78 {
-            porter_body_drag(env, sel == "touchMove:");
+    if (class == "Porter" || class == "NewScenePorter") && (sel == "touchBegan:" || sel == "touchMove:") {
+        let lr = env.cpu.regs()[14] & !1u32;
+        if class == "Porter" && lr == 0x30a78 {
+            porter_body_drag(env, sel == "touchMove:", &PORTER_SLOTS);
+        } else if class == "NewScenePorter" && lr == 0x2714e0 {
+            porter_body_drag(env, sel == "touchMove:", &NEW_SCENE_PORTER_SLOTS);
         }
         return false;
     }
