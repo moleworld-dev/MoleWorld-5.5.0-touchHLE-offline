@@ -99,7 +99,7 @@ UI_LAYOUT_CLASSES = frozenset([
     "GamePlayGoView", "GetItemRewardFromHaiwangLayer", "GetLastRewardLayer", "GiftAndMessageLayer",
     "GiftLayer", "GiftViewLayer", "GoodsViewLayer", "GreenRiceBallMainLayer", "GreenhouseLayer",
     "GuessWorldCupMainLayer", "HalloweenMainLayer", "HelpLayer", "HouseRecyclerView",
-    "IceSummerMainLayer", "InviteFriendsLayer", "JunkShopLayer", "LeaveMessageLayer",
+    "IceSummerMainLayer", "JunkShopLayer", "LeaveMessageLayer",
     "LeoAdvanceLayer", "Level1", "Level2", "Level3", "Level4", "LevelChooseLayer", "LevelUpLayer",
     "MagicNumberView", "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
     "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase", "MusicHallLayer",
@@ -131,6 +131,10 @@ KEEP_REAL_WIDTH_CLASSES = frozenset([
     # [2026-10-08 第十三轮] 右侧抽屉面板(底图 cropstoreback.png,init 里按「屏宽 − 面板宽」右对齐摆放,与主村 BuildingView 同一套):
     # 以前被自动归进 UI_LAYOUT_CLASSES 整体居中,长屏(逻辑宽 1670)上离右边缘 323 点、右侧还露着地图。改为保持真实宽度,贴屏幕右边。
     "ShoppingView", "ShopItemsLayer", "ApartmentView", "RestaurantView", "CropInfoView",
+    # [2026-10-08 第十三轮] 好友地图的顶部 HUD:-[InviteFriendsLayer init]@0x188b28 把搜索面板 seekBg1 锚点 (1,1) 放在 (winSize.宽, winSize.高)
+    # 右上角,输入框位置、搜索结果抽屉(cropstoreback.png)与 containsTouchLocation: 命中都由 winSize 推出;
+    # 以前被居中后搜索栏和好友数停在 1024 设计区里,好友地图本身(FriendsVillageLayer)却按真实宽铺开。
+    "InviteFriendsLayer",
     "ButterFlyLayer", "ButterFlyObject",
     # 贴边 HUD 与菜单条:必须拿真实宽才贴得住屏幕边
     "TopMenuLayer", "VillageMenuLayer", "NewSceneVillageMenuLayer",
