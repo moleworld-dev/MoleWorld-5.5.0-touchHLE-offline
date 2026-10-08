@@ -46,7 +46,13 @@ pub(super) struct DictionaryHostObject {
     /// hash-map, which is not ideally efficient. :)
     /// The keys are the hash values, the values are a list of key-value pairs
     /// where the keys have the same hash value.
-    pub(super) map: HashMap<Hash, Vec<(id, id)>>,
+    /// [2026-10-08 第十三轮] 用固定种子的 FxBuildHasher,不用标准库带随机种子的 RandomState。
+    /// 真机 CFDictionary 对同一串插入/删除遍历顺序是固定的,游戏有按遍历顺序取值的写法:好友页自己卡片的「最新成就」徽章
+    /// (-[FriendVillageUnit getlatestAchievementID:]@0x10f1e4 遍历 achieveAlreadyUnlock 取解锁时间最大者,同一秒解锁的
+    /// 多个成就谁最后被遍历到就是谁)以前每次启动都不一样(同一档一次 VIP 2、一次 VIP 4);用 allKeys/快速枚举出的列表
+    /// 也会每次启动换顺序。RandomState 连同一次运行里内容相同的两个实例都可能顺序不同。换成固定哈希后,同样的操作序列
+    /// 遍历顺序恒定;查找性能不变。
+    pub(super) map: HashMap<Hash, Vec<(id, id)>, rustc_hash::FxBuildHasher>,
     pub(super) count: NSUInteger,
 }
 impl HostObject for DictionaryHostObject {}

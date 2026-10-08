@@ -1744,7 +1744,13 @@ fn placement_busy(env: &mut Environment) -> Option<&'static str> {
 }
 
 /// [2026-10-07 第十一轮 R11-P1-1] 有物品正在摆放时拒绝修改器入口并提示;返回是否拒绝。
+/// [2026-10-08 第十三轮] 建造商店开着时同样拒绝(见 mole_items::store_open:摆放/小游戏会把商店隐藏,但它仍按下即吞触摸)。
 fn refuse_while_placing(env: &mut Environment, what: &str) -> bool {
+    if crate::mole_items::store_open(env) {
+        log!("[MOLEMENU] 拒绝{}:建造商店开着", what);
+        set_toast("建造商店开着:请先关闭商店,再用修改器".to_string());
+        return true;
+    }
     let Some(why) = placement_busy(env) else {
         return false;
     };
