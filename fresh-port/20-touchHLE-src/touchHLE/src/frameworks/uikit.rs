@@ -115,6 +115,14 @@ pub struct State {
 fn route_touch(env: &mut Environment, event: crate::window::Event) {
     // [补完 2026-09-15] 先记账(touch_shadow),再分发。
     track_touch_shadow(env, &event);
+    // [2026-10-10 触摸 P0] 同一轮里前一个触摸回调刚 show 的弹框,在下一根手指按下之前先挂上。
+    // -[UIAlertView show] 只入队,覆盖层原来要等下一轮 handle_events 开头的 pump;这一轮 while 循环里已经排队的按下
+    // (卡顿时连点、两指交替点)于是绕过模态直接交给游戏:同一按钮再触发一次排出第二个弹框,或点穿到下面的按钮/建筑。
+    // 真机 show 同步建立弹框窗口,之后按下的触摸都命中弹框。只在按下前补:移动/抬起/取消按 owned_fingers 判归属,
+    // 也免得挂起或打开菜单时的 cancel_tracked_touches 里临时挂出弹框。队列为空时 pump 只读两个字段就返回。
+    if matches!(event, crate::window::Event::TouchesDown(_)) {
+        ui_view::ui_alert_view::pump(env);
+    }
     if let Some(event) = ui_view::ui_alert_view::filter_touch_event(env, event) {
         ui_touch::handle_event(env, event);
     }
