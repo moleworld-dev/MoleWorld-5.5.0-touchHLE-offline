@@ -8,7 +8,7 @@
 use super::ui_event;
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
-use crate::mem::{GuestUSize, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, ObjC, SEL,
@@ -691,10 +691,22 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 /// 取舍:清零等于 ccTouchEnded: 里"只清零、不调 processTouched / onSpriteTouched:"的那半截,不收产出、
 /// 不领奖励;不改成给它们补发 ccTouchEnded:(那样滚一下滚轮就收产出、领奖励,等于把取消又变回点击)。
 /// 以后发现新的同类门控,往表里加一行即可;表外不认取消的代理照旧不回调。
+/// [2026-10-10 触摸 P0] 补三处同构门控(机器扫描:实现 ccTouchBegan:/ccTouchEnded: 却不认取消、Began 读 Ended 清零的 int 成员;
+/// 当初「只有这三处」的核查漏了它们):
+/// - AlarmFlag.state_(+476):ccTouchBegan@0xc0588 在 0xc05a6 非 0 返回 NO,ccTouchEnded@0xc064c 0xc0698 清零。成熟作物头顶的
+///   收获旗(-[Farm cropMatureHandler]@0x4a0b4)、岛上商铺售罄旗、发现号返航旗。
+/// - GameRoomFlag.state_(+476):ccTouchBegan@0xdbcfc / ccTouchEnded@0xdbe6c 同构。游戏屋头顶的小游戏图标。
+/// - NpcPrompt.state_(+480):ccTouchBegan@0x123560 / ccTouchEnded@0x123648 同构。NPC/任务对象头顶的感叹号提示。
+/// 桌面滚轮捏合两根虚拟手指以取消结束,落在这些图标上就把门控卡在 1:之后收获旗、游戏屋图标、感叹号再也点不动,
+/// 点下去落到下面的 ObjSelector 变成打开别的东西;安卓/iOS 切后台、打开修改器时按着的手指同理。
+/// (BugGame.level1..4/m_level、CutFruit.m_touchLayer 是选关/子层引用,不是门控。)
 const COCOS_CANCEL_GATES: &[(&str, &str)] = &[
     ("OutputHanlder", "state_"),
     ("TreasureRewardLayer", "_touchState"),
     ("FinalRewardAnimation", "_touchState"),
+    ("AlarmFlag", "state_"),
+    ("GameRoomFlag", "state_"),
+    ("NpcPrompt", "state_"),
 ];
 
 /// [复核修 2026-09-15] R1-3 返修(复核 issue 2):走 GameManager / NewGameManager 的村庄层(标准代理)。
@@ -869,6 +881,7 @@ fn reset_obj_selector_after_cancel(env: &mut Environment) {
         .objc
         .register_host_selector("instance".to_string(), &mut env.mem);
     let selector: id = msg_send(env, (class, instance_sel));
+    reset_porters_after_cancel(env);
     if selector == nil {
         return;
     }
@@ -890,5 +903,55 @@ fn reset_obj_selector_after_cancel(env: &mut Environment) {
                 old
             );
         }
+    }
+}
+
+/// [2026-10-10 触摸 P0] 取消后把摆放中的 Porter / NewScenePorter 从「按下/拖动中」复位。
+/// 原版 -[Porter touchEnd:]@0x30cc0(岛上 -[NewScenePorter touchEnd:]@0x271728 同构):本手势移动过(prevTouchType==1)就
+/// state=1 并 [[EditMenuLayer sharedInstance] update:objSprite] 把 ✓⇄⊘ 挪到物件旁;没移动且 state==2(按在底座上)就
+/// quickFinish 直接确认摆放;否则把物件瞬移到手指处。processTouch:withType:3(取消)不转给 touch*,state 停在 2/3:
+/// 下一次在任意位置单击(touchBegan 没按在底座上不改 state)抬起时见 state==2 就 quickFinish——把还红着/没摆好的物件
+/// 直接确认放下(买来的东西扣钱);state==3 时下一次拖动从任意位置都会拖走物件。桌面滚轮捏合以取消结束、
+/// 切后台/打开修改器时按着的手指都会走到这里。
+/// 修法:照原版「移动过」那一支收尾——state 为 2/3 时置 1 并让编辑菜单跟到物件旁;不确认、不瞬移、不扣钱。
+/// 单例只读静态变量(Porter +instance@0x28f40 缓存在 0xb40968,NewScenePorter +instance@0x26adb8 缓存在 0xb40c04),
+/// 不存在就不调 +instance,免得凭空建一个。调用方已确认没有别的手指还按着;在运行循环处理事件时调用,可以发消息。
+fn reset_porters_after_cancel(env: &mut Environment) {
+    for (static_slot, menu_class) in [(0xb40968u32, "EditMenuLayer"), (0xb40c04u32, "NewSceneEditMenuLayer")] {
+        let porter_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+        if porter_bits == 0 {
+            continue;
+        }
+        let porter: id = Ptr::from_bits(porter_bits);
+        let Some(state_ptr) = env
+            .objc
+            .object_lookup_ivar(&env.mem, porter, &"state".to_string())
+        else {
+            continue;
+        };
+        let state: GuestUSize = env.mem.read(state_ptr);
+        if state != 2 && state != 3 {
+            continue;
+        }
+        env.mem.write(state_ptr, 1);
+        let sprite = read_id_ivar(env, porter, "objSprite").unwrap_or(nil);
+        if sprite != nil {
+            let class = env.objc.get_known_class(menu_class, &mut env.mem);
+            let shared_sel: SEL = env
+                .objc
+                .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+            let menu: id = msg_send(env, (class, shared_sel));
+            if menu != nil {
+                let update_sel: SEL = env
+                    .objc
+                    .register_host_selector("update:".to_string(), &mut env.mem);
+                let _: () = msg_send(env, (menu, update_sel, sprite));
+            }
+        }
+        log!(
+            "[触摸 P0] 取消触摸:摆放中的 {:?} state {} → 1(不确认、不瞬移),编辑菜单跟到物件旁",
+            porter,
+            state
+        );
     }
 }
