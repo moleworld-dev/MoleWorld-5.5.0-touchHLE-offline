@@ -578,6 +578,7 @@ fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<Finge
                 MouseDragState {
                     down: coords,
                     broke: false,
+                    last: None,
                 },
             );
         }
@@ -592,9 +593,14 @@ fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<Finge
 /// [2026-10-05 第九轮 R9-B8] 触屏手指移动:还没越过阈值、离按下点不足阈值的手指从本次事件里去掉
 /// (不更新按下点);越过时把本帧真实坐标作为第一个移动下发(ui_touch 的上一位置仍是按下点,位移不丢)。
 /// 返回 false = 本次事件里的手指全被抑制,不入队。没有记录的手指(例如挂起前按下)原样下发。
+/// [2026-10-10 触摸 P0] 越过阈值时,若之前有被压住的中间点,先把最后一个放进 prefix(调用方在本次移动之前单独下发)。
+/// 只按单个采样点判定的游戏代码靠它:切水果 -[TouchTrailLayer ccTouchMoved:withEvent:objectList:]@0x143f86 →
+/// checkLists:touchPos:@0x144124 → -[Fruit checkAreaTouched:]@0x148b3c 只看当前这一个点,从果子上起刀的短促快切,
+/// 落在果子里的采样都在阈值内被压住,越过阈值的那个已经出了果子,这一刀就不算;手机上阈值按物理距离放大后更明显。
 fn touch_slop_move(
     state: &mut HashMap<i64, MouseDragState>,
     map: &mut HashMap<FingerId, Coords>,
+    prefix: &mut HashMap<FingerId, Coords>,
 ) -> bool {
     let slop = touch_drag_slop();
     map.retain(|finger, coords| {
@@ -609,9 +615,15 @@ fn touch_slop_move(
         }
         let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
         if (dx * dx + dy * dy).sqrt() < slop {
+            if *coords != drag.down {
+                drag.last = Some(*coords);
+            }
             return false;
         }
         drag.broke = true;
+        if let Some(last) = drag.last.take() {
+            prefix.insert(*finger, last);
+        }
         log_dbg!(
             "[触屏起拖] 手指 {} 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
             id,
@@ -647,6 +659,8 @@ struct MouseDragState {
     down: Coords,
     /// 本次按下内是否已越过起拖阈值;越过之后的移动全部原样下发,不再抑制。
     broke: bool,
+    /// [2026-10-10 触摸 P0] 触屏:最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move)。鼠标不用。
+    last: Option<Coords>,
 }
 
 struct DpadState {
@@ -1659,6 +1673,8 @@ impl Window {
                 _ => {}
             }
 
+            // [2026-10-10 触摸 P0] 触屏越过起拖阈值时要先补发的中间点(见 touch_slop_move),在本次事件入队后插到它前面。
+            let mut slop_prefix: HashMap<FingerId, Coords> = HashMap::new();
             self.event_queue.push_back(match event {
                 E::Quit { .. } => Event::Quit,
                 E::MouseButtonDown {
@@ -1673,6 +1689,7 @@ impl Window {
                     self.mouse_drag = Some(MouseDragState {
                         down: coords,
                         broke: false,
+                        last: None,
                     });
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1718,7 +1735,7 @@ impl Window {
                     // 否则 UITouch 的 previous_location(按下点)与抬起点之间会凭空多出几点位移。
                     // 越过阈值的拖动按真实坐标抬起。
                     let coords = match self.mouse_drag.take() {
-                        Some(MouseDragState { down, broke: false }) => {
+                        Some(MouseDragState { down, broke: false, .. }) => {
                             if down != coords {
                                 log_dbg!(
                                     "[鼠标起拖] 未越过 {}pt 阈值,抬起按按下点 {:?} 上报(实际 {:?})",
@@ -2026,7 +2043,7 @@ impl Window {
                             Event::TouchesUp(map)
                         }
                         E::FingerMotion { .. } => {
-                            if !touch_slop_move(&mut self.touch_drag, &mut map) {
+                            if !touch_slop_move(&mut self.touch_drag, &mut map, &mut slop_prefix) {
                                 continue;
                             }
                             Event::TouchesMove(map)
@@ -2076,7 +2093,12 @@ impl Window {
                     Event::TextInput(TextInputEvent::Text(text))
                 }
                 _ => continue,
-            })
+            });
+            if !slop_prefix.is_empty() {
+                let main = self.event_queue.pop_back().unwrap();
+                self.event_queue.push_back(Event::TouchesMove(slop_prefix));
+                self.event_queue.push_back(main);
+            }
         }
 
         // [扫描修 2026-09-15] F12-2:滚轮停下 PINCH_IDLE_TIMEOUT(约 150ms)后结束两根虚拟手指
