@@ -441,15 +441,60 @@ const MULTI_TOUCH_MERGE_MS: u32 = 4;
 /// 只对单指生效:同时按下两根及以上手指时全部立即放行(捏合缩放照原样逐帧下发)。
 /// 环境变量 MOLE_TOUCH_DRAG_SLOP 可改阈值(点),0 = 关闭(恢复为任何移动都下发)。
 const TOUCH_DRAG_SLOP_DEFAULT: f32 = 8.0;
+/// [2026-10-10 触摸 P0] 按屏幕物理尺寸算出的默认阈值(guest 点,f32 位模式;0 = 还没算,用 TOUCH_DRAG_SLOP_DEFAULT)。
+/// 8 个 guest 点在平板上约 1.7mm,但长屏手机短边只有约 70mm 却同样是 768 点,8 点只有约 0.7mm,不到安卓系统自己的触摸容差
+/// (ViewConfiguration 8dp ≈ 1.3mm)的一半:手指稍抖仍被当成拖动,点建筑/作物/摩尔/好友地图头像吞掉。
+/// 改为按物理距离 TOUCH_DRAG_SLOP_MM 换算成 guest 点,且不小于 8 点(平板、桌面触屏不变),不大于 24 点。见 init_touch_drag_slop。
+static TOUCH_DRAG_SLOP_AUTO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const TOUCH_DRAG_SLOP_MM: f32 = 1.3;
 fn touch_drag_slop() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let env_value = *V.get_or_init(|| {
         std::env::var("MOLE_TOUCH_DRAG_SLOP")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(TOUCH_DRAG_SLOP_DEFAULT)
-    })
+    });
+    if let Some(v) = env_value {
+        return v;
+    }
+    let auto = f32::from_bits(TOUCH_DRAG_SLOP_AUTO.load(std::sync::atomic::Ordering::Relaxed));
+    if auto > 0.0 {
+        auto
+    } else {
+        TOUCH_DRAG_SLOP_DEFAULT
+    }
+}
+
+/// [2026-10-10 触摸 P0] 建窗后按显示器 DPI 与画布像素算一次触屏起拖阈值:1.3mm → 物理像素(DPI/25.4)→ guest 点
+/// (guest 短边点数 / 画布短边像素)。取不到 DPI 或数值离谱就保持 8 点。
+/// 只在安卓/iOS 上算:那里画布(drawable)就是物理像素(iOS 开了 allow_highdpi),SDL 的 DPI 也是物理像素密度。
+/// 桌面窗口没开高分屏,画布是逻辑点而 DPI 是物理像素(Mac 视网膜屏 255 会算出 13 点、实际只合 6.5 点),桌面触屏又少,保持 8 点。
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(unused_variables))]
+fn init_touch_drag_slop(video_ctx: &sdl2::VideoSubsystem, window: &sdl2::video::Window, guest_short: u32) {
+    if !cfg!(any(target_os = "android", target_os = "ios")) {
+        return;
+    }
+    let Ok(display) = window.display_index() else {
+        return;
+    };
+    let Ok((ddpi, hdpi, vdpi)) = video_ctx.display_dpi(display) else {
+        return;
+    };
+    let dpi = if hdpi > 0.0 && vdpi > 0.0 { (hdpi + vdpi) * 0.5 } else { ddpi };
+    let (dw, dh) = window.drawable_size();
+    let draw_short = dw.min(dh) as f32;
+    if !(50.0..=1000.0).contains(&dpi) || draw_short < 100.0 || guest_short == 0 {
+        log!("[触屏起拖] DPI {:.0} / 画布 {}x{} 不可用,阈值保持 {} 点", dpi, dw, dh, TOUCH_DRAG_SLOP_DEFAULT);
+        return;
+    }
+    let px = TOUCH_DRAG_SLOP_MM * dpi / 25.4;
+    let slop = (px * guest_short as f32 / draw_short).clamp(TOUCH_DRAG_SLOP_DEFAULT, 24.0);
+    TOUCH_DRAG_SLOP_AUTO.store(slop.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    log!(
+        "[触屏起拖] DPI {:.0},画布 {}x{},guest 短边 {} 点 → 阈值 {:.1} 点(约 {}mm)",
+        dpi, dw, dh, guest_short, slop, TOUCH_DRAG_SLOP_MM
+    );
 }
 
 /// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
@@ -510,6 +555,8 @@ fn touch_slop_move(
 
 /// [2026-10-05 第九轮 R9-B8] 触屏手指抬起:没越过阈值(游戏一个移动也没收到)的手指按【按下点】上报,
 /// 游戏看到的是原地点击,与鼠标 K15 的处理一致;越过的按真实坐标。
+/// 注意 SDL_SendTouch 生成 FINGERUP 时不用抬起时传入的坐标,而是沿用该手指最后一次移动的坐标(SDL_touch.c
+/// 「I don't trust the coordinates passed on fingerUp」),所以真机上不存在「位移只体现在抬起事件里」的情况。
 fn touch_slop_up(state: &mut HashMap<i64, MouseDragState>, map: &mut HashMap<FingerId, Coords>) {
     for (finger, coords) in map.iter_mut() {
         if let FingerId::Touch(id) = *finger {
@@ -992,6 +1039,10 @@ impl Window {
             fit_window_into_usable_area(&video_ctx, &mut window);
             window
         };
+        {
+            let (pw, ph) = device_family.portrait_size();
+            init_touch_drag_slop(&video_ctx, &window, pw.min(ph));
+        }
 
         if env::consts::OS == "android" {
             // Sanity check
