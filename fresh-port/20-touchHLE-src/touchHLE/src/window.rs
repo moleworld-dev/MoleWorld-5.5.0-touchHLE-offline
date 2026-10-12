@@ -441,15 +441,131 @@ const MULTI_TOUCH_MERGE_MS: u32 = 4;
 /// 只对单指生效:同时按下两根及以上手指时全部立即放行(捏合缩放照原样逐帧下发)。
 /// 环境变量 MOLE_TOUCH_DRAG_SLOP 可改阈值(点),0 = 关闭(恢复为任何移动都下发)。
 const TOUCH_DRAG_SLOP_DEFAULT: f32 = 8.0;
+/// [2026-10-10 触摸 P0] 按屏幕物理尺寸算出的默认阈值(guest 点,f32 位模式;0 = 还没算,用 TOUCH_DRAG_SLOP_DEFAULT)。
+/// 8 个 guest 点在平板上约 1.7mm,但长屏手机短边只有约 70mm 却同样是 768 点,8 点只有约 0.7mm,不到安卓系统自己的触摸容差
+/// (ViewConfiguration 8dp ≈ 1.3mm)的一半:手指稍抖仍被当成拖动,点建筑/作物/摩尔/好友地图头像吞掉。
+/// 改为按物理距离 TOUCH_DRAG_SLOP_MM 换算成 guest 点,且不小于 8 点(平板、桌面触屏不变),不大于 24 点。见 init_touch_drag_slop。
+static TOUCH_DRAG_SLOP_AUTO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const TOUCH_DRAG_SLOP_MM: f32 = 1.3;
 fn touch_drag_slop() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let env_value = *V.get_or_init(|| {
         std::env::var("MOLE_TOUCH_DRAG_SLOP")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(TOUCH_DRAG_SLOP_DEFAULT)
-    })
+    });
+    if let Some(v) = env_value {
+        return v;
+    }
+    let auto = f32::from_bits(TOUCH_DRAG_SLOP_AUTO.load(std::sync::atomic::Ordering::Relaxed));
+    if auto > 0.0 {
+        auto
+    } else {
+        TOUCH_DRAG_SLOP_DEFAULT
+    }
+}
+
+/// [2026-10-10 触摸 P0] 建窗后按显示器 DPI 与画布像素算一次触屏起拖阈值:1.3mm → 物理像素(DPI/25.4)→ guest 点
+/// (guest 短边点数 / 画布短边像素)。取不到 DPI 或数值离谱就保持 8 点。
+/// 只在安卓/iOS 上算:那里画布(drawable)就是物理像素(iOS 开了 allow_highdpi),SDL 的 DPI 也是物理像素密度。
+/// 桌面窗口没开高分屏,画布是逻辑点而 DPI 是物理像素(Mac 视网膜屏 255 会算出 13 点、实际只合 6.5 点),桌面触屏又少,保持 8 点。
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(unused_variables))]
+fn init_touch_drag_slop(video_ctx: &sdl2::VideoSubsystem, window: &sdl2::video::Window, guest_short: u32) {
+    if !cfg!(any(target_os = "android", target_os = "ios")) {
+        return;
+    }
+    let Ok(display) = window.display_index() else {
+        return;
+    };
+    let Ok((ddpi, hdpi, vdpi)) = video_ctx.display_dpi(display) else {
+        return;
+    };
+    let dpi = if hdpi > 0.0 && vdpi > 0.0 { (hdpi + vdpi) * 0.5 } else { ddpi };
+    let (dw, dh) = window.drawable_size();
+    let draw_short = dw.min(dh) as f32;
+    if !(50.0..=1000.0).contains(&dpi) || draw_short < 100.0 || guest_short == 0 {
+        log!("[触屏起拖] DPI {:.0} / 画布 {}x{} 不可用,阈值保持 {} 点", dpi, dw, dh, TOUCH_DRAG_SLOP_DEFAULT);
+        return;
+    }
+    let px = TOUCH_DRAG_SLOP_MM * dpi / 25.4;
+    let slop = (px * guest_short as f32 / draw_short).clamp(TOUCH_DRAG_SLOP_DEFAULT, 24.0);
+    TOUCH_DRAG_SLOP_AUTO.store(slop.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    log!(
+        "[触屏起拖] DPI {:.0},画布 {}x{},guest 短边 {} 点 → 阈值 {:.1} 点(约 {}mm)",
+        dpi, dw, dh, guest_short, slop, TOUCH_DRAG_SLOP_MM
+    );
+}
+
+/// [2026-10-10 触摸 P0] iOS 系统取消的触摸打负压力标记,与安卓 SDLSurface.java 的 ACTION_CANCEL 同一约定(见那里的注释)。
+/// SDL 自带的 SDL_uikitview(rust-sdl2 捆绑的 C/ObjC 源码,不在 vendor/SDL 里)`touchesCancelled:withEvent:` 直接调
+/// `touchesEnded:withEvent:`,来电、下拉通知/控制中心、主屏手势、系统手势识别器接管时,按着的手指被当成普通抬起交给游戏 → 误点。
+/// 这里在运行时把 touchesCancelled 换成:置标记 → 调原 touchesEnded → 清标记;`pressureForTouch:` 在标记期间返回 -1,
+/// SDL_SendTouch 原样带进 FINGERUP,事件循环见到负压力的抬起就改发 TouchesCancel。正常抬起的压力(touch.force 或 1.0)恒非负。
+#[cfg(target_os = "ios")]
+mod ios_touch_cancel {
+    use std::ffi::{c_char, c_void};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    type Id = *mut c_void;
+    type Sel = *const c_void;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn class_getInstanceMethod(cls: *mut c_void, sel: Sel) -> *mut c_void;
+        fn method_getImplementation(m: *mut c_void) -> *const c_void;
+        fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
+    }
+
+    static CANCELLING: AtomicBool = AtomicBool::new(false);
+    static ENDED_IMP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static ENDED_SEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static PRESSURE_IMP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    extern "C" fn touches_cancelled(this: Id, _cmd: Sel, touches: Id, event: Id) {
+        let ended: extern "C" fn(Id, Sel, Id, Id) =
+            unsafe { std::mem::transmute(ENDED_IMP.load(Ordering::Relaxed)) };
+        CANCELLING.store(true, Ordering::Relaxed);
+        ended(this, ENDED_SEL.load(Ordering::Relaxed), touches, event);
+        CANCELLING.store(false, Ordering::Relaxed);
+    }
+
+    extern "C" fn pressure_for_touch(this: Id, cmd: Sel, touch: Id) -> f32 {
+        if CANCELLING.load(Ordering::Relaxed) {
+            return -1.0;
+        }
+        let orig: extern "C" fn(Id, Sel, Id) -> f32 =
+            unsafe { std::mem::transmute(PRESSURE_IMP.load(Ordering::Relaxed)) };
+        orig(this, cmd, touch)
+    }
+
+    pub fn install() {
+        unsafe {
+            let cls = objc_getClass(c"SDL_uikitview".as_ptr());
+            if cls.is_null() {
+                log!("[触摸] 找不到 SDL_uikitview,iOS 系统取消仍按抬起处理");
+                return;
+            }
+            let sel_ended = sel_registerName(c"touchesEnded:withEvent:".as_ptr());
+            let sel_cancelled = sel_registerName(c"touchesCancelled:withEvent:".as_ptr());
+            let sel_pressure = sel_registerName(c"pressureForTouch:".as_ptr());
+            let m_ended = class_getInstanceMethod(cls, sel_ended);
+            let m_cancelled = class_getInstanceMethod(cls, sel_cancelled);
+            let m_pressure = class_getInstanceMethod(cls, sel_pressure);
+            if m_ended.is_null() || m_cancelled.is_null() || m_pressure.is_null() {
+                log!("[触摸] SDL_uikitview 缺少触摸方法,iOS 系统取消仍按抬起处理");
+                return;
+            }
+            ENDED_IMP.store(method_getImplementation(m_ended) as *mut c_void, Ordering::Relaxed);
+            ENDED_SEL.store(sel_ended as *mut c_void, Ordering::Relaxed);
+            PRESSURE_IMP.store(method_getImplementation(m_pressure) as *mut c_void, Ordering::Relaxed);
+            method_setImplementation(m_pressure, pressure_for_touch as *const c_void);
+            method_setImplementation(m_cancelled, touches_cancelled as *const c_void);
+            log!("[触摸] 已接管 SDL_uikitview touchesCancelled:系统取消的触摸按取消交给游戏");
+        }
+    }
 }
 
 /// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
@@ -462,6 +578,7 @@ fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<Finge
                 MouseDragState {
                     down: coords,
                     broke: false,
+                    last: None,
                 },
             );
         }
@@ -476,9 +593,14 @@ fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<Finge
 /// [2026-10-05 第九轮 R9-B8] 触屏手指移动:还没越过阈值、离按下点不足阈值的手指从本次事件里去掉
 /// (不更新按下点);越过时把本帧真实坐标作为第一个移动下发(ui_touch 的上一位置仍是按下点,位移不丢)。
 /// 返回 false = 本次事件里的手指全被抑制,不入队。没有记录的手指(例如挂起前按下)原样下发。
+/// [2026-10-10 触摸 P0] 越过阈值时,若之前有被压住的中间点,先把最后一个放进 prefix(调用方在本次移动之前单独下发)。
+/// 只按单个采样点判定的游戏代码靠它:切水果 -[TouchTrailLayer ccTouchMoved:withEvent:objectList:]@0x143f86 →
+/// checkLists:touchPos:@0x144124 → -[Fruit checkAreaTouched:]@0x148b3c 只看当前这一个点,从果子上起刀的短促快切,
+/// 落在果子里的采样都在阈值内被压住,越过阈值的那个已经出了果子,这一刀就不算;手机上阈值按物理距离放大后更明显。
 fn touch_slop_move(
     state: &mut HashMap<i64, MouseDragState>,
     map: &mut HashMap<FingerId, Coords>,
+    prefix: &mut HashMap<FingerId, Coords>,
 ) -> bool {
     let slop = touch_drag_slop();
     map.retain(|finger, coords| {
@@ -493,9 +615,15 @@ fn touch_slop_move(
         }
         let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
         if (dx * dx + dy * dy).sqrt() < slop {
+            if *coords != drag.down {
+                drag.last = Some(*coords);
+            }
             return false;
         }
         drag.broke = true;
+        if let Some(last) = drag.last.take() {
+            prefix.insert(*finger, last);
+        }
         log_dbg!(
             "[触屏起拖] 手指 {} 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
             id,
@@ -510,6 +638,8 @@ fn touch_slop_move(
 
 /// [2026-10-05 第九轮 R9-B8] 触屏手指抬起:没越过阈值(游戏一个移动也没收到)的手指按【按下点】上报,
 /// 游戏看到的是原地点击,与鼠标 K15 的处理一致;越过的按真实坐标。
+/// 注意 SDL_SendTouch 生成 FINGERUP 时不用抬起时传入的坐标,而是沿用该手指最后一次移动的坐标(SDL_touch.c
+/// 「I don't trust the coordinates passed on fingerUp」),所以真机上不存在「位移只体现在抬起事件里」的情况。
 fn touch_slop_up(state: &mut HashMap<i64, MouseDragState>, map: &mut HashMap<FingerId, Coords>) {
     for (finger, coords) in map.iter_mut() {
         if let FingerId::Touch(id) = *finger {
@@ -529,6 +659,8 @@ struct MouseDragState {
     down: Coords,
     /// 本次按下内是否已越过起拖阈值;越过之后的移动全部原样下发,不再抑制。
     broke: bool,
+    /// [2026-10-10 触摸 P0] 触屏:最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move)。鼠标不用。
+    last: Option<Coords>,
 }
 
 struct DpadState {
@@ -1015,6 +1147,12 @@ impl Window {
             fit_window_into_usable_area(&video_ctx, &mut window);
             window
         };
+        {
+            let (pw, ph) = device_family.portrait_size();
+            init_touch_drag_slop(&video_ctx, &window, pw.min(ph));
+        }
+        #[cfg(target_os = "ios")]
+        ios_touch_cancel::install();
 
         if env::consts::OS == "android" {
             // Sanity check
@@ -1560,6 +1698,8 @@ impl Window {
                 _ => {}
             }
 
+            // [2026-10-10 触摸 P0] 触屏越过起拖阈值时要先补发的中间点(见 touch_slop_move),在本次事件入队后插到它前面。
+            let mut slop_prefix: HashMap<FingerId, Coords> = HashMap::new();
             self.event_queue.push_back(match event {
                 E::Quit { .. } => Event::Quit,
                 E::MouseButtonDown {
@@ -1574,6 +1714,7 @@ impl Window {
                     self.mouse_drag = Some(MouseDragState {
                         down: coords,
                         broke: false,
+                        last: None,
                     });
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1619,7 +1760,7 @@ impl Window {
                     // 否则 UITouch 的 previous_location(按下点)与抬起点之间会凭空多出几点位移。
                     // 越过阈值的拖动按真实坐标抬起。
                     let coords = match self.mouse_drag.take() {
-                        Some(MouseDragState { down, broke: false }) => {
+                        Some(MouseDragState { down, broke: false, .. }) => {
                             if down != coords {
                                 log_dbg!(
                                     "[鼠标起拖] 未越过 {}pt 阈值,抬起按按下点 {:?} 上报(实际 {:?})",
@@ -1885,6 +2026,7 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 }
                 | E::FingerMotion {
@@ -1892,6 +2034,7 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 }
                 | E::FingerDown {
@@ -1899,9 +2042,14 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 } => {
                     log_dbg!("Starting multi-touch for {:?}", event);
+                    // [2026-10-10 触摸 P0] 系统取消的触摸:安卓 SDLSurface.java 对 ACTION_CANCEL、iOS ios_touch_cancel 对
+                    // touchesCancelled 都发压力 -1 的抬起(见两处注释)。
+                    // 正常抬起压力恒非负。这组抬起改为 TouchesCancel,合并循环只把同样是取消的抬起并进来。
+                    let cancelled = matches!(event, E::FingerUp { .. }) && pressure < 0.0;
                     // To implement multi-touch we accumulate here same touch
                     // events at the same timestamp. This is consistent with
                     // UIKit, but could be broken if events come out of order.
@@ -1923,6 +2071,7 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             }
                             | E::FingerMotion {
@@ -1930,6 +2079,7 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             }
                             | E::FingerDown {
@@ -1937,10 +2087,12 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             } if timestamp.wrapping_sub(curr_timestamp) <= MULTI_TOUCH_MERGE_MS
                                 && next.is_same_kind_as(&event)
-                                && !map.contains_key(&FingerId::Touch(finger_id)) =>
+                                && !map.contains_key(&FingerId::Touch(finger_id))
+                                && (!matches!(next, E::FingerUp { .. }) || (pressure < 0.0) == cancelled) =>
                             {
                                 // [2026-10-06 第九轮 R9-B3] 合并窗口从「毫秒时间戳完全相等」放宽到「与首条相差不超过
                                 // MULTI_TOUCH_MERGE_MS 毫秒、且该手指还不在本组里」。安卓 SDLSurface.onTouch 对一次 ACTION_MOVE
@@ -1952,8 +2104,13 @@ impl Window {
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 map.insert(FingerId::Touch(finger_id), coords);
                             }
-                            E::MultiGesture { timestamp, .. } if timestamp == curr_timestamp => {
+                            E::MultiGesture { .. } => {
                                 // TODO: handle gestures
+                                // [2026-10-10 触摸 P0] 以前只认与首条时间戳完全相等的 MultiGesture。SDL 在两指及以上时于每次
+                                // 触点移动后自动追加一条 SDL_MULTIGESTURE(SDL_gesture.c),安卓 onNativeTouch 逐个手指入队、
+                                // 跨毫秒时它的时间戳与首条不等,就落到下面的 `_` 分支把合并循环打断:后面同一帧另一根手指的移动
+                                // 单独成一次单指 TouchesMove,6f60d7b 的同帧合并失效,捏合又一顿一顿、地图被拖。手势事件本来就
+                                // 不处理(外层也是 `_ => continue` 丢掉),在合并循环里无条件跳过即可。
                                 continue;
                             }
                             _ => {
@@ -1969,12 +2126,21 @@ impl Window {
                     log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
                     // [2026-10-05 第九轮 R9-B8] 单指起拖阈值(见 touch_drag_slop)。
                     match event {
+                        E::FingerUp { .. } if cancelled => {
+                            for finger in map.keys() {
+                                if let FingerId::Touch(id) = *finger {
+                                    self.touch_drag.remove(&id);
+                                }
+                            }
+                            log!("[触摸] 系统取消了 {} 根手指的触摸,按取消交给游戏(不算点击)", map.len());
+                            Event::TouchesCancel(map)
+                        }
                         E::FingerUp { .. } => {
                             touch_slop_up(&mut self.touch_drag, &mut map);
                             Event::TouchesUp(map)
                         }
                         E::FingerMotion { .. } => {
-                            if !touch_slop_move(&mut self.touch_drag, &mut map) {
+                            if !touch_slop_move(&mut self.touch_drag, &mut map, &mut slop_prefix) {
                                 continue;
                             }
                             Event::TouchesMove(map)
@@ -2024,7 +2190,12 @@ impl Window {
                     Event::TextInput(TextInputEvent::Text(text))
                 }
                 _ => continue,
-            })
+            });
+            if !slop_prefix.is_empty() {
+                let main = self.event_queue.pop_back().unwrap();
+                self.event_queue.push_back(Event::TouchesMove(slop_prefix));
+                self.event_queue.push_back(main);
+            }
         }
 
         // [扫描修 2026-09-15] F12-2:滚轮停下 PINCH_IDLE_TIMEOUT(约 150ms)后结束两根虚拟手指
