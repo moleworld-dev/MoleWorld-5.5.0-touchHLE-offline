@@ -384,6 +384,40 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // view to set of touches for this view
     let mut view_touches: HashMap<id, id> = HashMap::new();
 
+    // [2026-10-10 触摸 P0] 两指捏合时坐标没变的那根手指也报成 Moved。
+    // 触点坐标在 window.rs transform_input_coords 里取整到整数 guest 点,慢速捏合时每指每次只动零点几个点,两指的取整坐标常在
+    // 不同事件里各自跳变;下面原来把坐标没变的手指跳过,游戏收到的 touches 只剩 1 根:-[GameManager processTouch:withType:]
+    // 0x1a6f8 见 count==1 走单指平移(地图抖、ObjSelector 置已拖动),count≥2 才 0x1a7ce zoom:touch2:——而 zoom:touch2:@0x35668
+    // 按两指 location/previousLocation 的间距增量缩放,单指事件里那根手指的 previous 已被更新,这段间距变化永远补不回来,
+    // 玩家觉得慢慢捏合基本不缩放、一顿一顿。桌面滚轮捏合当初专门用整数半间距规避了同一机制(window.rs PinchState.half)。
+    // 做法:本次事件里有 ≥2 根已跟踪手指、且至少一根真的变了,就把没变的那根也作为零位移 Moved 放进集合(previous=location)。
+    // 只补本次事件里出现的手指(SDL 只对原始坐标真变了的手指发 FingerMotion,等于真机里它也动了亚点距离),不从当前触点里补
+    // 没上报的手指,保留真机「一指不动、另一指拖」走单指平移的语义;单指事件完全不变。
+    let tracked: Vec<(FingerId, id, CGPoint)> = map
+        .iter()
+        .filter_map(|(finger_id, coords)| {
+            env.framework_state
+                .uikit
+                .ui_touch
+                .current_touches
+                .get(finger_id)
+                .map(|&touch| {
+                    (
+                        *finger_id,
+                        touch,
+                        CGPoint {
+                            x: coords.0,
+                            y: coords.1,
+                        },
+                    )
+                })
+        })
+        .collect();
+    let report_unchanged = tracked.len() >= 2
+        && tracked
+            .iter()
+            .any(|&(_, touch, location)| env.objc.borrow::<UITouchHostObject>(touch).location != location);
+
     for (finger_id, coords) in map {
         let Some(&touch) = env
             .framework_state
@@ -407,7 +441,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let view = env.objc.borrow::<UITouchHostObject>(touch).view;
         let host_object = env.objc.borrow_mut::<UITouchHostObject>(touch);
 
-        if host_object.location == location {
+        if host_object.location == location && !report_unchanged {
             continue;
         }
 
