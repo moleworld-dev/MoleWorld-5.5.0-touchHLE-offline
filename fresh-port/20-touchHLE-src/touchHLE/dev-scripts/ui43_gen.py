@@ -83,38 +83,33 @@ UI_LAYOUT_CLASSES = frozenset([
     "ActivityHalloweenBasePopLayer", "ActivityXmasBasePopLayer", "Activity_Alice_BasePopLayer",
     "Activity_FlameWars_BasePopLayer", "Activity_FlameWars_MainLayer",
     "Activity_IceCream_BasePopLayer", "Activity_Shrek_BasePopLayer",
-    "Activity_Totoro_BasePopLayer", "AnimalsRecyclerView", "AnniversaryMainLayer",
+    "Activity_Totoro_BasePopLayer", "AnniversaryMainLayer",
     "AnniversarySubLayer", "ApplyHongKongTourLayer", "AroundTheWorldMainLayer",
     "AutumnMainLayer", "AvatarLayer", "BouquetTradeItem", "BugAchivement", "BugGame",
     "BugLevelBase", "BugLevelChoose", "CafeQuestItem", "CafeShopLayer", "CandyhouseLayer",
     "CaribbeanMainLayer", "ChangeRewardLayer", "ChooseVillageHelp", "ChooseVillageLayer",
     "ChoosingPagesMainLayer", "CommonChristmasFatherGiftLayer", "CouponsItems",
     "CrowPriestMessageLayer", "CustomerServiceLayer", "CutFruit", "CutFruitAchivement",
-    "CutFruitLevelChoose", "DailyQuestLayer", "DailySignLayer", "DecorateRoomLayer",
-    "DiscountInfoLayer", "DivineGame", "DriftBottleMessageLayer", "EasterEggGetRewardLayer",
+    "CutFruitLevelChoose", "DailyQuestLayer", "DailySignLayer",     "DiscountInfoLayer", "DivineGame", "DriftBottleMessageLayer", "EasterEggGetRewardLayer",
     "EasterEggMainLayer", "ExchangeCenterLayer", "FinalRewardAnimation", "FirstChargeGiftsLayer",
     "FishingAchivement", "FishingGame", "FishingLevelChoose", "FlowerStudioItem",
     "FlyKiteGetRewardLayer", "FlyKiteIntroductionsLayer", "FlyKiteMainLayer",
     "FriendsViewController", "FruitItem", "FuncIntroLayer", "GameDataCompareLayer",
     "GamePlayGoView", "GetItemRewardFromHaiwangLayer", "GetLastRewardLayer", "GiftAndMessageLayer",
-    "GiftLayer", "GiftViewLayer", "GoodsViewLayer", "GreenRiceBallMainLayer", "GreenhouseLayer",
-    "GuessWorldCupMainLayer", "HalloweenMainLayer", "HelpLayer", "HouseRecyclerView",
-    "IceSummerMainLayer", "InviteFriendsLayer", "JunkShopLayer", "LeaveMessageLayer",
+    "GiftLayer", "GreenRiceBallMainLayer", "GreenhouseLayer",
+    "GuessWorldCupMainLayer", "HalloweenMainLayer", "HelpLayer",     "IceSummerMainLayer", "JunkShopLayer", "LeaveMessageLayer",
     "LeoAdvanceLayer", "Level1", "Level2", "Level3", "Level4", "LevelChooseLayer", "LevelUpLayer",
-    "MagicNumberView", "MessageBox", "MessageBoxGift", "MessageViewController", "MessagesLayer",
-    "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase", "MusicHallLayer",
-    "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
+    "MagicNumberView", "MessageBox", "MessageBoxGift",     "MinerAchivement", "MinerGame", "MinerLevelChoose", "MiniBase",     "NaramGetTodayRewardLayer", "NaramSpringIntroduceLayer", "NaramSpringMainLayer",
     "NewRewardsLayer", "NewSceneLevelUp", "NewSceneQuestLayer", "NewSceneTestLayer",
     "NewStyleStoreItemsView", "NewStyleStoreMainLayer", "NewStyleStoreMenuView",
     "NoticeBoardLayer", "OpenTreasureChestMainLayer", "OptionLayer", "PaintingAchivement",
-    "PaintingGame", "PaintingLevelChoose", "PaybackObjectsTableLayer", "PersonalTargetLayer",
+    "PaintingGame", "PaintingLevelChoose", "PersonalTargetLayer",
     "Plow", "PlowAchivement", "PlowLevelChoose", "PopularItemsPKAdvanceLayer",
     "PopularItemsPKMainLayer", "PopularItemsPKVoteLayer", "PromoteSalesMainLayer",
     "PromoteShowItemsLayer", "QiXiAdvanceLayer", "QuestLayer", "QuestionnaireLayer",
     "ReceiveGiftLayer", "RegisterView", "RequestCodeLayer", "RewardLayer",
     "SeabedSeekingTreasureExchageRewardLayer", "SeabedSeekingTreasureMainLayer",
-    "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer", "SeekViewController", "ShowActivityRuleLayer", "ShowFreeShellsLayer", "ShowMoreFriendsLayer",
-    "ShowRuleLayer", "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer",
+    "SeabedSeekingTreasureRuleLayer", "SealExchangeLayer", "ShowActivityRuleLayer", "ShowFreeShellsLayer",     "ShowRuleLayer", "SpringPoemGetRewardLayer", "SpringPoemIntroduceLayer", "SpringPoemMainLayer",
     "SpringPoemPageLayer", "TeamTargetLayer", "TestLayer", "TourLineLayer", "TreasureHuntPopLayer",
     "TreasureRewardLayer", "VIPFunctionsLayer", "VIPItems", "VIPLayer", "VerifyInviteCodeLayer",
     "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose", "WaterTowerRewardView",
@@ -131,6 +126,19 @@ KEEP_REAL_WIDTH_CLASSES = frozenset([
     # [2026-10-08 第十三轮] 右侧抽屉面板(底图 cropstoreback.png,init 里按「屏宽 − 面板宽」右对齐摆放,与主村 BuildingView 同一套):
     # 以前被自动归进 UI_LAYOUT_CLASSES 整体居中,长屏(逻辑宽 1670)上离右边缘 323 点、右侧还露着地图。改为保持真实宽度,贴屏幕右边。
     "ShoppingView", "ShopItemsLayer", "ApartmentView", "RestaurantView", "CropInfoView",
+    # [2026-10-08 第十三轮] 好友地图的顶部 HUD:-[InviteFriendsLayer init]@0x188b28 把搜索面板 seekBg1 锚点 (1,1) 放在 (winSize.宽, winSize.高)
+    # 右上角,输入框位置、搜索结果抽屉(cropstoreback.png)与 containsTouchLocation: 命中都由 winSize 推出;
+    # 以前被居中后搜索栏和好友数停在 1024 设计区里,好友地图本身(FriendsVillageLayer)却按真实宽铺开。
+    "InviteFriendsLayer",
+    # [2026-10-09 第十四轮] 同一套右侧抽屉(底图 cropstoreback.png,init 里按「winSize.宽 − 面板宽(341/335/210)」右对齐、
+    # cropstoretop.png 锚点 (1,1) 放在 (winSize.宽, winSize.高)),挂在不右移的 HUD 层或运行场景上,以前被归进居中界面后
+    # 长屏下停在 1024 设计区右缘、右边露出一条地图:仓库 GoodsViewLayer、宠物之家 AnimalsRecyclerView、房屋仓库 HouseRecyclerView、
+    # 房屋改建 DecorateRoomLayer、送礼 GiftViewLayer、待领取物品 PaybackObjectsTableLayer、信件 MessagesLayer(自身 setPosition:
+    # 宽−335)、音乐 MusicHallLayer、更多好友 ShowMoreFriendsLayer;信件/搜索结果的 UIKit 表格 MessageViewController、
+    # SeekViewController 按 (winSize.宽 − 335) 设 frame,拿真实宽后落在设计区外,不再被子视图右移。命中判定全用真实坐标,自洽。
+    "GoodsViewLayer", "AnimalsRecyclerView", "HouseRecyclerView", "DecorateRoomLayer", "GiftViewLayer",
+    "PaybackObjectsTableLayer", "MessagesLayer", "MusicHallLayer", "ShowMoreFriendsLayer",
+    "MessageViewController", "SeekViewController",
     "ButterFlyLayer", "ButterFlyObject",
     # 贴边 HUD 与菜单条:必须拿真实宽才贴得住屏幕边
     "TopMenuLayer", "VillageMenuLayer", "NewSceneVillageMenuLayer",

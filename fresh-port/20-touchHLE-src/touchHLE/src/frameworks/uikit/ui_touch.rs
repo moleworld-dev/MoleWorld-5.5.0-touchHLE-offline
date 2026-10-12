@@ -8,7 +8,7 @@
 use super::ui_event;
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
-use crate::mem::{GuestUSize, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, ObjC, SEL,
@@ -30,6 +30,8 @@ pub const UITouchPhaseCancelled: UITouchPhase = 4;
 #[derive(Default)]
 pub struct State {
     current_touches: HashMap<FingerId, id>,
+    /// [2026-10-10 触摸 P0] 在村庄/岛上参与过双指缩放的手指(见 [mark_village_pinch]),抬起时按取消结束。
+    pinched: HashSet<FingerId>,
 }
 
 pub(super) struct UITouchHostObject {
@@ -187,6 +189,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
 
         log_dbg!("Finger {:?} touch down: {:?}", finger_id, coords);
+        current_touches_pinched_clear(env, finger_id);
 
         let location = CGPoint {
             x: coords.0,
@@ -383,6 +386,42 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     // view to set of touches for this view
     let mut view_touches: HashMap<id, id> = HashMap::new();
+    // [2026-10-10 触摸 P0] 视图 → 本次移动的 (手指, 触点),给 [mark_village_pinch] 用。
+    let mut view_fingers: HashMap<id, Vec<(FingerId, id)>> = HashMap::new();
+
+    // [2026-10-10 触摸 P0] 两指捏合时坐标没变的那根手指也报成 Moved。
+    // 触点坐标在 window.rs transform_input_coords 里取整到整数 guest 点,慢速捏合时每指每次只动零点几个点,两指的取整坐标常在
+    // 不同事件里各自跳变;下面原来把坐标没变的手指跳过,游戏收到的 touches 只剩 1 根:-[GameManager processTouch:withType:]
+    // 0x1a6f8 见 count==1 走单指平移(地图抖、ObjSelector 置已拖动),count≥2 才 0x1a7ce zoom:touch2:——而 zoom:touch2:@0x35668
+    // 按两指 location/previousLocation 的间距增量缩放,单指事件里那根手指的 previous 已被更新,这段间距变化永远补不回来,
+    // 玩家觉得慢慢捏合基本不缩放、一顿一顿。桌面滚轮捏合当初专门用整数半间距规避了同一机制(window.rs PinchState.half)。
+    // 做法:本次事件里有 ≥2 根已跟踪手指、且至少一根真的变了,就把没变的那根也作为零位移 Moved 放进集合(previous=location)。
+    // 只补本次事件里出现的手指(SDL 只对原始坐标真变了的手指发 FingerMotion,等于真机里它也动了亚点距离),不从当前触点里补
+    // 没上报的手指,保留真机「一指不动、另一指拖」走单指平移的语义;单指事件完全不变。
+    let tracked: Vec<(FingerId, id, CGPoint)> = map
+        .iter()
+        .filter_map(|(finger_id, coords)| {
+            env.framework_state
+                .uikit
+                .ui_touch
+                .current_touches
+                .get(finger_id)
+                .map(|&touch| {
+                    (
+                        *finger_id,
+                        touch,
+                        CGPoint {
+                            x: coords.0,
+                            y: coords.1,
+                        },
+                    )
+                })
+        })
+        .collect();
+    let report_unchanged = tracked.len() >= 2
+        && tracked
+            .iter()
+            .any(|&(_, touch, location)| env.objc.borrow::<UITouchHostObject>(touch).location != location);
 
     for (finger_id, coords) in map {
         let Some(&touch) = env
@@ -407,7 +446,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         let view = env.objc.borrow::<UITouchHostObject>(touch).view;
         let host_object = env.objc.borrow_mut::<UITouchHostObject>(touch);
 
-        if host_object.location == location {
+        if host_object.location == location && !report_unchanged {
             continue;
         }
 
@@ -427,6 +466,11 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
         let touches: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; touches addObject:touch];
+        view_fingers.entry(view).or_default().push((finger_id, touch));
+    }
+
+    for (view, list) in view_fingers {
+        mark_village_pinch(env, view, &list);
     }
 
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
@@ -457,7 +501,26 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     release(env, pool);
 }
 
-fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) {
+    // [2026-10-10 触摸 P0] 在村庄/岛上参与过双指缩放的手指按取消结束(见 [mark_village_pinch])。
+    let pinched: HashMap<FingerId, Coords> = {
+        let set = &env.framework_state.uikit.ui_touch.pinched;
+        map.iter()
+            .filter(|(finger, _)| set.contains(finger))
+            .map(|(&finger, &coords)| (finger, coords))
+            .collect()
+    };
+    if !pinched.is_empty() {
+        map.retain(|finger, _| !pinched.contains_key(finger));
+        log!(
+            "[触摸 P0] 双指缩放后抬起 {} 根手指:按取消交给游戏(不点建筑、不确认摆放、不瞬移)",
+            pinched.len()
+        );
+        handle_touches_cancelled(env, pinched);
+        if map.is_empty() {
+            return;
+        }
+    }
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
     let timestamp: NSTimeInterval = {
@@ -529,6 +592,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .ui_touch
             .current_touches
             .remove(&finger_id);
+        current_touches_pinched_clear(env, finger_id);
         release(env, touch); // only owner now should be the NSSet
     }
 
@@ -628,6 +692,7 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
             .ui_touch
             .current_touches
             .remove(&finger_id);
+        current_touches_pinched_clear(env, finger_id);
         release(env, touch); // only owner now should be the NSSet
     }
 
@@ -674,6 +739,98 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
     release(env, pool);
 }
 
+fn current_touches_pinched_clear(env: &mut Environment, finger_id: FingerId) {
+    env.framework_state.uikit.ui_touch.pinched.remove(&finger_id);
+}
+
+/// [2026-10-10 触摸 P0] 双指缩放后先后抬起手指,先抬的那根被游戏当成一次单指点击。
+/// 游戏只按本次 NSSet 的触点数区分单双指:-[GameManager processTouch:withType:]@0x1a680 在 0x1a6f8 见 count==1 走单指
+/// (依次交给 VillageLayer、Porter、ActorManager、ObjSelector),count≥2 只有移动才在 0x1a7ce zoom:touch2:,按下/抬起直接返回;
+/// -[NewGameManager processTouch:withType:]@0x245474(岛、节日村)同构。于是缩放完两指先后松开时,先抬的那根以 count==1 的抬起
+/// 收尾:-[ObjSelector touchEnd:]@0x4b284 在 isMoved==0 时点开第二根手指按下处的建筑/作物;-[Porter touchEnd:]@0x30cc0
+/// (岛上 NewScenePorter@0x271728)见上一次类型不是移动,手指按过底座就 quickFinish 直接确认摆放(买来的扣钱),否则把物件
+/// 瞬移到抬起点;后抬的那根再瞬移一次。
+/// 真机上这层很少暴露:UIKit 按显示帧合批,两指在同一帧内松开就是一次 count==2 的抬起被整包忽略;第一根手指按下后的细小抖动
+/// 也会先以单指移动把 isMoved 置 1。touchHLE 只合并 4ms 内的事件,触屏起拖容差又吞掉了按下后的小抖动,缩放过程中游戏一次
+/// 单指移动也看不到,第一次松手就成了一次干净的点击(0.0.9 起长屏手机最常见)。
+/// 做法:两根以上【没被目标代理认领】的手指一起移动、送进标准代理里有 VillageLayer/InGameLayer 的 EAGLView 时(GameManager
+/// 收到 count≥2,即真的发生了缩放),把这些手指记为「参与过缩放」;它们抬起时改走 [handle_touches_cancelled]:游戏走
+/// processTouch:withType:3(各子处理器只对类型 2 做点击),最后一根结束后由 [reset_obj_selector_after_cancel] 清 ObjSelector
+/// 标志、把摆放中的 Porter 复位。效果等于两指在同一帧松开。被 CCMenu 等认领的手指(一指按着按钮、一指拖地图)不记,照常抬起;
+/// 单指拖动、小游戏、UIKit 视图都不受影响。缩放后剩下的那根手指照样可以继续单指拖地图,只是松开时不算点击。
+fn mark_village_pinch(env: &mut Environment, view: id, list: &[(FingerId, id)]) {
+    if list.len() < 2 {
+        return;
+    }
+    {
+        let set = &env.framework_state.uikit.ui_touch.pinched;
+        if list.iter().all(|(finger, _)| set.contains(finger)) {
+            return;
+        }
+    }
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return;
+    }
+    let Some(dispatcher) = read_id_ivar(env, view, "touchDelegate_") else {
+        return;
+    };
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return;
+    }
+    let standard = read_id_ivar(env, dispatcher, "standardHandlers").unwrap_or(nil);
+    if standard == nil {
+        return;
+    }
+    let mut village = false;
+    let count: NSUInteger = msg![env; standard count];
+    for i in 0..count {
+        let handler: id = msg![env; standard objectAtIndex:i];
+        let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS).is_some() {
+            village = true;
+            break;
+        }
+    }
+    if !village {
+        return;
+    }
+    // 去掉被目标代理认领的触点(-[CCTouchDispatcher touches:withEvent:withTouchType:] 只把没认领的交给标准代理)。
+    let mut unclaimed: Vec<FingerId> = list.iter().map(|&(finger, _)| finger).collect();
+    let targeted = read_id_ivar(env, dispatcher, "targetedHandlers").unwrap_or(nil);
+    if targeted != nil {
+        let count: NSUInteger = msg![env; targeted count];
+        for i in 0..count {
+            let handler: id = msg![env; targeted objectAtIndex:i];
+            let claimed = read_id_ivar(env, handler, "claimedTouches").unwrap_or(nil);
+            if claimed == nil {
+                continue;
+            }
+            let claimed_count: NSUInteger = msg![env; claimed count];
+            if claimed_count == 0 {
+                continue;
+            }
+            for &(finger, touch) in list {
+                let contains: bool = msg![env; claimed containsObject:touch];
+                if contains {
+                    unclaimed.retain(|&f| f != finger);
+                }
+            }
+        }
+    }
+    if unclaimed.len() < 2 {
+        return;
+    }
+    let set = &mut env.framework_state.uikit.ui_touch.pinched;
+    let before = set.len();
+    set.extend(unclaimed.iter().copied());
+    if set.len() != before {
+        log!(
+            "[触摸 P0] 村庄/岛上双指缩放:手指 {:?} 抬起时按取消处理",
+            unclaimed
+        );
+    }
+}
+
 /// [复核修 2026-09-15] R1-3 返修(复核 issue 1):不认取消、却只靠 ccTouchEnded: 清门控的 cocos2d 目标代理
 /// → 门控 ivar(都是 int)。这些类实现了 ccTouchBegan:/ccTouchEnded:,但自己和父类链(CCNode,或
 /// CCLayerColor → CCLayer → CCNode)都没有 ccTouchCancelled:withEvent:(整个二进制只有 CCMenu、CCScrollView、
@@ -691,10 +848,22 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 /// 取舍:清零等于 ccTouchEnded: 里"只清零、不调 processTouched / onSpriteTouched:"的那半截,不收产出、
 /// 不领奖励;不改成给它们补发 ccTouchEnded:(那样滚一下滚轮就收产出、领奖励,等于把取消又变回点击)。
 /// 以后发现新的同类门控,往表里加一行即可;表外不认取消的代理照旧不回调。
+/// [2026-10-10 触摸 P0] 补三处同构门控(机器扫描:实现 ccTouchBegan:/ccTouchEnded: 却不认取消、Began 读 Ended 清零的 int 成员;
+/// 当初「只有这三处」的核查漏了它们):
+/// - AlarmFlag.state_(+476):ccTouchBegan@0xc0588 在 0xc05a6 非 0 返回 NO,ccTouchEnded@0xc064c 0xc0698 清零。成熟作物头顶的
+///   收获旗(-[Farm cropMatureHandler]@0x4a0b4)、岛上商铺售罄旗、发现号返航旗。
+/// - GameRoomFlag.state_(+476):ccTouchBegan@0xdbcfc / ccTouchEnded@0xdbe6c 同构。游戏屋头顶的小游戏图标。
+/// - NpcPrompt.state_(+480):ccTouchBegan@0x123560 / ccTouchEnded@0x123648 同构。NPC/任务对象头顶的感叹号提示。
+/// 桌面滚轮捏合两根虚拟手指以取消结束,落在这些图标上就把门控卡在 1:之后收获旗、游戏屋图标、感叹号再也点不动,
+/// 点下去落到下面的 ObjSelector 变成打开别的东西;安卓/iOS 切后台、打开修改器时按着的手指同理。
+/// (BugGame.level1..4/m_level、CutFruit.m_touchLayer 是选关/子层引用,不是门控。)
 const COCOS_CANCEL_GATES: &[(&str, &str)] = &[
     ("OutputHanlder", "state_"),
     ("TreasureRewardLayer", "_touchState"),
     ("FinalRewardAnimation", "_touchState"),
+    ("AlarmFlag", "state_"),
+    ("GameRoomFlag", "state_"),
+    ("NpcPrompt", "state_"),
 ];
 
 /// [复核修 2026-09-15] R1-3 返修(复核 issue 2):走 GameManager / NewGameManager 的村庄层(标准代理)。
@@ -869,6 +1038,7 @@ fn reset_obj_selector_after_cancel(env: &mut Environment) {
         .objc
         .register_host_selector("instance".to_string(), &mut env.mem);
     let selector: id = msg_send(env, (class, instance_sel));
+    reset_porters_after_cancel(env);
     if selector == nil {
         return;
     }
@@ -890,5 +1060,55 @@ fn reset_obj_selector_after_cancel(env: &mut Environment) {
                 old
             );
         }
+    }
+}
+
+/// [2026-10-10 触摸 P0] 取消后把摆放中的 Porter / NewScenePorter 从「按下/拖动中」复位。
+/// 原版 -[Porter touchEnd:]@0x30cc0(岛上 -[NewScenePorter touchEnd:]@0x271728 同构):本手势移动过(prevTouchType==1)就
+/// state=1 并 [[EditMenuLayer sharedInstance] update:objSprite] 把 ✓⇄⊘ 挪到物件旁;没移动且 state==2(按在底座上)就
+/// quickFinish 直接确认摆放;否则把物件瞬移到手指处。processTouch:withType:3(取消)不转给 touch*,state 停在 2/3:
+/// 下一次在任意位置单击(touchBegan 没按在底座上不改 state)抬起时见 state==2 就 quickFinish——把还红着/没摆好的物件
+/// 直接确认放下(买来的东西扣钱);state==3 时下一次拖动从任意位置都会拖走物件。桌面滚轮捏合以取消结束、
+/// 切后台/打开修改器时按着的手指都会走到这里。
+/// 修法:照原版「移动过」那一支收尾——state 为 2/3 时置 1 并让编辑菜单跟到物件旁;不确认、不瞬移、不扣钱。
+/// 单例只读静态变量(Porter +instance@0x28f40 缓存在 0xb40968,NewScenePorter +instance@0x26adb8 缓存在 0xb40c04),
+/// 不存在就不调 +instance,免得凭空建一个。调用方已确认没有别的手指还按着;在运行循环处理事件时调用,可以发消息。
+fn reset_porters_after_cancel(env: &mut Environment) {
+    for (static_slot, menu_class) in [(0xb40968u32, "EditMenuLayer"), (0xb40c04u32, "NewSceneEditMenuLayer")] {
+        let porter_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+        if porter_bits == 0 {
+            continue;
+        }
+        let porter: id = Ptr::from_bits(porter_bits);
+        let Some(state_ptr) = env
+            .objc
+            .object_lookup_ivar(&env.mem, porter, &"state".to_string())
+        else {
+            continue;
+        };
+        let state: GuestUSize = env.mem.read(state_ptr);
+        if state != 2 && state != 3 {
+            continue;
+        }
+        env.mem.write(state_ptr, 1);
+        let sprite = read_id_ivar(env, porter, "objSprite").unwrap_or(nil);
+        if sprite != nil {
+            let class = env.objc.get_known_class(menu_class, &mut env.mem);
+            let shared_sel: SEL = env
+                .objc
+                .register_host_selector("sharedInstance".to_string(), &mut env.mem);
+            let menu: id = msg_send(env, (class, shared_sel));
+            if menu != nil {
+                let update_sel: SEL = env
+                    .objc
+                    .register_host_selector("update:".to_string(), &mut env.mem);
+                let _: () = msg_send(env, (menu, update_sel, sprite));
+            }
+        }
+        log!(
+            "[触摸 P0] 取消触摸:摆放中的 {:?} state {} → 1(不确认、不瞬移),编辑菜单跟到物件旁",
+            porter,
+            state
+        );
     }
 }
