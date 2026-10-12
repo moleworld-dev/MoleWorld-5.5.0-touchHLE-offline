@@ -261,11 +261,15 @@ const FINGER_UP: u32 = sdl2::sys::SDL_EventType::SDL_FINGERUP as u32;
 /// (两指同一步)紧挨着推、共用同一毫秒;为 false 时两指之间睡 2 毫秒,模拟安卓逐指上报跨毫秒。
 /// rust-sdl2 的 push_event 不支持手指事件(event.rs to_ll 对 Finger* 返回 None),所以直接调 SDL_PushEvent;
 /// 它是线程安全的。只在注入通道打开时可达;整串最多睡约 1 秒(240 步),只用于测试。
-fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool) {
+/// [2026-10-10 触摸 P0] edge_gap_ms > 0 时,两指相邻的按下/抬起之间改睡这么久(模拟两指先后落下、先后松开,
+/// 超过窗口层同帧合并的 4ms);up_pressure 是抬起事件的压力(-1 = 系统取消,见 window.rs)。
+fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool, edge_gap_ms: u64, up_pressure: f32) {
     for (i, &(type_, finger, x, y)) in seq.iter().enumerate() {
         if i > 0 {
             let pair = seq[i - 1].0 == type_ && seq[i - 1].1 != finger;
+            let edge = type_ == FINGER_DOWN || type_ == FINGER_UP;
             let gap_ms = match (pair, pair_same_ts) {
+                (true, _) if edge && edge_gap_ms > 0 => edge_gap_ms,
                 (true, true) => 0,
                 (true, false) => 2,
                 (false, _) => 3,
@@ -284,7 +288,7 @@ fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool) {
             y: y.clamp(0.0, 1.0),
             dx: 0.0,
             dy: 0.0,
-            pressure: 1.0,
+            pressure: if type_ == FINGER_UP { up_pressure } else { 1.0 },
             windowID: 0,
         };
         let mut raw: sdl2::sys::SDL_Event = unsafe { std::mem::zeroed() };
@@ -423,6 +427,7 @@ pub fn next_inject() -> Option<Inject> {
         // (按下 → 若干移动 → 抬起),坐标是窗口归一化 0..1(左上角为原点,按画面所见方向)。和上面 tap/drag 直接把
         // 游戏坐标交给 UIKit 不同,这组事件走真机触屏同一条 window.rs Finger* 分支(坐标换算、起拖阈值都生效),
         // 用来在桌面上验证手指相关的输入层修复。步数 0 = 只按下/抬起,不移动。
+        // [2026-10-10 触摸 P0] 第 6 个参数 cancel=1 时抬起的压力填 -1,模拟安卓 ACTION_CANCEL / iOS touchesCancelled。
         Some("fdrag") => {
             let nx1: f32 = it.next()?.parse().ok()?;
             let ny1: f32 = it.next()?.parse().ok()?;
@@ -439,16 +444,18 @@ pub fn next_inject() -> Option<Inject> {
                 seq.push((FINGER_MOTION, 0, nx1 + (nx2 - nx1) * t, ny1 + (ny2 - ny1) * t));
             }
             seq.push((FINGER_UP, 0, nx2, ny2));
-            push_sdl_finger_events(&seq, false);
+            let cancel = it.next() == Some("1");
+            push_sdl_finger_events(&seq, false, 0, if cancel { -1.0 } else { 1.0 });
             log_line(&format!(
-                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps)",
-                nx1, ny1, nx2, ny2, steps
+                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps, cancel={})",
+                nx1, ny1, nx2, ny2, steps, cancel
             ));
             None
         }
         // [2026-10-05 第九轮] `fpinch <ncx> <ncy> <起始间距> <结束间距> [步数] [split]`:两根原始手指(0/1)以归一化
         // (ncx,ncy) 为中点、沿画面水平方向对称,间距(归一化宽度)线性变化。split=1 时同一步两根手指的移动用不同
         // 时间戳(两指之间真实间隔 2 毫秒,模拟安卓逐指上报跨毫秒),缺省 0 = 同一毫秒。
+        // [2026-10-10 触摸 P0] 第 7 个参数 gap(毫秒):手指 0 先按下、隔 gap 再按手指 1;松开时手指 0 先抬、隔 gap 再抬手指 1。
         Some("fpinch") => {
             let cx: f32 = it.next()?.parse().ok()?;
             let cy: f32 = it.next()?.parse().ok()?;
@@ -460,6 +467,7 @@ pub fn next_inject() -> Option<Inject> {
                 .unwrap_or(24)
                 .clamp(1, 240);
             let split = it.next() == Some("1");
+            let gap: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0).min(500);
             let mut seq = vec![
                 (FINGER_DOWN, 0, cx - d0 / 2.0, cy),
                 (FINGER_DOWN, 1, cx + d0 / 2.0, cy),
@@ -471,10 +479,10 @@ pub fn next_inject() -> Option<Inject> {
             }
             seq.push((FINGER_UP, 0, cx - d1 / 2.0, cy));
             seq.push((FINGER_UP, 1, cx + d1 / 2.0, cy));
-            push_sdl_finger_events(&seq, !split);
+            push_sdl_finger_events(&seq, !split, gap, 1.0);
             log_line(&format!(
-                "INJECT fpinch ({}, {}) 间距 {} -> {} ({} steps, split={})",
-                cx, cy, d0, d1, steps, split
+                "INJECT fpinch ({}, {}) 间距 {} -> {} ({} steps, split={}, gap={}ms)",
+                cx, cy, d0, d1, steps, split, gap
             ));
             None
         }
