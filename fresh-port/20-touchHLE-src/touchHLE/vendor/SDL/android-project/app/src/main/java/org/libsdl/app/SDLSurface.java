@@ -280,12 +280,12 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
                         pointerFingerId = event.getPointerId(i);
                         x = event.getX(i) / mWidth;
                         y = event.getY(i) / mHeight;
-                        p = event.getPressure(i);
-                        if (p > 1.0f) {
-                            // may be larger than 1.0f on some devices
-                            // see the documentation of getPressure(i)
-                            p = 1.0f;
-                        }
+                        // [MoleWorld 2026-10-10 触摸 P0] 系统取消(手势导航返回、防误触、系统接管触摸)以前当成普通抬起,
+                        // touchHLE 把它交给游戏变成一次点击(起拖容差还会把它吸回按下点),误点到边缘的按钮/建筑。
+                        // SDL 的 C 层没有取消事件(Android_OnTouch 只认按下/移动/抬起),这里仍发抬起,但压力填 -1 作为
+                        // 取消标记:SDL_SendTouch 生成 FINGERUP 时原样带上压力,touchHLE 的 window.rs 见到负压力的抬起
+                        // 就改为 TouchesCancel(UIKit touchesCancelled,不触发点击)。正常抬起的压力恒为非负。
+                        p = -1.0f;
                         SDLActivity.onNativeTouch(touchDevId, pointerFingerId, MotionEvent.ACTION_UP, x, y, p);
                     }
                     break;
