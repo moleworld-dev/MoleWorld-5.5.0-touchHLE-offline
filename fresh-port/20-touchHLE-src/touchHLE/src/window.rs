@@ -1855,8 +1855,13 @@ impl Window {
                                 let coords = transform_input_coords(self, abs_coords, false);
                                 map.insert(FingerId::Touch(finger_id), coords);
                             }
-                            E::MultiGesture { timestamp, .. } if timestamp == curr_timestamp => {
+                            E::MultiGesture { .. } => {
                                 // TODO: handle gestures
+                                // [2026-10-10 触摸 P0] 以前只认与首条时间戳完全相等的 MultiGesture。SDL 在两指及以上时于每次
+                                // 触点移动后自动追加一条 SDL_MULTIGESTURE(SDL_gesture.c),安卓 onNativeTouch 逐个手指入队、
+                                // 跨毫秒时它的时间戳与首条不等,就落到下面的 `_` 分支把合并循环打断:后面同一帧另一根手指的移动
+                                // 单独成一次单指 TouchesMove,6f60d7b 的同帧合并失效,捏合又一顿一顿、地图被拖。手势事件本来就
+                                // 不处理(外层也是 `_ => continue` 丢掉),在合并循环里无条件跳过即可。
                                 continue;
                             }
                             _ => {
