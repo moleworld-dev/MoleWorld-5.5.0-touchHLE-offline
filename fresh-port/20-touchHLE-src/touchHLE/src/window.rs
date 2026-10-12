@@ -497,6 +497,77 @@ fn init_touch_drag_slop(video_ctx: &sdl2::VideoSubsystem, window: &sdl2::video::
     );
 }
 
+/// [2026-10-10 触摸 P0] iOS 系统取消的触摸打负压力标记,与安卓 SDLSurface.java 的 ACTION_CANCEL 同一约定(见那里的注释)。
+/// SDL 自带的 SDL_uikitview(rust-sdl2 捆绑的 C/ObjC 源码,不在 vendor/SDL 里)`touchesCancelled:withEvent:` 直接调
+/// `touchesEnded:withEvent:`,来电、下拉通知/控制中心、主屏手势、系统手势识别器接管时,按着的手指被当成普通抬起交给游戏 → 误点。
+/// 这里在运行时把 touchesCancelled 换成:置标记 → 调原 touchesEnded → 清标记;`pressureForTouch:` 在标记期间返回 -1,
+/// SDL_SendTouch 原样带进 FINGERUP,事件循环见到负压力的抬起就改发 TouchesCancel。正常抬起的压力(touch.force 或 1.0)恒非负。
+#[cfg(target_os = "ios")]
+mod ios_touch_cancel {
+    use std::ffi::{c_char, c_void};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    type Id = *mut c_void;
+    type Sel = *const c_void;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn class_getInstanceMethod(cls: *mut c_void, sel: Sel) -> *mut c_void;
+        fn method_getImplementation(m: *mut c_void) -> *const c_void;
+        fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
+    }
+
+    static CANCELLING: AtomicBool = AtomicBool::new(false);
+    static ENDED_IMP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static ENDED_SEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static PRESSURE_IMP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    extern "C" fn touches_cancelled(this: Id, _cmd: Sel, touches: Id, event: Id) {
+        let ended: extern "C" fn(Id, Sel, Id, Id) =
+            unsafe { std::mem::transmute(ENDED_IMP.load(Ordering::Relaxed)) };
+        CANCELLING.store(true, Ordering::Relaxed);
+        ended(this, ENDED_SEL.load(Ordering::Relaxed), touches, event);
+        CANCELLING.store(false, Ordering::Relaxed);
+    }
+
+    extern "C" fn pressure_for_touch(this: Id, cmd: Sel, touch: Id) -> f32 {
+        if CANCELLING.load(Ordering::Relaxed) {
+            return -1.0;
+        }
+        let orig: extern "C" fn(Id, Sel, Id) -> f32 =
+            unsafe { std::mem::transmute(PRESSURE_IMP.load(Ordering::Relaxed)) };
+        orig(this, cmd, touch)
+    }
+
+    pub fn install() {
+        unsafe {
+            let cls = objc_getClass(c"SDL_uikitview".as_ptr());
+            if cls.is_null() {
+                log!("[触摸] 找不到 SDL_uikitview,iOS 系统取消仍按抬起处理");
+                return;
+            }
+            let sel_ended = sel_registerName(c"touchesEnded:withEvent:".as_ptr());
+            let sel_cancelled = sel_registerName(c"touchesCancelled:withEvent:".as_ptr());
+            let sel_pressure = sel_registerName(c"pressureForTouch:".as_ptr());
+            let m_ended = class_getInstanceMethod(cls, sel_ended);
+            let m_cancelled = class_getInstanceMethod(cls, sel_cancelled);
+            let m_pressure = class_getInstanceMethod(cls, sel_pressure);
+            if m_ended.is_null() || m_cancelled.is_null() || m_pressure.is_null() {
+                log!("[触摸] SDL_uikitview 缺少触摸方法,iOS 系统取消仍按抬起处理");
+                return;
+            }
+            ENDED_IMP.store(method_getImplementation(m_ended) as *mut c_void, Ordering::Relaxed);
+            ENDED_SEL.store(sel_ended as *mut c_void, Ordering::Relaxed);
+            PRESSURE_IMP.store(method_getImplementation(m_pressure) as *mut c_void, Ordering::Relaxed);
+            method_setImplementation(m_pressure, pressure_for_touch as *const c_void);
+            method_setImplementation(m_cancelled, touches_cancelled as *const c_void);
+            log!("[触摸] 已接管 SDL_uikitview touchesCancelled:系统取消的触摸按取消交给游戏");
+        }
+    }
+}
+
 /// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
 /// (多指手势不抑制移动、抬起也按真实坐标上报)。同一手指号重复按下(漏了抬起)直接覆盖。
 fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<FingerId, Coords>) {
@@ -1043,6 +1114,8 @@ impl Window {
             let (pw, ph) = device_family.portrait_size();
             init_touch_drag_slop(&video_ctx, &window, pw.min(ph));
         }
+        #[cfg(target_os = "ios")]
+        ios_touch_cancel::install();
 
         if env::consts::OS == "android" {
             // Sanity check
@@ -1839,6 +1912,7 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 }
                 | E::FingerMotion {
@@ -1846,6 +1920,7 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 }
                 | E::FingerDown {
@@ -1853,9 +1928,14 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    pressure,
                     ..
                 } => {
                     log_dbg!("Starting multi-touch for {:?}", event);
+                    // [2026-10-10 触摸 P0] 系统取消的触摸:安卓 SDLSurface.java 对 ACTION_CANCEL、iOS ios_touch_cancel 对
+                    // touchesCancelled 都发压力 -1 的抬起(见两处注释)。
+                    // 正常抬起压力恒非负。这组抬起改为 TouchesCancel,合并循环只把同样是取消的抬起并进来。
+                    let cancelled = matches!(event, E::FingerUp { .. }) && pressure < 0.0;
                     // To implement multi-touch we accumulate here same touch
                     // events at the same timestamp. This is consistent with
                     // UIKit, but could be broken if events come out of order.
@@ -1877,6 +1957,7 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             }
                             | E::FingerMotion {
@@ -1884,6 +1965,7 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             }
                             | E::FingerDown {
@@ -1891,10 +1973,12 @@ impl Window {
                                 finger_id,
                                 x,
                                 y,
+                                pressure,
                                 ..
                             } if timestamp.wrapping_sub(curr_timestamp) <= MULTI_TOUCH_MERGE_MS
                                 && next.is_same_kind_as(&event)
-                                && !map.contains_key(&FingerId::Touch(finger_id)) =>
+                                && !map.contains_key(&FingerId::Touch(finger_id))
+                                && (!matches!(next, E::FingerUp { .. }) || (pressure < 0.0) == cancelled) =>
                             {
                                 // [2026-10-06 第九轮 R9-B3] 合并窗口从「毫秒时间戳完全相等」放宽到「与首条相差不超过
                                 // MULTI_TOUCH_MERGE_MS 毫秒、且该手指还不在本组里」。安卓 SDLSurface.onTouch 对一次 ACTION_MOVE
@@ -1928,6 +2012,15 @@ impl Window {
                     log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
                     // [2026-10-05 第九轮 R9-B8] 单指起拖阈值(见 touch_drag_slop)。
                     match event {
+                        E::FingerUp { .. } if cancelled => {
+                            for finger in map.keys() {
+                                if let FingerId::Touch(id) = *finger {
+                                    self.touch_drag.remove(&id);
+                                }
+                            }
+                            log!("[触摸] 系统取消了 {} 根手指的触摸,按取消交给游戏(不算点击)", map.len());
+                            Event::TouchesCancel(map)
+                        }
                         E::FingerUp { .. } => {
                             touch_slop_up(&mut self.touch_drag, &mut map);
                             Event::TouchesUp(map)
