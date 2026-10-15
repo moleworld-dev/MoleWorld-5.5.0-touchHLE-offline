@@ -66,7 +66,11 @@ impl_HostObject_with_superclass!(UITextViewHostObject);
 impl Default for UITextViewHostObject {
     fn default() -> Self {
         UITextViewHostObject {
-            superclass: Default::default(),
+            // [2026-10-11 触摸 P0] 不沿响应链转发触摸(同 UITableView)。下面 touchesBegan: 只 becomeFirstResponder、不转发,
+            // 抬起/取消却继承 UIScrollView 的实现转发给 nextResponder(游戏把输入框直接 addSubview 到 EAGLView):
+            // EAGLView 收到没有按下的孤立抬起,CCTouchDispatcher 交给全部标准代理——-[ActorManager touchEnd:]@0x9df24
+            // 不查按下状态,按输入框局部坐标在 NPC/动物上做命中;好友地图收起搜索结果抽屉。真机 UITextView 自己消费触摸。
+            superclass: super::UIScrollViewHostObject::without_touch_forwarding(),
             // iOS 的 UITextView.editable 默认 YES(游戏多半不显式设);touchHLE 原来默认 false
             // 会让没设过 editable 的留言框拒绝 becomeFirstResponder → 输入不进。改为匹配 iOS。
             editable: true,
