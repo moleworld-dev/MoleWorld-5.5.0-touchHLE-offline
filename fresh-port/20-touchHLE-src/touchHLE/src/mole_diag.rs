@@ -23,7 +23,7 @@
 //!
 //! Output goes to `/tmp/mole_diag.log`, truncated once per emulator run.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -264,7 +264,15 @@ const FINGER_UP: u32 = sdl2::sys::SDL_EventType::SDL_FINGERUP as u32;
 /// [2026-10-10 触摸 P0] edge_gap_ms > 0 时,两指相邻的按下/抬起之间改睡这么久(模拟两指先后落下、先后松开,
 /// 超过窗口层同帧合并的 4ms);up_pressure 是抬起事件的压力(-1 = 系统取消,见 window.rs)。
 fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool, edge_gap_ms: u64, up_pressure: f32) {
+    // [2026-10-11 触摸 P0] dx/dy 按同一手指上一条的坐标算(与 SDL_SendTouchMotion 一致):窗口层丢弃 dx==dy==0 的移动
+    // (只有压力变化),注入的移动也要带上真实位移。
+    let mut last: HashMap<i64, (f32, f32)> = HashMap::new();
     for (i, &(type_, finger, x, y)) in seq.iter().enumerate() {
+        let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+        let (dx, dy) = match last.insert(finger, (x, y)) {
+            Some((lx, ly)) if type_ != FINGER_DOWN => (x - lx, y - ly),
+            _ => (0.0, 0.0),
+        };
         if i > 0 {
             let pair = seq[i - 1].0 == type_ && seq[i - 1].1 != finger;
             let edge = type_ == FINGER_DOWN || type_ == FINGER_UP;
@@ -284,10 +292,10 @@ fn push_sdl_finger_events(seq: &[(u32, i64, f32, f32)], pair_same_ts: bool, edge
             // 与真机设备号、SDL_MOUSE_TOUCHID(-1)都不冲突的测试设备号。
             touchId: 0x4d4f4c45,
             fingerId: finger,
-            x: x.clamp(0.0, 1.0),
-            y: y.clamp(0.0, 1.0),
-            dx: 0.0,
-            dy: 0.0,
+            x,
+            y,
+            dx,
+            dy,
             pressure: if type_ == FINGER_UP { up_pressure } else { 1.0 },
             windowID: 0,
         };
@@ -483,6 +491,34 @@ pub fn next_inject() -> Option<Inject> {
             log_line(&format!(
                 "INJECT fpinch ({}, {}) 间距 {} -> {} ({} steps, split={}, gap={}ms)",
                 cx, cy, d0, d1, steps, split, gap
+            ));
+            None
+        }
+        // [2026-10-11 触摸 P0] `frest <ax> <ay> <bx0> <by0> <bx1> <by1> [步数] [抖动]`:手指 0 按在 (ax,ay) 不动,手指 1 从 B0 拖到 B1,
+        // 每一步两根手指各报一次移动(同一毫秒,像安卓一次 ACTION_MOVE 带上全部手指):手指 0 坐标不变(只有压力变化,dx=dy=0),
+        // 抖动 > 0 时改为在按下点左右交替偏这么多(归一化)。复现「一指搭在屏幕上、另一指拖地图」。坐标同 fdrag。
+        Some("frest") => {
+            let ax: f32 = it.next()?.parse().ok()?;
+            let ay: f32 = it.next()?.parse().ok()?;
+            let bx0: f32 = it.next()?.parse().ok()?;
+            let by0: f32 = it.next()?.parse().ok()?;
+            let bx1: f32 = it.next()?.parse().ok()?;
+            let by1: f32 = it.next()?.parse().ok()?;
+            let steps: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(12).clamp(1, 120);
+            let jitter: f32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let mut seq = vec![(FINGER_DOWN, 0, ax, ay), (FINGER_DOWN, 1, bx0, by0)];
+            for i in 1..=steps {
+                let t = i as f32 / steps as f32;
+                let jx = if jitter > 0.0 { if i % 2 == 1 { jitter } else { -jitter } } else { 0.0 };
+                seq.push((FINGER_MOTION, 0, ax + jx, ay));
+                seq.push((FINGER_MOTION, 1, bx0 + (bx1 - bx0) * t, by0 + (by1 - by0) * t));
+            }
+            seq.push((FINGER_UP, 1, bx1, by1));
+            seq.push((FINGER_UP, 0, ax, ay));
+            push_sdl_finger_events(&seq, true, 40, 1.0);
+            log_line(&format!(
+                "INJECT frest 手指0 停在 ({}, {}) 抖动 {},手指1 ({}, {}) -> ({}, {}) ({} steps)",
+                ax, ay, jitter, bx0, by0, bx1, by1, steps
             ));
             None
         }
