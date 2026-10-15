@@ -122,6 +122,9 @@ impl ObjC {
                 "render",
                 // 每帧 drawScene 入口复位头像重建预算(anim_render_reset_frame_budget)。
                 "drawScene",
+                // [2026-10-15 隐形 P0] 新 AnimPlayer 初始化时清掉同地址旧对象的重建快照(anim_render_forget)。
+                // 全二进制只有 -[AnimInstance initWithAsprite:…] 里 0x20e598 / 0x20e706 两处调用。
+                "initAnimPlayer:batchNode:parent:posX:posY:",
                 "showNetWorkError",
                 // [合并注 2026-09-24] main 的 F1-05(2026-09-16)删掉了钩子块里 -[UserInfoData initWithCoder:] 贝壳还原臂
                 // 与 LogoLayer 四个标题页按钮(onMenuKefu/ChangeAccount/ChangePlayer/VersionInfo)删档臂,这里同步去掉
