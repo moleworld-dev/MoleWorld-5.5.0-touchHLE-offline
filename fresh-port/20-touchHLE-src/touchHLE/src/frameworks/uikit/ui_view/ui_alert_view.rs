@@ -156,8 +156,13 @@ const BTN_GAP: CGFloat = 10.0;
 const TITLE_FONT_SIZE: CGFloat = 21.0;
 const MESSAGE_FONT_SIZE: CGFloat = 17.0;
 const BUTTON_FONT_SIZE: CGFloat = 18.0;
-/// 松手判定的容差:手指从按钮上略微滑出仍算点击。
-const UP_SLOP: CGFloat = 24.0;
+/// 松手判定的容差:手指从【按下的那个】按钮上滑出这么远仍算点击(UIControl 跟踪时 bounds 外约 70 点仍算内部)。
+/// [2026-10-11 触摸 P0] 原来 24 点且在全部按钮里找第一个命中的:两键并排时左键的容差区盖住右键最左边 14 点,
+/// 按下是右键、松手先命中左键,down≠up 不算点击,手指不动也必然失败。改为只判按下的那个按钮。
+const UP_SLOP: CGFloat = 70.0;
+/// [2026-10-11 触摸 P0] 按下判定的容差:落在按钮外这么近的点按最近的按钮算(按钮行上方 18 点、两键间 10 点的空隙
+/// 不再是死区)。长屏手机上 768 逻辑点只有约 390pt,46 点高的按钮才约 23pt,零容差很容易按偏。
+const DOWN_SLOP: CGFloat = 18.0;
 /// 同时排队的弹框上限;超出后按旧行为自动关闭,防止周期性弹框无限堆积。
 const MAX_QUEUED: usize = 8;
 
@@ -666,7 +671,7 @@ fn filter_touches_down(
                 continue;
             }
             let (lx, ly) = overlay.map.guest_to_logical(x, y);
-            let pressed = hit_button(overlay, lx, ly, 0.0);
+            let pressed = hit_button(overlay, lx, ly, DOWN_SLOP);
             let better = match chosen {
                 None => true,
                 Some((_, previous)) => previous.is_none() && pressed.is_some(),
@@ -733,10 +738,9 @@ fn filter_touches_end(
                             Some(0)
                         } else {
                             let (lx, ly) = overlay.map.guest_to_logical(x, y);
-                            match (capture.pressed, hit_button(overlay, lx, ly, UP_SLOP)) {
-                                (Some(down), Some(up)) if down == up => Some(down),
-                                _ => None,
-                            }
+                            capture
+                                .pressed
+                                .filter(|&down| button_contains(overlay, down, lx, ly, UP_SLOP))
                         }
                     }
                     _ => None,
@@ -760,14 +764,30 @@ fn filter_touches_end(
     }
 }
 
+/// 点到按钮矩形的距离(在矩形内为 0)。
+fn button_distance(&(x, y, w, h, _): &(CGFloat, CGFloat, CGFloat, CGFloat, NSInteger), lx: CGFloat, ly: CGFloat) -> CGFloat {
+    let dx = (x - lx).max(0.0).max(lx - (x + w));
+    let dy = (y - ly).max(0.0).max(ly - (y + h));
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// [2026-10-11 触摸 P0] 按下:距离不超过 slop 的按钮里取最近的一个(在某个按钮内部时距离为 0,必然选它)。
 fn hit_button(overlay: &Overlay, lx: CGFloat, ly: CGFloat, slop: CGFloat) -> Option<NSInteger> {
     overlay
         .buttons
         .iter()
-        .find(|&&(x, y, w, h, _)| {
-            lx >= x - slop && lx <= x + w + slop && ly >= y - slop && ly <= y + h + slop
-        })
-        .map(|&(_, _, _, _, index)| index)
+        .map(|b| (button_distance(b, lx, ly), b.4))
+        .filter(|&(d, _)| d <= slop)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, index)| index)
+}
+
+/// [2026-10-11 触摸 P0] 松手:只看按下的那个按钮外扩 slop 后是否仍包含抬起点。
+fn button_contains(overlay: &Overlay, index: NSInteger, lx: CGFloat, ly: CGFloat, slop: CGFloat) -> bool {
+    overlay
+        .buttons
+        .iter()
+        .any(|b| b.4 == index && button_distance(b, lx, ly) <= slop)
 }
 
 fn rect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) -> CGRect {

@@ -704,6 +704,8 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
         .register_host_selector("touchesCancelled:withEvent:".to_string(), &mut env.mem);
     // [复核修 2026-09-15] R1-3 返修:本次取消送到了走 GameManager/NewGameManager 的村庄层,发完要清 ObjSelector 残留。
     let mut village_cancel = false;
+    // [2026-10-11 触摸 P0] 本次取消送到了好友地图层,发完要复位头像单元的按下标志(见 reset_friends_village_after_cancel)。
+    let mut friends_layers: Vec<id> = Vec::new();
     for (view, touches) in view_touches {
         // 开始时没投递给任何视图的触点(view 为 nil,见 handle_touches_down)无处可发。
         if view == nil {
@@ -723,6 +725,9 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
         // 才认得出是谁认领了它)。
         if let Some(list) = view_touch_lists.get(&view) {
             village_cancel |= cocos2d_prepare_cancel(env, view, list);
+            if let Some(layer) = find_standard_delegate(env, view, &["FriendsVillageLayer"]) {
+                friends_layers.push(layer);
+            }
         }
         log_dbg!(
             "Sending [{:?} touchesCancelled:{:?} withEvent:{:?}]",
@@ -734,6 +739,9 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
     }
     if village_cancel {
         reset_obj_selector_after_cancel(env);
+    }
+    for layer in friends_layers {
+        reset_friends_village_after_cancel(env, layer);
     }
 
     release(env, pool);
@@ -781,18 +789,55 @@ fn mark_village_pinch(env: &mut Environment, view: id, list: &[(FingerId, id)]) 
     if standard == nil {
         return;
     }
-    let mut village = false;
+    // [2026-10-11 触摸 P0] 复核返修:标准代理里除了村庄层,还有别的「靠抬起干活」的标准代理时不记——剧情对话
+    // StoryLayer/TimeStoryLayer/VipStoryLayer/NewSceneStoryLayer 只实现 ccTouchesEnded:(补全文字/翻页),不认取消;
+    // 好友地图 FriendsVillageLayer 按抬起进好友庄园。把它们的抬起改成取消会让这一下没反应。
+    let ended_sel: SEL = env
+        .objc
+        .register_host_selector("ccTouchesEnded:withEvent:".to_string(), &mut env.mem);
+    let mut village: Option<&'static str> = None;
     let count: NSUInteger = msg![env; standard count];
     for i in 0..count {
         let handler: id = msg![env; standard objectAtIndex:i];
         let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
-        if class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS).is_some() {
-            village = true;
-            break;
+        if delegate == nil {
+            continue;
+        }
+        if let Some(hit) = class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS) {
+            village = Some(hit);
+            continue;
+        }
+        let responds: bool = msg![env; delegate respondsToSelector:ended_sel];
+        if responds {
+            return;
         }
     }
-    if !village {
+    let Some(village) = village else {
         return;
+    };
+    // [2026-10-11 触摸 P0] 复核返修:管理器交互关着时(-[StoryLayer beginStory]@0x114724 setIsInteractEnabled:NO 等)
+    // -[GameManager processTouch:withType:]@0x1a69a 直接返回,根本没缩放,不记。单例只读静态变量(GameManager
+    // +sharedManager@0x18b50 缓存在 0xb4095c,NewGameManager +sharedManager@0x2453e4 缓存在 0xb40be0),不发消息。
+    let (static_slot, manager_class) = if village == "VillageLayer" {
+        (0xb4095cu32, "GameManager")
+    } else {
+        (0xb40be0u32, "NewGameManager")
+    };
+    let manager_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+    let manager: id = Ptr::from_bits(manager_bits);
+    if class_chain_match(env, manager, &[manager_class]).is_none() {
+        return;
+    }
+    if let Some(ptr) = env
+        .objc
+        .object_lookup_ivar(&env.mem, manager, &"isInteractEnabled".to_string())
+    {
+        // BOOL(char,1 字节)。
+        let ptr: MutPtr<u8> = ptr.cast();
+        let enabled: u8 = env.mem.read(ptr);
+        if enabled == 0 {
+            return;
+        }
     }
     // 去掉被目标代理认领的触点(-[CCTouchDispatcher touches:withEvent:withTouchType:] 只把没认领的交给标准代理)。
     let mut unclaimed: Vec<FingerId> = list.iter().map(|&(finger, _)| finger).collect();
@@ -1061,6 +1106,53 @@ fn reset_obj_selector_after_cancel(env: &mut Environment) {
             );
         }
     }
+}
+
+/// [2026-10-11 触摸 P0] EAGLView 的标准代理里第一个类链命中 names 的代理(只读 ivar、发宿主实现的 count/objectAtIndex:)。
+fn find_standard_delegate(env: &mut Environment, view: id, names: &[&'static str]) -> Option<id> {
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return None;
+    }
+    let dispatcher = read_id_ivar(env, view, "touchDelegate_")?;
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return None;
+    }
+    let standard = read_id_ivar(env, dispatcher, "standardHandlers").unwrap_or(nil);
+    if standard == nil {
+        return None;
+    }
+    let count: NSUInteger = msg![env; standard count];
+    for i in 0..count {
+        let handler: id = msg![env; standard objectAtIndex:i];
+        let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if class_chain_match(env, delegate, names).is_some() {
+            return Some(delegate);
+        }
+    }
+    None
+}
+
+/// [2026-10-11 触摸 P0] 取消后复位好友地图头像单元的按下标志。
+/// -[FriendsVillageLayer ccTouchesCancelled:withEvent:]@0x104f64 只清 isMoving_;-[FriendVillageUnit touchBeganHandler:withEvent:]
+/// @0x10f0ec 命中头像时置 isTouched_=1,只有 touchEndedHandler 末尾与 resetTouch 清零,而 touchEndedHandler@0x10f174 不看抬起位置、
+/// 见 isTouched_ 就进那位好友的庄园。系统取消(安卓手势返回等)、切后台时按在头像上的手指被取消后,下一次在空白处单击就进了
+/// 之前按过的那位好友的庄园。原版自带 -[FriendsVillageLayer resetAllTouchs]@0x104c68(对全部单元 resetTouch),没有别的手指
+/// 还按着时调它。在运行循环处理事件时调用,可以发消息。
+fn reset_friends_village_after_cancel(env: &mut Environment, layer: id) {
+    if !env
+        .framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .is_empty()
+    {
+        return;
+    }
+    let sel: SEL = env
+        .objc
+        .register_host_selector("resetAllTouchs".to_string(), &mut env.mem);
+    let _: () = msg_send(env, (layer, sel));
+    log!("[触摸 P0] 取消触摸后复位好友地图头像的按下标志(resetAllTouchs)");
 }
 
 /// [2026-10-10 触摸 P0] 取消后把摆放中的 Porter / NewScenePorter 从「按下/拖动中」复位。
