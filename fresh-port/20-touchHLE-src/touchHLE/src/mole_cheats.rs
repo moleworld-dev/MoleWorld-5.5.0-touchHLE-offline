@@ -9170,10 +9170,19 @@ fn wide_bg_align_on_add_child(env: &mut Environment) {
 /// [MoleWorld 宽屏适配·居中偏移 v2 · UIKit 子视图] `addSubview:` 拦截(r0=父 view, r2=子 view)。
 /// 见 [UI43_VIEWS]:挂到 EAGLView 上、且 frame 完全落在 1024 设计区内的子视图 → x += off 并登记。
 /// 按真实 winSize 布局的全屏视图(HUD/整屏网页)不落在设计区里,天然不动。
+/// [2026-10-11 触摸 P0] 不右移的 addSubview: 调用点(返回地址,去掉 Thumb 位)。这些视图由 KEEP_REAL_WIDTH 类按真实屏宽摆放,
+/// 本来就对:-[InviteFriendsLayer init]@0x188b28 在 0x1897a0~0x18980c 把米米号输入框放在 x = winSize.宽 − 300、宽 220,
+/// 0x189c24 addSubview:。dd7e51e 把 InviteFriendsLayer 改成真实宽度后,逻辑宽 1026~1105 的屏(11 英寸 iPad、7:5 安卓平板)上
+/// x+w 恰好 ≤ 1025,下面的几何判定把它当成按 1024 设计坐标摆的视图又右移一次:输入框与底框错位、盖住放大镜按钮左侧。
+const UI43_SUBVIEW_KEEP_LRS: [u32; 1] = [0x189c28];
+
 fn ui43_on_add_subview(env: &mut Environment) {
     let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
     let child: id = Ptr::from_bits(env.cpu.regs()[2]);
     if child == nil || recv == nil || ui43_view_contains(child.to_bits()) {
+        return;
+    }
+    if UI43_SUBVIEW_KEEP_LRS.contains(&(env.cpu.regs()[14] & !1u32)) {
         return;
     }
     let off = ui43_offset_x(env);
