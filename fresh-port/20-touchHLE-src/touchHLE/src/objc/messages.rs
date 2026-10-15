@@ -621,6 +621,18 @@ fn objc_msgSend_inner(
                 }
             }
         } else {
+            // [2026-10-15 隐形 P0] 新 AnimPlayer 初始化:这个地址上的重建快照属于已释放的旧对象(分配器同尺寸后进先出复用),
+            // 清掉再照常派发,免得新对象第一帧被当成「状态没变」跳过。见 mole_cheats::anim_render_forget。
+            #[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]
+            {
+                let init_sel = env.objc.register_host_selector(
+                    "initAnimPlayer:batchNode:parent:posX:posY:".to_string(),
+                    &mut env.mem,
+                );
+                if selector == init_sel {
+                    crate::mole_cheats::anim_render_forget(receiver);
+                }
+            }
             // 每帧 drawScene 入口复位头像重建预算(早于本帧 updateTick→render 遍历)。不拦截,照常派发。
             let draw_scene_sel = env
                 .objc
