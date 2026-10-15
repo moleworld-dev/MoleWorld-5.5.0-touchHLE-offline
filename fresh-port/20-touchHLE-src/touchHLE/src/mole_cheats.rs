@@ -8193,7 +8193,10 @@ const ANIM_SLOT_CCSPRITE_TEXTURE: (u32, u32) = (0xb07128, 264); // CCSprite.text
 const ANIM_SLOT_CCSPRITE_OPACITY: (u32, u32) = (0xb070d8, 420); // CCSprite.opacity_,紧跟 color_ 三字节
 
 /// [2026-10-15 隐形 P0] 决定一次 render 能不能跳过所看的状态:AnimPlayer 的 m_parent@64 / curAnim@24 / curFrame@28 /
-/// curFlags@16 / sprite(ASprite)@20 / m_BatchNode@60,加上 m_parent 的 opacity_+color_(4 字节一起读)。
+/// curFlags@16 / sprite(ASprite)@20 / m_BatchNode@60 / posX@8 / posY@12,加上 m_parent 的 opacity_+color_(4 字节一起读)。
+/// posX/posY 是 render 传给 PaintAFrame 的坐标(0x20f3c6 / 0x20f3ec):NPC/摩尔复用已有实例只换位置重播时(-[NpcAnimation
+/// playASpriteAnimation…] 0xde0f6、-[MoleAnimation …] 0x38cba setPosX:posY:,同一动画 setAnim: 0x20f0fc 直接返回不动帧),
+/// 不进快照的话目标精灵会停在旧位置。
 /// 透明度与颜色只在重建时由 PaintModule(0x20d0fa-0x20d170)复制给模块精灵,不进快照的话,移动模式(MoveLayer 模式 3
 /// 把物品调成 0x404040/0x40,退出再调回)里重建过的静止物品退出后会一直停在半透明灰色。
 #[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
@@ -8205,6 +8208,8 @@ struct AnimSnap {
     flags: u32,
     sprite: u32,
     batch: u32,
+    pos_x: u32,
+    pos_y: u32,
     tint: u32,
 }
 
@@ -8485,6 +8490,8 @@ pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
         flags: rd(env, 16),
         sprite: rd(env, 20),
         batch: rd(env, 60),
+        pos_x: rd(env, 8),
+        pos_y: rd(env, 12),
         tint: env.mem.read(ConstPtr::<u32>::from_bits(m_parent + off_opacity)),
     };
     let now = Instant::now();
@@ -8502,7 +8509,16 @@ pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
         }
         match map.get(&base) {
             Some(e) if e.snap == snap => None, // ① 同状态 → 跳过
-            Some(_) if empty => Some(Lane::First),
+            // 有记录、容器为空:换了承载节点/ASprite/批节点的才算没画过,走首建;同一套节点上为空只说明上一次画的这一帧
+            // 本身是空帧(PaintFrame 0x20ca68 模块数为 0 等),按普通重画走节流与公平门槛,不占首建预留。
+            Some(e)
+                if empty
+                    && (e.snap.parent != snap.parent
+                        || e.snap.batch != snap.batch
+                        || e.snap.sprite != snap.sprite) =>
+            {
+                Some(Lane::First)
+            }
             Some(e) if now.duration_since(e.last) < min_interval => None, // ③ 节流
             Some(e) => Some(Lane::Redraw(Some(e.last))),
             None if empty => Some(Lane::First),
@@ -8519,11 +8535,11 @@ pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
             Lane::First => {
                 if f.used < cap {
                     f.used += 1;
-                    f.diag_first += 1;
+                    f.diag_first = f.diag_first.wrapping_add(1);
                     true
                 } else {
                     f.first_denied += 1;
-                    f.diag_first_denied += 1;
+                    f.diag_first_denied = f.diag_first_denied.wrapping_add(1);
                     false
                 }
             }
@@ -8538,9 +8554,9 @@ pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
                 if ok {
                     f.redraw_used += 1;
                     f.used += 1;
-                    f.diag_redraw += 1;
+                    f.diag_redraw = f.diag_redraw.wrapping_add(1);
                 } else {
-                    f.diag_redraw_denied += 1;
+                    f.diag_redraw_denied = f.diag_redraw_denied.wrapping_add(1);
                 }
                 ok
             }
