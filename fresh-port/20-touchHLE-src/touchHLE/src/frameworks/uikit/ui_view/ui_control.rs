@@ -14,7 +14,7 @@ pub mod ui_slider;
 pub mod ui_switch;
 pub mod ui_text_field;
 
-use crate::frameworks::core_graphics::CGPoint;
+use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
@@ -30,6 +30,21 @@ const UIControlEventTouchDragOutside: UIControlEvents = 1 << 3;
 const UIControlEventTouchDragEnter: UIControlEvents = 1 << 4;
 const UIControlEventTouchDragExit: UIControlEvents = 1 << 5;
 pub const UIControlEventTouchUpInside: UIControlEvents = 1 << 6;
+/// [2026-10-11 触摸 P0] 跟踪被取消(touchesCancelled)。
+const UIControlEventTouchCancel: UIControlEvents = 1 << 8;
+/// [2026-10-11 触摸 P0] 跟踪期间「仍在控件内」的外扩容差(点)。真机 UIControl 手指拖出 bounds 约 70 点内松手仍发
+/// TouchUpInside、保持高亮;原来按精确 bounds(pointInside:)判断,信件/搜索结果里 47×47 的回复、拜访按钮在手机上
+/// 约 4mm 见方,手指越过起拖阈值后顺势滑出一点就成了 TouchUpOutside,游戏只注册 TouchUpInside,点了没反应。
+const TRACKING_SLOP: f32 = 70.0;
+
+/// [2026-10-11 触摸 P0] 跟踪期间的「内部」判定:bounds 四边各外扩 TRACKING_SLOP。
+fn inside_tracking_bounds(env: &mut Environment, this: id, point: CGPoint) -> bool {
+    let bounds: CGRect = msg![env; this bounds];
+    point.x >= bounds.origin.x - TRACKING_SLOP
+        && point.x <= bounds.origin.x + bounds.size.width + TRACKING_SLOP
+        && point.y >= bounds.origin.y - TRACKING_SLOP
+        && point.y <= bounds.origin.y + bounds.size.height + TRACKING_SLOP
+}
 const UIControlEventTouchUpOutside: UIControlEvents = 1 << 7;
 pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
 
@@ -255,8 +270,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let old_pos: CGPoint = msg![env; touch previousLocationInView:this];
     let new_pos: CGPoint = msg![env; touch locationInView:this];
-    let was_inside = msg![env; this pointInside:old_pos withEvent:event];
-    let is_inside = msg![env; this pointInside:new_pos withEvent:event];
+    let was_inside = inside_tracking_bounds(env, this, old_pos);
+    let is_inside = inside_tracking_bounds(env, this, new_pos);
 
     // TODO: unclear if this is meant to be affected by tracking
     send_actions(env, this, event, match (was_inside, is_inside) {
@@ -279,13 +294,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setHighlighted:false];
 
     let new_pos: CGPoint = msg![env; touch locationInView:this];
-    let is_inside = msg![env; this pointInside:new_pos withEvent:event];
+    let is_inside = inside_tracking_bounds(env, this, new_pos);
 
     // TODO: unclear if this is meant to be affected by tracking
     send_actions(env, this, event, match is_inside {
         true => UIControlEventTouchUpInside,
         false => UIControlEventTouchUpOutside,
     });
+}
+// [2026-10-11 触摸 P0] 取消:结束跟踪、取消高亮,发 TouchCancel(不发 TouchUpInside)。原来没有覆写,继承 UIView 的实现沿
+// 响应链转发取消,控件自己的 tracked_touch/高亮留着,系统取消(来电、手势返回)后按钮停在按下态。
+- (())touchesCancelled:(id)touches // NSSet* of UITouch*
+             withEvent:(id)event { // UIEvent*
+    let touch: id = msg![env; touches anyObject];
+    let tracked_touch = env.objc.borrow::<UIControlHostObject>(this).tracked_touch;
+    if tracked_touch == nil || tracked_touch != touch {
+        return;
+    }
+    release(env, tracked_touch);
+    env.objc.borrow_mut::<UIControlHostObject>(this).tracked_touch = nil;
+    env.objc.borrow_mut::<UIControlHostObject>(this).tracking = false;
+    () = msg![env; this setHighlighted:false];
+    send_actions(env, this, event, UIControlEventTouchCancel);
 }
 
 - (())addTarget:(id)target
