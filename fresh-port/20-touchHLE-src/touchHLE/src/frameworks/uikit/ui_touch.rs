@@ -789,18 +789,55 @@ fn mark_village_pinch(env: &mut Environment, view: id, list: &[(FingerId, id)]) 
     if standard == nil {
         return;
     }
-    let mut village = false;
+    // [2026-10-11 触摸 P0] 复核返修:标准代理里除了村庄层,还有别的「靠抬起干活」的标准代理时不记——剧情对话
+    // StoryLayer/TimeStoryLayer/VipStoryLayer/NewSceneStoryLayer 只实现 ccTouchesEnded:(补全文字/翻页),不认取消;
+    // 好友地图 FriendsVillageLayer 按抬起进好友庄园。把它们的抬起改成取消会让这一下没反应。
+    let ended_sel: SEL = env
+        .objc
+        .register_host_selector("ccTouchesEnded:withEvent:".to_string(), &mut env.mem);
+    let mut village: Option<&'static str> = None;
     let count: NSUInteger = msg![env; standard count];
     for i in 0..count {
         let handler: id = msg![env; standard objectAtIndex:i];
         let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
-        if class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS).is_some() {
-            village = true;
-            break;
+        if delegate == nil {
+            continue;
+        }
+        if let Some(hit) = class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS) {
+            village = Some(hit);
+            continue;
+        }
+        let responds: bool = msg![env; delegate respondsToSelector:ended_sel];
+        if responds {
+            return;
         }
     }
-    if !village {
+    let Some(village) = village else {
         return;
+    };
+    // [2026-10-11 触摸 P0] 复核返修:管理器交互关着时(-[StoryLayer beginStory]@0x114724 setIsInteractEnabled:NO 等)
+    // -[GameManager processTouch:withType:]@0x1a69a 直接返回,根本没缩放,不记。单例只读静态变量(GameManager
+    // +sharedManager@0x18b50 缓存在 0xb4095c,NewGameManager +sharedManager@0x2453e4 缓存在 0xb40be0),不发消息。
+    let (static_slot, manager_class) = if village == "VillageLayer" {
+        (0xb4095cu32, "GameManager")
+    } else {
+        (0xb40be0u32, "NewGameManager")
+    };
+    let manager_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+    let manager: id = Ptr::from_bits(manager_bits);
+    if class_chain_match(env, manager, &[manager_class]).is_none() {
+        return;
+    }
+    if let Some(ptr) = env
+        .objc
+        .object_lookup_ivar(&env.mem, manager, &"isInteractEnabled".to_string())
+    {
+        // BOOL(char,1 字节)。
+        let ptr: MutPtr<u8> = ptr.cast();
+        let enabled: u8 = env.mem.read(ptr);
+        if enabled == 0 {
+            return;
+        }
     }
     // 去掉被目标代理认领的触点(-[CCTouchDispatcher touches:withEvent:withTouchType:] 只把没认领的交给标准代理)。
     let mut unclaimed: Vec<FingerId> = list.iter().map(|&(finger, _)| finger).collect();
