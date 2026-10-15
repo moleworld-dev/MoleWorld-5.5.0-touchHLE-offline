@@ -568,8 +568,12 @@ mod ios_touch_cancel {
     }
 }
 
-/// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。按着的手指超过一根时,全部标为已起拖
-/// (多指手势不抑制移动、抬起也按真实坐标上报)。同一手指号重复按下(漏了抬起)直接覆盖。
+/// [2026-10-05 第九轮 R9-B8] 触屏手指按下:记下每根手指的按下点。同一手指号重复按下(漏了抬起)直接覆盖。
+/// [2026-10-11 触摸 P0] 以前按着的手指超过一根时全部标为已起拖,多指时不再抑制任何移动。安卓一根手指搭在屏幕上不动
+/// (握持时拇指常压着边缘)时,它的细小抖动于是都下发了:与另一根手指的拖动凑成两指移动,GameManager 见 count==2
+/// 改做 zoom:touch2:,拖地图变成缩放,摆放中的建筑也拖不动;另一根手指点建筑时第一根的抖动又置了 ObjSelector.isMoved,
+/// 点击被吞。改为每根手指各自保留阈值(与真机每个触点各自的起始迟滞一致):搭着不动的手指不越过阈值就一直不报移动;
+/// 捏合时两指各自挪过阈值后照常成对下发。
 fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<FingerId, Coords>) {
     for (finger, &coords) in map {
         if let FingerId::Touch(id) = *finger {
@@ -581,11 +585,6 @@ fn touch_slop_down(state: &mut HashMap<i64, MouseDragState>, map: &HashMap<Finge
                     last: None,
                 },
             );
-        }
-    }
-    if state.len() > 1 {
-        for drag in state.values_mut() {
-            drag.broke = true;
         }
     }
 }
@@ -2026,6 +2025,8 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    dx,
+                    dy,
                     pressure,
                     ..
                 }
@@ -2034,6 +2035,8 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    dx,
+                    dy,
                     pressure,
                     ..
                 }
@@ -2042,10 +2045,16 @@ impl Window {
                     finger_id,
                     x,
                     y,
+                    dx,
+                    dy,
                     pressure,
                     ..
                 } => {
                     log_dbg!("Starting multi-touch for {:?}", event);
+                    // [2026-10-11 触摸 P0] 只有压力变了、坐标没变的移动不算移动(见合并循环里同样的处理)。
+                    if matches!(event, E::FingerMotion { .. }) && dx == 0.0 && dy == 0.0 {
+                        continue;
+                    }
                     // [2026-10-10 触摸 P0] 系统取消的触摸:安卓 SDLSurface.java 对 ACTION_CANCEL、iOS ios_touch_cancel 对
                     // touchesCancelled 都发压力 -1 的抬起(见两处注释)。
                     // 正常抬起压力恒非负。这组抬起改为 TouchesCancel,合并循环只把同样是取消的抬起并进来。
@@ -2066,6 +2075,13 @@ impl Window {
                             _ => log_dbg!("Next possible multi-touch event: {:?}", next),
                         }
                         match next {
+                            // [2026-10-11 触摸 P0] 只有压力变了、坐标没变的 FingerMotion 直接丢掉、不打断合并。SDL_SendTouchMotion
+                            // 只在坐标和压力都没变时才不发(SDL_touch.c),安卓每次 ACTION_MOVE 都带上全部按着的手指,静止手指的
+                            // 压力几乎每帧在变,于是不停发坐标不变的移动。ui_touch 的两指补报(e02b64f)以「SDL 只对坐标真变了的
+                            // 手指发移动」为前提,这类事件会把一根搭着不动的手指补报成零位移移动,拖地图变成缩放。
+                            E::FingerMotion { dx, dy, .. } if dx == 0.0 && dy == 0.0 => {
+                                continue;
+                            }
                             E::FingerUp {
                                 timestamp,
                                 finger_id,

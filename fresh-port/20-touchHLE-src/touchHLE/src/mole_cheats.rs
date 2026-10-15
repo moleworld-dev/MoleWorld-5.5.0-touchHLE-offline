@@ -8165,75 +8165,293 @@ fn update_debug_hud(env: &mut Environment, mimi: u32) {
     log!("[MOLECHEAT] 调试悬浮窗已创建(默认关,MOLE_HUD=1 开启)");
 }
 
-/// [MoleWorld iOS perf · 点好友卡死根治] 单个 AnimPlayer 两次"真重建"之间的最小 host 墙钟间隔
+/// [MoleWorld iOS perf · 点好友卡死根治] 单个 AnimPlayer 两次「重画」之间的最小 host 墙钟间隔
 /// (≈15fps/头像)。用【host 时间】而非 curFrame 判据 → 对解释器单帧耗时免疫(dt 死亡螺旋里
-/// curFrame 每帧都变也不会让它疯狂重建)。
+/// curFrame 每帧都变也不会让它疯狂重建)。测试可用 MOLE_ANIM_MIN_INTERVAL_MS 覆盖。
 #[cfg_attr(
     not(any(target_os = "ios", feature = "cpu_interpreter")),
     allow(dead_code)
 )]
 const ANIM_REBUILD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
-/// [MoleWorld iOS perf] 单个 drawScene 帧内允许的头像"真重建"数量【硬上限】。这是防冻结的关键:
-/// 无论好友村有多少头像、dt 多大,一帧最多重建这么多个,其余的沿用上一帧已建好的 sprite、留到后续
-/// 帧摊销 → 保证 drawScene 必然快速返回、必然出帧,不再"永不返回=冻死"。每帧在 drawScene 入口复位。
+/// [MoleWorld iOS perf] 单个 drawScene 帧内【真重建总数】的硬上限(首建与重画共用一个计数)。这是防冻结的
+/// 关键:无论好友村有多少头像、dt 多大,一帧最多重建这么多个,其余留到后续帧摊销 → drawScene 必然快速返回、
+/// 必然出帧。每帧在 drawScene 入口复位。测试可用 MOLE_ANIM_BUDGET 覆盖(模拟慢机)。
 #[cfg_attr(
     not(any(target_os = "ios", feature = "cpu_interpreter")),
     allow(dead_code)
 )]
 const ANIM_REBUILD_BUDGET_PER_FRAME: u32 = 16;
+/// [2026-10-15 隐形 P0] 运行时读取的 ivar 偏移槽(游戏二进制的 _OBJC_IVAR_ 变量,值是 touchHLE 非脆弱 ivar 修正后的
+/// 真实偏移;读到 0 或离谱值时退回括号里的静态偏移)。
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+const ANIM_SLOT_CCNODE_CHILDREN: (u32, u32) = (0xb06ee4, 208); // CCNode.children_(CCArray*,延迟创建,可为 nil)
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+const ANIM_SLOT_CCARRAY_DATA: (u32, u32) = (0xb073d8, 4); // CCArray.data → ccArray{num@0,max@4,arr@8}
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+const ANIM_SLOT_CCSPRITE_TEXTURE: (u32, u32) = (0xb07128, 264); // CCSprite.texture_
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+const ANIM_SLOT_CCSPRITE_OPACITY: (u32, u32) = (0xb070d8, 420); // CCSprite.opacity_,紧跟 color_ 三字节
 
-thread_local! {
-    /// [MoleWorld iOS perf · 点好友卡死根治] 每个 AnimPlayer 的:上次"真重建"时的动画状态快照
-    /// (m_parent, curAnim, curFrame, curFlags) + 上次真重建的 host 时刻。按 AnimPlayer 指针索引。
-    /// 见 [anim_render_should_skip]。
-    static ANIM_RENDER_SNAP: RefCell<HashMap<u32, ((u32, u32, u32, u32), Instant)>> =
-        RefCell::new(HashMap::new());
-    /// 本 drawScene 帧剩余的头像重建预算(在 drawScene 入口由 [anim_render_reset_frame_budget] 复位)。
-    static ANIM_REBUILD_BUDGET: Cell<u32> = const { Cell::new(ANIM_REBUILD_BUDGET_PER_FRAME) };
+/// [2026-10-15 隐形 P0] 决定一次 render 能不能跳过所看的状态:AnimPlayer 的 m_parent@64 / curAnim@24 / curFrame@28 /
+/// curFlags@16 / sprite(ASprite)@20 / m_BatchNode@60,加上 m_parent 的 opacity_+color_(4 字节一起读)。
+/// 透明度与颜色只在重建时由 PaintModule(0x20d0fa-0x20d170)复制给模块精灵,不进快照的话,移动模式(MoveLayer 模式 3
+/// 把物品调成 0x404040/0x40,退出再调回)里重建过的静止物品退出后会一直停在半透明灰色。
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AnimSnap {
+    parent: u32,
+    anim: u32,
+    frame: u32,
+    flags: u32,
+    sprite: u32,
+    batch: u32,
+    tint: u32,
 }
 
-/// [MoleWorld iOS perf] 每帧(drawScene 入口)复位头像重建预算。由 objc/messages.rs 在派发
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+struct AnimSnapEntry {
+    /// 上次【本对象】被放行真重建时的状态。
+    snap: AnimSnap,
+    /// 上次真重建的 host 时刻。
+    last: Instant,
+}
+
+/// [2026-10-15 隐形 P0] 每帧的重建调度状态(drawScene 入口由 [anim_render_reset_frame_budget] 结算并复位)。
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+#[derive(Default)]
+struct AnimFrameState {
+    /// 本帧已放行的真重建总数(首建 + 重画),不超过 [anim_cap]。
+    used: u32,
+    /// 本帧重画最多可用 = 上限 − 给首建预留的名额(上一帧首建被挡多少就预留多少)。
+    redraw_quota: u32,
+    redraw_used: u32,
+    /// 本帧首建被挡次数,下一帧据此预留名额。
+    first_denied: u32,
+    /// 公平门槛:None = 不限;Some(t) = 本帧重画只放行「上次重建时刻 ≤ t」的对象(上一帧想重画的对象里最久没重画的
+    /// 前 redraw_quota 个)。时刻为 None 表示表里没有记录,视为最久。
+    redraw_limit: Option<Option<Instant>>,
+    /// 本帧所有想重画的对象的上次重建时刻(含被挡的),下一帧据此算门槛。
+    redraw_wants: Vec<Option<Instant>>,
+    diag_frames: u32,
+    diag_rebuilds: u32,
+    diag_max: u32,
+    diag_first: u32,
+    diag_first_denied: u32,
+    diag_redraw: u32,
+    diag_redraw_denied: u32,
+}
+
+thread_local! {
+    /// [MoleWorld iOS perf · 点好友卡死根治] 每个 AnimPlayer(按指针)上次真重建时的状态与时刻,见 [anim_render_should_skip]。
+    /// [2026-10-15 隐形 P0] 新 AnimPlayer 初始化时由 [anim_render_forget] 清掉同地址旧对象留下的表项。
+    static ANIM_RENDER_SNAP: RefCell<HashMap<u32, AnimSnapEntry>> = RefCell::new(HashMap::new());
+    static ANIM_FRAME: RefCell<AnimFrameState> = RefCell::new(AnimFrameState::default());
+    /// (children, data, texture, opacity) 的实际偏移,首次用到时从槽里读一次。
+    static ANIM_OFFS: Cell<Option<(u32, u32, u32, u32)>> = const { Cell::new(None) };
+}
+
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_diag() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MOLE_ANIM_DIAG").is_some())
+}
+
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_cap() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_ANIM_BUDGET")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(ANIM_REBUILD_BUDGET_PER_FRAME)
+    })
+}
+
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_min_interval() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOLE_ANIM_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(ANIM_REBUILD_MIN_INTERVAL)
+    })
+}
+
+/// [MoleWorld iOS perf] 每帧(drawScene 入口)结算上一帧、复位本帧的重建调度。由 objc/messages.rs 在派发
 /// `-[CCDirector drawScene]` 时调用,早于本帧的 updateTick→render 遍历。
 #[cfg_attr(
     not(any(target_os = "ios", feature = "cpu_interpreter")),
     allow(dead_code)
 )]
 pub fn anim_render_reset_frame_budget() {
-    ANIM_REBUILD_BUDGET.with(|b| b.set(ANIM_REBUILD_BUDGET_PER_FRAME));
+    let cap = anim_cap();
+    let table_len = if anim_diag() {
+        ANIM_RENDER_SNAP.with(|m| m.borrow().len())
+    } else {
+        0
+    };
+    ANIM_FRAME.with(|f| {
+        let mut f = f.borrow_mut();
+        if anim_diag() {
+            f.diag_frames += 1;
+            f.diag_rebuilds += f.used;
+            f.diag_max = f.diag_max.max(f.used);
+            if f.diag_frames >= 300 {
+                log!(
+                    "[ANIM] 近 {} 帧:真重建 {} 次(单帧最多 {},上限 {}),首建 {} / 被挡 {},重画 {} / 被挡 {},快照表 {} 项",
+                    f.diag_frames,
+                    f.diag_rebuilds,
+                    f.diag_max,
+                    cap,
+                    f.diag_first,
+                    f.diag_first_denied,
+                    f.diag_redraw,
+                    f.diag_redraw_denied,
+                    table_len
+                );
+                f.diag_frames = 0;
+                f.diag_rebuilds = 0;
+                f.diag_max = 0;
+                f.diag_first = 0;
+                f.diag_first_denied = 0;
+                f.diag_redraw = 0;
+                f.diag_redraw_denied = 0;
+            }
+        }
+        let reserve = f.first_denied.min(cap);
+        let quota = cap - reserve;
+        let mut wants = std::mem::take(&mut f.redraw_wants);
+        f.redraw_limit = if quota == 0 || wants.len() <= quota as usize {
+            None
+        } else {
+            let (_, nth, _) = wants.select_nth_unstable(quota as usize - 1);
+            Some(*nth)
+        };
+        wants.clear();
+        f.redraw_wants = wants;
+        f.used = 0;
+        f.redraw_used = 0;
+        f.redraw_quota = quota;
+        f.first_denied = 0;
+    });
 }
 
-/// [MoleWorld iOS perf] 跳过冗余的每帧头像 ASprite 重建(★"点好友卡死"根治)。
+/// [2026-10-15 隐形 P0] -[AnimPlayer initAnimPlayer:batchNode:parent:posX:posY:]@0x20edd4 派发前调用(messages.rs):
+/// 这个地址上的快照属于已释放的旧对象,清掉。touchHLE 的分配器同尺寸后进先出复用(AnimPlayer 80 字节块、CCSprite 480),
+/// -[StableAnimation playASpriteAnimation…] 先在 0xf8cb0 拆旧批节点、0xf8ce0 stopASAnimation 释放旧实例,紧接着
+/// 0xf8d4a 新建;新 AnimPlayer 与新 m_parent 落在旧地址、又从第 0 帧开始时,快照与旧的完全一样。
+#[cfg_attr(
+    not(any(target_os = "ios", feature = "cpu_interpreter")),
+    allow(dead_code)
+)]
+pub fn anim_render_forget(receiver: id) {
+    let base = receiver.to_bits();
+    ANIM_RENDER_SNAP.with(|m| {
+        m.borrow_mut().remove(&base);
+    });
+}
+
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_offs(env: &Environment) -> (u32, u32, u32, u32) {
+    ANIM_OFFS.with(|c| {
+        if let Some(v) = c.get() {
+            return v;
+        }
+        let rd = |(slot, fallback): (u32, u32)| {
+            let v: u32 = env.mem.read(ConstPtr::<u32>::from_bits(slot));
+            if v != 0 && v < 0x1000 {
+                v
+            } else {
+                fallback
+            }
+        };
+        let v = (
+            rd(ANIM_SLOT_CCNODE_CHILDREN),
+            rd(ANIM_SLOT_CCARRAY_DATA),
+            rd(ANIM_SLOT_CCSPRITE_TEXTURE),
+            rd(ANIM_SLOT_CCSPRITE_OPACITY),
+        );
+        c.set(Some(v));
+        v
+    })
+}
+
+/// [2026-10-15 隐形 P0] 指针是否指向一个活着的 ObjC 对象(在 touchHLE 对象表里)。m_parent 是 AnimPlayer 不持有的弱引用,
+/// 读它之前先确认,绝不在可能悬空的指针上往下读(空页读取会 panic)。
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_obj_live(env: &Environment, p: u32) -> bool {
+    p >= env.mem.null_segment_size() && p % 4 == 0 && env.objc.get_host_object(Ptr::from_bits(p)).is_some()
+}
+
+/// [2026-10-15 隐形 P0] 承载节点上现在有没有画面。None = 指针不可靠,调用方按「不跳过」处理(照原版真 render)。
+/// 动态物品没有静态底图兜底:-[StableAnimation addAnimation:finish:] 在 0xf5bfc-0xf5c08 把物品本体精灵 setOpacity:0,
+/// 能看见的只有 render 建出来的东西。
+/// - 路径 B(isModuleCacheFrame@68 == 0,建筑/装饰/商店图标/摆放物/动物):m_parent 是 [CCSprite spriteWithBatchNode:rect:
+///   CGRectZero](0x20e622),模块精灵在 PaintModule 0x20d1b2 addChild 到它下面 → 数 m_parent.children_ 的 num。
+///   不能数 m_BatchNode 的子节点:m_parent 自己就是它的子节点(0x20e72a),恒 ≥ 1。
+/// - 路径 A(isModuleCacheFrame == 1,NPC/摩尔,m_BatchNode 为 nil):只对目标精灵 setDisplayFrame:(0x20d066),
+///   目标精灵 init 时 setTexture:nil(0x2e0bec)→ texture_ 为 nil 即从未画过。
+#[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+fn anim_container_empty(env: &Environment, m_parent: u32, path_a: bool) -> Option<bool> {
+    if !anim_obj_live(env, m_parent) {
+        return None;
+    }
+    let (off_children, off_data, off_texture, _) = anim_offs(env);
+    if path_a {
+        let texture: u32 = env.mem.read(ConstPtr::<u32>::from_bits(m_parent + off_texture));
+        return Some(texture == 0);
+    }
+    let children: u32 = env.mem.read(ConstPtr::<u32>::from_bits(m_parent + off_children));
+    if children == 0 {
+        return Some(true);
+    }
+    if !anim_obj_live(env, children) {
+        return None;
+    }
+    let data: u32 = env.mem.read(ConstPtr::<u32>::from_bits(children + off_data));
+    if data == 0 {
+        return Some(true);
+    }
+    if data < env.mem.null_segment_size() || data % 4 != 0 {
+        return None;
+    }
+    let num: u32 = env.mem.read(ConstPtr::<u32>::from_bits(data));
+    Some(num == 0)
+}
+
+/// [MoleWorld iOS perf] 跳过冗余的每帧动画重建(★"点好友卡死"根治)。
 ///
 /// 真因(IDA RE 5.5.0 armv7 + 影子调用栈交叉印证):每帧 `-[AnimManager updateTick:]`(0x20f9b0)
 /// 对 m_AnimInstList 里**每个** AnimInstance 无条件发 `render` → `-[AnimPlayer render]`(0x20f2f4)
-/// → `-[ASprite PaintAFrame…]`(0x20c894):先 `removeAllChildrenWithCleanup:` 清空 batchNode,
-/// 再 `PaintFrame` 循环为该帧每个 module 走 `PaintModule`(0x20cbf4)—— 每个 module **新建一个
-/// CCSprite**(`spriteWithBatchNode:rect:isStrech:` / `spriteWithFile:…` + setContentSize/Color/
-/// Opacity/Scale/Position/Flip)再 `addChild:`。好友村里几十个好友头像、每个 ASprite 十几~几十个
-/// module → 每帧 alloc/init/dealloc 数百个 CCSprite + 数千次 objc_msgSend。JIT 桌面无感;**无 JIT 的
-/// iOS 解释器上单帧 drawScene 永远跑不完 = 从不出帧 = present 冻结 = 点好友卡死**(桌面 on_gl2 同图
-/// 正常 → 长期被误判为"原生 GLES1 渲染特有",实为解释器算力差异)。
+/// → `-[ASprite PaintAFrame…]`(0x20c894):先清空再为该帧每个 module 新建一个 CCSprite。好友村里几十个
+/// 好友头像 → 每帧 alloc/init/dealloc 数百个 CCSprite + 数千次 objc_msgSend。JIT 桌面无感;**无 JIT 的
+/// iOS 解释器上单帧 drawScene 跑不完 = 从不出帧 = 点好友卡死**。而绝大多数重建是冗余的:动画帧每秒才推进
+/// 几次,render 却每显示帧都重建一份一模一样的 sprite。本函数返回 `true` 让 messages.rs 直接 `return` 不派发
+/// 真 IMP(=跳过整次重建),`false` 则放行真重建。
 ///
-/// 而绝大多数重建是**冗余**的:动画帧(curFrame)每秒才推进几次,render 却每显示帧都重建一份一模
-/// 一样的 sprite。本函数返回 `true` 让 messages.rs 直接 `return` 不派发真 IMP(=跳过整次重建),`false`
-/// 则放行真重建。三层判据(任一命中即跳过):
-///   1. **同状态**:(m_parent,curAnim,curFrame,curFlags) 与上次真重建完全一致 → 内容不变,跳过。
-///   2. **host 时间节流**:距该头像上次真重建 < [ANIM_REBUILD_MIN_INTERVAL](≈66ms/≈15fps)→ 跳过。
-///      判据用【host 墙钟】而非 curFrame,故【对解释器算力免疫】:掉帧导致 dt 暴涨、curFrame 每帧都跳,
-///      也不会让它每帧重建(原快照版死穴)。
-///   3. **每帧硬预算**:本 drawScene 帧已重建满 [ANIM_REBUILD_BUDGET_PER_FRAME] 个 → 跳过(留到后续帧
-///      摊销)。这是【防冻结的硬保证】:无论多少头像、dt 多大,单帧重建量有上限 → drawScene 必然快速返回、
-///      必然出帧。首帧进好友村几十头像也不会一次性全建卡死。
-/// 只有"状态变了 且 距上次重建够久 且 本帧预算未满"才真重建。跳过时沿用 batchNode 里上一次建好的
-/// sprite(位移/父节点变换由 CCNode visit 处理,与子 sprite 是否重建无关)。视觉代价:真卡时头像动画
-/// 降到 ≤15fps 或延后一两帧刷新(有界、自愈),换来不冻结。在线/离线皆正确,不按 network_access 门控。
+/// [2026-10-15 隐形 P0] 改写调度,修「iOS 上摆放多个物品后动态物品/NPC/商店图标隐形」:
+/// 旧版每帧 16 个名额按 m_AnimInstList 的顺序先到先得(-[AnimManager addAsprite:] 0x20fd74 addObject: 追加到表尾,
+/// updateTick: 0x20fbe8 起从表头正序发 render),新实例没有快照也要抢名额,抢不到不留记录。表头是进村就建好、持续
+/// 播放的动画,真机解释器一帧常超过 66ms(节流②不再错峰),每帧都有资格重画、先吃光名额 → 表尾从没画过的实例
+/// (新摆的动态物品、商店预览、后出现的 NPC/动物/工人)永远拿不到第一次重建;动态物品本体透明(见上),于是整件
+/// 隐形。摆得越多,抢名额的越多。另一条:快照按地址作键、释放不清,复用旧地址的新实例第一帧就被规则①误判为未变。
+/// 新规则(单帧真重建总数仍封顶 [anim_cap],不放宽卡死保护):
+///   ① 状态与【本对象】上次被放行时完全相同 → 跳过(含它自己画出的合法空帧)。
+///   ② 承载节点上没有画面(从没画过,或状态变了而当前为空)→ 走「首建」:不受节流,优先占名额;上一帧首建被挡几个,
+///      这一帧就给首建预留几个名额(先保证看得见,再保证动起来)。
+///   ③ 有画面、状态变了:距本对象上次重建 < [anim_min_interval] → 跳过;否则走「重画」:只能用上限减去预留后的名额,
+///      并且按公平门槛只放行上一帧想重画的对象里最久没重画的那些,不再按表序先到先得。
+/// 新 AnimPlayer 初始化时清掉同地址的旧表项([anim_render_forget])。读 m_parent 前确认它是活对象。
 ///
-/// AnimPlayer ivar 偏移(IDA `_OBJC_IVAR_$_AnimPlayer.*`,5.5.0):m_pause@4 curFlags@16 curAnim@24
-/// curFrame@28 m_parent@64。
+/// AnimPlayer ivar 偏移(IDA `_OBJC_IVAR_$_AnimPlayer.*`,5.5.0,父类 NSObject 不受 fixup 影响):m_pause@4 curFlags@16
+/// sprite@20 curAnim@24 curFrame@28 m_BatchNode@60 m_parent@64 isModuleCacheFrame@68。
 ///
 /// [同步 iOS 2026-09-24] 只在无 JIT 构建(iOS / cpu_interpreter 解释器后端)生效,与 messages.rs 调用点的
 /// `#[cfg(any(target_os = "ios", feature = "cpu_interpreter"))]` 同一口径;默认桌面(JIT)构建恒返回 false(一律放行
-/// 真 render),头像动画与 main 完全一致。函数本身各平台都在,调用点门不门控都能编译。
+/// 真 render)。函数本身各平台都在,main 线没有调用点,两条线这一段逐字同步。
 #[cfg_attr(
     not(any(target_os = "ios", feature = "cpu_interpreter")),
     allow(dead_code)
@@ -8246,41 +8464,95 @@ pub fn anim_render_should_skip(env: &mut Environment, receiver: id) -> bool {
     if base == 0 {
         return false;
     }
+    let rd = |env: &Environment, off: u32| -> u32 { env.mem.read(ConstPtr::<u32>::from_bits(base + off)) };
     let m_pause: u8 = env.mem.read(ConstPtr::<u8>::from_bits(base + 4));
-    let cur_anim: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 24));
-    let m_parent: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 64));
-    let cur_frame: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 28));
-    let cur_flags: u32 = env.mem.read(ConstPtr::<u32>::from_bits(base + 16));
-    // 镜像 -[AnimPlayer render] 自身的前置守卫:暂停 / 无动画(curAnim<0)/ 无父节点时,真 render
-    // 本就只做廉价 early-return、不建任何 sprite —— 放行让它自己跑(不跳、不缓存)。
+    let cur_anim = rd(env, 24);
+    let m_parent = rd(env, 64);
+    // 镜像 -[AnimPlayer render] 自身的前置守卫(0x20f30c / 0x20f322 / 0x20f33a):暂停 / 无动画 / 无父节点时,真 render
+    // 本就只做廉价 early-return、不建任何 sprite —— 放行让它自己跑(不跳、不记)。
     if m_pause != 0 || (cur_anim as i32) < 0 || m_parent == 0 {
         return false;
     }
-    let snap = (m_parent, cur_anim, cur_frame, cur_flags);
+    let path_a: u8 = env.mem.read(ConstPtr::<u8>::from_bits(base + 68));
+    let Some(empty) = anim_container_empty(env, m_parent, path_a != 0) else {
+        return false;
+    };
+    let (_, _, _, off_opacity) = anim_offs(env);
+    let snap = AnimSnap {
+        parent: m_parent,
+        anim: cur_anim,
+        frame: rd(env, 28),
+        flags: rd(env, 16),
+        sprite: rd(env, 20),
+        batch: rd(env, 60),
+        tint: env.mem.read(ConstPtr::<u32>::from_bits(m_parent + off_opacity)),
+    };
     let now = Instant::now();
-    ANIM_RENDER_SNAP.with(|m| {
+    let min_interval = anim_min_interval();
+    #[derive(Clone, Copy)]
+    enum Lane {
+        First,
+        Redraw(Option<Instant>),
+    }
+    let lane = ANIM_RENDER_SNAP.with(|m| {
         let mut map = m.borrow_mut();
-        // 跨场景累积的死指针上限保护:超阈值清空 → 后续帧各头像重建一次(无害,自愈)。
+        // 跨场景累积的死指针上限保护(正常情况下 init 时已清旧项):超阈值清空,之后各对象按「无记录」重画一次,无害。
         if map.len() >= 8192 {
             map.clear();
         }
-        if let Some(&(prev_snap, last_render)) = map.get(&base) {
-            if prev_snap == snap {
-                return true; // ① 同状态 → 跳过
+        match map.get(&base) {
+            Some(e) if e.snap == snap => None, // ① 同状态 → 跳过
+            Some(_) if empty => Some(Lane::First),
+            Some(e) if now.duration_since(e.last) < min_interval => None, // ③ 节流
+            Some(e) => Some(Lane::Redraw(Some(e.last))),
+            None if empty => Some(Lane::First),
+            None => Some(Lane::Redraw(None)),
+        }
+    });
+    let Some(lane) = lane else {
+        return true;
+    };
+    let cap = anim_cap();
+    let granted = ANIM_FRAME.with(|f| {
+        let mut f = f.borrow_mut();
+        match lane {
+            Lane::First => {
+                if f.used < cap {
+                    f.used += 1;
+                    f.diag_first += 1;
+                    true
+                } else {
+                    f.first_denied += 1;
+                    f.diag_first_denied += 1;
+                    false
+                }
             }
-            if now.duration_since(last_render) < ANIM_REBUILD_MIN_INTERVAL {
-                return true; // ② host 时间节流 → 跳过(不更新快照,状态仍"待重建")
+            Lane::Redraw(last) => {
+                let fair = match f.redraw_limit {
+                    None => true,
+                    Some(limit) => last <= limit,
+                };
+                let ok = fair && f.redraw_used < f.redraw_quota && f.used < cap;
+                // 放行的按「现在」记入(它刚重画过),下一帧的门槛才会落到最久没重画、这一帧又被挡的那些上。
+                f.redraw_wants.push(if ok { Some(now) } else { last });
+                if ok {
+                    f.redraw_used += 1;
+                    f.used += 1;
+                    f.diag_redraw += 1;
+                } else {
+                    f.diag_redraw_denied += 1;
+                }
+                ok
             }
         }
-        // 想真重建:③ 受本帧硬预算约束。
-        let budget = ANIM_REBUILD_BUDGET.with(|b| b.get());
-        if budget == 0 {
-            return true; // 本帧预算耗尽 → 跳过,留到下一帧(不更新快照)
-        }
-        ANIM_REBUILD_BUDGET.with(|b| b.set(budget - 1));
-        map.insert(base, (snap, now));
-        false // 真重建
-    })
+    });
+    if !granted {
+        return true; // 名额不够 → 跳过,留到下一帧(不写快照)
+    }
+    ANIM_RENDER_SNAP.with(|m| {
+        m.borrow_mut().insert(base, AnimSnapEntry { snap, last: now });
+    });
+    false // 真重建
 }
 
 // [同步 iOS 2026-09-24] iOS 分支 91eb00f 在这里有 is_intercept_sel(把 intercept 里出现的选择子预注册成 SEL 指针集合,
@@ -9170,10 +9442,19 @@ fn wide_bg_align_on_add_child(env: &mut Environment) {
 /// [MoleWorld 宽屏适配·居中偏移 v2 · UIKit 子视图] `addSubview:` 拦截(r0=父 view, r2=子 view)。
 /// 见 [UI43_VIEWS]:挂到 EAGLView 上、且 frame 完全落在 1024 设计区内的子视图 → x += off 并登记。
 /// 按真实 winSize 布局的全屏视图(HUD/整屏网页)不落在设计区里,天然不动。
+/// [2026-10-11 触摸 P0] 不右移的 addSubview: 调用点(返回地址,去掉 Thumb 位)。这些视图由 KEEP_REAL_WIDTH 类按真实屏宽摆放,
+/// 本来就对:-[InviteFriendsLayer init]@0x188b28 在 0x1897a0~0x18980c 把米米号输入框放在 x = winSize.宽 − 300、宽 220,
+/// 0x189c24 addSubview:。dd7e51e 把 InviteFriendsLayer 改成真实宽度后,逻辑宽 1026~1105 的屏(11 英寸 iPad、7:5 安卓平板)上
+/// x+w 恰好 ≤ 1025,下面的几何判定把它当成按 1024 设计坐标摆的视图又右移一次:输入框与底框错位、盖住放大镜按钮左侧。
+const UI43_SUBVIEW_KEEP_LRS: [u32; 1] = [0x189c28];
+
 fn ui43_on_add_subview(env: &mut Environment) {
     let recv: id = Ptr::from_bits(env.cpu.regs()[0]);
     let child: id = Ptr::from_bits(env.cpu.regs()[2]);
     if child == nil || recv == nil || ui43_view_contains(child.to_bits()) {
+        return;
+    }
+    if UI43_SUBVIEW_KEEP_LRS.contains(&(env.cpu.regs()[14] & !1u32)) {
         return;
     }
     let off = ui43_offset_x(env);
