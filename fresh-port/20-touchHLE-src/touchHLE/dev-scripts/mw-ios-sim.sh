@@ -21,7 +21,15 @@ if [ ! -d "$APP" ]; then
   echo "[stage] 首次组装模拟器 .app"
   rm -rf "$STAGE"; mkdir -p "$APP"
   cp -R touchHLE_fonts "$APP/"; cp -R touchHLE_dylibs "$APP/"; cp touchHLE_default_options.txt "$APP/"
-  [ -f "$GAME_IPA" ] && cp "$GAME_IPA" "$APP/MoleWorld.ipa" || { echo "✗ 缺游戏 ipa"; exit 1; }
+  # [2026-10-24] 与 make-testflight.sh 用同一份游戏资源(仓库 01-cracked,含 17 张 *_wide.png 宽版底图):PlayCover 里那份旧 ipa
+  # 没有宽版底图,模拟器上标题页/剧情页会出现真机上没有的黑边。仓库目录不在时才退回 PlayCover 的 ipa。
+  GAME_APP_DIR="$TOUCHHLE_DIR/../../01-cracked/Payload/MoleWorld.app"
+  if [ -d "$GAME_APP_DIR" ]; then
+    rm -rf "$STAGE/_game" && mkdir -p "$STAGE/_game/Payload" && cp -R "$GAME_APP_DIR" "$STAGE/_game/Payload/"
+    ( cd "$STAGE/_game" && zip -r -X -0 -q "$APP/MoleWorld.ipa" Payload ) && rm -rf "$STAGE/_game"
+  else
+    [ -f "$GAME_IPA" ] && cp "$GAME_IPA" "$APP/MoleWorld.ipa" || { echo "✗ 缺游戏 ipa"; exit 1; }
+  fi
   sips -z 120 120 res/icon.png --out "$APP/AppIcon60x60@2x.png" >/dev/null 2>&1
   cat > "$APP/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
