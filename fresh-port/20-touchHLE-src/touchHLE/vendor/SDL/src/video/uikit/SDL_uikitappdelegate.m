@@ -66,7 +66,15 @@ int SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
 
     /* Give over control to run loop, SDLUIKitDelegate will handle most things from here */
     @autoreleasepool {
-        UIApplicationMain(argc, argv, nil, [SDLUIKitDelegate getAppDelegateClassName]);
+        /* [MoleWorld 2026-10-23] iOS 13+ 用场景生命周期的代理(见 SDLUIKitSceneDelegate),更早的系统退回原来的应用代理。 */
+        NSString *name = nil;
+        if (@available(iOS 13.0, tvOS 13.0, *)) {
+            name = [SDLUIKitSceneDelegate getSceneDelegateClassName];
+        }
+        if (!name) {
+            name = [SDLUIKitDelegate getAppDelegateClassName];
+        }
+        UIApplicationMain(argc, argv, nil, name);
     }
 
     /* free the memory we used to hold copies of argc and argv */
@@ -519,6 +527,141 @@ SDL_LoadLaunchImageNamed(NSString *name, int screenh)
 }
 
 #endif
+
+@end
+
+/* [MoleWorld 2026-10-23] UIScene 生命周期,移植自 SDL3 b46e26e(SDL_uikitappdelegate.m 的 SDLUIKitSceneDelegate)。
+ * 与应用代理版的区别:didFinishLaunching 只做进程级的事;启动画面窗口、工作目录、进入 SDL 主循环都推迟到场景连接
+ * (scene:willConnectToSession:options:)之后——此时才有 UIWindowScene,UIKit_CreateWindow 才能把 SDL 窗口挂上去。
+ * 前后台切换仍由 SDL_uikitevents.m 订阅的 UIApplication*Notification 驱动(场景生命周期下 UIKit 照常发这些应用级
+ * 通知),这里不再重复转发,免得 SDL_OnApplication* 被调两次。 */
+API_AVAILABLE(ios(13.0), tvos(13.0))
+@implementation SDLUIKitSceneDelegate {
+    UIWindow *sceneLaunchWindow;
+}
+
++ (NSString *)getSceneDelegateClassName
+{
+    return @"SDLUIKitSceneDelegate";
+}
+
++ (NSString *)getAppDelegateClassName
+{
+    return @"SDLUIKitSceneDelegate";
+}
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
+{
+    /* register a callback for the idletimer hint */
+    SDL_AddHintCallback(SDL_HINT_IDLE_TIMER_DISABLED,
+                        SDL_IdleTimerDisabledChanged, NULL);
+    return YES;
+}
+
+- (UISceneConfiguration *)application:(UIApplication *)application configurationForConnectingSceneSession:(UISceneSession *)connectingSceneSession options:(UISceneConnectionOptions *)options
+{
+    /* 实现它即向 UIKit 表明支持场景生命周期;Info.plist 的 UIApplicationSceneManifest 也声明了同一个代理类。 */
+    UISceneConfiguration *config = [[UISceneConfiguration alloc] initWithName:@"SDLSceneConfiguration" sessionRole:connectingSceneSession.role];
+    config.delegateClass = [SDLUIKitSceneDelegate class];
+    return config;
+}
+
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions
+{
+    if (![scene isKindOfClass:[UIWindowScene class]]) {
+        return;
+    }
+    UIWindowScene *windowScene = (UIWindowScene *)scene;
+    windowScene.delegate = self;
+
+    NSBundle *bundle = [NSBundle mainBundle];
+
+#if SDL_IPHONE_LAUNCHSCREEN
+    UIViewController *vc = nil;
+    NSString *screenname = nil;
+
+#if !TARGET_OS_TV
+    screenname = [bundle objectForInfoDictionaryKey:@"UILaunchStoryboardName"];
+
+    if (screenname) {
+        @try {
+            UIStoryboard *storyboard = [UIStoryboard storyboardWithName:screenname bundle:bundle];
+            __auto_type storyboardVc = [storyboard instantiateInitialViewController];
+            vc = [[SDLLaunchStoryboardViewController alloc] initWithStoryboardViewController:storyboardVc];
+        }
+        @catch (NSException *exception) {
+            /* Do nothing (there's more code to execute below). */
+        }
+    }
+#endif
+
+    if (vc == nil) {
+        vc = [[SDLLaunchScreenController alloc] initWithNibName:screenname bundle:bundle];
+    }
+
+    if (vc.view) {
+        sceneLaunchWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
+        sceneLaunchWindow.frame = windowScene.coordinateSpace.bounds;
+        sceneLaunchWindow.windowLevel = UIWindowLevelNormal + 1.0;
+        sceneLaunchWindow.hidden = NO;
+        sceneLaunchWindow.rootViewController = vc;
+    }
+#endif
+
+    /* Set working directory to resource path */
+    [[NSFileManager defaultManager] changeCurrentDirectoryPath:[bundle resourcePath]];
+
+    for (NSUserActivity *activity in connectionOptions.userActivities) {
+        if (activity.webpageURL) {
+            [self sendDropFileForURL:activity.webpageURL];
+        }
+    }
+    for (UIOpenURLContext *urlContext in connectionOptions.URLContexts) {
+        [self sendDropFileForURL:urlContext.URL];
+    }
+
+    SDL_SetMainReady();
+    [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
+}
+
+- (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts
+{
+    for (UIOpenURLContext *context in URLContexts) {
+        [self sendDropFileForURL:context.URL];
+    }
+}
+
+- (void)hideLaunchScreen
+{
+    UIWindow *window = sceneLaunchWindow;
+
+    if (!window || window.hidden) {
+        return;
+    }
+
+    sceneLaunchWindow = nil;
+
+    [UIView animateWithDuration:0.2 animations:^{
+        window.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        window.hidden = YES;
+        UIKit_ForceUpdateHomeIndicator();
+    }];
+}
+
+- (void)postFinishLaunch
+{
+    [self performSelector:@selector(hideLaunchScreen) withObject:nil afterDelay:0.0];
+
+    SDL_iPhoneSetEventPump(SDL_TRUE);
+    exit_status = forward_main(forward_argc, forward_argv);
+    SDL_iPhoneSetEventPump(SDL_FALSE);
+
+    if (sceneLaunchWindow) {
+        sceneLaunchWindow.hidden = YES;
+        sceneLaunchWindow = nil;
+    }
+}
 
 @end
 

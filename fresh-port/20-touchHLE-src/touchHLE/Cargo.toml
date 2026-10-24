@@ -121,3 +121,8 @@ cargo-license = "0.5.1"
 cc = { workspace = true }
 cmake = { workspace = true }
 gl_generator = { workspace = true }
+
+# [MoleWorld 2026-10-23] sdl2-sys 改从仓库内 vendor/sdl2-sys 构建(其 build.rs 指向 vendor/SDL,与上游 touchHLE-3 捆绑的
+# SDL 2.26.4 源码逐文件一致),以便给 iOS UIKit 后端打补丁:iOS 27 SDK 起强制场景生命周期(否则启动即崩溃)、iPhone Duo 开合。
+[patch."https://github.com/touchHLE/rust-sdl2"]
+sdl2-sys = { path = "vendor/sdl2-sys" }
