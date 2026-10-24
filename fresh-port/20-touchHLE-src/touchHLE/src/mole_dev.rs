@@ -2297,6 +2297,94 @@ pub fn camera_center(env: &mut Environment) -> DevResult {
     Ok("视角已回到进村时的位置和缩放".to_string())
 }
 
+// ───────────────────────── 节点树 ─────────────────────────
+
+/// [2026-10-24 iPhone Duo] `dev tree`:把当前运行场景的 cocos2d 节点树打到日志(类名、tag、position、contentSize、
+/// scale、anchor、visible,子节点缩进),用于排查不同屏宽下的布局。只读 ivar、只发宿主实现的 count/objectAtIndex: 与
+/// runningScene,不跑游戏逻辑。最多打印 6 层、600 个节点。
+pub fn dump_scene_tree(env: &mut Environment) -> DevResult {
+    let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    let shared = sel(env, "sharedDirector");
+    let director: id = msg_send(env, (director_class, shared));
+    if director == nil {
+        return Err("没有 CCDirector".to_string());
+    }
+    let running = sel(env, "runningScene");
+    let scene: id = msg_send(env, (director, running));
+    if scene == nil {
+        return Err("当前没有运行中的场景".to_string());
+    }
+    let mut count = 0u32;
+    dump_node(env, scene, 0, &mut count);
+    Ok(format!("节点树已写入日志,共 {} 个节点", count))
+}
+
+fn read_ivar_f32s(env: &Environment, obj: id, name: &str, n: u32) -> Vec<f32> {
+    match env.objc.object_lookup_ivar(&env.mem, obj, &name.to_string()) {
+        Some(ptr) => {
+            let base: ConstPtr<f32> = ptr.cast().cast_const();
+            (0..n).map(|i| env.mem.read(base + i)).collect()
+        }
+        None => vec![f32::NAN; n as usize],
+    }
+}
+
+fn dump_node(env: &mut Environment, node: id, depth: u32, count: &mut u32) {
+    if node == nil || depth > 6 || *count >= 600 {
+        return;
+    }
+    *count += 1;
+    let isa = crate::objc::ObjC::read_isa(node, &env.mem);
+    let class = env.objc.try_get_class_name(isa).unwrap_or("?").to_string();
+    let pos = read_ivar_f32s(env, node, "position_", 2);
+    let size = read_ivar_f32s(env, node, "contentSize_", 2);
+    let scale = read_ivar_f32s(env, node, "scaleX_", 2);
+    let anchor = read_ivar_f32s(env, node, "anchorPoint_", 2);
+    let visible: u8 = env
+        .objc
+        .object_lookup_ivar(&env.mem, node, &"visible_".to_string())
+        .map(|p| env.mem.read(p.cast::<u8>().cast_const()))
+        .unwrap_or(1);
+    let tag: i32 = env
+        .objc
+        .object_lookup_ivar(&env.mem, node, &"tag_".to_string())
+        .map(|p| env.mem.read(p.cast::<i32>().cast_const()))
+        .unwrap_or(-1);
+    log!(
+        "[TREE] {}{} {:?} tag={} pos=({:.1},{:.1}) size=({:.1},{:.1}) scale=({:.2},{:.2}) anchor=({:.2},{:.2}){}",
+        "  ".repeat(depth as usize),
+        class,
+        node,
+        tag,
+        pos[0],
+        pos[1],
+        size[0],
+        size[1],
+        scale[0],
+        scale[1],
+        anchor[0],
+        anchor[1],
+        if visible == 0 { " [隐藏]" } else { "" }
+    );
+    let children: id = match env
+        .objc
+        .object_lookup_ivar(&env.mem, node, &"children_".to_string())
+    {
+        Some(p) => Ptr::from_bits(env.mem.read(p.cast::<u32>().cast_const())),
+        None => nil,
+    };
+    if children == nil {
+        return;
+    }
+    let count_sel = sel(env, "count");
+    let at_sel = sel(env, "objectAtIndex:");
+    let n: u32 = msg_send(env, (children, count_sel));
+    for i in 0..n.min(200) {
+        let child: id = msg_send(env, (children, at_sel, i));
+        dump_node(env, child, depth + 1, count);
+    }
+}
+
 // ───────────────────────── 选择子跟踪 ─────────────────────────
 
 /// [扫描修 2026-09-15] F7-12 选择子跟踪开关。规则来自环境变量 MOLE_TRACE,只在启动后第一次用到时解析一次。
@@ -2419,13 +2507,14 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
                 set_time_scale(env, scale)
             }
             ["trace"] => toggle_trace(),
+            ["tree"] => dump_scene_tree(env),
             ["unlock"] => unlock_interaction(env),
             ["store"] => open_building_store(env),
             ["weather", k] => {
                 let kind: i64 = parse_command_number(k, "天气类型")?;
                 weather(env, kind)
             }
-            _ => Err("用法:dev fps | dev grid | dev center | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev weather <类型>"
+            _ => Err("用法:dev fps | dev grid | dev center | dev tree | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev weather <类型>"
                 .to_string()),
         },
         "quest" => match args.as_slice() {
