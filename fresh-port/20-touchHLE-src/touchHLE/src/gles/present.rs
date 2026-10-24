@@ -131,7 +131,8 @@ pub unsafe fn present_frame(
     // [MoleWorld 智能分辨率·环境补边] --ambient-fill:等比居中留了 letterbox 空白时,先把画面
     // 拉伸铺满整个 drawable(ambient 亮底)+ 压一层半透明黑,再在中间画锐利正片 → 两侧不是黑边
     // 而是画面本身的柔和横向延伸(视频播放器 ambilight 风)。复用主绘制的 vertices/texcoord/rotation。
-    let ambient = crate::window::ambient_fill_active()
+    // [2026-10-24 iPhone Duo] iOS 铺屏模式开合后比例变化改为等比放置时(见 Window::viewport),窄边同样补边。
+    let ambient = (crate::window::ambient_fill_active() || crate::window::ios_aspect_letterbox())
         && (viewport.2 < full_size.0 || viewport.3 < full_size.1);
     if ambient {
         // ① 亮底:NDC 全屏四边形 + viewport=整个 drawable → 4:3 画面横向拉伸填满两侧。
