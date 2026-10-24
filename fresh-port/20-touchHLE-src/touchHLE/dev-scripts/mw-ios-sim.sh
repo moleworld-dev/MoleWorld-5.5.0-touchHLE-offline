@@ -37,6 +37,20 @@ if [ ! -d "$APP" ]; then
 	<key>LSRequiresIPhoneOS</key><true/>
 	<key>MinimumOSVersion</key><string>15.0</string>
 	<key>UIRequiresFullScreen</key><true/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key> <false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key> <string>SDLSceneConfiguration</string>
+					<key>UISceneDelegateClassName</key> <string>SDLUIKitSceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UIStatusBarHidden</key><true/>
 	<key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>
 	<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>

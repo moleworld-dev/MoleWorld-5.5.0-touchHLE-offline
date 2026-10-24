@@ -45,3 +45,13 @@
 @end
 
 /* vi: set ts=4 sw=4 expandtab: */
+
+/* [MoleWorld 2026-10-23] UIScene 生命周期(移植自 SDL3 b46e26e)。用 iOS 27 及以上 SDK 编译的 app 必须采用场景生命周期,
+ * 否则 UIKit 在启动时断言崩溃;iPhone Duo 开合时窗口尺寸也经场景下发。这个类同时充当应用代理与场景代理。 */
+API_AVAILABLE(ios(13.0), tvos(13.0))
+@interface SDLUIKitSceneDelegate : SDLUIKitDelegate <UIWindowSceneDelegate>
+
++ (NSString *)getSceneDelegateClassName;
+
+@end
+

@@ -158,6 +158,30 @@ SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bool created)
     return 0;
 }
 
+/* [MoleWorld 2026-10-23] 按优先级挑一个 UIWindowScene:前台活跃 → 前台非活跃 → 任意一个(移植自 SDL3 GetActiveWindowScene)。 */
+API_AVAILABLE(ios(13.0), tvos(13.0))
+UIWindowScene *
+UIKit_GetActiveWindowScene(void)
+{
+    NSSet<UIScene *> *connectedScenes = [UIApplication sharedApplication].connectedScenes;
+    for (UIScene *scene in connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    for (UIScene *scene in connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundInactive) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    for (UIScene *scene in connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    return nil;
+}
+
 int
 UIKit_CreateWindow(_THIS, SDL_Window *window)
 {
@@ -212,13 +236,24 @@ UIKit_CreateWindow(_THIS, SDL_Window *window)
         }
 #endif /* !TARGET_OS_TV */
 
-        /* ignore the size user requested, and make a fullscreen window */
-        /* !!! FIXME: can we have a smaller view? */
-        UIWindow *uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
+        /* [MoleWorld 2026-10-23] 场景生命周期下窗口必须属于某个 UIWindowScene(移植自 SDL3 b46e26e)。iPhone Duo 开合时
+         * 场景尺寸变化经这个窗口下发。没有场景(iOS 12 及以下、外接屏)时退回原来按屏幕 bounds 建全屏窗口。 */
+        UIWindow *uiwindow = nil;
+        if (@available(iOS 13.0, tvOS 13.0, *)) {
+            UIWindowScene *scene = UIKit_GetActiveWindowScene();
+            if (scene && data.uiscreen == [UIScreen mainScreen]) {
+                uiwindow = [[SDL_uikitwindow alloc] initWithWindowScene:scene];
+            }
+        }
+        if (!uiwindow) {
+            /* ignore the size user requested, and make a fullscreen window */
+            /* !!! FIXME: can we have a smaller view? */
+            uiwindow = [[SDL_uikitwindow alloc] initWithFrame:data.uiscreen.bounds];
 
-        /* put the window on an external display if appropriate. */
-        if (data.uiscreen != [UIScreen mainScreen]) {
-            [uiwindow setScreen:data.uiscreen];
+            /* put the window on an external display if appropriate. */
+            if (data.uiscreen != [UIScreen mainScreen]) {
+                [uiwindow setScreen:data.uiscreen];
+            }
         }
 
         if (SetupWindowData(_this, window, uiwindow, SDL_TRUE) < 0) {

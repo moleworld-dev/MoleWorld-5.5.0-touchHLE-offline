@@ -54,6 +54,10 @@ extern NSUInteger UIKit_GetSupportedOrientations(SDL_Window * window);
 
 @end
 
+/* [MoleWorld 2026-10-23] 当前活跃的 UIWindowScene(场景生命周期),见 SDL_uikitwindow.m。 */
+API_AVAILABLE(ios(13.0), tvos(13.0))
+extern UIWindowScene *UIKit_GetActiveWindowScene(void);
+
 #endif /* SDL_uikitwindow_h_ */
 
 /* vi: set ts=4 sw=4 expandtab: */
