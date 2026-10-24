@@ -516,7 +516,7 @@ mod ios_touch_cancel {
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
     type Id = *mut c_void;
-    type Sel = *const c_void;
+    type Sel = *mut c_void; // 与 iOS 线另一处 sel_registerName 声明保持同一签名(否则 clashing_extern_declarations 告警)
 
     #[link(name = "objc")]
     extern "C" {
@@ -567,7 +567,7 @@ mod ios_touch_cancel {
                 return;
             }
             ENDED_IMP.store(method_getImplementation(m_ended) as *mut c_void, Ordering::Relaxed);
-            ENDED_SEL.store(sel_ended as *mut c_void, Ordering::Relaxed);
+            ENDED_SEL.store(sel_ended, Ordering::Relaxed);
             PRESSURE_IMP.store(method_getImplementation(m_pressure) as *mut c_void, Ordering::Relaxed);
             method_setImplementation(m_pressure, pressure_for_touch as *const c_void);
             method_setImplementation(m_cancelled, touches_cancelled as *const c_void);
