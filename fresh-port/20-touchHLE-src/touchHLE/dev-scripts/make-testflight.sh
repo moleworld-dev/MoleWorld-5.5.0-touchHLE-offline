@@ -229,11 +229,17 @@ SDK_DECL="$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -nE 's/^
 SDK_MAJOR="${SDK_DECL%%.*}"
 if [ -z "$SDK_DECL" ]; then
 	echo "✗ 读不出 LC_BUILD_VERSION,拒绝出包"; exit 1
-elif [ "$SDK_MAJOR" -ge 27 ]; then
-	echo "  sdk 声明 $SDK_DECL >= 27(iOS 27 会 UIScene trap)→ 降到 26.5"
+elif [ "$SDK_MAJOR" -ge 27 ] && [ "$(strings "$APP/$APPNAME" | grep -c "SDLUIKitSceneDelegate")" = "0" ]; then
+	# (不用 grep -q:它提前退出会让 strings 收到 SIGPIPE,set -o pipefail 下整条管道判失败,误判成「没有场景代理」)
+	echo "  sdk 声明 $SDK_DECL >= 27 但二进制里没有 SDLUIKitSceneDelegate(iOS 27 会 UIScene trap)→ 降到 26.5"
 	vtool -set-build-version 2 15.0 26.5 -replace -output "$APP/$APPNAME.patched" "$APP/$APPNAME" >/dev/null 2>&1 \
 	  && mv "$APP/$APPNAME.patched" "$APP/$APPNAME" && chmod +x "$APP/$APPNAME" \
 	  || { echo "✗ vtool 降 SDK 失败"; exit 1; }
+elif [ "$SDK_MAJOR" -ge 27 ]; then
+	# [2026-10-24 iPhone Duo] SDL 已补场景生命周期(main d26f78a,SDLUIKitSceneDelegate + Info.plist 场景清单),iOS 27.1
+	# 模拟器实测 27.1 SDK 编译的包正常启动。保留 27.x:只有 iOS 27.1 SDK 编译的 app 在 iPhone Duo 上才全屏贴边,
+	# 降回 26.5 会让 Duo 进兼容模式(外屏 mini 比例一侧黑边、内屏居中四周留白)。
+	echo "  sdk 声明 $SDK_DECL(已含场景生命周期,保留,iPhone Duo 全屏需要 27.1 SDK)"
 elif [ "$SDK_MAJOR" -lt 26 ]; then
 	echo "✗ sdk 声明 $SDK_DECL < 26,App Store Connect 会以 90725 拒收。"
 	echo "  请用正式版 Xcode 26.x 重新编译(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer)。"; exit 1
