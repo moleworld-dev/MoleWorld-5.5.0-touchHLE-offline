@@ -9387,6 +9387,53 @@ fn ui43_center_on_enter(env: &mut Environment) {
     }
 }
 
+/// [2026-10-24 iPhone Duo] 标题页右下角那组按钮(设置/帮助/更多游戏/切换账号/弹出钮)在较窄的宽屏上挤到画面中间。
+/// -[MainMenuScene init]@0xb2dc0 把整屏底图(tag 12281,宽屏下 fs 层换成 1792×768 的 logoiPad_wide.png)放在 winSize 中心、
+/// 锚点 0.5,按钮菜单 CCMenu(tag 12282)position=(0,0) 挂在【底图】下;按钮位置由 popoutMenuPosition@0xb3dec 等按
+/// winSize.宽 − 按钮宽/2 算(MainMenuScene 在 KEEP_REAL_WIDTH 名单,winSize 是真实宽 W),即假定底图局部原点就是屏幕左边。
+/// 原版底图 1024 宽、屏幕也 1024 宽,两者重合;换成 1792 宽的宽版底图后局部原点落在屏幕 W/2 − 896,按钮整体左移 896 − W/2:
+/// W=1670 时只左移 61 不明显,iPhone Duo 外屏 W=1117 左移 337、11 英寸 iPad W≈1105 左移 344,按钮压住「点击进入游戏」。
+/// 修法:进场时把这个菜单的 x 设成 896 − 底图.x(底图 x = W/2),菜单原点回到屏幕左边;弹出/收起动画都在菜单局部坐标里算,
+/// 点击判定走 CCMenu 的真实变换,一并跟着对。只认 1792 宽、锚点 0.5、缩放 1 的底图,其余情况不动。
+fn main_menu_wide_align(env: &mut Environment) {
+    let scene: id = Ptr::from_bits(env.cpu.regs()[0]);
+    if scene == nil {
+        return;
+    }
+    let saved = [
+        env.cpu.regs()[0],
+        env.cpu.regs()[1],
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+    ];
+    let s = ui43_sels(env);
+    let get_child = env.objc.register_host_selector("getChildByTag:".to_string(), &mut env.mem);
+    let bg: id = msg_send(env, (scene, get_child, 12281i32));
+    if bg != nil && ui43_is_kind(env, bg, "CCSprite") {
+        let cs: CGSize = msg_send(env, (bg, s.cs));
+        let sx: f32 = msg_send(env, (bg, s.sx));
+        let ap: CGPoint = msg_send(env, (bg, s.ap));
+        if (cs.width - WIDE_BG_W).abs() < 0.5 && (sx - 1.0).abs() < 1e-3 && (ap.x - 0.5).abs() < 1e-3 {
+            let menu: id = msg_send(env, (bg, get_child, 12282i32));
+            if menu != nil {
+                let pos_sel = env.objc.register_host_selector("position".to_string(), &mut env.mem);
+                let set_pos = env.objc.register_host_selector("setPosition:".to_string(), &mut env.mem);
+                let bg_pos: CGPoint = msg_send(env, (bg, pos_sel));
+                let menu_pos: CGPoint = msg_send(env, (menu, pos_sel));
+                let nx = WIDE_BG_W / 2.0 - bg_pos.x;
+                if (menu_pos.x - nx).abs() > 0.5 {
+                    let _: () = msg_send(env, (menu, set_pos, CGPoint { x: nx, y: menu_pos.y }));
+                    let (old_x, bg_x) = (menu_pos.x, bg_pos.x);
+                    log!("[宽屏底图] 标题页按钮菜单原点对齐屏幕左边:x {} → {}(底图中心 {})", old_x, nx, bg_x);
+                }
+            }
+        }
+    }
+    for (i, v) in saved.iter().enumerate() {
+        env.cpu.regs_mut()[i] = *v;
+    }
+}
+
 /// [MoleWorld 宽屏适配·居中偏移 v2] `addChild:` / `addChild:z:` / `addChild:z:tag:` 拦截(r0=父, r2=子):
 /// 父是**已右移根层** → 迟到的全宽背景子节点当场拉伸铺满;普通子节点不用管(局部坐标 = 设计坐标,
 /// 随根层整体居中)。[ui43_stretch_child] 写的是绝对值(幂等),所以 addChild 链一次添加触发 2~3 次无害,
@@ -10360,6 +10407,10 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     // [MoleWorld 宽屏适配·居中偏移] 白名单 UI 根层进场 → 整体右移居中(见 ui43_center_on_enter)。
     // 永远 return false 让真 onEnter 继续跑(只是顺手改了 position)。
     if sel == "onEnter" && ui43_mode() {
+        // [2026-10-24 iPhone Duo] 标题页按钮菜单挂在宽版底图下,先把菜单原点拉回屏幕左边(见 main_menu_wide_align)。
+        if class == "MainMenuScene" {
+            main_menu_wide_align(env);
+        }
         ui43_center_on_enter(env);
         return false;
     }
