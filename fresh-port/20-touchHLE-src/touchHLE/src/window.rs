@@ -490,7 +490,10 @@ fn init_touch_drag_slop(video_ctx: &sdl2::VideoSubsystem, window: &sdl2::video::
     }
     let px = TOUCH_DRAG_SLOP_MM * dpi / 25.4;
     let slop = (px * guest_short as f32 / draw_short).clamp(TOUCH_DRAG_SLOP_DEFAULT, 24.0);
-    TOUCH_DRAG_SLOP_AUTO.store(slop.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    let previous = TOUCH_DRAG_SLOP_AUTO.swap(slop.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    if previous == slop.to_bits() {
+        return;
+    }
     log!(
         "[触屏起拖] DPI {:.0},画布 {}x{},guest 短边 {} 点 → 阈值 {:.1} 点(约 {}mm)",
         dpi, dw, dh, guest_short, slop, TOUCH_DRAG_SLOP_MM
@@ -1146,10 +1149,6 @@ impl Window {
             fit_window_into_usable_area(&video_ctx, &mut window);
             window
         };
-        {
-            let (pw, ph) = device_family.portrait_size();
-            init_touch_drag_slop(&video_ctx, &window, pw.min(ph));
-        }
         #[cfg(target_os = "ios")]
         ios_touch_cancel::install();
 
@@ -1266,6 +1265,9 @@ impl Window {
         // 不是 iOS 专属;仍保留这一行,因为排查 iOS 真机 present 黑屏要看这个非 0 的默认 FBO。
         log!("[present] SDL 窗口默认 framebuffer={} renderbuffer={}", window_default_fbo, window_default_rbo);
         window.internal_gl_ins = Some(gl_ins);
+        // [2026-10-24] 起拖阈值要等 GL 视图建好再算:iOS 上建窗后、GL 上下文创建前 SDL_GL_GetDrawableSize 返回的是【点】
+        // (iPhone 17 Pro 为 874×402),按像素 DPI 一除阈值被放大 3 倍、一律截到上限 24 点;此时才是原生像素(2622×1206)。
+        window.refresh_touch_drag_slop();
 
         if window.splash_image.is_some() {
             window.display_splash();
@@ -1587,6 +1589,8 @@ impl Window {
                         | sdl2::event::WindowEvent::Resized(w, h),
                     ..
                 } => {
+                    // [2026-10-24] 画布尺寸变了(iPhone Duo 开合、窗口缩放)→ 按新画布重算触屏起拖阈值(只在安卓/iOS 生效)。
+                    self.refresh_touch_drag_slop();
                     // 仅显式 --lock-aspect(且非全屏)才 set_size 锁窗口比例。
                     if self.lock_aspect
                         && !self.fullscreen
@@ -3146,6 +3150,13 @@ impl Window {
 
     /// [MoleWorld 智能分辨率] 完整 drawable 尺寸(整个窗口/全屏区,像素)。present 传给
     /// present_frame 判断 letterbox 空白、做 --ambient-fill 环境补边。
+    /// [2026-10-24] 按当前画布与显示器 DPI 重算触屏起拖阈值(见 init_touch_drag_slop)。建窗完成后算一次,窗口尺寸变化
+    /// (iPhone Duo 展开/合上:内外屏物理尺寸不同,同样 768 个逻辑点对应的毫米数差约三分之一)时再算。
+    fn refresh_touch_drag_slop(&self) {
+        let (pw, ph) = self.device_family.portrait_size();
+        init_touch_drag_slop(&self.video_ctx, &self.window, pw.min(ph));
+    }
+
     pub fn drawable_size(&self) -> (u32, u32) {
         self.window.drawable_size()
     }
