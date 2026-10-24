@@ -624,6 +624,39 @@ API_AVAILABLE(ios(13.0), tvos(13.0))
     [self performSelector:@selector(postFinishLaunch) withObject:nil afterDelay:0.0];
 }
 
+/* [MoleWorld 2026-10-24] iOS 27 新增:返回值取代 Info.plist 的 UISupportedInterfaceOrientations,作用于这个场景。
+ * iPhone Duo 内屏不遵守 Info.plist 的方向声明,横屏游戏竖拿时会拿到竖长窗口;Defold(#13431/#13514)验证过在场景代理
+ * 里只返回横屏能把内屏锁成横屏。这里只按 Info.plist 声明(再与 SDL_HINT_ORIENTATIONS 取交集)计算,不经过 SDL 视图控制器:
+ * UIKit_GetSupportedOrientations 对可调尺寸窗口返回「全部方向」(原本靠系统再与 Info.plist 取交集),且内部会调
+ * -[UIApplication supportedInterfaceOrientationsForWindow:],iOS 27 上可能回到本方法造成递归。 */
+- (UIInterfaceOrientationMask)supportedInterfaceOrientationsForWindowScene:(UIWindowScene *)windowScene
+{
+    NSArray *orients = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UISupportedInterfaceOrientations"];
+    UIInterfaceOrientationMask mask = 0;
+    for (NSString *o in orients) {
+        if ([o isEqualToString:@"UIInterfaceOrientationLandscapeLeft"]) mask |= UIInterfaceOrientationMaskLandscapeLeft;
+        else if ([o isEqualToString:@"UIInterfaceOrientationLandscapeRight"]) mask |= UIInterfaceOrientationMaskLandscapeRight;
+        else if ([o isEqualToString:@"UIInterfaceOrientationPortrait"]) mask |= UIInterfaceOrientationMaskPortrait;
+        else if ([o isEqualToString:@"UIInterfaceOrientationPortraitUpsideDown"]) mask |= UIInterfaceOrientationMaskPortraitUpsideDown;
+    }
+    if (mask == 0) {
+        mask = UIInterfaceOrientationMaskAll;
+    }
+    const char *hint = SDL_GetHint(SDL_HINT_ORIENTATIONS);
+    if (hint != NULL) {
+        NSArray *wanted = [@(hint) componentsSeparatedByString:@" "];
+        UIInterfaceOrientationMask hinted = 0;
+        if ([wanted containsObject:@"LandscapeLeft"]) hinted |= UIInterfaceOrientationMaskLandscapeLeft;
+        if ([wanted containsObject:@"LandscapeRight"]) hinted |= UIInterfaceOrientationMaskLandscapeRight;
+        if ([wanted containsObject:@"Portrait"]) hinted |= UIInterfaceOrientationMaskPortrait;
+        if ([wanted containsObject:@"PortraitUpsideDown"]) hinted |= UIInterfaceOrientationMaskPortraitUpsideDown;
+        if ((hinted & mask) != 0) {
+            mask &= hinted;
+        }
+    }
+    return mask;
+}
+
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts
 {
     for (UIOpenURLContext *context in URLContexts) {
