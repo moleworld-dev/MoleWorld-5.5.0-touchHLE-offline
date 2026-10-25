@@ -82,6 +82,10 @@ pub fn set_ambient_fill(on: bool) {
     AMBIENT_FILL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 /// [MoleWorld 智能分辨率] present 查:是否启用环境补边。
+/// iOS 定制逻辑屏时,画布比例与逻辑比例相差在此以内仍铺满拉伸(iPhone Duo 开合约 2.3%),超出才等比加补边。
+#[cfg(target_os = "ios")]
+const IOS_STRETCH_TOLERANCE: f32 = 0.03;
+
 /// [2026-10-24 iPhone Duo] iOS 铺屏模式下画布比例偏离逻辑比例而改为等比放置时,present 也要给窄边做环境补边。
 pub fn ios_aspect_letterbox() -> bool {
     cfg!(target_os = "ios") && custom_guest_size_active()
@@ -3219,11 +3223,13 @@ impl Window {
         // 是外屏 1.455、展开是内屏 1.4216,开合后画布比例与逻辑比例差约 2.3%,铺满就会横向压扁/拉长。Apple 要求游戏不变形,
         // 所以比例差超过 0.5% 时改走下面的等比放置,四周只留约 1% 的窄边,由 present 的环境补边(ios_aspect_letterbox)填上
         // 画面延伸,不是纯黑。普通 iPhone/iPad 屏幕比例在启动后不变,误差为 0,行为不变。
+        // [2026-10-24 真机反馈] 用户在 Duo 真机上看到上下两条灰边,明确不要。开合造成的比例差只有约 2.3%,拉伸后肉眼几乎看不出,
+        // 远比两条灰边顺眼,所以 3% 以内照样铺满,只有更大的比例差才等比放置加补边。
         #[cfg(target_os = "ios")]
         let free_stretch = custom && !ambient && {
             let app_aspect = app_width as f32 / app_height as f32;
             let screen_aspect = screen_width as f32 / screen_height as f32;
-            (screen_aspect / app_aspect - 1.0).abs() <= 0.005
+            (screen_aspect / app_aspect - 1.0).abs() <= IOS_STRETCH_TOLERANCE
         };
         #[cfg(not(target_os = "ios"))]
         let free_stretch = ((!self.fullscreen && !Self::rotatable_fullscreen()) || custom) && !ambient;
