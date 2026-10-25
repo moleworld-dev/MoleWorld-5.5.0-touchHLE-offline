@@ -182,6 +182,28 @@ UIKit_GetActiveWindowScene(void)
     return nil;
 }
 
+/* [MoleWorld 2026-10-24 iPhone Duo] 当前活跃 window scene 的尺寸(点)。touchHLE 启动时按它算铺屏逻辑比例:
+ * iPhone Duo 有内外两块屏,UIScreen.mainScreen(SDL display 0)展开时可能仍是外屏,按它算的比例(1.455)画到内屏(1.42)
+ * 会上下留边;Apple 要求从 window scene 取尺寸而不是 UIScreen.main。成功返回 1。 */
+int
+MoleWorld_UIKit_GetActiveSceneSize(int *w, int *h)
+{
+    @autoreleasepool {
+        if (@available(iOS 13.0, tvOS 13.0, *)) {
+            UIWindowScene *scene = UIKit_GetActiveWindowScene();
+            if (scene) {
+                CGSize size = scene.coordinateSpace.bounds.size;
+                if (size.width > 0 && size.height > 0) {
+                    *w = (int) size.width;
+                    *h = (int) size.height;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int
 UIKit_CreateWindow(_THIS, SDL_Window *window)
 {

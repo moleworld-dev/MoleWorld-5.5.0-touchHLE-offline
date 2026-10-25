@@ -1045,8 +1045,30 @@ impl Window {
         // 仅当未显式指定 guest 逻辑屏(--logical-size)时生效(显式优先)。结果存
         // AUTO_PORTRAIT,供 portrait_size(ui_screen bounds + 窗口尺寸都走它)读取。默认(不请求)零回归。
         if fill_screen_requested() && guest_portrait_override().is_none() {
-            if let Ok(db) = video_ctx.display_bounds(0) {
-                let (dw, dh) = db.size();
+            // [2026-10-24 iPhone Duo] iOS 优先按当前 window scene 的尺寸算(SDL 补丁 MoleWorld_UIKit_GetActiveSceneSize):
+            // display_bounds(0) 是 UIScreen.mainScreen,iPhone Duo 展开时它可能仍是外屏(1.455),按它算的逻辑比例画到内屏(1.42)
+            // 上下会多出两条边。其它平台与取不到场景时照旧用主显示器。
+            #[cfg(target_os = "ios")]
+            let scene_size: Option<(u32, u32)> = {
+                extern "C" {
+                    fn MoleWorld_UIKit_GetActiveSceneSize(w: *mut i32, h: *mut i32) -> i32;
+                }
+                let (mut w, mut h) = (0i32, 0i32);
+                if unsafe { MoleWorld_UIKit_GetActiveSceneSize(&mut w, &mut h) } == 1 && w > 0 && h > 0 {
+                    Some((w as u32, h as u32))
+                } else {
+                    None
+                }
+            };
+            #[cfg(target_os = "ios")]
+            log!(
+                "[MOLE-RES] iOS 取屏:当前场景 {:?},主显示器 {:?}(铺屏比例优先按场景算)",
+                scene_size,
+                video_ctx.display_bounds(0).ok().map(|db| db.size())
+            );
+            #[cfg(not(target_os = "ios"))]
+            let scene_size: Option<(u32, u32)> = None;
+            if let Some((dw, dh)) = scene_size.or_else(|| video_ctx.display_bounds(0).ok().map(|db| db.size())) {
                 let (long, short) = if dw >= dh { (dw, dh) } else { (dh, dw) };
                 if short > 0 {
                     let base_short = match device_family {
