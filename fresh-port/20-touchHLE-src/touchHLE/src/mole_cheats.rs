@@ -10160,6 +10160,104 @@ fn porter_reattach_diag(env: &Environment) {
     );
 }
 
+/// [2026-10-28] 刚 attach 过一件物件,等运行循环受理点检查它是不是落在红色(放不下)的位置。
+static PORTER_FREE_SPOT_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn porter_free_spot_pending() -> bool {
+    PORTER_FREE_SPOT_PENDING.load(O)
+}
+
+/// 往外找空位的最大圈数(以格为单位;第 r 圈 8r 个格)。12 圈约 600 次判定,只在放下那一刻跑一次。
+const PORTER_FREE_SPOT_MAX_RING: i32 = 12;
+
+/// [2026-10-28] 占卜奖励 / 连续购买的物件不再压在别的物件上变红。
+/// 原版 -[Porter attachObjectWithHouseLevel:data:]@0x298bc 在 canMultiPut 时调 -[Porter checkCanPutNewPos:]@0x2968c,
+/// 只试上一件四周 8 个邻位(按物件尺寸偏移),都放不下就原样返回上一件的格,0x29eae moveToBaseTile: 把新物件压在上一件上,
+/// 必红;第一件(canMultiPut=0)放在屏幕中心,也常压在占卜屋或别的建筑上。高大的奖励图又只有 1×1 的底座可拖,
+/// 10-07 测试者反馈「卡在红区移不动、强退后消失」。
+/// 做法:attach 钩子只置标志;这里(运行循环受理点,栈上没有游戏方法体,可以发消息)若 Porter 手上有物件、刚放下没在拖
+/// (state==1)、而且是红的(canPut==0),就以 lastBaseTile(没有就用 baseTile)为中心,一圈一圈往外用原版
+/// calNewTile:offsetX:offsetY: 取格、checkCanPut: 判定,找到第一个放得下的格就照原版 moveToBaseTile: 挪过去(它会更新位置、
+/// 颜色并把视角移过去),并照 0x29e7e 的写法记进 lastBaseTile,下一件接着贴它放。桥、梯子、美人鱼这类带幻影的特殊物件不动。
+/// 找不到就保持原版行为(玩家仍可拖动或收回)。只改落点,不改任何判定与存档。
+pub fn porter_free_spot_poll(env: &mut Environment) {
+    if !PORTER_FREE_SPOT_PENDING.swap(false, O) {
+        return;
+    }
+    // +[Porter instance]@0x28f40 的单例缓存;不存在就不调 +instance,免得凭空建一个。
+    let Some(porter) = peek_u32(env, 0xb40968).filter(|&p| p != 0) else {
+        return;
+    };
+    let sprite = peek_ivar(env, porter, 0xb03284).unwrap_or(0);
+    let state = peek_ivar(env, porter, 0xb03290).unwrap_or(0);
+    if sprite == 0 || state != 1 {
+        return;
+    }
+    let Some(can_put_off) = peek_u32(env, 0xb0328c) else {
+        return;
+    };
+    let can_put: u8 = env.mem.read(ConstPtr::<u8>::from_bits(porter + can_put_off));
+    if can_put != 0 {
+        return;
+    }
+    // 桥(+316 bridgePhantom)、美人鱼(+320 mermaidPhantom)有自己的可放判定,不动。
+    if peek_ivar(env, porter, 0xb032b0).unwrap_or(0) != 0 || peek_ivar(env, porter, 0xb032c0).unwrap_or(0) != 0 {
+        return;
+    }
+    let ladders = peek_ivar(env, porter, 0xb03298).unwrap_or(0);
+    if ladders != 0 {
+        let count_s = island_sel(env, "count");
+        let n: u32 = msg_send(env, (id::from_bits(ladders), count_s));
+        if n != 0 {
+            return;
+        }
+    }
+    let last = peek_ivar(env, porter, 0xb032a0).unwrap_or(0);
+    let origin = if last != 0 {
+        last
+    } else {
+        peek_ivar(env, porter, 0xb032a4).unwrap_or(0)
+    };
+    if origin == 0 {
+        return;
+    }
+    let (porter_id, origin_id) = (id::from_bits(porter), id::from_bits(origin));
+    let cal_s = island_sel(env, "calNewTile:offsetX:offsetY:");
+    let check_s = island_sel(env, "checkCanPut:");
+    let mut found: Option<(id, i32, i32)> = None;
+    'rings: for r in 1..=PORTER_FREE_SPOT_MAX_RING {
+        // 第 r 圈:格坐标 (a,b) 满足 max(|a|,|b|)==r;a 沿等距网格的一条轴、b 沿另一条。
+        // calNewTile 的偏移以半格为单位:沿 a 轴一格 = (+1,+1),沿 b 轴一格 = (+1,-1)(与 checkCanPutNewPos: 的邻位一致)。
+        for a in -r..=r {
+            for b in -r..=r {
+                if a.abs().max(b.abs()) != r {
+                    continue;
+                }
+                let (dx, dy) = (a + b, a - b);
+                let tile: id = msg_send(env, (porter_id, cal_s, origin_id, dx, dy));
+                if tile == nil {
+                    continue;
+                }
+                let ok: bool = msg_send(env, (porter_id, check_s, tile));
+                if ok {
+                    found = Some((tile, a, b));
+                    break 'rings;
+                }
+            }
+        }
+    }
+    let Some((tile, a, b)) = found else {
+        log!("[摆放] 放下的物件是红色,{} 圈内找不到空位,保持原位", PORTER_FREE_SPOT_MAX_RING);
+        return;
+    };
+    let move_s = island_sel(env, "moveToBaseTile:");
+    let _: () = msg_send(env, (porter_id, move_s, tile));
+    if let Some(off) = peek_u32(env, 0xb032a0) {
+        env.mem.write(MutPtr::<u32>::from_bits(porter + off), tile.to_bits());
+    }
+    log!("[摆放] 放下的物件是红色,已挪到最近的空位(偏移 {} 格,{} 格)", a, b);
+}
+
 /// [2026-10-08 第十二轮] 摆放时按住建筑图身也能拖:本次手势按下点(Porter 指针, 触点)。
 static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::Mutex::new(None);
 
@@ -10309,6 +10407,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
     if sel == "attachObjectWithHouseLevel:data:" {
         if class == "Porter" {
             porter_reattach_diag(env);
+            // [2026-10-28] 放下后若是红色(邻位全满),由运行循环受理点往外找最近的空位(见 porter_free_spot_poll)。
+            PORTER_FREE_SPOT_PENDING.store(true, O);
         }
         return false;
     }
