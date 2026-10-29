@@ -940,6 +940,70 @@ pub struct Window {
 }
 
 impl Window {
+    /// [2026-10-28] 用系统原生弹窗(SDL_ShowMessageBox:iOS UIAlertController、Mac NSAlert、安卓 AlertDialog、
+    /// Windows 系统对话框)显示游戏的 UIAlertView,阻塞到玩家点掉为止。返回被点按钮在 `buttons` 里的下标;
+    /// 系统级关闭(Esc、安卓返回键等)有取消键时算点了取消键,没有取消键就重新弹出(原版框只能点按钮关,
+    /// 而 Porter 等框的索引 0 是 exit(0),不能替玩家选)。弹窗显示失败返回 None,由调用方退回自绘覆盖层。
+    /// 必须在宿主栈上调用(Environment::on_parent_stack_in_coroutine)。
+    pub fn show_native_alert(
+        &self,
+        title: &str,
+        message: &str,
+        buttons: &[String],
+        cancel: Option<usize>,
+    ) -> Option<usize> {
+        use sdl2::messagebox;
+        assert!(self.on_main_stack);
+        if buttons.is_empty() {
+            return None;
+        }
+        // 回车默认键:第一个非取消键(只有一个键时就是它)。
+        let default_index = (0..buttons.len()).find(|&i| Some(i) != cancel).unwrap_or(0);
+        let data: Vec<messagebox::ButtonData> = buttons
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut flags = messagebox::MessageBoxButtonFlag::NOTHING;
+                if Some(i) == cancel {
+                    flags |= messagebox::MessageBoxButtonFlag::ESCAPEKEY_DEFAULT;
+                }
+                if i == default_index && Some(i) != cancel {
+                    flags |= messagebox::MessageBoxButtonFlag::RETURNKEY_DEFAULT;
+                }
+                messagebox::ButtonData {
+                    flags,
+                    button_id: i as i32,
+                    text: text.as_str(),
+                }
+            })
+            .collect();
+        // 文本里不能有 NUL(CString),换成空格。
+        let title = title.replace('\0', " ");
+        let message = message.replace('\0', " ");
+        loop {
+            match messagebox::show_message_box(
+                messagebox::MessageBoxFlag::INFORMATION,
+                &data,
+                &title,
+                &message,
+                Some(&self.window),
+                None,
+            ) {
+                Ok(messagebox::ClickedButton::CustomButton(b)) => return Some(b.button_id as usize),
+                Ok(messagebox::ClickedButton::CloseButton) => {
+                    if cancel.is_some() {
+                        return cancel;
+                    }
+                    log!("[弹框] 系统弹窗被关闭但没有取消键,重新弹出");
+                }
+                Err(e) => {
+                    log!("[弹框] 系统原生弹窗显示失败:{:?}", e);
+                    return None;
+                }
+            }
+        }
+    }
+
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
     /// Android devices.
