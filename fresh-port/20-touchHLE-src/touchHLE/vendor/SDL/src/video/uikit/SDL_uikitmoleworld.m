@@ -71,6 +71,49 @@ static int moleworld_notify_seq = 0;
 /* 每次全部取消加一。申请权限的回调是异步的:切后台马上又回前台时,取消可能先于回调执行,回调里见代数变了就不再添加。 */
 static atomic_int moleworld_notify_generation = 0;
 
+/* 取得通知权限后执行 then(granted)(在系统的后台队列上)。
+ * 玩家已经答复过:直接按现有结果执行(切后台那一刻预约提醒就走这条)。
+ * 还没答复:系统只在应用处于前台活跃状态时才会弹授权框,启动早期场景还没进前台或切后台那一刻申请,请求会被挂起、
+ * 授权框不出来、回调也不来,所以放到主线程,应用正活跃就立刻申请,否则等 UIApplicationDidBecomeActiveNotification。 */
+static void
+MoleWorld_Notify_WithAuthorization(void (^then)(BOOL granted))
+{
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+        if (settings.authorizationStatus != UNAuthorizationStatusNotDetermined) {
+            if (then) {
+                then(settings.authorizationStatus == UNAuthorizationStatusAuthorized ||
+                     settings.authorizationStatus == UNAuthorizationStatusProvisional);
+            }
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^request)(void) = ^{
+                [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
+                                      completionHandler:^(BOOL granted, NSError *error) {
+                    NSLog(@"[MoleWorld] 本地通知权限:%@", granted ? @"允许" : @"拒绝");
+                    if (then) {
+                        then(granted);
+                    }
+                }];
+            };
+            if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+                request();
+                return;
+            }
+            __block id observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidBecomeActiveNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                [[NSNotificationCenter defaultCenter] removeObserver:observer];
+                observer = nil;
+                request();
+            }];
+        });
+    }];
+}
+
 void
 MoleWorld_Notify_Schedule(double delay_secs, const char *body, const char *action)
 {
@@ -83,13 +126,13 @@ MoleWorld_Notify_Schedule(double delay_secs, const char *body, const char *actio
             return;
         }
         NSString *identifier = [NSString stringWithFormat:@"moleworld-%d", moleworld_notify_seq++];
-        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
         int generation = atomic_load(&moleworld_notify_generation);
-        [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
-                              completionHandler:^(BOOL granted, NSError *error) {
+        /* 切后台时应用已不活跃:若玩家还没答复过授权,这条要等回到前台答复后才加;已答复过的系统会立刻回调。 */
+        MoleWorld_Notify_WithAuthorization(^(BOOL granted) {
             if (!granted || atomic_load(&moleworld_notify_generation) != generation) {
                 return;
             }
+            UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
             UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
             content.body = text;
             content.sound = [UNNotificationSound defaultSound];
@@ -100,9 +143,11 @@ MoleWorld_Notify_Schedule(double delay_secs, const char *body, const char *actio
             [center addNotificationRequest:request withCompletionHandler:^(NSError *err) {
                 if (err) {
                     NSLog(@"[MoleWorld] 本地通知预约失败 %@", err);
+                } else {
+                    NSLog(@"[MoleWorld] 本地通知已预约 %@:%.0f 秒后", identifier, delay_secs);
                 }
             }];
-        }];
+        });
     }
 }
 
@@ -117,10 +162,7 @@ MoleWorld_Notify_CancelAll(void)
          * 第一次的提醒会静默丢掉;所以在第一次取消时就先申请(系统只问一次,之后直接返回结果)。 */
         if (!authorization_requested) {
             authorization_requested = 1;
-            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
-                                  completionHandler:^(BOOL granted, NSError *error) {
-                NSLog(@"[MoleWorld] 本地通知权限:%@", granted ? @"允许" : @"拒绝");
-            }];
+            MoleWorld_Notify_WithAuthorization(nil);
         }
         [center removeAllPendingNotificationRequests];
         [center removeAllDeliveredNotifications];
