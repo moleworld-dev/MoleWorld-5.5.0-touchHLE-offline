@@ -328,12 +328,24 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
             NSNumberHostObject::LongLong(ll) => Value::from(*ll),
             NSNumberHostObject::Short(s) => Value::from(*s),
             NSNumberHostObject::Char(c) => Value::from(*c),
-            _ => todo!("num {:?}", num),
+            // [2026-10-29 R18-A-4] 以前落到 todo! 让整个模拟器 panic(写偏好在失活存档时刻);plist 本就支持这两种整数。
+            // 读档时超过 i64 的整数会建成 UnsignedLongLong,原来读得进来、写不回去。
+            NSNumberHostObject::UnsignedLongLong(u) => Value::from(*u),
+            NSNumberHostObject::UnsignedShort(u) => Value::from(*u),
         }
-    } else if class == env.objc.get_known_class("NSData", &mut env.mem) {
+    } else if {
+        // [2026-10-29 R18-A-4] 以前按类名精确比较,NSMutableData 会落到下面的 unimplemented!。
+        let ns_data = env.objc.get_known_class("NSData", &mut env.mem);
+        env.objc.class_is_subclass_of(class, ns_data)
+    } {
         let data = env.objc.borrow::<NSDataHostObject>(plist);
-        let buffer_slice = env.mem.bytes_at(data.bytes.cast(), data.length);
-        Value::Data(buffer_slice.to_vec())
+        // [2026-10-29 R18-A-2] 新建后一个字节都没写过的 NSData 的 bytes 是空指针,bytes_at 遇到空页即使长度 0 也 panic。
+        if data.length == 0 || data.bytes.is_null() {
+            Value::Data(Vec::new())
+        } else {
+            let buffer_slice = env.mem.bytes_at(data.bytes.cast(), data.length);
+            Value::Data(buffer_slice.to_vec())
+        }
     } else if class == env.objc.get_known_class("NSDate", &mut env.mem) {
         let date = env.objc.borrow::<NSDateHostObject>(plist);
         // [深扫修 2026-09-12] 原来 Duration::from_secs_f64 遇到 2001 年以前的日期(负值)

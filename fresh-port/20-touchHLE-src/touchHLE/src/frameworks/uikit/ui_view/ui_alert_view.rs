@@ -101,6 +101,9 @@ pub struct State {
     /// 以前只有一个不记手指的 capture 槽:别的手指的抬起会被吞掉(游戏残留只有 began 的触点),
     /// 真正按弹框那根的抬起反被当成孤立抬起传给游戏,弹框点击也丢了。
     owned_fingers: HashSet<FingerId>,
+    /// [2026-10-29 R18-D-2] 本轮运行循环里显示过系统原生弹窗:剩下已排队的按下都归弹框(见 swallow_down_after_native)。
+    /// 每轮 handle_events 开头由 begin_round 清掉。
+    swallow_downs: bool,
     /// "keyWindow 还没建好"的日志只打一次。
     waiting_logged: bool,
 }
@@ -595,13 +598,56 @@ pub fn pump(env: &mut Environment) {
     env.framework_state.uikit.ui_alert_view.waiting_logged = false;
     // [2026-10-28] 用户要求弹框一律用系统原生弹窗、不许自己绘制:先用宿主原生弹窗(阻塞到玩家点掉),
     // 点了哪个按钮就按真实索引走 dismiss(回调顺序与点自绘覆盖层完全相同)。只有原生弹窗显示失败时才退回自绘覆盖层。
+    // [2026-10-29 R18-D-2] 原生弹窗阻塞到玩家点掉才返回,期间系统对话框会吃掉游戏手里还按着的手指的抬起:
+    // 先把它们以取消结束(与真机弹框盖上来时 UIKit 取消底下触摸一致),免得游戏残留只有 began 的触点。
+    crate::frameworks::uikit::cancel_tracked_touches(env, "系统原生弹窗弹出");
     if let Some(index) = show_native(env, front) {
         log!("[弹框] 系统原生弹窗 {:?} 玩家点了索引 {}", front, index);
+        env.framework_state.uikit.ui_alert_view.swallow_downs = true;
+        skip_next_frame_delta(env);
         dismiss(env, front, index, /* clicked: */ true);
         return;
     }
     log!("[弹框] 系统原生弹窗不可用,{:?} 退回自绘覆盖层", front);
     present(env, front, window);
+}
+
+/// [2026-10-29 R18-D-3] 原生弹窗阻塞期间游戏一帧都没跑,关掉后 -[CCDirector calculateDeltaTime]@0x2c7d74 会把整段停留时长
+/// 当成一帧的 dt(动作一步跳完、粒子余量暴涨)。原版 UIAlertView 不阻塞,弹框底下照常逐帧走,不会有这一大帧。
+/// 照游戏自己处理时间跳变的写法(-[iMoleVillageAppDelegate applicationSignificantTimeChange:]@0x11a80)让下一帧 dt 归零。
+/// 在 handle_events 里调用,不在帧栈上,可以发消息;没有 CCDirector 类(别的游戏)时什么都不做。
+fn skip_next_frame_delta(env: &mut Environment) {
+    let class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    if class == nil {
+        return;
+    }
+    let director: id = msg![env; class sharedDirector];
+    if director != nil {
+        () = msg![env; director setNextDeltaTimeZero:true];
+    }
+}
+
+/// [2026-10-29 R18-D-2] 每轮 handle_events 开头调用:清掉上一轮「显示过原生弹窗」的标记。
+pub fn begin_round(env: &mut Environment) {
+    env.framework_state.uikit.ui_alert_view.swallow_downs = false;
+}
+
+/// [2026-10-29 R18-D-2] 本轮显示过系统原生弹窗时,把这次按下整个归弹框(返回 true = 不交给游戏),
+/// 并记进 owned_fingers,让它之后的移动/抬起/取消也被吞掉。
+/// 根因:自绘覆盖层是「先挂上、再吞同一轮已排队的按下」(10-10 触摸 P0);原生弹窗阻塞到点掉后立刻关闭,
+/// overlay 从没设上,于是弹框出现前就排在 SDL 队列里的按下(卡顿时连点、两指交替点)在关框后照样交给游戏,
+/// 同一按钮再触发一次排出第二个弹框,或点穿到下面。真机 show 同步建立弹框窗口,这些按下都落在弹框上。
+pub fn swallow_down_after_native(env: &mut Environment, map: &HashMap<FingerId, Coords>) -> bool {
+    let state = &mut env.framework_state.uikit.ui_alert_view;
+    if !state.swallow_downs || map.is_empty() {
+        return false;
+    }
+    if state.capture.as_ref().is_some_and(|c| map.contains_key(&c.finger)) {
+        state.capture = None;
+    }
+    state.owned_fingers.extend(map.keys().copied());
+    log!("[弹框] 原生弹窗关闭后吞掉本轮已排队的按下 {:?}", map.keys().collect::<Vec<_>>());
+    true
 }
 
 /// [2026-10-28] 用宿主系统原生弹窗显示弹框,返回被点按钮的真实索引;显示失败返回 None。
@@ -636,6 +682,12 @@ fn show_native(env: &mut Environment, alert: id) -> Option<NSInteger> {
         cancel = None;
     }
     log!("[弹框] 系统原生弹窗 {:?}:{} / {} 按钮 {:?}(取消键 {:?})", alert, title, message, buttons, cancel);
+    // [2026-10-29] 测试开关:MOLE_NATIVE_ALERT_FAKE_CLICK=1 时不真弹(原生弹窗阻塞,无头脚本点不到),直接当作点了索引 0,
+    // 走与真点完全相同的后续路径(吞本轮已排队的按下、dismiss 回调)。不设时行为不变。
+    if std::env::var("MOLE_NATIVE_ALERT_FAKE_CLICK").is_ok_and(|v| v != "0") {
+        log!("[弹框] 测试开关 MOLE_NATIVE_ALERT_FAKE_CLICK:不显示,按点了索引 0 处理");
+        return Some(0);
+    }
     let index = env.on_parent_stack_in_coroutine(move |window, _options| {
         window.show_native_alert(&title, &message, &buttons, cancel)
     })?;

@@ -578,6 +578,7 @@ pub fn run_run_loop(
 /// 偏移从未改过(代数为 0)时直接返回,零行为变化;UIApplication 尚未创建(应用选择器阶段)时只记账不发送。
 fn deliver_significant_time_change(env: &mut Environment) {
     let generation = crate::libc::time::time_jump_generation();
+    let clock_jump = guest_clock_jumped();
     // [2026-10-02 同步上游 v0.3.0] 记账字段已迁到线程本地状态;只在主线程 run loop 调用,固定读写线程 0 那份。
     if generation
         == env.threads[0]
@@ -585,6 +586,7 @@ fn deliver_significant_time_change(env: &mut Environment) {
             .foundation
             .ns_run_loop
             .seen_time_jump_generation
+        && clock_jump.is_none()
     {
         return;
     }
@@ -599,11 +601,18 @@ fn deliver_significant_time_change(env: &mut Environment) {
     if ui_application == nil {
         return;
     }
-    log!(
-        "[time travel] clock offset is now {}s (jump #{}), sending applicationSignificantTimeChange:",
-        crate::libc::time::time_offset_secs(),
-        generation
-    );
+    if let Some(secs) = clock_jump {
+        log!(
+            "[时间] 游戏墙钟两次检查之间跳了 {} 秒(电脑睡眠唤醒、宿主改钟或运行循环长时间阻塞),补发 applicationSignificantTimeChange:",
+            secs
+        );
+    } else {
+        log!(
+            "[time travel] clock offset is now {}s (jump #{}), sending applicationSignificantTimeChange:",
+            crate::libc::time::time_offset_secs(),
+            generation
+        );
+    }
 
     let pool: id = msg_class![env; NSAutoreleasePool new];
     let delegate: id = msg![env; ui_application delegate];
@@ -621,6 +630,35 @@ fn deliver_significant_time_change(env: &mut Environment) {
     () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
 
     let _: () = msg![env; pool drain];
+}
+
+/// [2026-10-29 第十八轮 R18-B-1] 游戏看到的墙钟(宿主墙钟 + 时间旅行偏移)在相邻两次检查之间前进或后退超过 120 秒时,
+/// 返回跳变秒数(后退为负)。只在主线程 run loop 的 deliver_significant_time_change 里调用(每轮、每个定时器前各一次,
+/// 正常间隔是毫秒级)。
+/// 根因:-[CCDirector calculateDeltaTime]@0x2c7d74 用 gettimeofday 算 dt,只有 nextDeltaTimeZero_ 为真才清零、没有上限。
+/// 真机睡眠/切后台会经历失活→激活(resume 重设 lastUpdate_),改系统时间会收到 applicationSignificantTimeChange:
+/// (游戏 0x11a80 setNextDeltaTimeZero:YES),永远拿不到跨越休眠的 dt。桌面电脑合盖睡眠、宿主大幅校时不发这些回调,
+/// 唤醒后第一帧所有 update:/动作/粒子吃到以小时计的 dt:动作一步跳完,持续发射的粒子 emitCounter 留下巨大余量,
+/// 从此一直满密度喷发(-[CCParticleSystem update:] 0x2d8bb6)。这里照「系统时间被改」补发通知。
+/// 只看墙钟增量、不减单调钟:Windows 的 Instant(QPC)睡眠期间是否走时不确定;运行循环本身被阻塞(原生弹窗挂了很久)
+/// 时补发也正好让下一帧 dt 归零。阈值 120 秒,与昼夜对钟(mole_items.rs day_night_clock_jumped)一致,两边各自记账。
+fn guest_clock_jumped() -> Option<i64> {
+    use std::cell::Cell;
+    use std::time::{Duration, SystemTime};
+    thread_local! {
+        static LAST: Cell<Option<SystemTime>> = const { Cell::new(None) };
+    }
+    let now = crate::libc::time::guest_wall_clock_now();
+    let threshold = Duration::from_secs(120);
+    LAST.with(|last| {
+        let jumped = last.get().and_then(|prev| match now.duration_since(prev) {
+            Ok(fwd) if fwd > threshold => Some(fwd.as_secs() as i64),
+            Err(back) if back.duration() > threshold => Some(-(back.duration().as_secs() as i64)),
+            _ => None,
+        });
+        last.set(Some(now));
+        jumped
+    })
 }
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods

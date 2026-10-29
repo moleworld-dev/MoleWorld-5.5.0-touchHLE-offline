@@ -503,6 +503,22 @@ pub fn next_inject() -> Option<Inject> {
             ));
             None
         }
+        // [2026-10-29] `ftaps <次数> <nx> <ny>`:同一根原始手指在同一处连点 N 次,全部按下/抬起一次性压进 SDL 队列,
+        // 落在同一轮 handle_events 里处理(模拟卡顿时连点)。用来验证弹框模态是否吞掉同一轮已排队的按下。
+        Some("ftaps") => {
+            let n: u32 = it.next()?.parse().ok()?;
+            let nx: f32 = it.next()?.parse().ok()?;
+            let ny: f32 = it.next()?.parse().ok()?;
+            let n = n.clamp(1, 10);
+            let mut seq = Vec::new();
+            for _ in 0..n {
+                seq.push((FINGER_DOWN, 0, nx, ny));
+                seq.push((FINGER_UP, 0, nx, ny));
+            }
+            push_sdl_finger_events(&seq, false, 0, 1.0);
+            log_line(&format!("INJECT ftaps {} 次 ({}, {})", n, nx, ny));
+            None
+        }
         // [2026-10-05 第九轮] `fpinch <ncx> <ncy> <起始间距> <结束间距> [步数] [split]`:两根原始手指(0/1)以归一化
         // (ncx,ncy) 为中点、沿画面水平方向对称,间距(归一化宽度)线性变化。split=1 时同一步两根手指的移动用不同
         // 时间戳(两指之间真实间隔 2 毫秒,模拟安卓逐指上报跨毫秒),缺省 0 = 同一毫秒。
@@ -591,6 +607,13 @@ pub fn next_inject() -> Option<Inject> {
                 sdl2::sys::SDL_PushEvent(&mut ev);
             }
             log_line(&format!("INJECT ftext {:?}", text));
+            None
+        }
+        // [2026-10-29] `clockjump <秒>`:只把游戏墙钟往前挪(不发 applicationSignificantTimeChange:),模拟电脑合盖睡眠唤醒。
+        Some("clockjump") => {
+            let secs: i64 = it.next()?.parse().ok()?;
+            crate::libc::time::simulate_host_clock_jump_secs(secs.clamp(-86400 * 30, 86400 * 30));
+            log_line(&format!("INJECT clockjump {} 秒", secs));
             None
         }
         Some("fbksp") => {
