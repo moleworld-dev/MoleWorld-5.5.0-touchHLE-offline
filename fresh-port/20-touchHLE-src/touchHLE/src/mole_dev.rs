@@ -2480,6 +2480,8 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 ///   quest main|time|vip|island <任务号>                → quest_jump
 ///   story <段号>                                       → story_play
 ///   time <分钟>                                        → apply_time_minutes
+///   travel <小时>                                      → time_travel_hours(修改器「时间旅行」)
+///   summon <类名>                                      → mole_menu::summon_class(修改器「召唤」)
 ///   give <物品ID>                                      → mole_items::place_item(与召唤页、隐藏物品页同一入口)
 ///   island ff <分钟>                                   → island_fast_forward_minutes([2026-09-24 第四轮 K4 I4-05] 岛档计时快进,
 ///                                                        主村离线执行、先自动存快照,下次进岛生效)
@@ -2549,6 +2551,22 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
                 apply_time_minutes(env, minutes)
             }
             _ => Err(format!("用法:time <分钟>(1..{})", TIME_SKIP_MAX_MINUTES)),
+        },
+        // [2026-10-28] 修改器「时间旅行」的命令行入口(测试惊吓盒子、水塔等按 getCurrentServerTime 计的冷却)。
+        "travel" => match args.as_slice() {
+            [h] => {
+                let hours: i64 = parse_command_number(h, "小时数")?;
+                time_travel_hours(env, hours)
+            }
+            _ => Err("用法:travel <小时>(同修改器「时间旅行」,只往前拨)".to_string()),
+        },
+        // [2026-10-28] 修改器「召唤」的命令行入口(无头测试打开旧活动等界面;与菜单同一个 summon_class,拒绝规则一致)。
+        "summon" => match args.as_slice() {
+            [c] => {
+                crate::mole_menu::summon_class(env, c, 88888);
+                Ok(format!("已请求召唤 {}(结果见 [MOLEMENU] 日志/提示条)", c))
+            }
+            _ => Err("用法:summon <类名>(同修改器「召唤」)".to_string()),
         },
         "give" => match args.as_slice() {
             [id] => {

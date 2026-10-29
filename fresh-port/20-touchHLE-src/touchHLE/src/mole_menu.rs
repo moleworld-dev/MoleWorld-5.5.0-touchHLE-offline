@@ -1618,7 +1618,7 @@ fn outside_main_village(env: &mut Environment) -> Option<(i32, bool)> {
     }
 }
 
-fn summon_class(env: &mut Environment, name: &str, z: i32) {
+pub(crate) fn summon_class(env: &mut Environment, name: &str, z: i32) {
     if refuse_while_placing(env, &format!("召唤 {}", name)) {
         return;
     }

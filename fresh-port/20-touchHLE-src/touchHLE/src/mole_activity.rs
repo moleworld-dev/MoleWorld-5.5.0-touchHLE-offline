@@ -193,6 +193,19 @@ const SITE_SIGN_SHOW_CONNECTED: u32 = 0x397178;
 /// getDailyTaskListFromServerWithSceneId:(0x11780),这是跨天回来换日常列表的唯一入口;离线主村这道门恒假,
 /// 挂后台跨过零点回来日常任务还是昨天那组。放行后离线 getServerTime 发包空过,1074 由回环按当天应答。
 const SITE_FOREGROUND_DAILY_CONNECTED: u32 = 0x1171c;
+/// [2026-10-28] -[RewardBox processTouched]@0x39df58 惊吓盒子(物品 14905/14906)冷却到点后点击领奖 isReachable(LR 0x39e02b)。
+/// 原版两道门失败就在 0x39e172 直接返回:晶玉领不到、礼物标记一直挂着。门后整段是本地逻辑(calculateRewardId: 算奖励、
+/// GameData addCoupon:number: 入账、CouponAnimation、removeFlag、setCoolDownTime: 重置冷却),不发包,离线放行即照原版发奖。
+const SITE_REWARDBOX_REACHABLE: u32 = 0x39e026;
+/// 同上 isConnected(LR 0x39e04b)。
+const SITE_REWARDBOX_CONNECTED: u32 = 0x39e046;
+/// [2026-10-28] -[GameManager checkNetWorkOK]@0x1bf10 isReachable(LR 0x1bf43)。唯一调用方是 -[GameManager initGameData]
+/// @0x1bfc0(进村时),门过了才对 AchievementControl 做六组 checkConditions:(1/4/8/0x40/0x100/2)成就补判;离线恒假,
+/// 整段跳过,离线期间达成的成就要等别的触发点才解锁。两道门必须一起放:只放 isReachable 时 isConnected 失败会走
+/// 0x1bf70 disconnect + setState:2 + establishConnection 去重连。
+const SITE_GM_CHECKNET_REACHABLE: u32 = 0x1bf3e;
+/// 同上 isConnected(LR 0x1bf65)。
+const SITE_GM_CHECKNET_CONNECTED: u32 = 0x1bf60;
 /// -[SealExchangeLayer initData] isReachable(LR 0x39aac7)。
 const SITE_SEAL_INIT_REACHABLE: u32 = 0x39aac2;
 /// 同上 isConnected(LR 0x39aae5)。
@@ -525,6 +538,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_SEAL_INIT_REACHABLE)
                 || lr_is(env, SITE_EDIT_SEABED_REACHABLE)
                 || lr_is(env, SITE_SEABED_INIT_REACHABLE)
+                || lr_is(env, SITE_REWARDBOX_REACHABLE)
+                || lr_is(env, SITE_GM_CHECKNET_REACHABLE)
             {
                 env.cpu.regs_mut()[0] = 1;
                 Some(true)
@@ -533,6 +548,11 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             }
         }
         ("NetworkManager", "isConnected") => {
+            if lr_is(env, SITE_REWARDBOX_CONNECTED) {
+                log!("[ACTIVITY] 惊吓盒子领奖网络门:离线放行,照原版本地算奖励、加晶玉并重置冷却");
+            } else if lr_is(env, SITE_GM_CHECKNET_CONNECTED) {
+                log!("[ACTIVITY] 进村成就补判(initGameData → checkNetWorkOK):离线放行,照原版跑六组 checkConditions:");
+            }
             // [2026-09-16] X4-02 对称兜底(正常到不了:时间旅行中同一分支上面的 isReachable 门已先失败)。只读寄存器,没发消息。
             if lr_is(env, SITE_EDIT_SEABED_CONNECTED) && time_travel_active() {
                 return None;
@@ -550,6 +570,8 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_SEAL_INIT_CONNECTED)
                 || lr_is(env, SITE_EDIT_SEABED_CONNECTED)
                 || lr_is(env, SITE_SEABED_INIT_CONNECTED)
+                || lr_is(env, SITE_REWARDBOX_CONNECTED)
+                || lr_is(env, SITE_GM_CHECKNET_CONNECTED)
             {
                 env.cpu.regs_mut()[0] = 1;
                 Some(true)
