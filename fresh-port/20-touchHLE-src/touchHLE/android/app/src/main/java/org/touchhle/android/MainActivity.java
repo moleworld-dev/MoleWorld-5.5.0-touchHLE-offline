@@ -11,6 +11,8 @@ package org.touchhle.android;
 import android.content.Context;
 import android.content.ComponentCallbacks2;
 import android.content.pm.ActivityInfo;
+import android.media.AudioManager;
+import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.inputmethod.InputMethodManager;
@@ -77,6 +79,63 @@ public class MainActivity extends SDLActivity {
 
     /** 与 window.rs 的 reset_text_input_connection 一致。 */
     private static final int COMMAND_RESTART_INPUT = COMMAND_USER + 1;
+    /** 与 mole_host.rs 的 set_audio_category 一致:参数 1 = 与别的 App 混音,0 = 独占。 */
+    private static final int COMMAND_AUDIO_CATEGORY = COMMAND_USER + 2;
+
+    /**
+     * [2026-10-29 第十八轮 R18-C-1] 告诉宿主有没有别的 App 在放音乐(原版 kAudioSessionProperty_OtherAudioIsPlaying)。
+     * 原版 CocosDenshion 据此选 Ambient(混音、不放背景音乐,只出音效)或 SoloAmbient(独占、放背景音乐)。
+     */
+    private static native void nativeSetOtherAudioPlaying(boolean playing);
+
+    /** 上次游戏选的是不是独占类别(-1 = 还没选)。 */
+    private int mAudioSolo = -1;
+    private final AudioManager.OnAudioFocusChangeListener mAudioFocusListener = focusChange -> { };
+
+    private void reportOtherAudio() {
+        if (mBrokenLibraries) {
+            return;
+        }
+        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        boolean playing = am != null && am.isMusicActive();
+        try {
+            nativeSetOtherAudioPlaying(playing);
+        } catch (UnsatisfiedLinkError e) {
+            Log.w("touchHLE", "nativeSetOtherAudioPlaying 不可用", e);
+            return;
+        }
+        // 回前台时别的音乐已经停了、游戏上次选的是独占:像 iOS 重新激活 SoloAmbient 会话一样重新拿回音频焦点。
+        if (!playing && mAudioSolo == 1 && am != null) {
+            am.requestAudioFocus(mAudioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        }
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        reportOtherAudio();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        reportOtherAudio();
+    }
+
+    /** UI 线程:独占 = 申请 AUDIOFOCUS_GAIN(别的 App 暂停,同 iOS SoloAmbient 打断别的音频);混音 = 放掉焦点(两边一起响,同 Ambient)。 */
+    private void applyAudioCategory(boolean mix) {
+        mAudioSolo = mix ? 0 : 1;
+        AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) {
+            return;
+        }
+        if (mix) {
+            am.abandonAudioFocus(mAudioFocusListener);
+        } else {
+            am.requestAudioFocus(mAudioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        }
+        Log.v("touchHLE", "音频会话:游戏选" + (mix ? "混音(放掉音频焦点)" : "独占(申请音频焦点)"));
+    }
 
     /**
      * [2026-10-29 第十一轮 R11-H-7] 游戏委托拒收输入(如换头像面板拒收纯空格)后,宿主经 SDL_AndroidSendMessage 发来。
@@ -86,6 +145,10 @@ public class MainActivity extends SDLActivity {
      */
     @Override
     protected boolean onUnhandledMessage(int command, Object param) {
+        if (command == COMMAND_AUDIO_CATEGORY) {
+            applyAudioCategory(param instanceof Integer && (Integer) param != 0);
+            return true;
+        }
         if (command == COMMAND_RESTART_INPUT) {
             if (mTextEdit != null) {
                 InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);

@@ -31,6 +31,7 @@ const kAudioSessionProperty_PreferredHardwareIOBufferDuration: AudioSessionPrope
 const kAudioSessionProperty_PreferredHardwareSampleRate: AudioSessionPropertyID = fourcc(b"hwsr");
 
 const kAudioSessionCategory_SoloAmbientSound: u32 = fourcc(b"solo");
+const kAudioSessionCategory_AmbientSound: u32 = fourcc(b"ambi");
 const kAudioSessionProperty_CurrentHardwareIOBufferDuration: u32 = fourcc(b"chbd");
 
 pub struct State {
@@ -101,7 +102,8 @@ fn AudioSessionGetProperty(
     let state = &env.framework_state.audio_toolbox.audio_session;
     match in_ID {
         kAudioSessionProperty_OtherAudioIsPlaying => {
-            let value: u32 = 0;
+            // [2026-10-29 R18-C-1] 问宿主(iOS AVAudioSession / 安卓 AudioManager),桌面恒 0。见 mole_host。
+            let value: u32 = crate::mole_host::other_audio_playing() as u32;
             env.mem.write(out_data.cast(), value);
         }
         kAudioSessionProperty_AudioCategory => {
@@ -155,6 +157,19 @@ fn AudioSessionSetProperty(
     if in_data_size != required_size {
         log!("Warning: AudioSessionSetProperty() failed");
         return kAudioSessionBadPropertySizeError;
+    }
+    // [2026-10-29 R18-C-1] 类别交给宿主音频会话(以前只记日志)。
+    if in_ID == kAudioSessionProperty_AudioCategory {
+        let category: u32 = env.mem.read(in_data.cast::<u32>());
+        env.framework_state
+            .audio_toolbox
+            .audio_session
+            .audio_session_category = category;
+        if category == kAudioSessionCategory_AmbientSound {
+            crate::mole_host::set_audio_category(crate::mole_host::AudioCategory::Ambient);
+        } else if category == kAudioSessionCategory_SoloAmbientSound {
+            crate::mole_host::set_audio_category(crate::mole_host::AudioCategory::SoloAmbient);
+        }
     }
     if in_ID == kAudioSessionProperty_PreferredHardwareSampleRate {
         env.framework_state

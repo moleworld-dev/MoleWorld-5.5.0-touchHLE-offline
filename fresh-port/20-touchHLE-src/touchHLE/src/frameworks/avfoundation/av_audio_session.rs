@@ -51,12 +51,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)setCategory:(AVAudioSessionCategory)category
               error:(MutPtr<id>)error { // NSError **
-    log!(
-        "TODO: [(AVAudioSession *){:?} setCategory:'{}' error:{:?}] -> true",
-        this,
-        ns_string::to_rust_string(env, category),
-        error
-    );
+    // [2026-10-29 R18-C-1] -[CDAudioManager audioSessionSetCategory:]@0x2fc470 按 isOtherAudioPlaying 选 Ambient / SoloAmbient,
+    // 交给宿主音频会话(见 mole_host);其余类别本游戏不用,照旧只记日志。
+    let name = ns_string::to_rust_string(env, category);
+    match &*name {
+        AVAudioSessionCategoryAmbient => {
+            crate::mole_host::set_audio_category(crate::mole_host::AudioCategory::Ambient);
+        }
+        AVAudioSessionCategorySoloAmbient => {
+            crate::mole_host::set_audio_category(crate::mole_host::AudioCategory::SoloAmbient);
+        }
+        _ => {
+            log!(
+                "TODO: [(AVAudioSession *){:?} setCategory:'{}' error:{:?}] -> true",
+                this,
+                name,
+                error
+            );
+        }
+    }
     true
 }
 
