@@ -102,7 +102,18 @@ UIKit_ShowMessageBoxAlertController(const SDL_MessageBoxData *messageboxdata, in
     }
 
     if (window == nil || window.rootViewController == nil) {
-        alertwindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        /* [MoleWorld 2026-10-28] iOS 13+ 场景生命周期下(iOS 27 SDK 强制),不挂 windowScene 的 UIWindow 永远不显示,
+         * 弹窗看不见而这里一直等点击 = 卡死。有活跃场景就挂到场景上。 */
+        alertwindow = nil;
+        if (@available(iOS 13.0, tvOS 13.0, *)) {
+            UIWindowScene *scene = UIKit_GetActiveWindowScene();
+            if (scene) {
+                alertwindow = [[UIWindow alloc] initWithWindowScene:scene];
+            }
+        }
+        if (alertwindow == nil) {
+            alertwindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        }
         alertwindow.rootViewController = [UIViewController new];
         alertwindow.windowLevel = UIWindowLevelAlert;
 

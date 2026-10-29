@@ -11,6 +11,10 @@
 //! AppDelegate 的 tag 框,index 0 就是 exit(0);MainMenuScene 关框即重连,等于无退避自动重连)。
 //!
 //! 现在的做法:
+//! - [2026-10-28] 用户要求弹框一律用系统原生弹窗、不许自己绘制:[pump] 取到队首弹框后先用宿主原生弹窗
+//!   (Window::show_native_alert = SDL_ShowMessageBox:iOS UIAlertController、Mac NSAlert、安卓 AlertDialog、
+//!   Windows 系统对话框)阻塞显示,玩家点了哪个按钮就按真实索引走 [dismiss]。下面的自绘覆盖层与触摸改道
+//!   只在原生弹窗显示失败时兜底。
 //! - `show` 只把弹框压进 Rust 队列(持有一次 retain),同一时刻只显示队首一个(防叠加);
 //!   由 [pump](uikit::handle_events 每轮运行循环调用)挂到 keyWindow 最上层。
 //!   keyWindow 还没建好、或作弊菜单开着时继续排队,下一帧再试。
@@ -589,7 +593,53 @@ pub fn pump(env: &mut Environment) {
         return;
     }
     env.framework_state.uikit.ui_alert_view.waiting_logged = false;
+    // [2026-10-28] 用户要求弹框一律用系统原生弹窗、不许自己绘制:先用宿主原生弹窗(阻塞到玩家点掉),
+    // 点了哪个按钮就按真实索引走 dismiss(回调顺序与点自绘覆盖层完全相同)。只有原生弹窗显示失败时才退回自绘覆盖层。
+    if let Some(index) = show_native(env, front) {
+        log!("[弹框] 系统原生弹窗 {:?} 玩家点了索引 {}", front, index);
+        dismiss(env, front, index, /* clicked: */ true);
+        return;
+    }
+    log!("[弹框] 系统原生弹窗不可用,{:?} 退回自绘覆盖层", front);
     present(env, front, window);
+}
+
+/// [2026-10-28] 用宿主系统原生弹窗显示弹框,返回被点按钮的真实索引;显示失败返回 None。
+/// 没有按钮的框(原版只能等程序关闭)补一个「确定」键,按索引 0 关闭,与以前自绘覆盖层「点任意处按索引 0 关闭」一致。
+fn show_native(env: &mut Environment, alert: id) -> Option<NSInteger> {
+    let (title, message, button_titles, cancel_index) = {
+        let host = env.objc.borrow::<UIAlertViewHostObject>(alert);
+        (
+            host.title,
+            host.message,
+            host.button_titles.clone(),
+            host.cancel_index,
+        )
+    };
+    let to_string = |env: &mut Environment, s: id| -> String {
+        if s == nil {
+            String::new()
+        } else {
+            ns_string::to_rust_string(env, s).into_owned()
+        }
+    };
+    let title = to_string(env, title);
+    let message = to_string(env, message);
+    let mut buttons: Vec<String> = button_titles.iter().map(|&t| to_string(env, t)).collect();
+    let mut cancel = if cancel_index >= 0 && (cancel_index as usize) < buttons.len() {
+        Some(cancel_index as usize)
+    } else {
+        None
+    };
+    if buttons.is_empty() {
+        buttons.push(String::from("确定"));
+        cancel = None;
+    }
+    log!("[弹框] 系统原生弹窗 {:?}:{} / {} 按钮 {:?}(取消键 {:?})", alert, title, message, buttons, cancel);
+    let index = env.on_parent_stack_in_coroutine(move |window, _options| {
+        window.show_native_alert(&title, &message, &buttons, cancel)
+    })?;
+    Some(index as NSInteger)
 }
 
 /// [扫描修 2026-09-15] uikit.rs 在把触摸交给游戏前先调用。
