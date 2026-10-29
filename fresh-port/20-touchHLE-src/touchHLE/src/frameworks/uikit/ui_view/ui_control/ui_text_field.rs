@@ -966,6 +966,9 @@ pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
         store_text(env, text_field, new_text);
         () = msg![env; text_field setNeedsDisplay];
         release(env, new_text);
+    } else {
+        // [2026-10-29 R11-H-7] 拒收后让安卓输入连接重新开始,免得之后删字多删一个真字(见 reset_text_input_connection)。
+        env.on_parent_stack_in_coroutine(|window, _| window.reset_text_input_connection());
     }
     release(env, curr_text);
     release(env, txt);

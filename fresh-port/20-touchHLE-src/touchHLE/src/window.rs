@@ -3206,6 +3206,25 @@ impl Window {
         }
     }
 
+    /// [2026-10-29 第十一轮 R11-H-7] 安卓:游戏委托拒收了一段输入(如换头像面板拒收纯空格)后调用。
+    /// SDLInputConnection 只拿自己的 Editable 与 mCommittedText 做差量,不知道游戏没收,之后输入法删掉那段
+    /// 字会多补退格、删掉游戏里的真字。这里经 SDL_AndroidSendMessage 让 MainActivity 在 UI 线程对输入框
+    /// restartInput(),新的输入连接从空文本开始,和刚弹出键盘时一样(删已有字走 KEYCODE_DEL 按键),键盘不收起。
+    /// 其他平台没有这层差量,空操作。
+    pub fn reset_text_input_connection(&self) {
+        #[cfg(target_os = "android")]
+        {
+            extern "C" {
+                fn SDL_AndroidSendMessage(command: u32, param: std::ffi::c_int) -> std::ffi::c_int;
+            }
+            // 与 MainActivity.COMMAND_RESTART_INPUT 一致(SDL 的 COMMAND_USER = 0x8000 起为自定义命令)。
+            const COMMAND_RESTART_INPUT: u32 = 0x8001;
+            if unsafe { SDL_AndroidSendMessage(COMMAND_RESTART_INPUT, 0) } != 0 {
+                log!("安卓输入法:重置输入连接的消息没发出去");
+            }
+        }
+    }
+
     pub fn on_main_stack(&self) -> bool {
         self.on_main_stack
     }

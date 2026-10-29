@@ -8,8 +8,10 @@
  */
 package org.touchhle.android;
 
+import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.util.Log;
+import android.view.inputmethod.InputMethodManager;
 
 import org.libsdl.app.SDLActivity;
 
@@ -40,5 +42,28 @@ public class MainActivity extends SDLActivity {
             return;
         }
         super.setOrientationBis(w, h, resizable, hint);
+    }
+
+    /** 与 window.rs 的 reset_text_input_connection 一致。 */
+    private static final int COMMAND_RESTART_INPUT = COMMAND_USER + 1;
+
+    /**
+     * [2026-10-29 第十一轮 R11-H-7] 游戏委托拒收输入(如换头像面板拒收纯空格)后,宿主经 SDL_AndroidSendMessage 发来。
+     * SDLInputConnection 按自己的 Editable 做差量补退格,不知道游戏没收,之后删字会多删一个真字。
+     * restartInput 让输入法重新 onCreateInputConnection,新连接从空文本开始(和刚弹出键盘时一样),键盘不收起。
+     * 本方法由 SDLCommandHandler 在 UI 线程调用。
+     */
+    @Override
+    protected boolean onUnhandledMessage(int command, Object param) {
+        if (command == COMMAND_RESTART_INPUT) {
+            if (mTextEdit != null) {
+                InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.restartInput(mTextEdit);
+                }
+            }
+            return true;
+        }
+        return super.onUnhandledMessage(command, param);
     }
 }
