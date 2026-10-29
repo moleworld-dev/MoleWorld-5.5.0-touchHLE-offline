@@ -604,11 +604,27 @@ pub fn pump(env: &mut Environment) {
     if let Some(index) = show_native(env, front) {
         log!("[弹框] 系统原生弹窗 {:?} 玩家点了索引 {}", front, index);
         env.framework_state.uikit.ui_alert_view.swallow_downs = true;
+        skip_next_frame_delta(env);
         dismiss(env, front, index, /* clicked: */ true);
         return;
     }
     log!("[弹框] 系统原生弹窗不可用,{:?} 退回自绘覆盖层", front);
     present(env, front, window);
+}
+
+/// [2026-10-29 R18-D-3] 原生弹窗阻塞期间游戏一帧都没跑,关掉后 -[CCDirector calculateDeltaTime]@0x2c7d74 会把整段停留时长
+/// 当成一帧的 dt(动作一步跳完、粒子余量暴涨)。原版 UIAlertView 不阻塞,弹框底下照常逐帧走,不会有这一大帧。
+/// 照游戏自己处理时间跳变的写法(-[iMoleVillageAppDelegate applicationSignificantTimeChange:]@0x11a80)让下一帧 dt 归零。
+/// 在 handle_events 里调用,不在帧栈上,可以发消息;没有 CCDirector 类(别的游戏)时什么都不做。
+fn skip_next_frame_delta(env: &mut Environment) {
+    let class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    if class == nil {
+        return;
+    }
+    let director: id = msg![env; class sharedDirector];
+    if director != nil {
+        () = msg![env; director setNextDeltaTimeZero:true];
+    }
 }
 
 /// [2026-10-29 R18-D-2] 每轮 handle_events 开头调用:清掉上一轮「显示过原生弹窗」的标记。
