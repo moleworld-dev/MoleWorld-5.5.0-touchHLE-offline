@@ -114,15 +114,22 @@ pub struct State {
 /// (弹框出现前就按下、已交给游戏的)照常交给游戏,不再整包吞掉或整包放行。
 fn route_touch(env: &mut Environment, event: crate::window::Event) {
     // [补完 2026-09-15] 先记账(touch_shadow),再分发。
-    track_touch_shadow(env, &event);
+    // [2026-10-29 R18-D-2] pump 放到记账之前:原生弹窗弹出前要把游戏手里还按着的手指以取消结束,
+    // 这次刚来的按下游戏还没见过,不能被一起取消。
     // [2026-10-10 触摸 P0] 同一轮里前一个触摸回调刚 show 的弹框,在下一根手指按下之前先挂上。
     // -[UIAlertView show] 只入队,覆盖层原来要等下一轮 handle_events 开头的 pump;这一轮 while 循环里已经排队的按下
     // (卡顿时连点、两指交替点)于是绕过模态直接交给游戏:同一按钮再触发一次排出第二个弹框,或点穿到下面的按钮/建筑。
     // 真机 show 同步建立弹框窗口,之后按下的触摸都命中弹框。只在按下前补:移动/抬起/取消按 owned_fingers 判归属,
     // 也免得挂起或打开菜单时的 cancel_tracked_touches 里临时挂出弹框。队列为空时 pump 只读两个字段就返回。
-    if matches!(event, crate::window::Event::TouchesDown(_)) {
+    if let crate::window::Event::TouchesDown(map) = &event {
         ui_view::ui_alert_view::pump(env);
+        // [2026-10-29 R18-D-2] 本轮显示过原生弹窗:这次按下归弹框,不交给游戏(仍记账,抬起时照常移除)。
+        if ui_view::ui_alert_view::swallow_down_after_native(env, map) {
+            track_touch_shadow(env, &event);
+            return;
+        }
     }
+    track_touch_shadow(env, &event);
     if let Some(event) = ui_view::ui_alert_view::filter_touch_event(env, event) {
         ui_touch::handle_event(env, event);
     }
@@ -161,7 +168,7 @@ fn track_touch_shadow(env: &mut Environment, event: &crate::window::Event) {
 /// 经 route_touch 发出:系统弹框先收回归它的手指(取消不算点击),其余交给 ui_touch 的
 /// handle_touches_cancelled(含 cocos2d 门控收尾);ui_touch 不认识的手指只记警告、不 panic。
 /// 调用上下文与 route_touch 相同(handle_events 内,可以发 msg_send)。
-fn cancel_tracked_touches(env: &mut Environment, reason: &str) {
+pub(crate) fn cancel_tracked_touches(env: &mut Environment, reason: &str) {
     let map = std::mem::take(&mut env.framework_state.uikit.touch_shadow);
     if map.is_empty() {
         return;
@@ -185,6 +192,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
 
     // [扫描修 2026-09-15] F12-1:队首系统弹框还没挂上就在这里挂到 keyWindow
     // (show 时只入队;keyWindow 未建好 / 作弊菜单开着时下一轮再试)。
+    ui_view::ui_alert_view::begin_round(env);
     ui_view::ui_alert_view::pump(env);
 
     // [MoleWorld DIAG] Inject a synthetic tap from /tmp/mole_input so the game
