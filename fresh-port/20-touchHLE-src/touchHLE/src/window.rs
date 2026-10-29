@@ -1653,6 +1653,11 @@ impl Window {
                 } => {
                     // [2026-10-24] 画布尺寸变了(iPhone Duo 开合、窗口缩放)→ 按新画布重算触屏起拖阈值(只在安卓/iOS 生效)。
                     self.refresh_touch_drag_slop();
+                    // [2026-10-29] 手机上记一笔画布尺寸变化(iPhone Duo 展开/合上、安卓折叠屏开合),真机排查开合问题时能对上时间点。
+                    // SizeChanged 与 Resized 常成对到达,同一尺寸只记一次。
+                    if cfg!(any(target_os = "ios", target_os = "android")) {
+                        self.log_canvas_size_change();
+                    }
                     // 仅显式 --lock-aspect(且非全屏)才 set_size 锁窗口比例。
                     if self.lock_aspect
                         && !self.fullscreen
@@ -3104,6 +3109,32 @@ impl Window {
     fn refresh_touch_drag_slop(&self) {
         let (pw, ph) = self.device_family.portrait_size();
         init_touch_drag_slop(&self.video_ctx, &self.window, pw.min(ph));
+    }
+
+    /// [2026-10-29] 画布尺寸变化时记一行日志:新画布像素、画布比例与游戏逻辑比例(启动时算定,cocos2d-iphone v1 不能运行时重排)
+    /// 之差、当前视口。同一尺寸只记一次。
+    fn log_canvas_size_change(&self) {
+        static LAST: std::sync::Mutex<(u32, u32)> = std::sync::Mutex::new((0, 0));
+        let (dw, dh) = self.window.drawable_size();
+        {
+            let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+            if *last == (dw, dh) || dw == 0 || dh == 0 {
+                return;
+            }
+            *last = (dw, dh);
+        }
+        let (aw, ah) = size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
+        let canvas = dw.max(dh) as f32 / dw.min(dh) as f32;
+        let logical = aw.max(ah) as f32 / aw.min(ah).max(1) as f32;
+        log!(
+            "[MOLE-RES] 画布尺寸变化 {}x{}(比例 {:.4}),游戏逻辑比例 {:.4},相差 {:.2}%,视口 {:?}",
+            dw,
+            dh,
+            canvas,
+            logical,
+            (canvas / logical - 1.0).abs() * 100.0,
+            self.viewport()
+        );
     }
 
     pub fn drawable_size(&self) -> (u32, u32) {
