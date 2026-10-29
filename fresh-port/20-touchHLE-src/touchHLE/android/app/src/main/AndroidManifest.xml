@@ -107,6 +107,8 @@
                 <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
             </intent-filter>
         </provider>
+        <!-- [2026-10-29 第十八轮 R18-C-2] 游戏预约的本地提醒到点后发系统通知(见 NotificationReceiver / MainActivity)。 -->
+        <receiver android:name="org.touchhle.android.NotificationReceiver" android:exported="false" />
     </application>
 
 </manifest>

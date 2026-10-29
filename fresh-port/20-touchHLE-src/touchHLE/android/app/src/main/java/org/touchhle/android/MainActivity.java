@@ -8,7 +8,14 @@
  */
 package org.touchhle.android;
 
+import android.app.AlarmManager;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.os.Build;
 import android.content.ComponentCallbacks2;
 import android.content.pm.ActivityInfo;
 import android.media.AudioManager;
@@ -16,6 +23,12 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.inputmethod.InputMethodManager;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 
 import org.libsdl.app.SDLActivity;
 
@@ -114,6 +127,96 @@ public class MainActivity extends SDLActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         reportOtherAudio();
+        // targetSdk 31 的应用在安卓 13+ 上,系统会在建第一个通知渠道时弹「是否允许通知」(应用在前台时)。
+        ensureNotificationChannel(this);
+    }
+
+    // ───── [2026-10-29 第十八轮 R18-C-2] 本地提醒 ─────
+    // 原版切后台时预约「作物成熟 / 作物快枯萎 / 摩尔派遣回来 / 太久没来」,回前台时全部取消。宿主(mole_host.rs)把每条
+    // 写成 <getExternalFilesDir>/mole_notify/<触发毫秒>-<序号>.txt(第 1 行触发时刻毫秒时间戳,第 2 行正文,第 3 行按钮文字),
+    // 再发 COMMAND_NOTIFY_SCHEDULE;这里读走、用 AlarmManager 排上并删除文件。不精确闹钟即可(安卓 12+ 精确闹钟要额外权限)。
+    // 重启手机后已排的提醒会丢,与原版无关紧要的差别。
+    static final String NOTIFY_CHANNEL = "moleworld_reminders";
+    private static final int COMMAND_NOTIFY_SCHEDULE = COMMAND_USER + 3;
+    private static final int COMMAND_NOTIFY_CANCEL = COMMAND_USER + 4;
+    private static final String NOTIFY_PREFS = "moleworld_notify";
+    private static final String NOTIFY_NEXT_ID = "next_id";
+
+    static void ensureNotificationChannel(Context context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return;
+        }
+        NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null || nm.getNotificationChannel(NOTIFY_CHANNEL) != null) {
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(NOTIFY_CHANNEL, "庄园提醒",
+                NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("作物成熟、作物快枯萎、摩尔派遣回来等提醒");
+        nm.createNotificationChannel(channel);
+    }
+
+    private File notifyDir() {
+        File base = getExternalFilesDir(null);
+        return base == null ? null : new File(base, "mole_notify");
+    }
+
+    private PendingIntent reminderIntent(int id, String body, int flags) {
+        Intent intent = new Intent(this, NotificationReceiver.class)
+                .putExtra(NotificationReceiver.EXTRA_ID, id);
+        if (body != null) {
+            intent.putExtra(NotificationReceiver.EXTRA_BODY, body);
+        }
+        return PendingIntent.getBroadcast(this, id, intent, PendingIntent.FLAG_IMMUTABLE | flags);
+    }
+
+    private void schedulePendingReminders() {
+        File dir = notifyDir();
+        File[] files = dir == null ? null : dir.listFiles((d, name) -> name.endsWith(".txt"));
+        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (files == null || am == null) {
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences(NOTIFY_PREFS, MODE_PRIVATE);
+        int nextId = prefs.getInt(NOTIFY_NEXT_ID, 0);
+        for (File f : files) {
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+                long fireMs = Long.parseLong(r.readLine().trim());
+                String body = r.readLine();
+                if (body != null && !body.isEmpty()) {
+                    int id = nextId++;
+                    am.set(AlarmManager.RTC_WAKEUP, fireMs,
+                            reminderIntent(id, body, PendingIntent.FLAG_UPDATE_CURRENT));
+                    Log.v("touchHLE", "本地提醒已排:" + body + " @" + fireMs);
+                }
+            } catch (Exception e) {
+                Log.w("touchHLE", "读本地提醒预约失败 " + f, e);
+            }
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+        }
+        prefs.edit().putInt(NOTIFY_NEXT_ID, nextId).apply();
+    }
+
+    private void cancelAllReminders() {
+        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        SharedPreferences prefs = getSharedPreferences(NOTIFY_PREFS, MODE_PRIVATE);
+        int nextId = prefs.getInt(NOTIFY_NEXT_ID, 0);
+        for (int id = 0; id < nextId; id++) {
+            PendingIntent pi = reminderIntent(id, null, PendingIntent.FLAG_NO_CREATE);
+            if (pi != null) {
+                if (am != null) {
+                    am.cancel(pi);
+                }
+                pi.cancel();
+            }
+        }
+        prefs.edit().putInt(NOTIFY_NEXT_ID, 0).apply();
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) {
+            nm.cancelAll();
+        }
     }
 
     @Override
@@ -145,6 +248,14 @@ public class MainActivity extends SDLActivity {
      */
     @Override
     protected boolean onUnhandledMessage(int command, Object param) {
+        if (command == COMMAND_NOTIFY_SCHEDULE) {
+            schedulePendingReminders();
+            return true;
+        }
+        if (command == COMMAND_NOTIFY_CANCEL) {
+            cancelAllReminders();
+            return true;
+        }
         if (command == COMMAND_AUDIO_CATEGORY) {
             applyAudioCategory(param instanceof Integer && (Integer) param != 0);
             return true;

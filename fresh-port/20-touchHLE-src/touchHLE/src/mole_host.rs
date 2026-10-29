@@ -94,3 +94,122 @@ pub fn set_audio_category(category: AudioCategory) {
 extern "C" {
     fn SDL_AndroidSendMessage(command: u32, param: std::ffi::c_int) -> std::ffi::c_int;
 }
+
+// ───────────────────────── 本地通知(R18-C-2) ─────────────────────────
+//
+// 原版切后台时按本地存档预约「作物成熟 / 作物快枯萎 / 摩尔派遣回来 / 太久没来」四条提醒,回前台时
+// cancelAllLocalNotifications 清掉;纯本地功能,离线照样有。桌面平台没有对应概念,只记日志。
+// iOS:UNUserNotificationCenter(第一次预约前申请通知权限,拒绝就静默跳过)。
+// 安卓:每条写成 <外部存储>/mole_notify/<序号>.txt(第 1 行触发时刻的毫秒时间戳,第 2 行正文,第 3 行按钮文字),
+// 再发 COMMAND_NOTIFY_SCHEDULE;MainActivity 在 UI 线程读走并用 AlarmManager 排上,读完删除。一条一个文件,
+// 免得宿主追加和 Java 读取同一个文件时丢条目。
+
+/// 预约一条 `delay_secs` 秒后触发的本地通知。
+pub fn schedule_notification(delay_secs: f64, body: &str, action: &str) {
+    log!(
+        "[本地通知] 预约 {:.0} 秒后:{}(按钮「{}」)",
+        delay_secs,
+        body,
+        action
+    );
+    #[cfg(target_os = "ios")]
+    {
+        extern "C" {
+            fn MoleWorld_Notify_Schedule(
+                delay_secs: f64,
+                body: *const std::ffi::c_char,
+                action: *const std::ffi::c_char,
+            );
+        }
+        let (Ok(body), Ok(action)) = (
+            std::ffi::CString::new(body.replace('\0', "")),
+            std::ffi::CString::new(action.replace('\0', "")),
+        ) else {
+            return;
+        };
+        unsafe { MoleWorld_Notify_Schedule(delay_secs, body.as_ptr(), action.as_ptr()) };
+    }
+    #[cfg(target_os = "android")]
+    android_write_notification(delay_secs, body, action);
+}
+
+/// 取消所有已预约、已投递的本地通知。
+pub fn cancel_all_notifications() {
+    log!("[本地通知] 全部取消");
+    #[cfg(target_os = "ios")]
+    {
+        extern "C" {
+            fn MoleWorld_Notify_CancelAll();
+        }
+        unsafe { MoleWorld_Notify_CancelAll() };
+    }
+    #[cfg(target_os = "android")]
+    {
+        // 与 MainActivity.COMMAND_NOTIFY_CANCEL 一致。还没被 Java 读走的预约文件一并作废。
+        if let Some(dir) = android_notify_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        const COMMAND_NOTIFY_CANCEL: u32 = 0x8004;
+        unsafe { SDL_AndroidSendMessage(COMMAND_NOTIFY_CANCEL, 0) };
+    }
+}
+
+/// 应用图标角标数字(原版 -[UIApplication setApplicationIconBadgeNumber:])。只有 iOS 有角标。
+pub fn set_badge_number(number: i32) {
+    #[cfg(target_os = "ios")]
+    {
+        extern "C" {
+            fn MoleWorld_Notify_SetBadge(number: std::ffi::c_int);
+        }
+        unsafe { MoleWorld_Notify_SetBadge(number) };
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = number;
+}
+
+#[cfg(target_os = "android")]
+fn android_notify_dir() -> Option<std::path::PathBuf> {
+    extern "C" {
+        fn SDL_AndroidGetExternalStoragePath() -> *const std::ffi::c_char;
+    }
+    let path = unsafe { SDL_AndroidGetExternalStoragePath() };
+    if path.is_null() {
+        return None;
+    }
+    let base = unsafe { std::ffi::CStr::from_ptr(path) }.to_str().ok()?;
+    Some(std::path::Path::new(base).join("mole_notify"))
+}
+
+#[cfg(target_os = "android")]
+fn android_write_notification(delay_secs: f64, body: &str, action: &str) {
+    use std::sync::atomic::AtomicU32;
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let Some(dir) = android_notify_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let fire_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        + (delay_secs * 1000.0) as u64;
+    let one_line = |s: &str| s.replace(['\r', '\n'], " ");
+    let text = format!("{}\n{}\n{}\n", fire_ms, one_line(body), one_line(action));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!("{}-{}.txt", fire_ms, seq);
+    // 先写临时文件再改名,Java 只认 .txt,读不到写了一半的文件。
+    let tmp = dir.join(format!("{}.tmp", name));
+    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, dir.join(&name)).is_err() {
+        log!("[本地通知] 安卓:写预约文件失败");
+        return;
+    }
+    // 与 MainActivity.COMMAND_NOTIFY_SCHEDULE 一致。
+    const COMMAND_NOTIFY_SCHEDULE: u32 = 0x8003;
+    unsafe { SDL_AndroidSendMessage(COMMAND_NOTIFY_SCHEDULE, 0) };
+}

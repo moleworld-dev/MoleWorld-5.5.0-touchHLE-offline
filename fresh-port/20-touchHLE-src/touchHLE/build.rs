@@ -131,6 +131,8 @@ pub fn main() {
             "Metal",
             "CoreVideo",
             "ImageIO",
+            // [2026-10-29 R18-C-2] 本地通知(vendor/SDL/src/video/uikit/SDL_uikitmoleworld.m)。
+            "UserNotifications",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

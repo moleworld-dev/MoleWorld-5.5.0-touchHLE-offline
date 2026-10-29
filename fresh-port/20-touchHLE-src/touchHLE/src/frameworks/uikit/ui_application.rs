@@ -336,8 +336,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSInteger)applicationIconBadgeNumber {
     0 // default value
 }
+// [2026-10-29 R18-C-2] 交给宿主(只有 iOS 有角标,见 mole_host)。
 - (())setApplicationIconBadgeNumber:(NSInteger)bn {
-    log!("TODO: ignoring setApplicationIconBadgeNumber:{}", bn);
+    crate::mole_host::set_badge_number(bn);
 }
 
 - (bool)applicationSupportsShakeToEdit {
@@ -364,11 +365,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+// [2026-10-29 R18-C-2] 本地通知交给宿主系统(iOS UNUserNotificationCenter / 安卓 AlarmManager,桌面只记日志),
+// 见 ui_local_notification.rs 与 mole_host。
 - (())cancelAllLocalNotifications {
-    log!("TODO: [(UIApplication*){:?} cancelAllLocalNotifications", this);
+    crate::mole_host::cancel_all_notifications();
 }
 - (())scheduleLocalNotification:(id)local_notif { // UILocalNotification *
-    log!("TODO: [(UIApplication*){:?} scheduleLocalNotification:{:?}", this, local_notif);
+    if local_notif == nil {
+        return;
+    }
+    match super::ui_local_notification::to_pending(env, local_notif) {
+        Some(n) => crate::mole_host::schedule_notification(n.delay_secs, &n.body, &n.action),
+        None => {
+            log!("[本地通知] {:?} 没有未来的触发时间或正文为空,跳过", local_notif);
+        }
+    }
 }
 
 @end
