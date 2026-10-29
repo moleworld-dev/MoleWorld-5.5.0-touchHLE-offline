@@ -193,6 +193,12 @@ const SITE_SIGN_SHOW_CONNECTED: u32 = 0x397178;
 /// getDailyTaskListFromServerWithSceneId:(0x11780),这是跨天回来换日常列表的唯一入口;离线主村这道门恒假,
 /// 挂后台跨过零点回来日常任务还是昨天那组。放行后离线 getServerTime 发包空过,1074 由回环按当天应答。
 const SITE_FOREGROUND_DAILY_CONNECTED: u32 = 0x1171c;
+/// [2026-10-28] -[RewardBox processTouched]@0x39df58 惊吓盒子(物品 14905/14906)冷却到点后点击领奖 isReachable(LR 0x39e02b)。
+/// 原版两道门失败就在 0x39e172 直接返回:晶玉领不到、礼物标记一直挂着。门后整段是本地逻辑(calculateRewardId: 算奖励、
+/// GameData addCoupon:number: 入账、CouponAnimation、removeFlag、setCoolDownTime: 重置冷却),不发包,离线放行即照原版发奖。
+const SITE_REWARDBOX_REACHABLE: u32 = 0x39e026;
+/// 同上 isConnected(LR 0x39e04b)。
+const SITE_REWARDBOX_CONNECTED: u32 = 0x39e046;
 /// -[SealExchangeLayer initData] isReachable(LR 0x39aac7)。
 const SITE_SEAL_INIT_REACHABLE: u32 = 0x39aac2;
 /// 同上 isConnected(LR 0x39aae5)。
@@ -525,6 +531,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_SEAL_INIT_REACHABLE)
                 || lr_is(env, SITE_EDIT_SEABED_REACHABLE)
                 || lr_is(env, SITE_SEABED_INIT_REACHABLE)
+                || lr_is(env, SITE_REWARDBOX_REACHABLE)
             {
                 env.cpu.regs_mut()[0] = 1;
                 Some(true)
@@ -533,6 +540,9 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
             }
         }
         ("NetworkManager", "isConnected") => {
+            if lr_is(env, SITE_REWARDBOX_CONNECTED) {
+                log!("[ACTIVITY] 惊吓盒子领奖网络门:离线放行,照原版本地算奖励、加晶玉并重置冷却");
+            }
             // [2026-09-16] X4-02 对称兜底(正常到不了:时间旅行中同一分支上面的 isReachable 门已先失败)。只读寄存器,没发消息。
             if lr_is(env, SITE_EDIT_SEABED_CONNECTED) && time_travel_active() {
                 return None;
@@ -550,6 +560,7 @@ pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> Option<bool> 
                 || lr_is(env, SITE_SEAL_INIT_CONNECTED)
                 || lr_is(env, SITE_EDIT_SEABED_CONNECTED)
                 || lr_is(env, SITE_SEABED_INIT_CONNECTED)
+                || lr_is(env, SITE_REWARDBOX_CONNECTED)
             {
                 env.cpu.regs_mut()[0] = 1;
                 Some(true)
