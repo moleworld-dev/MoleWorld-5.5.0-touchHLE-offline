@@ -164,7 +164,13 @@ pub const CLASSES: ClassExports = objc_classes! {
            length:(NSUInteger)length
            forKey:(id)key { // NSString *
     let key = normalize_key(env, key);
-    let data = env.mem.bytes_at(bytes.cast(), length).to_vec();
+    // [2026-10-29 R18-A-2] 新建后一个字节都没写过的 NSData/NSMutableData 的 bytes 是空指针,bytes_at 遇到空页
+    // 即使长度为 0 也 panic,整个模拟器在存档时退出。真机归档空 NSData 只写一个空 <data>。
+    let data = if length == 0 || bytes.is_null() {
+        Vec::new()
+    } else {
+        env.mem.bytes_at(bytes.cast(), length).to_vec()
+    };
     let scope = get_value_to_encode_for_current_key(env, this);
     assert!(!scope.contains_key(&key));
     scope.insert(key, Value::Data(data));
