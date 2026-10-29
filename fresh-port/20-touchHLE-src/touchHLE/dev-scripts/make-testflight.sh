@@ -246,6 +246,24 @@ elif [ "$SDK_MAJOR" -lt 26 ]; then
 fi
 echo "✓ LC_BUILD_VERSION:$(vtool -show-build-version "$APP/$APPNAME" 2>/dev/null | sed -nE 's/^ *(minos|sdk) /\1=/p' | tr '\n' ' ')"
 
+# ---- 6.6) 按构建号存档主程序(符号化崩溃用)----
+# TestFlight 崩溃日志只有地址;要还原成函数名,必须拿到 UUID 完全一致的那份二进制。事后按旧提交重编,UUID 和大小
+# 都对不上(2026-10-28 一次 iPad 崩溃因此无法符号化)。所以每次打包都把最终要签名的主程序(LC_BUILD_VERSION
+# 已校准,与包里的 UUID 一致,带符号表)连同 UUID、提交号存到 $SYMBOLS_DIR/<构建号>/。目录在仓库外,不进 git。
+# 用法:atos -arch arm64 -o $SYMBOLS_DIR/<构建号>/MoleWorldHD -l <崩溃日志里的加载地址> <地址...>
+SYMBOLS_DIR="${SYMBOLS_DIR:-$HOME/MoleWorldHD-TestFlight-symbols}"
+SYM_OUT="$SYMBOLS_DIR/$BUILD"
+mkdir -p "$SYM_OUT"
+cp "$APP/$APPNAME" "$SYM_OUT/$APPNAME"
+{
+	echo "build=$BUILD"
+	echo "uuid=$(dwarfdump --uuid "$APP/$APPNAME" | awk '{print $2}' | head -1)"
+	echo "commit=$(git -C "$TOUCHHLE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+	echo "dirty=$(git -C "$TOUCHHLE_DIR" status --porcelain -- src vendor 2>/dev/null | wc -l | tr -d ' ')"
+	echo "date=$(date '+%Y-%m-%d %H:%M:%S')"
+} > "$SYM_OUT/build-info.txt"
+echo "✓ 主程序已存档:$SYM_OUT($(sed -n 's/^uuid=//p' "$SYM_OUT/build-info.txt"))"
+
 # ---- 7) 嵌 profile + 发布签名 ----
 cp "$PROFILE" "$APP/embedded.mobileprovision"
 # guest dylib 先各自签(Mach-O,bundle 校验要求有签名)
