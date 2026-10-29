@@ -504,6 +504,10 @@ pub fn run_run_loop(
         if is_main_run_loop && crate::mole_items::run_loop_pending() {
             crate::mole_items::run_loop_poll(env);
         }
+        // [2026-10-28] 放下的物件是红色时往外找最近的空位(见 mole_cheats::porter_free_spot_poll),attach 钩子只置标志。
+        if is_main_run_loop && crate::mole_cheats::porter_free_spot_pending() {
+            crate::mole_cheats::porter_free_spot_poll(env);
+        }
 
         // [2026-09-25 第五轮遗留 FLUSH] 黄金岛「关键操作即时落盘」受理点:本轮触摸(handle_events)、定时器(CADisplayLink →
         // CCDirector mainLoop → CCScheduler)、perform 队列都已返回,栈上没有游戏方法体,等价于原 afterDelay:0 的时机,
