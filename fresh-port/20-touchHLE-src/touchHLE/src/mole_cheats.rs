@@ -10184,6 +10184,8 @@ pub fn porter_free_spot_pending() -> bool {
 
 /// 往外找空位的最大圈数(以格为单位;第 r 圈 8r 个格)。12 圈约 600 次判定,只在放下那一刻跑一次。
 const PORTER_FREE_SPOT_MAX_RING: i32 = 12;
+/// [2026-10-29 R18-D-1] 判定通过、挪过去后重判仍是红色(底边未扩建)的最多试挪次数;每次挪都会带动视角。
+const PORTER_FREE_SPOT_MAX_MOVES: i32 = 4;
 
 /// [2026-10-28] 占卜奖励 / 连续购买的物件不再压在别的物件上变红。
 /// 原版 -[Porter attachObjectWithHouseLevel:data:]@0x298bc 在 canMultiPut 时调 -[Porter checkCanPutNewPos:]@0x2968c,
@@ -10195,6 +10197,8 @@ const PORTER_FREE_SPOT_MAX_RING: i32 = 12;
 /// calNewTile:offsetX:offsetY: 取格、checkCanPut: 判定,找到第一个放得下的格就照原版 moveToBaseTile: 挪过去(它会更新位置、
 /// 颜色并把视角移过去),并照 0x29e7e 的写法记进 lastBaseTile,下一件接着贴它放。桥、梯子、美人鱼这类带幻影的特殊物件不动。
 /// 找不到就保持原版行为(玩家仍可拖动或收回)。只改落点,不改任何判定与存档。
+/// [2026-10-29 R18-D-1] 原版 checkCanPut: 判区域/底边看的是物件当前位置,不是参数格:判定时临时换 baseTile 让区域按候选格算;
+/// 挪过去后再读 canPut,仍红(底边未扩建)就接着找,最多试挪 PORTER_FREE_SPOT_MAX_MOVES 次,都不行挪回原格。
 pub fn porter_free_spot_poll(env: &mut Environment) {
     if !PORTER_FREE_SPOT_PENDING.swap(false, O) {
         return;
@@ -10236,9 +10240,16 @@ pub fn porter_free_spot_poll(env: &mut Environment) {
     if origin == 0 {
         return;
     }
+    let Some(base_off) = peek_u32(env, 0xb032a4) else {
+        return;
+    };
+    let base_ptr = MutPtr::<u32>::from_bits(porter + base_off);
     let (porter_id, origin_id) = (id::from_bits(porter), id::from_bits(origin));
     let cal_s = island_sel(env, "calNewTile:offsetX:offsetY:");
     let check_s = island_sel(env, "checkCanPut:");
+    let move_s = island_sel(env, "moveToBaseTile:");
+    let mut moved = false;
+    let mut tries = 0;
     let mut found: Option<(id, i32, i32)> = None;
     'rings: for r in 1..=PORTER_FREE_SPOT_MAX_RING {
         // 第 r 圈:格坐标 (a,b) 满足 max(|a|,|b|)==r;a 沿等距网格的一条轴、b 沿另一条。
@@ -10253,20 +10264,44 @@ pub fn porter_free_spot_poll(env: &mut Environment) {
                 if tile == nil {
                     continue;
                 }
+                // [2026-10-29 R18-D-1] checkCanPut: 只有占格循环用参数格;区域判定 0x3017a [self isReachable] 读的是
+                // self.baseTile(0x294a6~0x294b6 regionOfTile: 再比 mapExtend)。判定期间临时把 baseTile 指针换成候选格
+                // (裸写、不经 retain 语义的 setter,判完原样写回),区域就按候选格算,不会把物件挪进未扩建地块。
+                let saved: u32 = env.mem.read(base_ptr.cast_const());
+                env.mem.write(base_ptr, tile.to_bits());
                 let ok: bool = msg_send(env, (porter_id, check_s, tile));
-                if ok {
+                env.mem.write(base_ptr, saved);
+                if !ok {
+                    continue;
+                }
+                // 底边判定 0x3009c [self isBeyondMapBottom] 读当前四个顶点 points,判定时还没跟着换;挪过去后
+                // moveToBaseTile: 会按新格重判(0x30002/0x2fe28 checkCanPut),再读一次 canPut,仍红就接着找。
+                let _: () = msg_send(env, (porter_id, move_s, tile));
+                moved = true;
+                let now: u8 = env.mem.read(ConstPtr::<u8>::from_bits(porter + can_put_off));
+                if now != 0 {
                     found = Some((tile, a, b));
+                    break 'rings;
+                }
+                tries += 1;
+                if tries >= PORTER_FREE_SPOT_MAX_MOVES {
                     break 'rings;
                 }
             }
         }
     }
     let Some((tile, a, b)) = found else {
-        log!("[摆放] 放下的物件是红色,{} 圈内找不到空位,保持原位", PORTER_FREE_SPOT_MAX_RING);
+        if moved {
+            // 试挪过但都还是红的:挪回原来的格,保持原版落点。
+            let _: () = msg_send(env, (porter_id, move_s, origin_id));
+        }
+        log!(
+            "[摆放] 放下的物件是红色,{} 圈内找不到空位(试挪 {} 次),保持原位",
+            PORTER_FREE_SPOT_MAX_RING,
+            tries
+        );
         return;
     };
-    let move_s = island_sel(env, "moveToBaseTile:");
-    let _: () = msg_send(env, (porter_id, move_s, tile));
     if let Some(off) = peek_u32(env, 0xb032a0) {
         env.mem.write(MutPtr::<u32>::from_bits(porter + off), tile.to_bits());
     }
