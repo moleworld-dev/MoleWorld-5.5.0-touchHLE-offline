@@ -109,9 +109,19 @@ MoleWorld_Notify_Schedule(double delay_secs, const char *body, const char *actio
 void
 MoleWorld_Notify_CancelAll(void)
 {
+    static int authorization_requested = 0;
     atomic_fetch_add(&moleworld_notify_generation, 1);
     @autoreleasepool {
         UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        /* 游戏进村和回前台时都会先全部取消,这时应用在前台。预约发生在切后台那一刻,系统那时未必弹授权框,
+         * 第一次的提醒会静默丢掉;所以在第一次取消时就先申请(系统只问一次,之后直接返回结果)。 */
+        if (!authorization_requested) {
+            authorization_requested = 1;
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
+                                  completionHandler:^(BOOL granted, NSError *error) {
+                NSLog(@"[MoleWorld] 本地通知权限:%@", granted ? @"允许" : @"拒绝");
+            }];
+        }
         [center removeAllPendingNotificationRequests];
         [center removeAllDeliveredNotifications];
     }
