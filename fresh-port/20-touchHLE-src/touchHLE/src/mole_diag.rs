@@ -566,6 +566,13 @@ pub fn next_inject() -> Option<Inject> {
             log_line(&format!("INJECT ftext {:?}", text));
             None
         }
+        // [2026-10-29] `clockjump <秒>`:只把游戏墙钟往前挪(不发 applicationSignificantTimeChange:),模拟电脑合盖睡眠唤醒。
+        Some("clockjump") => {
+            let secs: i64 = it.next()?.parse().ok()?;
+            crate::libc::time::simulate_host_clock_jump_secs(secs.clamp(-86400 * 30, 86400 * 30));
+            log_line(&format!("INJECT clockjump {} 秒", secs));
+            None
+        }
         Some("fbksp") => {
             unsafe {
                 let mut ev: sdl2::sys::SDL_Event = std::mem::zeroed();

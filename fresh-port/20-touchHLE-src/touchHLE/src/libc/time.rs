@@ -596,6 +596,12 @@ pub fn add_time_offset_secs(delta: i64) {
 /// -[iMoleVillageAppDelegate applicationSignificantTimeChange:]@0x11a80 正是
 /// [[CCDirector sharedDirector] setNextDeltaTimeZero:YES]。所以 NSRunLoop 主循环比较这个代数,
 /// 变化时补发该回调(忠实复现真机行为),下一帧 dt 归零、不跳帧。
+/// [2026-10-29] 诊断注入 `clockjump <秒>` 专用:只挪游戏墙钟、不记跳变代数,模拟电脑睡眠唤醒或宿主改钟
+/// (这两种情形宿主不会发任何回调),用来验证 ns_run_loop 的墙钟跳变检测。
+pub fn simulate_host_clock_jump_secs(delta: i64) {
+    TIME_OFFSET_SECS.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+}
+
 static TIME_JUMP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [扫描修 2026-09-15] 当前时间旅行跳变代数(见 TIME_JUMP_GENERATION)。
