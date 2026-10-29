@@ -114,6 +114,10 @@ UI_LAYOUT_CLASSES = frozenset([
     "TreasureRewardLayer", "VIPFunctionsLayer", "VIPItems", "VIPLayer", "VerifyInviteCodeLayer",
     "WashRoomAchievement", "WashRoomGame", "WashRoomLevelChoose", "WaterTowerRewardView",
     "XmasMainLayer",
+    # [2026-10-29 核实] TestLayer(修改器召唤的 GM 面板)留在本组、整体右移是对的,别挪去 KEEP_REAL_WIDTH:
+    # -[TestLayer init] 末尾 0x145c62 self setAnchorPoint:(0,1),0x145cc4 起 setPosition:(iPad 500 / iPhone 250,
+    # winSize.高 − 底板高×scaleY),原版在 1024 宽画面里本就停在中间偏左;右移 off 后长屏上的相对位置与原版一致。
+    # (第十四轮审计 #13 说它「贴左下」是只看了底板精灵的锚点 (0,0),没看 self 的位置。)
 ])
 
 # 2) 保持真实宽度的类(类级):这些类的 winSize 调用点一律不进名单。

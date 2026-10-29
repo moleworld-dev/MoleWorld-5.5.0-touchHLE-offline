@@ -572,6 +572,38 @@ pub fn next_inject() -> Option<Inject> {
             log_line("INJECT kbhide(SDL_StopTextInput)");
             None
         }
+        // [2026-10-29] `ftext <文字>`:往 SDL 队列压一个 SDL_TEXTINPUT(和键盘/输入法上屏同一个事件),走 window.rs →
+        // 输入框 handle_text,含委托拒收分支。命令行按空白切分,所以文字里的 `\s` 当一个空格(`ftext \s` = 单个空格);
+        // 最多 31 字节(SDL_TextInputEvent.text 定长 32)。`fbksp`:压一个退格键按下(SDL_KEYDOWN Backspace)。
+        Some("ftext") => {
+            let text = it.next()?.replace("\\s", " ");
+            let bytes = text.as_bytes();
+            if bytes.is_empty() || bytes.len() > 31 {
+                log_line("INJECT ftext 文字为空或超过 31 字节,忽略");
+                return None;
+            }
+            unsafe {
+                let mut ev: sdl2::sys::SDL_Event = std::mem::zeroed();
+                ev.text.type_ = sdl2::sys::SDL_EventType::SDL_TEXTINPUT as u32;
+                for (i, b) in bytes.iter().enumerate() {
+                    ev.text.text[i] = *b as std::ffi::c_char;
+                }
+                sdl2::sys::SDL_PushEvent(&mut ev);
+            }
+            log_line(&format!("INJECT ftext {:?}", text));
+            None
+        }
+        Some("fbksp") => {
+            unsafe {
+                let mut ev: sdl2::sys::SDL_Event = std::mem::zeroed();
+                ev.key.type_ = sdl2::sys::SDL_EventType::SDL_KEYDOWN as u32;
+                ev.key.keysym.scancode = sdl2::sys::SDL_Scancode::SDL_SCANCODE_BACKSPACE;
+                ev.key.keysym.sym = sdl2::sys::SDL_KeyCode::SDLK_BACKSPACE as i32;
+                sdl2::sys::SDL_PushEvent(&mut ev);
+            }
+            log_line("INJECT fbksp(SDL_KEYDOWN Backspace)");
+            None
+        }
         // [2026-10-06 第十轮 R10-A3] `lowmem`:往 SDL 队列压一个 SDL_APP_LOWMEMORY(与 iOS/安卓系统低内存警告同一个事件),
         // 在桌面上验证 poll_for_events → applicationDidReceiveMemoryWarning: 的整条转发链。
         Some("lowmem") => {
