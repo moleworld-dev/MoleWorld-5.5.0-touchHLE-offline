@@ -50,6 +50,7 @@ mod mole_cheats;
 mod mole_dev;
 mod mole_diag;
 mod mole_framecheck;
+mod mole_host;
 mod mole_items;
 mod mole_menu;
 mod mole_savebak;
