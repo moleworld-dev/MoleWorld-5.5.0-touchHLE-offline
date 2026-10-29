@@ -9359,6 +9359,21 @@ fn ui43_center_on_enter(env: &mut Environment) {
     }
     if !nested && ui43_is_kind(env, recv, "CCLayerColor") {
         ui43_extend_color_quad(env, recv, off, real_w, &s);
+    } else if nested && ui43_is_kind(env, recv, "CCLayerColor") {
+        // [2026-10-28 第十四轮审计 #10] 嵌套在已右移根层下的全屏半透明遮罩(海底寻宝规则/兑换、活动规则、环游世界路线、
+        //   春天的诗介绍/领奖、加勒比寻宝弹层等九个类,都是 [super initWithColor:0xc8141414])。initWithColor: 自己取 winSize
+        //   (真实宽),色块盖的是世界 [原点, 原点+宽],左边 [0, 原点] 那条竖条没被遮住,在原点处有一条硬边。
+        //   按它在世界坐标里的原点外扩到整屏 [0, real_w];只认宽 ≥ 900 的全屏遮罩,小色块不动。
+        let cs: CGSize = msg_send(env, (recv, s.cs));
+        if cs.width >= 900.0 {
+            let to_world = env
+                .objc
+                .register_host_selector("convertToWorldSpace:".to_string(), &mut env.mem);
+            let wp: CGPoint = msg_send(env, (recv, to_world, CGPoint { x: 0.0, y: 0.0 }));
+            if wp.x > 0.5 && wp.x < real_w {
+                ui43_extend_color_quad(env, recv, wp.x, real_w, &s);
+            }
+        }
     }
     if !already && !nested {
         let children: id = msg_send(env, (recv, s.children));
