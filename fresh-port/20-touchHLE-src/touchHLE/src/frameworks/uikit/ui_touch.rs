@@ -195,6 +195,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let mut repeated_downs: HashMap<FingerId, Coords> = HashMap::new();
     // [扫描修 2026-09-15] 本次新建的滚轮虚拟捏合手指(FingerId::PinchA/PinchB)对应的 UITouch。
     let mut pinch_touches: HashSet<id> = HashSet::new();
+    // [2026-11-07 第十九轮] 这次按下里滚轮虚拟捏合是否投给游戏(两根虚拟手指共用一次判定,见 [wheel_pinch_allowed_for])。
+    let mut wheel_pinch_allowed: Option<bool> = None;
 
     for (finger_id, coords) in map {
         let current_touches = &mut env.framework_state.uikit.ui_touch.current_touches;
@@ -323,6 +325,18 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
+        // [2026-11-07 第十九轮 R19-A-1/B-1/B-2/C-2/E-1/G-04] 滚轮合成的虚拟捏合只在村庄/岛上地图真能缩放时投给游戏,
+        // 两根虚拟手指同进同退(判一次)。原版 iPad 没有滚轮,这是桌面给地图缩放加的便利;以前不看落点:在仓库、岛上
+        // 商品/店铺、建造商店、选关等列表上滚一格,短列表(canDrag_=0)把结束时的取消当成抬起点中光标那一格(物品被取出、
+        // 商品被选中、直接进关),虚拟手指落在抽屉外还会把抽屉关掉;小游戏(挖矿、犁地、钓鱼、切水果)把两根虚拟手指当成
+        // 两次真实按下。不投递时照下面 !isMultipleTouchEnabled 的办法处理:触点照常跟踪到取消,但 view 为 nil。
+        if pinch_touches.contains(&touch) && is_multi_touch_enabled {
+            let allowed = *wheel_pinch_allowed.get_or_insert_with(|| wheel_pinch_allowed_for(env, view));
+            if !allowed {
+                log_dbg!("滚轮虚拟捏合不投递:地图不能缩放或前台有列表/抽屉 {:?}", view);
+                continue;
+            }
+        }
         if !is_multi_touch_enabled && pinch_touches.contains(&touch) {
             // [扫描修 2026-09-15] 滚轮合成的虚拟捏合手指只投给允许多点触控的视图(游戏的 EAGLView,
             // -[iMoleVillageAppDelegate applicationDidFinishLaunching:] 里 setMultipleTouchEnabled:YES)。
@@ -946,6 +960,116 @@ const COCOS_CANCEL_GATES: &[(&str, &str)] = &[
 /// -[InGameLayer ccTouchesCancelled:withEvent:]@0x2403f8(节日村 HolidayVillageLayer 等子类继承它)→
 /// [NewGameManager processTouch:withType:3]。两者单指时都会转给 ObjSelector,见 [reset_obj_selector_after_cancel]。
 const COCOS_VILLAGE_LAYERS: &[&str] = &["VillageLayer", "InGameLayer"];
+
+/// [2026-11-07 第十九轮] 前台有这些界面时,滚轮不合成地图缩放(见 [wheel_pinch_allowed_for])。
+/// 右侧抽屉/顶层面板的 ccTouchBegan: 多数「永远认领、点到面板外就 detech」(如 -[GoodsViewLayer ccTouchBegan:withEvent:]@0x1b8834),
+/// 加上建造商店与岛上的店铺/公寓/餐厅、各列表宿主。
+const WHEEL_PINCH_BLOCKERS: &[&str] = &[
+    "CCScrollView",
+    "GoodsViewLayer",
+    "ShopItemsLayer",
+    "ShoppingView",
+    "ApartmentView",
+    "RestaurantView",
+    "NewStyleStoreMainLayer",
+    "NewStyleStoreMenuView",
+    "NewStyleStoreItemsView",
+    "PaybackObjectsTableLayer",
+    "HouseRecyclerView",
+    "AnimalsRecyclerView",
+    "GiftViewLayer",
+    "DecorateRoomLayer",
+    "CropViewLayer",
+    "FlowerCropViewLayer",
+    "FruitCropViewLayer",
+    "CropInfoView",
+    "BuildingView",
+    "MessagesLayer",
+    "MusicHallLayer",
+    "JunkShopLayer",
+    "CafeShopLayer",
+];
+
+/// [2026-11-07 第十九轮 R19-A-1/B-1/B-2/C-2/E-1/G-04] 滚轮虚拟捏合能否投给这个视图:
+/// ① 是游戏的 EAGLView,它的 CCTouchDispatcher 标准代理里有村庄层 VillageLayer / 岛上 InGameLayer;
+/// ② 对应管理器(GameManager 缓存在 0xb4095c、NewGameManager 缓存在 0xb40be0)的 isInteractEnabled 非 0——小游戏
+///    (-[MiniGameManager startMiniGame:playType:callbackTarget:select:] 起)、剧情、任务、升级框都会关掉交互;
+/// ③ 目标代理表里没有可见的 [WHEEL_PINCH_BLOCKERS] 界面。
+/// 与 [mark_village_pinch] 同一套判据,只读成员、不改游戏状态。
+fn wheel_pinch_allowed_for(env: &mut Environment, view: id) -> bool {
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return false;
+    }
+    let Some(dispatcher) = read_id_ivar(env, view, "touchDelegate_") else {
+        return false;
+    };
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return false;
+    }
+    let standard = read_id_ivar(env, dispatcher, "standardHandlers").unwrap_or(nil);
+    if standard == nil {
+        return false;
+    }
+    let mut village: Option<&'static str> = None;
+    let count: NSUInteger = msg![env; standard count];
+    for i in 0..count {
+        let handler: id = msg![env; standard objectAtIndex:i];
+        let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if delegate == nil {
+            continue;
+        }
+        if let Some(hit) = class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS) {
+            village = Some(hit);
+            break;
+        }
+    }
+    let Some(village) = village else {
+        return false;
+    };
+    let (static_slot, manager_class) = if village == "VillageLayer" {
+        (0xb4095cu32, "GameManager")
+    } else {
+        (0xb40be0u32, "NewGameManager")
+    };
+    let manager_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+    let manager: id = Ptr::from_bits(manager_bits);
+    if class_chain_match(env, manager, &[manager_class]).is_none() {
+        return false;
+    }
+    if let Some(ptr) = env
+        .objc
+        .object_lookup_ivar(&env.mem, manager, &"isInteractEnabled".to_string())
+    {
+        let ptr: MutPtr<u8> = ptr.cast();
+        let enabled: u8 = env.mem.read(ptr);
+        if enabled == 0 {
+            return false;
+        }
+    }
+    let targeted = read_id_ivar(env, dispatcher, "targetedHandlers").unwrap_or(nil);
+    if targeted != nil {
+        let count: NSUInteger = msg![env; targeted count];
+        for i in 0..count {
+            let handler: id = msg![env; targeted objectAtIndex:i];
+            let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+            if delegate == nil {
+                continue;
+            }
+            if let Some(hit) = class_chain_match(env, delegate, WHEEL_PINCH_BLOCKERS) {
+                let visible = env
+                    .objc
+                    .object_lookup_ivar(&env.mem, delegate, &"visible_".to_string())
+                    .map(|p| env.mem.read(p.cast::<u8>().cast_const()))
+                    .unwrap_or(1);
+                if visible != 0 {
+                    log!("[滚轮] 前台有 {}(可见),这次滚轮不当地图缩放交给游戏", hit);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 
 /// [复核修 2026-09-15] R1-3 返修:沿对象的 isa/superclass 链找第一个名字在 names 里的类(不发消息)。
 /// 只用于游戏自己的对象(EAGLView、CCTouchDispatcher、cocos2d 节点),它们的类链都是真实类;遇到 NSObject 就停。
