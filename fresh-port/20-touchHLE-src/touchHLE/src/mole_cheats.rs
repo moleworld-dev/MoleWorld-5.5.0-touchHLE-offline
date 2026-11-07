@@ -9782,6 +9782,15 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
                     let p = ui43_point_arg(env, &regs);
                     let mut q: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, p)));
                     q.x -= off;
+                    // [2026-11-07 第十九轮 R19-C-1] 建造商店分类页/商品页「吞触摸带」的世界点夹进设计宽:
+                    // -[NewStyleStoreMenuView ccTouchBegan:withEvent:]@0x3b76b4、-[NewStyleStoreItemsView ccTouchBegan:withEvent:]@0x3bda3c
+                    // 拿 CGRectContainsPoint({0,0,winSize.w,582}, 世界点)(0x3b77aa/0x3bda32)决定吞不吞,原版 iPad 上这条带就是整屏
+                    // 下部,底栏按钮都在带内、商店开着时点不到。宽屏下 winSize 与世界点都被虚拟化,带只覆盖真实 [off, off+1024],
+                    // 两侧条带被拉伸的商店底板盖着、看着仍是商店,点进去却先到 HUD 的 CCMenu,点中被盖住的免费贝壳、好友等按钮。
+                    // 这两处世界点只用于紧接着的这次判定,夹紧没有其它副作用。
+                    if lr == 0x3b778c || lr == 0x3bdb14 {
+                        q.x = q.x.clamp(0.0, UI43_W - 1.0);
+                    }
                     q
                 }
                 _ => {
