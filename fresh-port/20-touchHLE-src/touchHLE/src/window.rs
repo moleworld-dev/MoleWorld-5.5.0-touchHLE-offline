@@ -1575,7 +1575,12 @@ impl Window {
             }
             let now = Instant::now();
             if window.pinch.is_none() {
-                let cursor = (mouse.x() as f32, mouse.y() as f32);
+                let mut cursor = (mouse.x() as f32, mouse.y() as f32);
+                // [2026-11-07] 诊断注入 fwheel 指定的光标位置(归一化,窗口左上为原点),见 mole_diag。
+                if let Some((nx, ny)) = crate::mole_diag::take_wheel_cursor_override() {
+                    let (w, h) = window.window.size();
+                    cursor = (nx * w as f32, ny * h as f32);
+                }
                 let Some(p) = begin_wheel_pinch(window, cursor, now) else {
                     return;
                 };
