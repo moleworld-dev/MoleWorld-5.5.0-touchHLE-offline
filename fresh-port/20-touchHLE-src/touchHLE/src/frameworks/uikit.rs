@@ -169,6 +169,36 @@ fn track_touch_shadow(env: &mut Environment, event: &crate::window::Event) {
 /// handle_touches_cancelled(含 cocos2d 门控收尾);ui_touch 不认识的手指只记警告、不 panic。
 /// 调用上下文与 route_touch 相同(handle_events 内,可以发 msg_send)。
 pub(crate) fn cancel_tracked_touches(env: &mut Environment, reason: &str) {
+    let suppressed = match env.window.as_mut() {
+        Some(window) => window.take_slop_suppressed_points(),
+        None => std::collections::HashMap::new(),
+    };
+    cancel_tracked_touches_after(env, reason, suppressed);
+}
+
+/// [2026-11-07 第十九轮 R19-A-2 补全] 同 [cancel_tracked_touches],`suppressed` 由调用方事先从窗口取出
+/// (window.take_slop_suppressed_points;切后台要在 discard_pending_input 清掉起拖状态之前取)。
+/// 取消之前,先把其中已经交给游戏、仍按着的手指被起拖阈值压住的最后一点作为一次移动交给游戏,
+/// 游戏看到原版的「按下 → 移动 → 取消」:列表格子上稍挪一下时切后台、打开修改器菜单或弹出系统原生弹窗,
+/// 不再被 -[CCTableView ccTouchEnded:]@0x91da0(取消经 ccTouchCancelled 转成抬起)当成点了这一格。
+pub(crate) fn cancel_tracked_touches_after(
+    env: &mut Environment,
+    reason: &str,
+    suppressed: std::collections::HashMap<crate::window::FingerId, crate::window::Coords>,
+) {
+    let moves: std::collections::HashMap<_, _> = suppressed
+        .into_iter()
+        .filter(|(finger, _)| env.framework_state.uikit.touch_shadow.contains_key(finger))
+        .collect();
+    if !moves.is_empty() {
+        log!(
+            "[生命周期] {}:先补发 {} 个被起拖阈值压住的移动 {:?}",
+            reason,
+            moves.len(),
+            moves
+        );
+        route_touch(env, crate::window::Event::TouchesMove(moves));
+    }
     let map = std::mem::take(&mut env.framework_state.uikit.touch_shadow);
     if map.is_empty() {
         return;
@@ -328,6 +358,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             | Event::TouchesCancel(..) => {
                 // [扫描修 2026-09-15] F12-1:系统弹框显示中先由弹框处理(模态)。
                 route_touch(env, event)
+            }
+            // [2026-11-07 第十九轮] 鼠标滚轮/触控板翻列表(见 ui_touch::wheel_scroll_list)。修改器菜单开着、
+            // 自绘弹框(模态)显示中不滚底下的列表。
+            Event::WheelScroll(at, notches) => {
+                if !crate::mole_menu::is_open() && !ui_view::ui_alert_view::overlay_showing(env) {
+                    ui_touch::wheel_scroll_list(env, at, notches);
+                }
             }
             // [扫描修 2026-09-15] F12-3:桌面窗口最小化/还原(W2 在 window.rs 发出)→ 原版失活/激活回调
             // 与对应通知;不发 DidEnterBackground/WillEnterForeground。细节见 ui_application.rs。

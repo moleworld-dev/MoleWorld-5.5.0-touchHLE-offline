@@ -949,11 +949,14 @@ pub(super) fn suspend_app(env: &mut Environment, end: crate::window::SuspendEnd,
     env.framework_state.uikit.ui_application.suspended = true;
 
     // ① 输入收尾:队列里还没交给游戏的丢掉,游戏里仍按着的以取消结束。
+    // [2026-11-07 第十九轮 R19-A-2 补全] 被起拖阈值压住的最后一点要在 discard_pending_input 清掉起拖状态之前取出,
+    // 取消前先作为一次移动交给游戏(见 cancel_tracked_touches_after)。
+    let suppressed = env.window_mut().take_slop_suppressed_points();
     let dropped = env.window_mut().discard_pending_input();
     if dropped > 0 {
         log!("[生命周期] 丢弃挂起前尚未分发的输入事件 {} 个", dropped);
     }
-    super::cancel_tracked_touches(env, "进入后台挂起");
+    super::cancel_tracked_touches_after(env, "进入后台挂起", suppressed);
 
     // ② 决定发哪些回调。
     let ui_application: id = msg_class![env; UIApplication sharedApplication];

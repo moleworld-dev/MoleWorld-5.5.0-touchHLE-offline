@@ -6,7 +6,7 @@
 //! `UITouch`.
 
 use super::ui_event;
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
@@ -136,12 +136,35 @@ fn view_is_in_window(env: &mut Environment, view: id, window: id) -> bool {
     }
 }
 
+/// [2026-11-07 第十九轮 R19-D-3] 正在派发的这次触摸事件里只有一根手指时,记下是哪根(否则 None)。
+/// 游戏的摆放器 -[Porter processTouch:withType:] 只在单指事件里被调用(-[GameManager processTouch:withType:] 0x1a6f8
+/// 见 count==1),宿主的摆放钩子据此按手指配对按下点(见 mole_cheats::porter_body_drag)。只在派发期间有效。
+static DISPATCH_SINGLE_FINGER: std::sync::Mutex<Option<FingerId>> = std::sync::Mutex::new(None);
+
+pub fn dispatch_single_finger() -> Option<FingerId> {
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [2026-11-07 第十九轮 R19-D-3] 这根手指是否在村庄/岛上参与过双指缩放(见 [mark_village_pinch])。
+pub fn finger_pinched(env: &Environment, finger: FingerId) -> bool {
+    env.framework_state.uikit.ui_touch.pinched.contains(&finger)
+}
+
 pub fn handle_event(env: &mut Environment, event: Event) {
     // before processing anything, we mark all current touches as stationary
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
         env.objc.borrow_mut::<UITouchHostObject>(touch).phase = UITouchPhaseStationary;
     }
+    let single = match &event {
+        Event::TouchesDown(map) | Event::TouchesMove(map) | Event::TouchesUp(map) | Event::TouchesCancel(map)
+            if map.len() == 1 =>
+        {
+            map.keys().next().copied()
+        }
+        _ => None,
+    };
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner()) = single;
     match event {
         Event::TouchesDown(map) => handle_touches_down(env, map),
         Event::TouchesMove(map) => handle_touches_move(env, map),
@@ -150,6 +173,7 @@ pub fn handle_event(env: &mut Environment, event: Event) {
         Event::TouchesCancel(map) => handle_touches_cancelled(env, map),
         _ => unreachable!(),
     }
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
@@ -166,11 +190,15 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // [扫描修 2026-09-15] 已按下的手指又收到 Down:先记下来,本次 Down 分发完再按移动处理。
     let mut repeated_downs: HashMap<FingerId, Coords> = HashMap::new();
     // [扫描修 2026-09-15] 本次新建的滚轮虚拟捏合手指(FingerId::PinchA/PinchB)对应的 UITouch。
     let mut pinch_touches: HashSet<id> = HashSet::new();
+    // [2026-11-07 第十九轮] 这次按下里滚轮虚拟捏合是否投给游戏(两根虚拟手指共用一次判定,见 [wheel_pinch_allowed_for])。
+    let mut wheel_pinch_allowed: Option<bool> = None;
 
     for (finger_id, coords) in map {
         let current_touches = &mut env.framework_state.uikit.ui_touch.current_touches;
@@ -225,6 +253,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -299,6 +329,18 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
+        // [2026-11-07 第十九轮 R19-A-1/B-1/B-2/C-2/E-1/G-04] 滚轮合成的虚拟捏合只在村庄/岛上地图真能缩放时投给游戏,
+        // 两根虚拟手指同进同退(判一次)。原版 iPad 没有滚轮,这是桌面给地图缩放加的便利;以前不看落点:在仓库、岛上
+        // 商品/店铺、建造商店、选关等列表上滚一格,短列表(canDrag_=0)把结束时的取消当成抬起点中光标那一格(物品被取出、
+        // 商品被选中、直接进关),虚拟手指落在抽屉外还会把抽屉关掉;小游戏(挖矿、犁地、钓鱼、切水果)把两根虚拟手指当成
+        // 两次真实按下。不投递时照下面 !isMultipleTouchEnabled 的办法处理:触点照常跟踪到取消,但 view 为 nil。
+        if pinch_touches.contains(&touch) && is_multi_touch_enabled {
+            let allowed = *wheel_pinch_allowed.get_or_insert_with(|| wheel_pinch_allowed_for(env, view));
+            if !allowed {
+                log_dbg!("滚轮虚拟捏合不投递:地图不能缩放或前台有列表/抽屉 {:?}", view);
+                continue;
+            }
+        }
         if !is_multi_touch_enabled && pinch_touches.contains(&touch) {
             // [扫描修 2026-09-15] 滚轮合成的虚拟捏合手指只投给允许多点触控的视图(游戏的 EAGLView,
             // -[iMoleVillageAppDelegate applicationDidFinishLaunching:] 里 setMultipleTouchEnabled:YES)。
@@ -341,6 +383,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         // won't end up with an empty set.
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -383,6 +427,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // view to set of touches for this view
     let mut view_touches: HashMap<id, id> = HashMap::new();
@@ -462,6 +508,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -474,6 +522,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -517,6 +567,12 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
             pinched.len()
         );
         handle_touches_cancelled(env, pinched);
+        // [2026-11-07 第十九轮 R19-D-2] 立即把摆放器从拖动中(state 2/3)复位成 1,不等最后一根手指结束。
+        // 取消不经过 -[Porter touchEnd:],以前要等剩下那根手指也抬起才复位:这期间它一挪,建筑就带着第一根手指留下的
+        // putRef 跳到它下面并一路跟着走(GameManager 见 state>1 不平移地图)。复位相当于原版第一根手指 touchEnd: 走
+        // 0x30cda→0x30d44 的「移动过」分支(state=1、编辑菜单 update:),不确认、不瞬移;剩下的手指照原版平移地图。
+        // ObjSelector 的已选中/已拖动标志仍等最后一根手指结束再清。重复调用无副作用(state 已是 1 就跳过)。
+        reset_porters_after_cancel(env);
         if map.is_empty() {
             return;
         }
@@ -529,10 +585,14 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // We need to construct all touches set _BEFORE_ removing touches!
     // (as removed one are reported as the part of the event)
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -581,6 +641,8 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -631,6 +693,8 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 
     // 与抬起相同:必须在移除触点【之前】收集全部触点(被取消的触点也属于本次事件)。
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -679,6 +743,8 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -916,6 +982,130 @@ const COCOS_CANCEL_GATES: &[(&str, &str)] = &[
 /// -[InGameLayer ccTouchesCancelled:withEvent:]@0x2403f8(节日村 HolidayVillageLayer 等子类继承它)→
 /// [NewGameManager processTouch:withType:3]。两者单指时都会转给 ObjSelector,见 [reset_obj_selector_after_cancel]。
 const COCOS_VILLAGE_LAYERS: &[&str] = &["VillageLayer", "InGameLayer"];
+
+/// [2026-11-07 第十九轮] 前台有这些界面时,滚轮不合成地图缩放(见 [wheel_pinch_allowed_for])。
+/// 右侧抽屉/顶层面板的 ccTouchBegan: 多数「永远认领、点到面板外就 detech」(如 -[GoodsViewLayer ccTouchBegan:withEvent:]@0x1b8834),
+/// 加上建造商店与岛上的店铺/公寓/餐厅、各列表宿主。
+const WHEEL_PINCH_BLOCKERS: &[&str] = &[
+    "CCScrollView",
+    "GoodsViewLayer",
+    "ShopItemsLayer",
+    "ShoppingView",
+    "ApartmentView",
+    "RestaurantView",
+    "NewStyleStoreMainLayer",
+    "NewStyleStoreMenuView",
+    "NewStyleStoreItemsView",
+    "PaybackObjectsTableLayer",
+    "HouseRecyclerView",
+    "AnimalsRecyclerView",
+    "GiftViewLayer",
+    "DecorateRoomLayer",
+    "CropViewLayer",
+    "FlowerCropViewLayer",
+    "FruitCropViewLayer",
+    "CropInfoView",
+    "BuildingView",
+    "MessagesLayer",
+    "MusicHallLayer",
+    "JunkShopLayer",
+    "CafeShopLayer",
+];
+
+/// [2026-11-07 第十九轮 R19-A-1/B-1/B-2/C-2/E-1/G-04] 滚轮虚拟捏合能否投给这个视图:
+/// ① 是游戏的 EAGLView,它的 CCTouchDispatcher 标准代理里有村庄层 VillageLayer / 岛上 InGameLayer;
+/// ② 对应管理器(GameManager 缓存在 0xb4095c、NewGameManager 缓存在 0xb40be0)的 isInteractEnabled 非 0——小游戏
+///    (-[MiniGameManager startMiniGame:playType:callbackTarget:select:] 起)、剧情、任务、升级框都会关掉交互;
+/// ③ 目标代理表里没有可见的 [WHEEL_PINCH_BLOCKERS] 界面。
+/// 与 [mark_village_pinch] 同一套判据,只读成员、不改游戏状态。
+fn wheel_pinch_allowed_for(env: &mut Environment, view: id) -> bool {
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return false;
+    }
+    let Some(dispatcher) = read_id_ivar(env, view, "touchDelegate_") else {
+        return false;
+    };
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return false;
+    }
+    let standard = read_id_ivar(env, dispatcher, "standardHandlers").unwrap_or(nil);
+    if standard == nil {
+        return false;
+    }
+    let mut village: Option<&'static str> = None;
+    let count: NSUInteger = msg![env; standard count];
+    for i in 0..count {
+        let handler: id = msg![env; standard objectAtIndex:i];
+        let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if delegate == nil {
+            continue;
+        }
+        if let Some(hit) = class_chain_match(env, delegate, COCOS_VILLAGE_LAYERS) {
+            village = Some(hit);
+            break;
+        }
+    }
+    let Some(village) = village else {
+        wheel_block_log("前台不是村庄或岛上地图(小游戏、全屏界面等)");
+        return false;
+    };
+    let (static_slot, manager_class) = if village == "VillageLayer" {
+        (0xb4095cu32, "GameManager")
+    } else {
+        (0xb40be0u32, "NewGameManager")
+    };
+    let manager_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
+    let manager: id = Ptr::from_bits(manager_bits);
+    if class_chain_match(env, manager, &[manager_class]).is_none() {
+        return false;
+    }
+    if let Some(ptr) = env
+        .objc
+        .object_lookup_ivar(&env.mem, manager, &"isInteractEnabled".to_string())
+    {
+        let ptr: MutPtr<u8> = ptr.cast();
+        let enabled: u8 = env.mem.read(ptr);
+        if enabled == 0 {
+            wheel_block_log(&format!(
+                "{} 的交互已关闭(小游戏、剧情、任务框等)",
+                manager_class
+            ));
+            return false;
+        }
+    }
+    let targeted = read_id_ivar(env, dispatcher, "targetedHandlers").unwrap_or(nil);
+    if targeted != nil {
+        let count: NSUInteger = msg![env; targeted count];
+        for i in 0..count {
+            let handler: id = msg![env; targeted objectAtIndex:i];
+            let delegate = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+            if delegate == nil {
+                continue;
+            }
+            if let Some(hit) = class_chain_match(env, delegate, WHEEL_PINCH_BLOCKERS) {
+                let visible = env
+                    .objc
+                    .object_lookup_ivar(&env.mem, delegate, &"visible_".to_string())
+                    .map(|p| env.mem.read(p.cast::<u8>().cast_const()))
+                    .unwrap_or(1);
+                if visible != 0 {
+                    log!("[滚轮] 前台有 {}(可见),这次滚轮不当地图缩放交给游戏", hit);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// [2026-11-07 第十九轮] 滚轮因「前台不是地图」或「交互已关闭」被挡时记一笔(限前 30 次,连续滚动不刷屏),
+/// 无头测试据此确认小游戏、选关页里的滚轮没有交给游戏。
+fn wheel_block_log(why: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+        log!("[滚轮] {},这次滚轮不当地图缩放交给游戏", why);
+    }
+}
 
 /// [复核修 2026-09-15] R1-3 返修:沿对象的 isa/superclass 链找第一个名字在 names 里的类(不发消息)。
 /// 只用于游戏自己的对象(EAGLView、CCTouchDispatcher、cocos2d 节点),它们的类链都是真实类;遇到 NSObject 就停。
@@ -1166,6 +1356,8 @@ fn reset_friends_village_after_cancel(env: &mut Environment, layer: id) {
 /// 单例只读静态变量(Porter +instance@0x28f40 缓存在 0xb40968,NewScenePorter +instance@0x26adb8 缓存在 0xb40c04),
 /// 不存在就不调 +instance,免得凭空建一个。调用方已确认没有别的手指还按着;在运行循环处理事件时调用,可以发消息。
 fn reset_porters_after_cancel(env: &mut Environment) {
+    // [2026-11-07 第十九轮 R19-D-4] 按图身起拖用的是抓取偏移(putRef 可能在占地范围外),收尾时复位到占地中心。
+    crate::mole_cheats::porter_grab_restore(env);
     for (static_slot, menu_class) in [(0xb40968u32, "EditMenuLayer"), (0xb40c04u32, "NewSceneEditMenuLayer")] {
         let porter_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
         if porter_bits == 0 {
@@ -1203,4 +1395,157 @@ fn reset_porters_after_cancel(env: &mut Environment) {
             state
         );
     }
+}
+
+/// [2026-11-07 第十九轮] 桌面滚轮翻列表:滚一格移动的点数(主村仓库格子高 192,约三分之一格)。
+const WHEEL_SCROLL_STEP: f32 = 64.0;
+/// [2026-11-07 第十九轮] +[CCDirector sharedDirector]@0x2c7928 的单例静态变量。只读它,不调 sharedDirector
+/// (那会在导演建好之前新建一个)。
+const CC_SHARED_DIRECTOR_SLOT: u32 = 0xb40cdc;
+
+/// [2026-11-07 第十九轮] 鼠标滚轮/触控板翻列表(桌面;安卓、iPad 接鼠标时走同一路径)。
+/// 原版 iPad 没有滚轮。ecc4400 起光标下有可见列表时,滚轮不再合成虚拟双指交给游戏(以前滚一格会点中格子、
+/// 关掉抽屉、在建造商店直接购买),列表于是只能按住拖。这里照游戏自己的门控找光标下的列表,直接改它的滚动位置:
+/// ① 光标下的视图按 handle_touches_down 同样的方式命中(窗口从前往后 pointInside → hitTest),必须是游戏的
+///    EAGLView,取它的 CCTouchDispatcher;光标经 -[CCDirector convertToGL:] 转成世界坐标。宿主直接发消息,
+///    不经过宽屏 UI43 按调用点的坐标换算,用的是真实几何。
+/// ② 目标代理里排在最前(优先级最高)、光标落在自身 viewSize 范围内的 CCScrollView(含 CCTableView)就是光标下的列表。
+///    判据同 -[CCScrollView ccTouchBegan:withEvent:]@0x8fa9c 与 ccTouchMoved:@0x8fc04:自身和各级父节点 visible_、
+///    在运行中(isRunning_),canDrag_ 非 0,没在手指拖动中(isDragging_ = 0)。不能拖(短列表 Drag:NO)就什么都不做。
+/// ③ 新位置夹在 [minContainerOffset, maxContainerOffset](@0x8f27c / @0x8f270)之间,再调
+///    -[CCScrollView setContentOffset:]@0x8ed88:手指拖动时 ccTouchMoved: 末尾(0x90016)调的就是它,容器移动后
+///    经 scrollViewDidScroll: 让 CCTableView 回收、补齐格子。
+/// 不产生任何触摸:不会点中格子、不会关抽屉。竖向列表往下滚看后面的格子,横向列表往下滚看右边的格子。
+/// 调用上下文与 route_touch 相同(handle_events 内,可以发 msg_send)。
+pub(super) fn wheel_scroll_list(env: &mut Environment, at: Coords, notches: f32) {
+    if notches == 0.0 || !notches.is_finite() {
+        return;
+    }
+    let location = CGPoint { x: at.0, y: at.1 };
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let Some((window, in_window)) = windows.into_iter().rev().find_map(|window| {
+        let p: CGPoint = msg![env; window convertPoint:location fromWindow:nil];
+        let inside: bool = msg![env; window pointInside:p withEvent:nil];
+        inside.then_some((window, p))
+    }) else {
+        return;
+    };
+    let view: id = msg![env; window hitTest:in_window withEvent:nil];
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return;
+    }
+    let Some(dispatcher) = read_id_ivar(env, view, "touchDelegate_") else {
+        return;
+    };
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return;
+    }
+    let director_bits: GuestUSize =
+        env.mem
+            .read(ConstPtr::<GuestUSize>::from_bits(CC_SHARED_DIRECTOR_SLOT));
+    let director: id = Ptr::from_bits(director_bits);
+    if class_chain_match(env, director, &["CCDirector"]).is_none() {
+        return;
+    }
+    let in_view: CGPoint = msg![env; view convertPoint:location fromView:nil];
+    let world: CGPoint = msg![env; director convertToGL:in_view];
+    let targeted = read_id_ivar(env, dispatcher, "targetedHandlers").unwrap_or(nil);
+    if targeted == nil {
+        return;
+    }
+    let count: NSUInteger = msg![env; targeted count];
+    for i in 0..count {
+        let handler: id = msg![env; targeted objectAtIndex:i];
+        let list = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if class_chain_match(env, list, &["CCScrollView"]).is_none()
+            || !node_chain_running_visible(env, list)
+        {
+            continue;
+        }
+        let Some(size) = read_ivar::<CGSize>(env, list, "viewSize_") else {
+            continue;
+        };
+        let local: CGPoint = msg![env; list convertToNodeSpace:world];
+        if !(local.x >= 0.0 && local.x <= size.width && local.y >= 0.0 && local.y <= size.height) {
+            continue;
+        }
+        // 光标下最上层的列表:能拖才滚,不再往下找(下面的列表被它盖着)。
+        if read_ivar::<u8>(env, list, "canDrag_").unwrap_or(0) == 0
+            || read_ivar::<u8>(env, list, "isDragging_").unwrap_or(0) != 0
+        {
+            return;
+        }
+        let horizontal = read_ivar::<i32>(env, list, "direction_").unwrap_or(1) == 0;
+        let offset: CGPoint = msg![env; list contentOffset];
+        let min: CGPoint = msg![env; list minContainerOffset];
+        let max: CGPoint = msg![env; list maxContainerOffset];
+        let mut new = offset;
+        if horizontal {
+            if min.x > max.x {
+                return;
+            }
+            new.x = (offset.x + notches * WHEEL_SCROLL_STEP).clamp(min.x, max.x);
+        } else {
+            if min.y > max.y {
+                return;
+            }
+            new.y = (offset.y - notches * WHEEL_SCROLL_STEP).clamp(min.y, max.y);
+        }
+        if (new.x - offset.x).abs() < 0.5 && (new.y - offset.y).abs() < 0.5 {
+            return;
+        }
+        let _: () = msg![env; list setContentOffset:new];
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            let class = env
+                .objc
+                .try_get_class_name(ObjC::read_isa(list, &env.mem))
+                .unwrap_or("?")
+                .to_string();
+            let (ox, oy, nx, ny) = (offset.x, offset.y, new.x, new.y);
+            log!(
+                "[滚轮] 翻列表 {} {:?}:{} ({:.0},{:.0}) → ({:.0},{:.0})",
+                class,
+                list,
+                if horizontal { "横向" } else { "竖向" },
+                ox,
+                oy,
+                nx,
+                ny
+            );
+        }
+        return;
+    }
+}
+
+/// [2026-11-07 第十九轮] 节点在运行中的场景里、自身和各级父节点都可见(visible_ 与 isRunning_ 非 0,一直到 CCScene)。
+fn node_chain_running_visible(env: &Environment, node: id) -> bool {
+    if read_ivar::<u8>(env, node, "isRunning_").unwrap_or(0) == 0 {
+        return false;
+    }
+    let mut n = node;
+    for _ in 0..64 {
+        if n == nil {
+            return false;
+        }
+        if read_ivar::<u8>(env, n, "visible_").unwrap_or(1) == 0 {
+            return false;
+        }
+        if class_chain_match(env, n, &["CCScene"]).is_some() {
+            return true;
+        }
+        n = read_id_ivar(env, n, "parent_").unwrap_or(nil);
+    }
+    false
+}
+
+/// [2026-11-07 第十九轮] 按名字读任意可安全读取类型的 ivar(沿类链查,偏移取运行时值)。没有这个 ivar 返回 None。
+fn read_ivar<T: crate::mem::SafeRead>(env: &Environment, obj: id, name: &str) -> Option<T> {
+    if obj == nil {
+        return None;
+    }
+    let ptr = env
+        .objc
+        .object_lookup_ivar(&env.mem, obj, &name.to_string())?;
+    Some(env.mem.read(ptr.cast::<T>().cast_const()))
 }

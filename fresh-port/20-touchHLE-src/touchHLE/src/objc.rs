@@ -109,9 +109,9 @@ pub struct ObjC {
 }
 
 impl ObjC {
-    /// [性能观测] 当前活着的 objc 对象数(host 侧对象表大小)。
-    /// (合并复核:唯一调用点 mole_perf::tick 只在 iOS / 解释器构建上调,桌面上不用它,免未使用告警。)
-    #[cfg_attr(not(any(target_os = "ios", feature = "cpu_interpreter")), allow(dead_code))]
+    /// [性能观测] 当前活着的 objc 对象数(host 侧对象表大小)。调用点:mole_perf::tick(iOS / 解释器构建),
+    /// 以及 [2026-11-07 第十九轮] 主线的无头命令 `dev objs`(衡量触摸事件对象是否泄漏,比进程常驻内存准)。
+    /// 合并主线时两边各有一份同样的实现,保留这一份。
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }

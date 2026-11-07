@@ -144,6 +144,13 @@ const FRAME_PATH: &str = "/tmp/mole_frame.ppm";
 /// 这些平台上没法用脚本驱动做回归。现在首选 paths::user_data_base_path() 下的同名文件(桌面是工作目录,
 /// macOS .app 是 SDL pref_path,Android 是外部存储,iOS 是 App 的 Documents),再兼容读旧路径,老脚本不用改。
 /// 写入方约定不变:先写临时文件、再 rename 成这个名字;读到就删。
+/// [2026-11-07] 注入 fwheel 登记的光标位置(归一化),窗口层合成滚轮捏合时取走一次。
+static WHEEL_CURSOR_OVERRIDE: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+
+pub fn take_wheel_cursor_override() -> Option<(f32, f32)> {
+    WHEEL_CURSOR_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 const INPUT_NAME: &str = "mole_input";
 const LEGACY_INPUT_PATH: &str = "/tmp/mole_input";
 
@@ -494,12 +501,18 @@ pub fn next_inject() -> Option<Inject> {
                 let t = i as f32 / steps as f32;
                 seq.push((FINGER_MOTION, 0, nx1 + (nx2 - nx1) * t, ny1 + (ny2 - ny1) * t));
             }
-            seq.push((FINGER_UP, 0, nx2, ny2));
-            let cancel = it.next() == Some("1");
+            // 第 6 个参数:1 = 以系统取消结束(负压力);[2026-11-07] 2 = 按住不放(不推抬起),
+            // 留给随后的 suspend / menu 以取消收尾,验证外部取消路径。
+            let mode = it.next();
+            let cancel = mode == Some("1");
+            let hold = mode == Some("2");
+            if !hold {
+                seq.push((FINGER_UP, 0, nx2, ny2));
+            }
             push_sdl_finger_events(&seq, false, 0, if cancel { -1.0 } else { 1.0 });
             log_line(&format!(
-                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps, cancel={})",
-                nx1, ny1, nx2, ny2, steps, cancel
+                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps, cancel={}, hold={})",
+                nx1, ny1, nx2, ny2, steps, cancel, hold
             ));
             None
         }
@@ -614,6 +627,23 @@ pub fn next_inject() -> Option<Inject> {
             let secs: i64 = it.next()?.parse().ok()?;
             crate::libc::time::simulate_host_clock_jump_secs(secs.clamp(-86400 * 30, 86400 * 30));
             log_line(&format!("INJECT clockjump {} 秒", secs));
+            None
+        }
+        // [2026-11-07] `fwheel <nx> <ny> <格数>`:在归一化光标位置(左上为原点)滚一下鼠标滚轮(正数=向上),走窗口层
+        // 滚轮合成虚拟捏合的同一条路径;无头时真实光标不可控,这里先登记光标位置再压一条 SDL_MOUSEWHEEL。
+        Some("fwheel") => {
+            let nx: f32 = it.next()?.parse().ok()?;
+            let ny: f32 = it.next()?.parse().ok()?;
+            let notches: f32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            *WHEEL_CURSOR_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some((nx, ny));
+            unsafe {
+                let mut ev: sdl2::sys::SDL_Event = std::mem::zeroed();
+                ev.wheel.type_ = sdl2::sys::SDL_EventType::SDL_MOUSEWHEEL as u32;
+                ev.wheel.y = notches.round() as i32;
+                ev.wheel.preciseY = notches;
+                sdl2::sys::SDL_PushEvent(&mut ev);
+            }
+            log_line(&format!("INJECT fwheel ({}, {}) {} 格", nx, ny, notches));
             None
         }
         Some("fbksp") => {

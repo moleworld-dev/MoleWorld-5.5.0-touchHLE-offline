@@ -311,6 +311,33 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     sdl2::hint::set("SDL_IOS_ORIENTATIONS", hint);
 }
 
+/// [2026-11-07 第十九轮 R19-G-01] 同一组手指的连续移动按 UIKit 语义合并成一条,坐标取最新。
+/// 真机 UIKit 每次主运行循环最多给一次 touchesMoved(同一 UITouch 的多次采样合并,previousLocationInView 是上次
+/// 交给 app 的位置),原版 iPad 触摸采样又与 60Hz 刷新同频。touchHLE 以前把两帧之间攒下的每个采样逐条派发:
+/// 高刷安卓(90~144Hz)、ProMotion iPhone、桌面鼠标(120Hz 轮询),以及游戏掉帧时,一帧要派发好几次移动。
+/// 游戏的滚动列表 -[CCScrollView ccTouchMoved:withEvent:]@0x8fc04 把【最后一次事件】的位移记进 scrollDistance_
+/// (0x8ffe4–0x9000a),松手后 deaccelerateScrolling:@0x8f320 每帧按它滑行再乘 0.95,于是惯性只剩整帧位移的几分之一
+/// (仓库、岛上商品、建造商店、选关等所有列表「甩不动、只能一格格拖」;桌面同距离 3 次事件滑 1382 点、24 次只滑 262 点);
+/// 拖地图、拖摆放物件时每个采样都完整走一遍 GameManager/ObjSelector/Porter,事件越多帧越卡。
+/// 只在刚入队的一条与它前一条都是 TouchesMove、手指集合完全相同时合并;Down/Up/Cancel、手指集合变化处不跨越。
+/// 越过起拖阈值时补发的中间点(touch_slop_move)入队那一轮不调这里,补发点保留为单独一条。
+fn coalesce_queued_touch_move(queue: &mut VecDeque<Event>) {
+    let n = queue.len();
+    if n < 2 {
+        return;
+    }
+    let same_fingers = match (&queue[n - 2], &queue[n - 1]) {
+        (Event::TouchesMove(prev), Event::TouchesMove(last)) => {
+            prev.len() == last.len() && prev.keys().all(|k| last.contains_key(k))
+        }
+        _ => false,
+    };
+    if same_fingers {
+        let last = queue.pop_back().unwrap();
+        *queue.back_mut().unwrap() = last;
+    }
+}
+
 /// [2026-10-06 第九轮 R9-B2] 安卓加速度 → 原版 iPad 的 UIAcceleration 机身坐标(x 沿竖屏短边、y 沿竖屏长边)。
 /// SDL 传感器(SDL_androidsensor.c:168-178)原样交出 ASensorEvent.data,轴以【设备自然方向】为准,不按屏幕旋转。
 /// 自然竖屏的手机:原始轴就是竖屏机身坐标,与 iPad 一致,原样用(现状)。自然横屏的平板(多数三星 Tab、联想平板):
@@ -670,7 +697,8 @@ struct MouseDragState {
     down: Coords,
     /// 本次按下内是否已越过起拖阈值;越过之后的移动全部原样下发,不再抑制。
     broke: bool,
-    /// [2026-10-10 触摸 P0] 触屏:最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move)。鼠标不用。
+    /// [2026-10-10 触摸 P0] 最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move;
+    /// [2026-11-07] 鼠标左键拖动同样补发,见 E::MouseMotion 分支)。
     last: Option<Coords>,
 }
 
@@ -725,6 +753,10 @@ pub enum Event {
     /// 虚拟手指会走 ccTouchEnded → activate,被当成一次点击;取消只走 ccTouchCancelled(不 activate)。
     /// 不认取消的 cocos2d 代理由 ui_touch 的 handle_touches_cancelled 收尾([复核修 2026-09-15] R1-3 返修)。
     TouchesCancel(HashMap<FingerId, Coords>),
+    /// [2026-11-07 第十九轮] 一个鼠标滚轮/触控板滚动事件:光标处的 guest 坐标(与触摸坐标同一坐标系)和滚动格数
+    /// (正数 = 往上/往前看,SDL 已按系统「自然滚动」设置换算成内容方向)。frameworks/uikit.rs 交给
+    /// ui_touch::wheel_scroll_list:光标下有可见、可拖动的列表就滚动它,否则忽略(地图缩放仍由虚拟捏合负责)。
+    WheelScroll(Coords, f32),
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
@@ -1555,9 +1587,8 @@ impl Window {
         /// 滚轮停下 PINCH_IDLE_TIMEOUT 后由 poll_for_events 末尾统一结束([复核修 2026-09-15] R1-3:
         /// 以 TouchesCancel 结束,见 end_wheel_pinch)。已按下的虚拟手指绝不再发 Down。
         fn handle_wheel_pinch(window: &mut Window, notches_int: i32, notches_precise: f32) {
-            // 不合成的情形:开关关闭 / 正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
-            if !wheel_pinch_enabled()
-                || MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            // 不处理的情形:正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
+            if MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || crate::mole_menu::is_open()
             {
                 return;
@@ -1567,21 +1598,33 @@ impl Window {
             if window.mouse_left_down && mouse.left() {
                 return;
             }
-            let mut delta = if notches_precise != 0.0 && notches_precise.is_finite() {
+            let raw = if notches_precise != 0.0 && notches_precise.is_finite() {
                 notches_precise
             } else {
                 notches_int as f32
             };
-            if wheel_pinch_inverted() {
-                delta = -delta;
-            }
-            let delta = delta.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
-            if delta == 0.0 {
+            let raw = raw.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
+            if raw == 0.0 {
                 return;
             }
+            let mut cursor = (mouse.x() as f32, mouse.y() as f32);
+            // [2026-11-07] 诊断注入 fwheel 指定的光标位置(归一化,窗口左上为原点),见 mole_diag。
+            if let Some((nx, ny)) = crate::mole_diag::take_wheel_cursor_override() {
+                let (w, h) = window.window.size();
+                cursor = (nx * w as f32, ny * h as f32);
+            }
+            // [2026-11-07 第十九轮] 每个滚轮事件都交给 uikit 试着滚动光标下的列表(见 Event::WheelScroll);
+            // 光标在列表上时下面合成的虚拟双指会被 ui_touch 的 wheel_pinch_allowed_for 挡下,两者不会同时生效。
+            // 方向不受 wheel_pinch_inverted(那是缩放方向的个人设置)影响。
+            let at = transform_input_coords(window, cursor, false);
+            window.event_queue.push_back(Event::WheelScroll(at, raw));
+            // 地图缩放(虚拟双指)受开关控制。
+            if !wheel_pinch_enabled() {
+                return;
+            }
+            let delta = if wheel_pinch_inverted() { -raw } else { raw };
             let now = Instant::now();
             if window.pinch.is_none() {
-                let cursor = (mouse.x() as f32, mouse.y() as f32);
                 let Some(p) = begin_wheel_pinch(window, cursor, now) else {
                     return;
                 };
@@ -1832,14 +1875,23 @@ impl Window {
                     // 下发,此后本次按下内不再抑制。ui_touch 的 previous_location 是上一次下发的位置(即按下点),所以第一个 Move
                     // 的位移包含了被抑制的那几个点,地图平移不会永久少走这段距离,只是起拖晚了一点。
                     // mouse_drag 为 None(没看到按下,例如在窗口外按下再拖进来)时按原样下发。
+                    // [2026-11-07 第十九轮 R19-E-2] 照触屏(5e8b429)补上:阈值内记下最后一个与按下点不同的坐标,越过阈值时先把它
+                    // 作为一次移动补发(slop_prefix,插在本次移动之前)。切水果 -[TouchTrailLayer ccTouchMoved:...]@0x143e20 只拿下发的
+                    // 采样点逐个 checkLists:touchPos:,从水果边缘起刀、阈值内就划出水果时,水果里的那个点以前被吞掉,这一刀落空。
                     let slop = mouse_drag_slop();
                     if let Some(drag) = self.mouse_drag.as_mut() {
                         if !drag.broke {
                             let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
                             if (dx * dx + dy * dy).sqrt() < slop {
+                                if coords != drag.down {
+                                    drag.last = Some(coords);
+                                }
                                 continue;
                             }
                             drag.broke = true;
+                            if let Some(last) = drag.last.take() {
+                                slop_prefix.insert(FingerId::Mouse, last);
+                            }
                             log_dbg!(
                                 "[鼠标起拖] 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
                                 slop,
@@ -2249,7 +2301,20 @@ impl Window {
                         E::FingerUp { .. } if cancelled => {
                             for finger in map.keys() {
                                 if let FingerId::Touch(id) = *finger {
-                                    self.touch_drag.remove(&id);
+                                    // [2026-11-07 第十九轮 R19-A-2] 没越过起拖阈值、但有被压住的位移时,先把最后一个被压住的点
+                                    // 作为一次移动补发(插在取消之前,见下方 slop_prefix),游戏看到的是原版的「按下 → 移动 → 取消」。
+                                    // 原版真机上 UIKit 对任何位移都发 touchesMoved,系统取消到来前手指几乎总已动过;我们把阈值内的
+                                    // 位移全压住,游戏只看到「按下 → 取消」:-[CCScrollView ccTouchCancelled:]@0x900c8 改发
+                                    // ccTouchEnded:,-[CCTableView ccTouchEnded:]@0x91da0 见 touchMoved_==0 就 table:cellTouched:
+                                    // ——仓库物品被取出、种子被种下、礼物被送出(安卓边缘返回手势、防误触、来电等)。
+                                    // 零位移的取消照原版处理。
+                                    if let Some(drag) = self.touch_drag.remove(&id) {
+                                        if !drag.broke {
+                                            if let Some(last) = drag.last {
+                                                slop_prefix.insert(*finger, last);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             log!("[触摸] 系统取消了 {} 根手指的触摸,按取消交给游戏(不算点击)", map.len());
@@ -2315,6 +2380,8 @@ impl Window {
                 let main = self.event_queue.pop_back().unwrap();
                 self.event_queue.push_back(Event::TouchesMove(slop_prefix));
                 self.event_queue.push_back(main);
+            } else {
+                coalesce_queued_touch_move(&mut self.event_queue);
             }
         }
 
@@ -2381,6 +2448,31 @@ impl Window {
     /// 结束,两边一起清,回来后第一下按键/触摸重新从"按下"开始:不会出现窗口侧以为还按着、只发移动
     /// (ui_touch 不认识而丢掉),也不会让右键倾斜一直生效。只改字段、不调 SDL,可以在协程栈上调用。
     /// 其它事件(Quit、WindowMinimized/Restored、EnterDebugger 等)保留。返回丢掉的事件数。
+    /// [2026-11-07 第十九轮 R19-A-2 补全] 外部取消(切后台挂起、打开修改器菜单、系统原生弹窗)之前调用:取出还没越过
+    /// 起拖阈值、但有位移被阈值压住的手指(触屏手指与鼠标左键)最后一个被压住的点,并清掉这条记录(不再重复补发)。
+    /// 调用方在发取消之前先把它们作为一次移动交给游戏,游戏看到的是原版的「按下 → 移动 → 取消」,与 FingerUp 系统取消
+    /// 分支(a67f2ec)一致:列表格子上稍挪一下就被取消,-[CCTableView ccTouchEnded:]@0x91da0 见 touchMoved_ 已置位,
+    /// 不再当成点了这一格(仓库取出物品、待领取直接领取等)。已越过阈值的手指游戏早已收到真实移动,不在此列;
+    /// 零位移的不补,原地被取消照原版当点击。切后台要在 discard_pending_input 清掉起拖状态之前取。
+    pub fn take_slop_suppressed_points(&mut self) -> HashMap<FingerId, Coords> {
+        let mut out = HashMap::new();
+        for (&id, drag) in self.touch_drag.iter_mut() {
+            if !drag.broke {
+                if let Some(last) = drag.last.take() {
+                    out.insert(FingerId::Touch(id), last);
+                }
+            }
+        }
+        if let Some(drag) = self.mouse_drag.as_mut() {
+            if !drag.broke {
+                if let Some(last) = drag.last.take() {
+                    out.insert(FingerId::Mouse, last);
+                }
+            }
+        }
+        out
+    }
+
     pub fn discard_pending_input(&mut self) -> usize {
         let before = self.event_queue.len();
         self.event_queue.retain(|event| {
@@ -2390,6 +2482,7 @@ impl Window {
                     | Event::TouchesMove(_)
                     | Event::TouchesUp(_)
                     | Event::TouchesCancel(_)
+                    | Event::WheelScroll(..)
                     | Event::TextInput(_)
                     | Event::ToggleMoleMenu
             )

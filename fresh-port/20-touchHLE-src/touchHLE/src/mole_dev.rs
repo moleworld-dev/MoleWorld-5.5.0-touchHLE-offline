@@ -2302,6 +2302,127 @@ pub fn camera_center(env: &mut Environment) -> DevResult {
 /// [2026-10-24 iPhone Duo] `dev tree`:把当前运行场景的 cocos2d 节点树打到日志(类名、tag、position、contentSize、
 /// scale、anchor、visible,子节点缩进),用于排查不同屏宽下的布局。只读 ivar、只发宿主实现的 count/objectAtIndex: 与
 /// runningScene,不跑游戏逻辑。最多打印 6 层、600 个节点。
+/// [2026-11-07] 场景树里第一个该类节点,找不到再试 +sharedInstance。
+fn node_or_singleton(env: &mut Environment, class_name: &str) -> id {
+    let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    let shared = sel(env, "sharedDirector");
+    let director: id = msg_send(env, (director_class, shared));
+    let running = sel(env, "runningScene");
+    let scene: id = if director == nil {
+        nil
+    } else {
+        msg_send(env, (director, running))
+    };
+    let found = find_node_by_class(env, scene, class_name, 0);
+    if found != nil {
+        return found;
+    }
+    let class = env.objc.get_known_class(class_name, &mut env.mem);
+    if class == nil {
+        return nil;
+    }
+    // 地图物件(店铺、餐厅等)不一定挂在场景树上,再查 [[ObjectManager sharedManager] objects]。
+    let om = node_or_singleton_via(env, "ObjectManager", "sharedManager");
+    if om != nil {
+        let objects_sel = sel(env, "objects");
+        let objects: id = msg_send(env, (om, objects_sel));
+        if objects != nil {
+            let count_sel = sel(env, "count");
+            let at_sel = sel(env, "objectAtIndex:");
+            let kind_sel = sel(env, "isKindOfClass:");
+            let n: u32 = msg_send(env, (objects, count_sel));
+            for i in 0..n {
+                let o: id = msg_send(env, (objects, at_sel, i));
+                let is_kind: bool = msg_send(env, (o, kind_sel, class));
+                if is_kind {
+                    return o;
+                }
+            }
+        }
+    }
+    let si = sel(env, "sharedInstance");
+    let responds = sel(env, "respondsToSelector:");
+    let has_singleton: bool = msg_send(env, (class, responds, si));
+    if has_singleton {
+        msg_send(env, (class, si))
+    } else {
+        nil
+    }
+}
+
+/// [2026-11-07] 类的单例(按给定的类方法取)。
+fn node_or_singleton_via(env: &mut Environment, class_name: &str, accessor: &str) -> id {
+    let class = env.objc.get_known_class(class_name, &mut env.mem);
+    if class == nil {
+        return nil;
+    }
+    let s = sel(env, accessor);
+    msg_send(env, (class, s))
+}
+
+/// [2026-11-07] 见 run_text_command 的 show。
+fn show_with_target(env: &mut Environment, class_name: &str, target_class: &str, callback: &str) -> DevResult {
+    let obj = node_or_singleton(env, class_name);
+    if obj == nil {
+        return Err(format!("拿不到 {}", class_name));
+    }
+    let target = node_or_singleton(env, target_class);
+    if target == nil {
+        return Err(format!("拿不到 {}", target_class));
+    }
+    let show = sel(env, "showWithTarget:selector:");
+    let cb = sel(env, callback);
+    let _: () = msg_send(env, (obj, show, target, cb));
+    Ok(format!("已对 {} {:?} 发送 showWithTarget:{} {:?} selector:{}", class_name, obj, target_class, target, callback))
+}
+
+/// [2026-11-07] 见 run_text_command 的 invoke。
+fn invoke_on_node(env: &mut Environment, class_name: &str, selector: &str) -> DevResult {
+    let target = node_or_singleton(env, class_name);
+    if target == nil {
+        return Err(format!("场景里没有 {} 节点,物件表里也没有,也拿不到它的单例", class_name));
+    }
+    let s = sel(env, selector);
+    let responds = sel(env, "respondsToSelector:");
+    let ok: bool = msg_send(env, (target, responds, s));
+    if !ok {
+        return Err(format!("{} {:?} 不响应 {}", class_name, target, selector));
+    }
+    let _: () = msg_send(env, (target, s));
+    Ok(format!("已对 {} {:?} 发送 {}", class_name, target, selector))
+}
+
+fn find_node_by_class(env: &mut Environment, node: id, class_name: &str, depth: u32) -> id {
+    if node == nil || depth > 14 {
+        return nil;
+    }
+    let isa = crate::objc::ObjC::read_isa(node, &env.mem);
+    if env.objc.try_get_class_name(isa) == Some(class_name) {
+        return node;
+    }
+    let children: id = match env
+        .objc
+        .object_lookup_ivar(&env.mem, node, &"children_".to_string())
+    {
+        Some(p) => Ptr::from_bits(env.mem.read(p.cast::<u32>().cast_const())),
+        None => nil,
+    };
+    if children == nil {
+        return nil;
+    }
+    let count_sel = sel(env, "count");
+    let at_sel = sel(env, "objectAtIndex:");
+    let n: u32 = msg_send(env, (children, count_sel));
+    for i in 0..n {
+        let child: id = msg_send(env, (children, at_sel, i));
+        let found = find_node_by_class(env, child, class_name, depth + 1);
+        if found != nil {
+            return found;
+        }
+    }
+    nil
+}
+
 pub fn dump_scene_tree(env: &mut Environment) -> DevResult {
     let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
     let shared = sel(env, "sharedDirector");
@@ -2330,7 +2451,7 @@ fn read_ivar_f32s(env: &Environment, obj: id, name: &str, n: u32) -> Vec<f32> {
 }
 
 fn dump_node(env: &mut Environment, node: id, depth: u32, count: &mut u32) {
-    if node == nil || depth > 6 || *count >= 600 {
+    if node == nil || depth > 12 || *count >= 2000 {
         return;
     }
     *count += 1;
@@ -2477,6 +2598,7 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 /// 菜单加页、宽屏 --fill-screen 多出水平偏移,坐标就失效。这里按名字直接调菜单按钮背后的同一批函数:
 ///   dev fps | dev grid | dev center | dev speed <倍率> → toggle_fps / toggle_map_grid / camera_center / set_time_scale
 ///   dev trace | dev unlock | dev store | dev weather <类型> → toggle_trace / unlock_interaction / open_building_store / weather
+///   dev objs                                           → 对象表计数(ObjC::object_count,衡量触摸事件对象泄漏)
 ///   quest main|time|vip|island <任务号>                → quest_jump
 ///   story <段号>                                       → story_play
 ///   time <分钟>                                        → apply_time_minutes
@@ -2512,11 +2634,13 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             ["tree"] => dump_scene_tree(env),
             ["unlock"] => unlock_interaction(env),
             ["store"] => open_building_store(env),
+            // [2026-11-07 第十九轮] 对象表计数(衡量触摸事件对象泄漏,见 ObjC::object_count)。
+            ["objs"] => Ok(format!("对象表 {} 个", env.objc.object_count())),
             ["weather", k] => {
                 let kind: i64 = parse_command_number(k, "天气类型")?;
                 weather(env, kind)
             }
-            _ => Err("用法:dev fps | dev grid | dev center | dev tree | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev weather <类型>"
+            _ => Err("用法:dev fps | dev grid | dev center | dev tree | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev objs | dev weather <类型>"
                 .to_string()),
         },
         "quest" => match args.as_slice() {
@@ -2561,6 +2685,33 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             _ => Err("用法:travel <小时>(同修改器「时间旅行」,只往前拨)".to_string()),
         },
         // [2026-10-28] 修改器「召唤」的命令行入口(无头测试打开旧活动等界面;与菜单同一个 summon_class,拒绝规则一致)。
+        // [2026-11-07] `invoke <类名> <无参方法>`:在当前场景树里找第一个该类的节点(找不到再试 +sharedInstance 单例),
+        // 给它发这个无参消息,走游戏自己的入口(如 invoke VillageMenuLayer onAddGoodsSelected 打开仓库)。测试用。
+        "invoke" => match args.as_slice() {
+            [class, selector] => invoke_on_node(env, class, selector),
+            _ => Err("用法:invoke <类名> <无参方法>".to_string()),
+        },
+        // [2026-11-07] `show <抽屉类> <目标类> <回调方法>`:对抽屉(场景节点或单例)发 showWithTarget:目标 selector:回调,
+        // 目标同样按场景节点/单例找。如 show GoodsViewLayer ObjSelector onAddGoodsSelected 打开主村仓库。测试用。
+        // [2026-11-07] `stock <物品ID> <数量>`:照游戏自己的 -[ObjectManager addGoodsNumber:andCount:]@0x42ea0 往仓库加物品。测试用。
+        "stock" => match args.as_slice() {
+            [id_, n] => {
+                let item: i32 = parse_command_number(id_, "物品ID")?;
+                let count: i32 = parse_command_number(n, "数量")?;
+                let om = node_or_singleton_via(env, "ObjectManager", "sharedManager");
+                if om == nil {
+                    return Err("拿不到 ObjectManager".to_string());
+                }
+                let add = sel(env, "addGoodsNumber:andCount:");
+                let _: () = msg_send(env, (om, add, item, count));
+                Ok(format!("已往仓库加 {} 个物品 {}", count, item))
+            }
+            _ => Err("用法:stock <物品ID> <数量>".to_string()),
+        },
+        "show" => match args.as_slice() {
+            [class, target_class, callback] => show_with_target(env, class, target_class, callback),
+            _ => Err("用法:show <抽屉类> <目标类> <回调方法>".to_string()),
+        },
         "summon" => match args.as_slice() {
             [c] => {
                 crate::mole_menu::summon_class(env, c, 88888);
