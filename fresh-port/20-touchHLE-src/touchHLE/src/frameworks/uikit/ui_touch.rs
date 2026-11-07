@@ -190,6 +190,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // [扫描修 2026-09-15] 已按下的手指又收到 Down:先记下来,本次 Down 分发完再按移动处理。
     let mut repeated_downs: HashMap<FingerId, Coords> = HashMap::new();
@@ -251,6 +253,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -379,6 +383,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         // won't end up with an empty set.
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -421,6 +427,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // view to set of touches for this view
     let mut view_touches: HashMap<id, id> = HashMap::new();
@@ -500,6 +508,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -512,6 +522,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     }
 
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -573,10 +585,14 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
     };
 
     let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, touches);
 
     // We need to construct all touches set _BEFORE_ removing touches!
     // (as removed one are reported as the part of the event)
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -625,6 +641,8 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();
@@ -675,6 +693,8 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 
     // 与抬起相同:必须在移除触点【之前】收集全部触点(被取消的触点也属于本次事件)。
     let all_touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+    autorelease(env, all_touches);
     for &touch in env
         .framework_state
         .uikit
@@ -723,6 +743,8 @@ fn handle_touches_cancelled(env: &mut Environment, map: HashMap<FingerId, Coords
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+            // [2026-11-07 第十九轮 R19-G-05] 交给本函数的自动释放池(派发、取消收尾之后才排空),以前从不释放。
+            autorelease(env, touches);
             e.insert(touches);
         }
         let touches: id = *view_touches.get(&view).unwrap();

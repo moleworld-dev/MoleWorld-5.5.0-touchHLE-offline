@@ -9,7 +9,8 @@ use super::ui_touch::UITouchHostObject;
 use crate::frameworks::foundation::{NSTimeInterval, NSUInteger};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use crate::Environment;
 
@@ -37,6 +38,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
     release(env, touches);
+    // [2026-11-07 第十九轮 R19-G-05] 以前只放掉 touches、不回收自身,每个触摸事件在对象表里留一条永久条目。
+    env.objc.dealloc_object(this, &mut env.mem)
 }
 
 - (NSTimeInterval)timestamp {
@@ -47,6 +50,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &UIEventHostObject { touches, .. } = env.objc.borrow(this);
 
     let touches_for_view: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+    // [2026-11-07 第十九轮 R19-G-05] 照 Cocoa 约定返回自动释放的集合,以前调用一次漏一个。
+    autorelease(env, touches_for_view);
 
     let touches_arr: id = msg![env; touches allObjects];
     let touches_count: NSUInteger = msg![env; touches_arr count];
