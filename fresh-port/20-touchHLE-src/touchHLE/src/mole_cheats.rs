@@ -9172,6 +9172,14 @@ fn ui43_debug() -> bool {
     *S.get_or_init(|| std::env::var("MOLE_UI43_DEBUG").map(|v| v != "0").unwrap_or(cfg!(target_os = "ios")))
 }
 
+/// [2026-11-07 第十九轮 R19-H-1] 逐触摸事件的 [UI43] 日志(滚动表格命中换算、坐标换算)只在显式设了 MOLE_UI43_DEBUG=1 时打。
+/// iOS 上 ui43_debug() 默认开(界面进场等低频日志留着排查 TestFlight),但这两类每次按下/移动都会走到:拖建造商店、
+/// 选关等居中界面里的列表时每个移动事件同步写一行(SDL_Log → NSLog + 日志文件),解释器上拖得越久越卡。
+fn ui43_debug_touch() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("MOLE_UI43_DEBUG").map(|v| v != "0").unwrap_or(false))
+}
+
 /// [MoleWorld 宽屏适配·诊断] 对象的运行时类名(nil → "nil")。
 fn ui43_cls_name(env: &Environment, obj: id) -> String {
     if obj == nil {
@@ -9754,7 +9762,7 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
                 let mut q: CGPoint = ui43_inner(env, |env| msg_send(env, (recv, sel, p)));
                 q.x -= off;
                 env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), q);
-                if ui43_debug() {
+                if ui43_debug_touch() {
                     let (qx, qy) = (q.x, q.y);
                     log!("[UI43] 滚动表格命中 lr={:#x} 世界点 → 设计 ({:.0},{:.0})", lr, qx, qy);
                 }
@@ -9783,7 +9791,7 @@ pub fn intercept_fast(env: &mut Environment, sel: SEL, from_host: bool) -> bool 
                 }
             };
             env.mem.write(MutPtr::<CGPoint>::from_bits(regs[0]), out);
-            if ui43_debug() {
+            if ui43_debug_touch() {
                 static N: AtomicU32 = AtomicU32::new(0);
                 let n = N.fetch_add(1, O);
                 if n < 40 || n % 200 == 0 {
