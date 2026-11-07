@@ -458,12 +458,18 @@ pub fn next_inject() -> Option<Inject> {
                 let t = i as f32 / steps as f32;
                 seq.push((FINGER_MOTION, 0, nx1 + (nx2 - nx1) * t, ny1 + (ny2 - ny1) * t));
             }
-            seq.push((FINGER_UP, 0, nx2, ny2));
-            let cancel = it.next() == Some("1");
+            // 第 6 个参数:1 = 以系统取消结束(负压力);[2026-11-07] 2 = 按住不放(不推抬起),
+            // 留给随后的 suspend / menu 以取消收尾,验证外部取消路径。
+            let mode = it.next();
+            let cancel = mode == Some("1");
+            let hold = mode == Some("2");
+            if !hold {
+                seq.push((FINGER_UP, 0, nx2, ny2));
+            }
             push_sdl_finger_events(&seq, false, 0, if cancel { -1.0 } else { 1.0 });
             log_line(&format!(
-                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps, cancel={})",
-                nx1, ny1, nx2, ny2, steps, cancel
+                "INJECT fdrag ({}, {}) -> ({}, {}) ({} steps, cancel={}, hold={})",
+                nx1, ny1, nx2, ny2, steps, cancel, hold
             ));
             None
         }

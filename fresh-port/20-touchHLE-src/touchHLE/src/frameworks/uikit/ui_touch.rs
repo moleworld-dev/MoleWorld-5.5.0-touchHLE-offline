@@ -1024,6 +1024,7 @@ fn wheel_pinch_allowed_for(env: &mut Environment, view: id) -> bool {
         }
     }
     let Some(village) = village else {
+        wheel_block_log("前台不是村庄或岛上地图(小游戏、全屏界面等)");
         return false;
     };
     let (static_slot, manager_class) = if village == "VillageLayer" {
@@ -1043,6 +1044,10 @@ fn wheel_pinch_allowed_for(env: &mut Environment, view: id) -> bool {
         let ptr: MutPtr<u8> = ptr.cast();
         let enabled: u8 = env.mem.read(ptr);
         if enabled == 0 {
+            wheel_block_log(&format!(
+                "{} 的交互已关闭(小游戏、剧情、任务框等)",
+                manager_class
+            ));
             return false;
         }
     }
@@ -1069,6 +1074,15 @@ fn wheel_pinch_allowed_for(env: &mut Environment, view: id) -> bool {
         }
     }
     true
+}
+
+/// [2026-11-07 第十九轮] 滚轮因「前台不是地图」或「交互已关闭」被挡时记一笔(限前 30 次,连续滚动不刷屏),
+/// 无头测试据此确认小游戏、选关页里的滚轮没有交给游戏。
+fn wheel_block_log(why: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+        log!("[滚轮] {},这次滚轮不当地图缩放交给游戏", why);
+    }
 }
 
 /// [复核修 2026-09-15] R1-3 返修:沿对象的 isa/superclass 链找第一个名字在 names 里的类(不发消息)。

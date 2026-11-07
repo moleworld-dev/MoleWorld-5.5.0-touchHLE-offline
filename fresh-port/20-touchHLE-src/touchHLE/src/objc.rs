@@ -103,6 +103,12 @@ impl ObjC {
             message_type_info: None,
         }
     }
+
+    /// [2026-11-07 第十九轮] 诊断用:当前登记在对象表里的(带宿主对象的)guest 对象个数。
+    /// 无头测试(`dev objs`)据此衡量触摸事件对象是否泄漏,比进程常驻内存准(后者受系统内存压缩影响)。
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
 }
 
 pub const DYLIB: HostDylib = HostDylib {

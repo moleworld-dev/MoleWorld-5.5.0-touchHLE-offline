@@ -2598,6 +2598,7 @@ fn parse_command_number<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T
 /// 菜单加页、宽屏 --fill-screen 多出水平偏移,坐标就失效。这里按名字直接调菜单按钮背后的同一批函数:
 ///   dev fps | dev grid | dev center | dev speed <倍率> → toggle_fps / toggle_map_grid / camera_center / set_time_scale
 ///   dev trace | dev unlock | dev store | dev weather <类型> → toggle_trace / unlock_interaction / open_building_store / weather
+///   dev objs                                           → 对象表计数(ObjC::object_count,衡量触摸事件对象泄漏)
 ///   quest main|time|vip|island <任务号>                → quest_jump
 ///   story <段号>                                       → story_play
 ///   time <分钟>                                        → apply_time_minutes
@@ -2633,11 +2634,13 @@ pub fn run_text_command(env: &mut Environment, line: &str) -> DevResult {
             ["tree"] => dump_scene_tree(env),
             ["unlock"] => unlock_interaction(env),
             ["store"] => open_building_store(env),
+            // [2026-11-07 第十九轮] 对象表计数(衡量触摸事件对象泄漏,见 ObjC::object_count)。
+            ["objs"] => Ok(format!("对象表 {} 个", env.objc.object_count())),
             ["weather", k] => {
                 let kind: i64 = parse_command_number(k, "天气类型")?;
                 weather(env, kind)
             }
-            _ => Err("用法:dev fps | dev grid | dev center | dev tree | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev weather <类型>"
+            _ => Err("用法:dev fps | dev grid | dev center | dev tree | dev speed <0.25..4> | dev trace | dev unlock | dev store | dev objs | dev weather <类型>"
                 .to_string()),
         },
         "quest" => match args.as_slice() {
