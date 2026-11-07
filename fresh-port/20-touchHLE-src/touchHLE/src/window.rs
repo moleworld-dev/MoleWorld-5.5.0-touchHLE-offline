@@ -302,6 +302,33 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     sdl2::hint::set("SDL_IOS_ORIENTATIONS", hint);
 }
 
+/// [2026-11-07 第十九轮 R19-G-01] 同一组手指的连续移动按 UIKit 语义合并成一条,坐标取最新。
+/// 真机 UIKit 每次主运行循环最多给一次 touchesMoved(同一 UITouch 的多次采样合并,previousLocationInView 是上次
+/// 交给 app 的位置),原版 iPad 触摸采样又与 60Hz 刷新同频。touchHLE 以前把两帧之间攒下的每个采样逐条派发:
+/// 高刷安卓(90~144Hz)、ProMotion iPhone、桌面鼠标(120Hz 轮询),以及游戏掉帧时,一帧要派发好几次移动。
+/// 游戏的滚动列表 -[CCScrollView ccTouchMoved:withEvent:]@0x8fc04 把【最后一次事件】的位移记进 scrollDistance_
+/// (0x8ffe4–0x9000a),松手后 deaccelerateScrolling:@0x8f320 每帧按它滑行再乘 0.95,于是惯性只剩整帧位移的几分之一
+/// (仓库、岛上商品、建造商店、选关等所有列表「甩不动、只能一格格拖」;桌面同距离 3 次事件滑 1382 点、24 次只滑 262 点);
+/// 拖地图、拖摆放物件时每个采样都完整走一遍 GameManager/ObjSelector/Porter,事件越多帧越卡。
+/// 只在刚入队的一条与它前一条都是 TouchesMove、手指集合完全相同时合并;Down/Up/Cancel、手指集合变化处不跨越。
+/// 越过起拖阈值时补发的中间点(touch_slop_move)入队那一轮不调这里,补发点保留为单独一条。
+fn coalesce_queued_touch_move(queue: &mut VecDeque<Event>) {
+    let n = queue.len();
+    if n < 2 {
+        return;
+    }
+    let same_fingers = match (&queue[n - 2], &queue[n - 1]) {
+        (Event::TouchesMove(prev), Event::TouchesMove(last)) => {
+            prev.len() == last.len() && prev.keys().all(|k| last.contains_key(k))
+        }
+        _ => false,
+    };
+    if same_fingers {
+        let last = queue.pop_back().unwrap();
+        *queue.back_mut().unwrap() = last;
+    }
+}
+
 /// [2026-10-06 第九轮 R9-B2] 安卓加速度 → 原版 iPad 的 UIAcceleration 机身坐标(x 沿竖屏短边、y 沿竖屏长边)。
 /// SDL 传感器(SDL_androidsensor.c:168-178)原样交出 ASensorEvent.data,轴以【设备自然方向】为准,不按屏幕旋转。
 /// 自然竖屏的手机:原始轴就是竖屏机身坐标,与 iPad 一致,原样用(现状)。自然横屏的平板(多数三星 Tab、联想平板):
@@ -2209,6 +2236,8 @@ impl Window {
                 let main = self.event_queue.pop_back().unwrap();
                 self.event_queue.push_back(Event::TouchesMove(slop_prefix));
                 self.event_queue.push_back(main);
+            } else {
+                coalesce_queued_touch_move(&mut self.event_queue);
             }
         }
 
