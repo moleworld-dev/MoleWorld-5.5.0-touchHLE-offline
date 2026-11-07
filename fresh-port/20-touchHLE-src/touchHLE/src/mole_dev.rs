@@ -2302,7 +2302,7 @@ pub fn camera_center(env: &mut Environment) -> DevResult {
 /// [2026-10-24 iPhone Duo] `dev tree`:把当前运行场景的 cocos2d 节点树打到日志(类名、tag、position、contentSize、
 /// scale、anchor、visible,子节点缩进),用于排查不同屏宽下的布局。只读 ivar、只发宿主实现的 count/objectAtIndex: 与
 /// runningScene,不跑游戏逻辑。最多打印 6 层、600 个节点。
-/// [2026-11-07] 场景树里第一个该类节点,找不到再试 +sharedInstance。
+/// [2026-11-07] 场景树里第一个该类节点,找不到再查物件表,最后试类的单例(+sharedInstance / +shareInstance / +sharedManager / +shareManager)。
 fn node_or_singleton(env: &mut Environment, class_name: &str) -> id {
     let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
     let shared = sel(env, "sharedDirector");
@@ -2340,14 +2340,16 @@ fn node_or_singleton(env: &mut Environment, class_name: &str) -> id {
             }
         }
     }
-    let si = sel(env, "sharedInstance");
+    // 淘米代码里单例取法不统一(MiniGameManager 是 +shareInstance,ObjectManager 是 +sharedManager),按常见几种依次试。
     let responds = sel(env, "respondsToSelector:");
-    let has_singleton: bool = msg_send(env, (class, responds, si));
-    if has_singleton {
-        msg_send(env, (class, si))
-    } else {
-        nil
+    for accessor in ["sharedInstance", "shareInstance", "sharedManager", "shareManager"] {
+        let si = sel(env, accessor);
+        let has_singleton: bool = msg_send(env, (class, responds, si));
+        if has_singleton {
+            return msg_send(env, (class, si));
+        }
     }
+    nil
 }
 
 /// [2026-11-07] 类的单例(按给定的类方法取)。
@@ -2388,7 +2390,12 @@ fn invoke_on_node(env: &mut Environment, class_name: &str, selector: &str) -> De
     if !ok {
         return Err(format!("{} {:?} 不响应 {}", class_name, target, selector));
     }
-    let _: () = msg_send(env, (target, s));
+    // 带一个参数的(按钮回调 onXxxSelected: 等)参数传 nil,不让 r2 留着上一次调用的值。
+    if selector.matches(':').count() == 1 && selector.ends_with(':') {
+        let _: () = msg_send(env, (target, s, nil));
+    } else {
+        let _: () = msg_send(env, (target, s));
+    }
     Ok(format!("已对 {} {:?} 发送 {}", class_name, target, selector))
 }
 
