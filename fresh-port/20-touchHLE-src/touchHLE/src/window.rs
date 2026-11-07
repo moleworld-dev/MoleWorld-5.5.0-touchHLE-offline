@@ -2170,7 +2170,20 @@ impl Window {
                         E::FingerUp { .. } if cancelled => {
                             for finger in map.keys() {
                                 if let FingerId::Touch(id) = *finger {
-                                    self.touch_drag.remove(&id);
+                                    // [2026-11-07 第十九轮 R19-A-2] 没越过起拖阈值、但有被压住的位移时,先把最后一个被压住的点
+                                    // 作为一次移动补发(插在取消之前,见下方 slop_prefix),游戏看到的是原版的「按下 → 移动 → 取消」。
+                                    // 原版真机上 UIKit 对任何位移都发 touchesMoved,系统取消到来前手指几乎总已动过;我们把阈值内的
+                                    // 位移全压住,游戏只看到「按下 → 取消」:-[CCScrollView ccTouchCancelled:]@0x900c8 改发
+                                    // ccTouchEnded:,-[CCTableView ccTouchEnded:]@0x91da0 见 touchMoved_==0 就 table:cellTouched:
+                                    // ——仓库物品被取出、种子被种下、礼物被送出(安卓边缘返回手势、防误触、来电等)。
+                                    // 零位移的取消照原版处理。
+                                    if let Some(drag) = self.touch_drag.remove(&id) {
+                                        if !drag.broke {
+                                            if let Some(last) = drag.last {
+                                                slop_prefix.insert(*finger, last);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             log!("[触摸] 系统取消了 {} 根手指的触摸,按取消交给游戏(不算点击)", map.len());
