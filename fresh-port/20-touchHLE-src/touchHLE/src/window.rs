@@ -2316,6 +2316,31 @@ impl Window {
     /// 结束,两边一起清,回来后第一下按键/触摸重新从"按下"开始:不会出现窗口侧以为还按着、只发移动
     /// (ui_touch 不认识而丢掉),也不会让右键倾斜一直生效。只改字段、不调 SDL,可以在协程栈上调用。
     /// 其它事件(Quit、WindowMinimized/Restored、EnterDebugger 等)保留。返回丢掉的事件数。
+    /// [2026-11-07 第十九轮 R19-A-2 补全] 外部取消(切后台挂起、打开修改器菜单、系统原生弹窗)之前调用:取出还没越过
+    /// 起拖阈值、但有位移被阈值压住的手指(触屏手指与鼠标左键)最后一个被压住的点,并清掉这条记录(不再重复补发)。
+    /// 调用方在发取消之前先把它们作为一次移动交给游戏,游戏看到的是原版的「按下 → 移动 → 取消」,与 FingerUp 系统取消
+    /// 分支(a67f2ec)一致:列表格子上稍挪一下就被取消,-[CCTableView ccTouchEnded:]@0x91da0 见 touchMoved_ 已置位,
+    /// 不再当成点了这一格(仓库取出物品、待领取直接领取等)。已越过阈值的手指游戏早已收到真实移动,不在此列;
+    /// 零位移的不补,原地被取消照原版当点击。切后台要在 discard_pending_input 清掉起拖状态之前取。
+    pub fn take_slop_suppressed_points(&mut self) -> HashMap<FingerId, Coords> {
+        let mut out = HashMap::new();
+        for (&id, drag) in self.touch_drag.iter_mut() {
+            if !drag.broke {
+                if let Some(last) = drag.last.take() {
+                    out.insert(FingerId::Touch(id), last);
+                }
+            }
+        }
+        if let Some(drag) = self.mouse_drag.as_mut() {
+            if !drag.broke {
+                if let Some(last) = drag.last.take() {
+                    out.insert(FingerId::Mouse, last);
+                }
+            }
+        }
+        out
+    }
+
     pub fn discard_pending_input(&mut self) -> usize {
         let before = self.event_queue.len();
         self.event_queue.retain(|event| {
