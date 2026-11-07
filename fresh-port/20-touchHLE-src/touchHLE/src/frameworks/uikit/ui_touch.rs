@@ -136,12 +136,35 @@ fn view_is_in_window(env: &mut Environment, view: id, window: id) -> bool {
     }
 }
 
+/// [2026-11-07 第十九轮 R19-D-3] 正在派发的这次触摸事件里只有一根手指时,记下是哪根(否则 None)。
+/// 游戏的摆放器 -[Porter processTouch:withType:] 只在单指事件里被调用(-[GameManager processTouch:withType:] 0x1a6f8
+/// 见 count==1),宿主的摆放钩子据此按手指配对按下点(见 mole_cheats::porter_body_drag)。只在派发期间有效。
+static DISPATCH_SINGLE_FINGER: std::sync::Mutex<Option<FingerId>> = std::sync::Mutex::new(None);
+
+pub fn dispatch_single_finger() -> Option<FingerId> {
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [2026-11-07 第十九轮 R19-D-3] 这根手指是否在村庄/岛上参与过双指缩放(见 [mark_village_pinch])。
+pub fn finger_pinched(env: &Environment, finger: FingerId) -> bool {
+    env.framework_state.uikit.ui_touch.pinched.contains(&finger)
+}
+
 pub fn handle_event(env: &mut Environment, event: Event) {
     // before processing anything, we mark all current touches as stationary
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
         env.objc.borrow_mut::<UITouchHostObject>(touch).phase = UITouchPhaseStationary;
     }
+    let single = match &event {
+        Event::TouchesDown(map) | Event::TouchesMove(map) | Event::TouchesUp(map) | Event::TouchesCancel(map)
+            if map.len() == 1 =>
+        {
+            map.keys().next().copied()
+        }
+        _ => None,
+    };
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner()) = single;
     match event {
         Event::TouchesDown(map) => handle_touches_down(env, map),
         Event::TouchesMove(map) => handle_touches_move(env, map),
@@ -150,6 +173,7 @@ pub fn handle_event(env: &mut Environment, event: Event) {
         Event::TouchesCancel(map) => handle_touches_cancelled(env, map),
         _ => unreachable!(),
     }
+    *DISPATCH_SINGLE_FINGER.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
@@ -517,6 +541,12 @@ fn handle_touches_up(env: &mut Environment, mut map: HashMap<FingerId, Coords>) 
             pinched.len()
         );
         handle_touches_cancelled(env, pinched);
+        // [2026-11-07 第十九轮 R19-D-2] 立即把摆放器从拖动中(state 2/3)复位成 1,不等最后一根手指结束。
+        // 取消不经过 -[Porter touchEnd:],以前要等剩下那根手指也抬起才复位:这期间它一挪,建筑就带着第一根手指留下的
+        // putRef 跳到它下面并一路跟着走(GameManager 见 state>1 不平移地图)。复位相当于原版第一根手指 touchEnd: 走
+        // 0x30cda→0x30d44 的「移动过」分支(state=1、编辑菜单 update:),不确认、不瞬移;剩下的手指照原版平移地图。
+        // ObjSelector 的已选中/已拖动标志仍等最后一根手指结束再清。重复调用无副作用(state 已是 1 就跳过)。
+        reset_porters_after_cancel(env);
         if map.is_empty() {
             return;
         }
@@ -1166,6 +1196,8 @@ fn reset_friends_village_after_cancel(env: &mut Environment, layer: id) {
 /// 单例只读静态变量(Porter +instance@0x28f40 缓存在 0xb40968,NewScenePorter +instance@0x26adb8 缓存在 0xb40c04),
 /// 不存在就不调 +instance,免得凭空建一个。调用方已确认没有别的手指还按着;在运行循环处理事件时调用,可以发消息。
 fn reset_porters_after_cancel(env: &mut Environment) {
+    // [2026-11-07 第十九轮 R19-D-4] 按图身起拖用的是抓取偏移(putRef 可能在占地范围外),收尾时复位到占地中心。
+    crate::mole_cheats::porter_grab_restore(env);
     for (static_slot, menu_class) in [(0xb40968u32, "EditMenuLayer"), (0xb40c04u32, "NewSceneEditMenuLayer")] {
         let porter_bits: GuestUSize = env.mem.read(ConstPtr::<GuestUSize>::from_bits(static_slot));
         if porter_bits == 0 {

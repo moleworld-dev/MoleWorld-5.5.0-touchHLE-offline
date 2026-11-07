@@ -8774,7 +8774,7 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         //   照 moleIslandFlushNow 再放一道,与 intercept 里不绑类的 `sel == "moleIslandTimeTravelNotice"` 臂对应)。
         || sel == "moleIslandTimeTravelNotice"
         // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
-        || (matches!(class, "Porter" | "NewScenePorter") && matches!(sel, "touchBegan:" | "touchMove:"))
+        || (matches!(class, "Porter" | "NewScenePorter") && matches!(sel, "touchBegan:" | "touchMove:" | "touchEnd:"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -10316,22 +10316,33 @@ pub fn porter_free_spot_poll(env: &mut Environment) {
     log!("[摆放] 放下的物件是红色,已挪到最近的空位(偏移 {} 格,{} 格)", a, b);
 }
 
-/// [2026-10-08 第十二轮] 摆放时按住建筑图身也能拖:本次手势按下点(Porter 指针, 触点)。
-static PORTER_BODY_DOWN: std::sync::Mutex<Option<(u32, CGPoint)>> = std::sync::Mutex::new(None);
+/// [2026-10-08 第十二轮] 摆放时按住建筑图身也能拖:按下点。
+/// [2026-11-07 第十九轮 R19-D-3] 改为按手指记(摆放器指针, 手指, 触点):以前是全局单值,两指时第二根手指的按下点会覆盖
+/// 第一根的,第一根手指的单指移动就借用它做图身命中,建筑被甩到第一根手指下(捏合起手、拇指搭着时常见)。
+static PORTER_BODY_DOWN: std::sync::Mutex<Vec<(u32, crate::window::FingerId, CGPoint)>> =
+    std::sync::Mutex::new(Vec::new());
+/// [2026-11-07 第十九轮 R19-D-4] 正在用「抓取偏移」拖动的摆放器(putRef 可能在占地范围外),收尾时要复位到占地中心。
+static PORTER_GRAB: AtomicU32 = AtomicU32::new(0);
 
 /// [2026-10-08 第十二轮,用户拍板的交互放宽] 摆放中从建筑图身起拖也能拖动正在摆放的物件。
 /// 原版 -[Porter touchBegan:]@0x30a88 只在按下点落在占地菱形格(1×1 奖池物件只有 60×30 的底座)上时置 state=2;
 /// -[Porter touchMove:]@0x30c50 只在 state 为 2/3 时跟手;-[GameManager processTouch:withType:] 随后见 state≤1 就平移地图。
 /// 高大的占卜奖品/建筑图身占绝大部分面积,玩家按图身拖只会平移地图,10-07 反馈「卡在红区移不动」。
-/// 做法:两个前置钩子都只认 -[Porter processTouch:withType:]@0x30a74 这一个调用点(LR 0x30a79)。
-///   · touchBegan: 记下按下点;
-///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、按下点落在
-///     objSprite 的包围盒里,就照原版 setPutRefToCenter@0x2f6a4 的算法把 putRef 设到占地中心并置 state=2,
-///     然后放行原 touchMove:,由它 moveTo: 跟手并置 state=3;GameManager 见 state>1 不再平移地图。
+/// 做法:三个前置钩子都只认 -[Porter processTouch:withType:]@0x30a74 这一个调用点(LR 0x30a79)。
+///   · touchBegan: 按手指记下按下点;
+///   · 本手势第一次 touchMove:(prevTouchType==0)时,若原版没起拖(state==1)、正在摆放(objSprite≠0)、这根手指自己的
+///     按下点落在 objSprite 的图上,就置 state=2 并把 putRef 设成「抓取偏移」(见下),然后放行原 touchMove:,由它 moveTo:
+///     跟手并置 state=3;GameManager 见 state>1 不再平移地图;
+///   · touchEnd: 见 [porter_touch_end]。
 /// 从占地格起拖、从图外起拖平移、单击瞬移/确认都与原版一样;✓/⇄/⊘ 是 CCMenu 先吞触摸不受影响。
 /// [2026-10-08 第十三轮] 黄金岛的摆放类 NewScenePorter 与 Porter 逐条同构(touchBegan:@0x2714f0、touchMove:@0x2716b8 只在
-/// state 2/3 跟手、setPutRefToCenter@0x270820 同算法),只是成员偏移槽不同、分派调用点是 processTouch:withType:@0x2714dc
-/// (LR 0x2714e1),一并覆盖:岛上买店后按店的图身也能拖。
+/// state 2/3 跟手、setPutRefToCenter@0x270820、calcBaseTile@0x270874 同算法),只是成员偏移槽不同、分派调用点是
+/// processTouch:withType:@0x2714dc(LR 0x2714e1),一并覆盖:岛上买店后按店的图身也能拖。
+/// [2026-11-07 第十九轮 R19-D-4] 以前起拖时一律把 putRef 设成占地中心,而玩家几乎总是按在底座上方的图身中部,第一次移动时
+/// 建筑整体朝手指跳一截(多半往上),每从图身中部重拖一次就再窜一次。现在照原版 touchBegan: 的写法让「按下点所在的格」与
+/// 「当前底座格」保持原有相对位置:-[Porter calcBaseTile]@0x2f6f8 是 base.col = t.col + putRefY − putRefX、
+/// base.line = t.line + trunc((((t.col & 1) ^ 1) + putRefX + putRefY) / 2)(0x2f7b0–0x2f7cc),由按下点的格 t 与当前底座格
+/// 反解 putRef,第一次 moveTo: 时底座格不变,抓哪拖哪;解不出才退回占地中心。
 /// 触摸在运行循环的事件分派里处理,不在绘制帧内,可以发宿主消息;发完恢复 r0–r3。
 struct PorterSlots {
     obj_sprite: u32,
@@ -10340,6 +10351,7 @@ struct PorterSlots {
     put_ref_y: u32,
     state: u32,
     prev_touch_type: u32,
+    base_tile: u32,
 }
 const PORTER_SLOTS: PorterSlots = PorterSlots {
     obj_sprite: 0xb03284,
@@ -10348,6 +10360,7 @@ const PORTER_SLOTS: PorterSlots = PorterSlots {
     put_ref_y: 0xb032bc,
     state: 0xb03290,
     prev_touch_type: 0xb03294,
+    base_tile: 0xb032a4,
 };
 const NEW_SCENE_PORTER_SLOTS: PorterSlots = PorterSlots {
     obj_sprite: 0xb062b4,
@@ -10356,24 +10369,47 @@ const NEW_SCENE_PORTER_SLOTS: PorterSlots = PorterSlots {
     put_ref_y: 0xb062e8,
     state: 0xb062c0,
     prev_touch_type: 0xb062c4,
+    base_tile: 0xb062d4,
 };
-fn porter_body_drag(env: &mut Environment, is_move: bool, slots: &PorterSlots) {
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PorterTouch {
+    Began,
+    Moved,
+}
+
+fn porter_body_drag(env: &mut Environment, phase: PorterTouch, slots: &PorterSlots) {
     let regs = *env.cpu.regs();
     let porter = regs[0];
     let p = CGPoint {
         x: f32::from_bits(regs[2]),
         y: f32::from_bits(regs[3]),
     };
-    let mut down = PORTER_BODY_DOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if !is_move {
-        *down = Some((porter, p));
+    let finger = crate::frameworks::uikit::ui_touch::dispatch_single_finger();
+    if phase == PorterTouch::Began {
+        let Some(finger) = finger else {
+            return;
+        };
+        let mut down = PORTER_BODY_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+        down.retain(|&(_, f, _)| f != finger);
+        down.push((porter, finger, p));
+        if down.len() > 8 {
+            down.remove(0);
+        }
         return;
     }
-    let Some((down_porter, down_pt)) = down.take() else {
+    // 只用正在移动的这根手指自己的按下点(取出即删);参与过双指缩放的手指不做图身起拖。
+    let Some(finger) = finger else {
         return;
     };
-    drop(down);
-    if down_porter != porter
+    let down_pt = {
+        let mut down = PORTER_BODY_DOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(i) = down.iter().position(|&(q, f, _)| q == porter && f == finger) else {
+            return;
+        };
+        down.remove(i).2
+    };
+    if crate::frameworks::uikit::ui_touch::finger_pinched(env, finger)
         || peek_ivar(env, porter, slots.state) != Some(1)
         || peek_ivar(env, porter, slots.prev_touch_type) != Some(0)
     {
@@ -10428,8 +10464,8 @@ fn porter_body_drag(env: &mut Environment, is_move: bool, slots: &PorterSlots) {
             }
         }
     }
-    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
     if !hit {
+        env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
         return;
     }
     let (Some(state_off), Some(size_off), Some(rx_off), Some(ry_off)) = (
@@ -10438,27 +10474,164 @@ fn porter_body_drag(env: &mut Environment, is_move: bool, slots: &PorterSlots) {
         peek_u32(env, slots.put_ref_x),
         peek_u32(env, slots.put_ref_y),
     ) else {
+        env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
         return;
     };
-    let size: CGSize = env.mem.read(ConstPtr::<CGSize>::from_bits(porter + size_off));
-    let (rx, ry) = ((size.width * 0.5) as i32, (size.height * 0.5) as i32);
+    let grab = porter_grab_put_ref(env, porter, down_pt, slots);
+    let (rx, ry) = match grab {
+        Some(r) => r,
+        None => {
+            let size: CGSize = env.mem.read(ConstPtr::<CGSize>::from_bits(porter + size_off));
+            ((size.width * 0.5) as i32, (size.height * 0.5) as i32)
+        }
+    };
     env.mem.write(MutPtr::<i32>::from_bits(porter + rx_off), rx);
     env.mem.write(MutPtr::<i32>::from_bits(porter + ry_off), ry);
     env.mem.write(MutPtr::<i32>::from_bits(porter + state_off), 2);
+    PORTER_GRAB.store(if grab.is_some() { porter } else { 0 }, O);
+    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
     static N: AtomicU32 = AtomicU32::new(0);
     if N.fetch_add(1, O) < 20 {
         let (dx, dy) = (down_pt.x, down_pt.y);
-        log!("[摆放] 从图身起拖:按下点 ({:.0},{:.0}) 在摆放物件图上,改为拖动物件(占地中心对手指)", dx, dy);
+        if grab.is_some() {
+            log!(
+                "[摆放] 从图身起拖:按下点 ({:.0},{:.0}) 在摆放物件图上,改为拖动物件(保持抓取位置,putRef=({},{}))",
+                dx,
+                dy,
+                rx,
+                ry
+            );
+        } else {
+            log!("[摆放] 从图身起拖:按下点 ({:.0},{:.0}) 在摆放物件图上,改为拖动物件(占地中心对手指)", dx, dy);
+        }
+    }
+}
+
+/// [2026-11-07 第十九轮 R19-D-4] 由按下点所在的格 t 与当前底座格 b 反解 putRef,让 calcBaseTile(见 [porter_body_drag])
+/// 第一次就算回 b。按下点到格的换算照原版 -[Porter moveTo:]@0x2fe7c / -[NewScenePorter moveTo:]@0x270e38:
+/// [[Coord instance] screenToMap:点] → [[[WrapperManager sharedManager] runtimeMap] tileAtPos:needDummy:YES]。
+/// 设 D=b.col−t.col、E=b.line−t.line、c=(t.col&1)^1、S=putRefX+putRefY:要 S≡D(mod 2) 且 trunc((S+c)/2)==E,
+/// 则 putRefX=(S−D)/2、putRefY=(S+D)/2。解不出(格取不到、偏得离谱)返回 None。
+fn porter_grab_put_ref(env: &mut Environment, porter: u32, down_pt: CGPoint, slots: &PorterSlots) -> Option<(i32, i32)> {
+    let base = peek_ivar(env, porter, slots.base_tile).filter(|&b| b != 0)?;
+    let s_instance = env.objc.register_host_selector("instance".to_string(), &mut env.mem);
+    let s_shared = env.objc.register_host_selector("sharedManager".to_string(), &mut env.mem);
+    let s_screen_to_map = env
+        .objc
+        .register_host_selector("screenToMap:".to_string(), &mut env.mem);
+    let s_runtime_map = env.objc.register_host_selector("runtimeMap".to_string(), &mut env.mem);
+    let s_tile_at = env
+        .objc
+        .register_host_selector("tileAtPos:needDummy:".to_string(), &mut env.mem);
+    let s_line = env.objc.register_host_selector("line".to_string(), &mut env.mem);
+    let s_column = env.objc.register_host_selector("column".to_string(), &mut env.mem);
+    let coord_class = env.objc.get_known_class("Coord", &mut env.mem);
+    let wrapper_class = env.objc.get_known_class("WrapperManager", &mut env.mem);
+    if coord_class == nil || wrapper_class == nil {
+        return None;
+    }
+    let coord: id = msg_send(env, (coord_class, s_instance));
+    let wrapper: id = msg_send(env, (wrapper_class, s_shared));
+    if coord == nil || wrapper == nil {
+        return None;
+    }
+    let map_pt: CGPoint = msg_send(env, (coord, s_screen_to_map, down_pt));
+    let runtime_map: id = msg_send(env, (wrapper, s_runtime_map));
+    if runtime_map == nil {
+        return None;
+    }
+    let tile: id = msg_send(env, (runtime_map, s_tile_at, map_pt, true));
+    if tile == nil {
+        return None;
+    }
+    let base_tile: id = Ptr::from_bits(base);
+    let t_line: i32 = msg_send(env, (tile, s_line));
+    let t_col: i32 = msg_send(env, (tile, s_column));
+    let b_line: i32 = msg_send(env, (base_tile, s_line));
+    let b_col: i32 = msg_send(env, (base_tile, s_column));
+    let d = b_col - t_col;
+    let e = b_line - t_line;
+    let c = (t_col & 1) ^ 1;
+    // C 的截断除法(0x2f7c0 add r2,r2,r2,lsr#31 ; asr #1)。
+    let trunc_half = |v: i32| v / 2;
+    (-64..=64)
+        .filter(|s| (s - d).rem_euclid(2) == 0 && trunc_half(s + c) == e)
+        .map(|s| ((s - d) / 2, (s + d) / 2))
+        .find(|&(rx, ry)| {
+            // 照 calcBaseTile 回算校验。
+            t_col + ry - rx == b_col && t_line + trunc_half(c + rx + ry) == b_line
+        })
+}
+
+/// [2026-11-07 第十九轮 R19-D-4] 抓取偏移收尾:把 putRef 复位到占地中心(原版 setPutRefToCenter),免得范围外的 putRef 留到
+/// 下一次 attachObjectWithHouseLevel:data:(0x29f1a)/岛上 attachObject:(0x26c23c)或放大时 moveToBaseTile:(0x2fe4a/0x270e08)
+/// 的 moveTo:(屏幕中心),让下一件物件按抓取偏移错位。touchEnd: 前置钩子与取消复位(ui_touch::reset_porters_after_cancel)调用。
+/// 原版 touchEnd: 在移动过时直接 state=1,不读 putRef,提前复位没有副作用。可以发消息的上下文(事件分派)。
+pub fn porter_grab_restore(env: &mut Environment) {
+    let porter = PORTER_GRAB.swap(0, O);
+    if porter == 0 {
+        return;
+    }
+    let regs = *env.cpu.regs();
+    let s = env
+        .objc
+        .register_host_selector("setPutRefToCenter".to_string(), &mut env.mem);
+    let recv: id = Ptr::from_bits(porter);
+    let _: () = msg_send(env, (recv, s));
+    env.cpu.regs_mut()[0..4].copy_from_slice(&regs[0..4]);
+}
+
+/// [2026-11-07 第十九轮] -[Porter touchEnd:]@0x30cc0 / -[NewScenePorter touchEnd:]@0x271728 前置钩子(同一分派点)。
+///   · 抓取偏移收尾(R19-D-4,见 [porter_grab_restore]);
+///   · 按下点记录里删掉这根手指;
+///   · R19-D-1 体验修正:进来时 prevTouchType 是 2(上一根手指刚抬起)或 3(取消)就改成 1,让原方法走 0x30cda→0x30d44 的
+///     「移动过」分支(state=1、编辑菜单 update:),不 setPutRefToCenter+moveTo:(抬起点)瞬移、也不 quickFinish。
+///     单指手势里 touchEnd: 之前一定是本手势的 0(点按)或 1(移动过),2/3 只会出现在「另一根手指已抬起/取消之后」:
+///     拇指搭在屏幕边上、另一指拖好建筑抬起后再松开拇指,原版 iPad 上搭着的手指几乎总有亚点级移动(prevTouchType=1),
+///     我们按手指的起拖阈值把它吞成 0 位移,它的抬起就成了一次单击,建筑瞬移到拇指下。这是阈值放大的偏差,不改原版逻辑。
+fn porter_touch_end(env: &mut Environment, slots: &PorterSlots) {
+    porter_grab_restore(env);
+    let regs = *env.cpu.regs();
+    let porter = regs[0];
+    if let Some(finger) = crate::frameworks::uikit::ui_touch::dispatch_single_finger() {
+        PORTER_BODY_DOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(_, f, _)| f != finger);
+    }
+    let prev = peek_ivar(env, porter, slots.prev_touch_type);
+    if matches!(prev, Some(2) | Some(3)) {
+        if let Some(off) = peek_u32(env, slots.prev_touch_type) {
+            env.mem.write(MutPtr::<i32>::from_bits(porter + off), 1);
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, O) < 20 {
+                log!(
+                    "[摆放] 另一根手指先抬起后,这根手指抬起(上次类型 {}):按「移动过」收尾,不瞬移、不确认",
+                    prev.unwrap_or(0)
+                );
+            }
+        }
     }
 }
 
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
-    if (class == "Porter" || class == "NewScenePorter") && (sel == "touchBegan:" || sel == "touchMove:") {
+    if (class == "Porter" || class == "NewScenePorter")
+        && (sel == "touchBegan:" || sel == "touchMove:" || sel == "touchEnd:")
+    {
         let lr = env.cpu.regs()[14] & !1u32;
-        if class == "Porter" && lr == 0x30a78 {
-            porter_body_drag(env, sel == "touchMove:", &PORTER_SLOTS);
+        let slots = if class == "Porter" && lr == 0x30a78 {
+            Some(&PORTER_SLOTS)
         } else if class == "NewScenePorter" && lr == 0x2714e0 {
-            porter_body_drag(env, sel == "touchMove:", &NEW_SCENE_PORTER_SLOTS);
+            Some(&NEW_SCENE_PORTER_SLOTS)
+        } else {
+            None
+        };
+        if let Some(slots) = slots {
+            match sel {
+                "touchBegan:" => porter_body_drag(env, PorterTouch::Began, slots),
+                "touchMove:" => porter_body_drag(env, PorterTouch::Moved, slots),
+                _ => porter_touch_end(env, slots),
+            }
         }
         return false;
     }
