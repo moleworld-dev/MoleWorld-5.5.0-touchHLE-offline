@@ -8775,6 +8775,9 @@ pub fn intercept_wants(class: &str, sel: &str) -> bool {
         || sel == "moleIslandTimeTravelNotice"
         // [2026-10-08 第十二轮] 摆放时按住图身也能拖(见 porter_body_drag);Porter 不进 CLASSES,只放这两个选择子。
         || (matches!(class, "Porter" | "NewScenePorter") && matches!(sel, "touchBegan:" | "touchMove:" | "touchEnd:"))
+        // [2026-11-07 第十九轮 R19-E-3] 小游戏期间 iOS 边缘系统手势延迟(见 mini_game_edge_gestures)。
+        || (class == "MiniGameManager"
+            && matches!(sel, "startMiniGame:playType:callbackTarget:select:" | "endMiniGame"))
         // [扫描修 2026-09-15] 集成:新模块各自的粗筛(各模块保证只做字符串比较,足够廉价)。
         || crate::mole_dev::wants(class, sel)
         || crate::mole_items::wants(class, sel)
@@ -10623,7 +10626,35 @@ fn porter_touch_end(env: &mut Environment, slots: &PorterSlots) {
     }
 }
 
+/// [2026-11-07 第十九轮 R19-E-3] 小游戏期间把 iOS 屏幕边缘的系统手势改成「先交给游戏、再划一次才给系统」。
+/// 平时(a448c75)设 SDL_IOS_HIDE_HOME_INDICATOR=1:主屏指示条自动隐藏、系统手势一次生效;但切水果等划动类小游戏从底边往上
+/// 起刀会直接回主屏、从顶边往下划会拉出通知中心,这一刀被系统取消。原版 iOS 5/6 隐藏状态栏的全屏应用,下拉通知中心本来就要
+/// 两次。-[MiniGameManager startMiniGame:playType:callbackTarget:select:]@0xf3e34 进场时设 "2"(SDL 的
+/// preferredScreenEdgesDeferringSystemGestures 返回 UIRectEdgeAll;代价是这期间主屏指示条常亮,SDL 让两者互斥),所有小游戏的
+/// 统一出口 -[MiniGameManager endMiniGame]@0xf4730 改回 "1"。只设 SDL 提示、不发宿主消息;其它平台空操作。
+fn mini_game_edge_gestures(starting: bool) {
+    #[cfg(target_os = "ios")]
+    {
+        sdl2::hint::set("SDL_IOS_HIDE_HOME_INDICATOR", if starting { "2" } else { "1" });
+        log!(
+            "[小游戏] {}:屏幕边缘系统手势{}",
+            if starting { "进场" } else { "退场" },
+            if starting { "改为先交给游戏" } else { "恢复一次生效" }
+        );
+    }
+    #[cfg(not(target_os = "ios"))]
+    let _ = starting;
+}
+
 pub fn intercept(env: &mut Environment, class: &str, sel: &str) -> bool {
+    if class == "MiniGameManager" {
+        if sel == "startMiniGame:playType:callbackTarget:select:" {
+            mini_game_edge_gestures(true);
+        } else if sel == "endMiniGame" {
+            mini_game_edge_gestures(false);
+        }
+        // MiniGameManager 的其它钩子在下面照常处理。
+    }
     if (class == "Porter" || class == "NewScenePorter")
         && (sel == "touchBegan:" || sel == "touchMove:" || sel == "touchEnd:")
     {
