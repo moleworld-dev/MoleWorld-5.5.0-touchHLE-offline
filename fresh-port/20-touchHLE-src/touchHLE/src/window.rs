@@ -728,6 +728,10 @@ pub enum Event {
     /// 虚拟手指会走 ccTouchEnded → activate,被当成一次点击;取消只走 ccTouchCancelled(不 activate)。
     /// 不认取消的 cocos2d 代理由 ui_touch 的 handle_touches_cancelled 收尾([复核修 2026-09-15] R1-3 返修)。
     TouchesCancel(HashMap<FingerId, Coords>),
+    /// [2026-11-07 第十九轮] 一个鼠标滚轮/触控板滚动事件:光标处的 guest 坐标(与触摸坐标同一坐标系)和滚动格数
+    /// (正数 = 往上/往前看,SDL 已按系统「自然滚动」设置换算成内容方向)。frameworks/uikit.rs 交给
+    /// ui_touch::wheel_scroll_list:光标下有可见、可拖动的列表就滚动它,否则忽略(地图缩放仍由虚拟捏合负责)。
+    WheelScroll(Coords, f32),
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
@@ -1550,9 +1554,8 @@ impl Window {
         /// 滚轮停下 PINCH_IDLE_TIMEOUT 后由 poll_for_events 末尾统一结束([复核修 2026-09-15] R1-3:
         /// 以 TouchesCancel 结束,见 end_wheel_pinch)。已按下的虚拟手指绝不再发 Down。
         fn handle_wheel_pinch(window: &mut Window, notches_int: i32, notches_precise: f32) {
-            // 不合成的情形:开关关闭 / 正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
-            if !wheel_pinch_enabled()
-                || MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            // 不处理的情形:正在输入文字 / 修改器菜单打开(uikit.rs 会把 Down 当成点菜单)。
+            if MOLE_TEXT_INPUT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || crate::mole_menu::is_open()
             {
                 return;
@@ -1562,26 +1565,33 @@ impl Window {
             if window.mouse_left_down && mouse.left() {
                 return;
             }
-            let mut delta = if notches_precise != 0.0 && notches_precise.is_finite() {
+            let raw = if notches_precise != 0.0 && notches_precise.is_finite() {
                 notches_precise
             } else {
                 notches_int as f32
             };
-            if wheel_pinch_inverted() {
-                delta = -delta;
-            }
-            let delta = delta.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
-            if delta == 0.0 {
+            let raw = raw.clamp(-PINCH_MAX_NOTCHES_PER_EVENT, PINCH_MAX_NOTCHES_PER_EVENT);
+            if raw == 0.0 {
                 return;
             }
+            let mut cursor = (mouse.x() as f32, mouse.y() as f32);
+            // [2026-11-07] 诊断注入 fwheel 指定的光标位置(归一化,窗口左上为原点),见 mole_diag。
+            if let Some((nx, ny)) = crate::mole_diag::take_wheel_cursor_override() {
+                let (w, h) = window.window.size();
+                cursor = (nx * w as f32, ny * h as f32);
+            }
+            // [2026-11-07 第十九轮] 每个滚轮事件都交给 uikit 试着滚动光标下的列表(见 Event::WheelScroll);
+            // 光标在列表上时下面合成的虚拟双指会被 ui_touch 的 wheel_pinch_allowed_for 挡下,两者不会同时生效。
+            // 方向不受 wheel_pinch_inverted(那是缩放方向的个人设置)影响。
+            let at = transform_input_coords(window, cursor, false);
+            window.event_queue.push_back(Event::WheelScroll(at, raw));
+            // 地图缩放(虚拟双指)受开关控制。
+            if !wheel_pinch_enabled() {
+                return;
+            }
+            let delta = if wheel_pinch_inverted() { -raw } else { raw };
             let now = Instant::now();
             if window.pinch.is_none() {
-                let mut cursor = (mouse.x() as f32, mouse.y() as f32);
-                // [2026-11-07] 诊断注入 fwheel 指定的光标位置(归一化,窗口左上为原点),见 mole_diag。
-                if let Some((nx, ny)) = crate::mole_diag::take_wheel_cursor_override() {
-                    let (w, h) = window.window.size();
-                    cursor = (nx * w as f32, ny * h as f32);
-                }
                 let Some(p) = begin_wheel_pinch(window, cursor, now) else {
                     return;
                 };
@@ -2350,6 +2360,7 @@ impl Window {
                     | Event::TouchesMove(_)
                     | Event::TouchesUp(_)
                     | Event::TouchesCancel(_)
+                    | Event::WheelScroll(..)
                     | Event::TextInput(_)
                     | Event::ToggleMoleMenu
             )

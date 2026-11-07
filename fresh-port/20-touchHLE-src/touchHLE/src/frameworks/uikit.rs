@@ -357,6 +357,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 // [扫描修 2026-09-15] F12-1:系统弹框显示中先由弹框处理(模态)。
                 route_touch(env, event)
             }
+            // [2026-11-07 第十九轮] 鼠标滚轮/触控板翻列表(见 ui_touch::wheel_scroll_list)。修改器菜单开着、
+            // 自绘弹框(模态)显示中不滚底下的列表。
+            Event::WheelScroll(at, notches) => {
+                if !crate::mole_menu::is_open() && !ui_view::ui_alert_view::overlay_showing(env) {
+                    ui_touch::wheel_scroll_list(env, at, notches);
+                }
+            }
             // [扫描修 2026-09-15] F12-3:桌面窗口最小化/还原(W2 在 window.rs 发出)→ 原版失活/激活回调
             // 与对应通知;不发 DidEnterBackground/WillEnterForeground。细节见 ui_application.rs。
             Event::WindowMinimized => ui_application::handle_window_minimized(env),

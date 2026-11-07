@@ -707,6 +707,11 @@ fn show_native(env: &mut Environment, alert: id) -> Option<NSInteger> {
 /// - 滚轮合成的虚拟捏合手指(FingerId::PinchA/PinchB,R1-1)归弹框时只吞不点:以前光标停在按钮上
 ///   滚一格,两根虚拟手指都落在按钮内,约 150ms 后结束时就回调 clickedButtonAtIndex:(Porter tag1326 等框
 ///   索引 0 = exit(0)),无按钮框(tap_anywhere)滚一下就被关闭。
+/// [2026-11-07 第十九轮] 自绘弹框覆盖层正在显示(模态):桌面滚轮翻列表时不滚底下的列表。
+pub fn overlay_showing(env: &Environment) -> bool {
+    env.framework_state.uikit.ui_alert_view.overlay.is_some()
+}
+
 pub fn filter_touch_event(env: &mut Environment, event: Event) -> Option<Event> {
     match event {
         Event::TouchesDown(map) => filter_touches_down(env, map).map(Event::TouchesDown),

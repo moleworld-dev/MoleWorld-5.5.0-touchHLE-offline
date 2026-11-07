@@ -6,7 +6,7 @@
 //! `UITouch`.
 
 use super::ui_event;
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
@@ -1395,4 +1395,157 @@ fn reset_porters_after_cancel(env: &mut Environment) {
             state
         );
     }
+}
+
+/// [2026-11-07 第十九轮] 桌面滚轮翻列表:滚一格移动的点数(主村仓库格子高 192,约三分之一格)。
+const WHEEL_SCROLL_STEP: f32 = 64.0;
+/// [2026-11-07 第十九轮] +[CCDirector sharedDirector]@0x2c7928 的单例静态变量。只读它,不调 sharedDirector
+/// (那会在导演建好之前新建一个)。
+const CC_SHARED_DIRECTOR_SLOT: u32 = 0xb40cdc;
+
+/// [2026-11-07 第十九轮] 鼠标滚轮/触控板翻列表(桌面;安卓、iPad 接鼠标时走同一路径)。
+/// 原版 iPad 没有滚轮。ecc4400 起光标下有可见列表时,滚轮不再合成虚拟双指交给游戏(以前滚一格会点中格子、
+/// 关掉抽屉、在建造商店直接购买),列表于是只能按住拖。这里照游戏自己的门控找光标下的列表,直接改它的滚动位置:
+/// ① 光标下的视图按 handle_touches_down 同样的方式命中(窗口从前往后 pointInside → hitTest),必须是游戏的
+///    EAGLView,取它的 CCTouchDispatcher;光标经 -[CCDirector convertToGL:] 转成世界坐标。宿主直接发消息,
+///    不经过宽屏 UI43 按调用点的坐标换算,用的是真实几何。
+/// ② 目标代理里排在最前(优先级最高)、光标落在自身 viewSize 范围内的 CCScrollView(含 CCTableView)就是光标下的列表。
+///    判据同 -[CCScrollView ccTouchBegan:withEvent:]@0x8fa9c 与 ccTouchMoved:@0x8fc04:自身和各级父节点 visible_、
+///    在运行中(isRunning_),canDrag_ 非 0,没在手指拖动中(isDragging_ = 0)。不能拖(短列表 Drag:NO)就什么都不做。
+/// ③ 新位置夹在 [minContainerOffset, maxContainerOffset](@0x8f27c / @0x8f270)之间,再调
+///    -[CCScrollView setContentOffset:]@0x8ed88:手指拖动时 ccTouchMoved: 末尾(0x90016)调的就是它,容器移动后
+///    经 scrollViewDidScroll: 让 CCTableView 回收、补齐格子。
+/// 不产生任何触摸:不会点中格子、不会关抽屉。竖向列表往下滚看后面的格子,横向列表往下滚看右边的格子。
+/// 调用上下文与 route_touch 相同(handle_events 内,可以发 msg_send)。
+pub(super) fn wheel_scroll_list(env: &mut Environment, at: Coords, notches: f32) {
+    if notches == 0.0 || !notches.is_finite() {
+        return;
+    }
+    let location = CGPoint { x: at.0, y: at.1 };
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let Some((window, in_window)) = windows.into_iter().rev().find_map(|window| {
+        let p: CGPoint = msg![env; window convertPoint:location fromWindow:nil];
+        let inside: bool = msg![env; window pointInside:p withEvent:nil];
+        inside.then_some((window, p))
+    }) else {
+        return;
+    };
+    let view: id = msg![env; window hitTest:in_window withEvent:nil];
+    if class_chain_match(env, view, &["EAGLView"]).is_none() {
+        return;
+    }
+    let Some(dispatcher) = read_id_ivar(env, view, "touchDelegate_") else {
+        return;
+    };
+    if class_chain_match(env, dispatcher, &["CCTouchDispatcher"]).is_none() {
+        return;
+    }
+    let director_bits: GuestUSize =
+        env.mem
+            .read(ConstPtr::<GuestUSize>::from_bits(CC_SHARED_DIRECTOR_SLOT));
+    let director: id = Ptr::from_bits(director_bits);
+    if class_chain_match(env, director, &["CCDirector"]).is_none() {
+        return;
+    }
+    let in_view: CGPoint = msg![env; view convertPoint:location fromView:nil];
+    let world: CGPoint = msg![env; director convertToGL:in_view];
+    let targeted = read_id_ivar(env, dispatcher, "targetedHandlers").unwrap_or(nil);
+    if targeted == nil {
+        return;
+    }
+    let count: NSUInteger = msg![env; targeted count];
+    for i in 0..count {
+        let handler: id = msg![env; targeted objectAtIndex:i];
+        let list = read_id_ivar(env, handler, "delegate").unwrap_or(nil);
+        if class_chain_match(env, list, &["CCScrollView"]).is_none()
+            || !node_chain_running_visible(env, list)
+        {
+            continue;
+        }
+        let Some(size) = read_ivar::<CGSize>(env, list, "viewSize_") else {
+            continue;
+        };
+        let local: CGPoint = msg![env; list convertToNodeSpace:world];
+        if !(local.x >= 0.0 && local.x <= size.width && local.y >= 0.0 && local.y <= size.height) {
+            continue;
+        }
+        // 光标下最上层的列表:能拖才滚,不再往下找(下面的列表被它盖着)。
+        if read_ivar::<u8>(env, list, "canDrag_").unwrap_or(0) == 0
+            || read_ivar::<u8>(env, list, "isDragging_").unwrap_or(0) != 0
+        {
+            return;
+        }
+        let horizontal = read_ivar::<i32>(env, list, "direction_").unwrap_or(1) == 0;
+        let offset: CGPoint = msg![env; list contentOffset];
+        let min: CGPoint = msg![env; list minContainerOffset];
+        let max: CGPoint = msg![env; list maxContainerOffset];
+        let mut new = offset;
+        if horizontal {
+            if min.x > max.x {
+                return;
+            }
+            new.x = (offset.x + notches * WHEEL_SCROLL_STEP).clamp(min.x, max.x);
+        } else {
+            if min.y > max.y {
+                return;
+            }
+            new.y = (offset.y - notches * WHEEL_SCROLL_STEP).clamp(min.y, max.y);
+        }
+        if (new.x - offset.x).abs() < 0.5 && (new.y - offset.y).abs() < 0.5 {
+            return;
+        }
+        let _: () = msg![env; list setContentOffset:new];
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            let class = env
+                .objc
+                .try_get_class_name(ObjC::read_isa(list, &env.mem))
+                .unwrap_or("?")
+                .to_string();
+            let (ox, oy, nx, ny) = (offset.x, offset.y, new.x, new.y);
+            log!(
+                "[滚轮] 翻列表 {} {:?}:{} ({:.0},{:.0}) → ({:.0},{:.0})",
+                class,
+                list,
+                if horizontal { "横向" } else { "竖向" },
+                ox,
+                oy,
+                nx,
+                ny
+            );
+        }
+        return;
+    }
+}
+
+/// [2026-11-07 第十九轮] 节点在运行中的场景里、自身和各级父节点都可见(visible_ 与 isRunning_ 非 0,一直到 CCScene)。
+fn node_chain_running_visible(env: &Environment, node: id) -> bool {
+    if read_ivar::<u8>(env, node, "isRunning_").unwrap_or(0) == 0 {
+        return false;
+    }
+    let mut n = node;
+    for _ in 0..64 {
+        if n == nil {
+            return false;
+        }
+        if read_ivar::<u8>(env, n, "visible_").unwrap_or(1) == 0 {
+            return false;
+        }
+        if class_chain_match(env, n, &["CCScene"]).is_some() {
+            return true;
+        }
+        n = read_id_ivar(env, n, "parent_").unwrap_or(nil);
+    }
+    false
+}
+
+/// [2026-11-07 第十九轮] 按名字读任意可安全读取类型的 ivar(沿类链查,偏移取运行时值)。没有这个 ivar 返回 None。
+fn read_ivar<T: crate::mem::SafeRead>(env: &Environment, obj: id, name: &str) -> Option<T> {
+    if obj == nil {
+        return None;
+    }
+    let ptr = env
+        .objc
+        .object_lookup_ivar(&env.mem, obj, &name.to_string())?;
+    Some(env.mem.read(ptr.cast::<T>().cast_const()))
 }
