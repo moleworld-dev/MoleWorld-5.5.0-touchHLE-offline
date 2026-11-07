@@ -688,7 +688,8 @@ struct MouseDragState {
     down: Coords,
     /// 本次按下内是否已越过起拖阈值;越过之后的移动全部原样下发,不再抑制。
     broke: bool,
-    /// [2026-10-10 触摸 P0] 触屏:最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move)。鼠标不用。
+    /// [2026-10-10 触摸 P0] 最后一个被阈值压住、且与按下点不同的坐标(越过阈值时先补发它,见 touch_slop_move;
+    /// [2026-11-07] 鼠标左键拖动同样补发,见 E::MouseMotion 分支)。
     last: Option<Coords>,
 }
 
@@ -1830,14 +1831,23 @@ impl Window {
                     // 下发,此后本次按下内不再抑制。ui_touch 的 previous_location 是上一次下发的位置(即按下点),所以第一个 Move
                     // 的位移包含了被抑制的那几个点,地图平移不会永久少走这段距离,只是起拖晚了一点。
                     // mouse_drag 为 None(没看到按下,例如在窗口外按下再拖进来)时按原样下发。
+                    // [2026-11-07 第十九轮 R19-E-2] 照触屏(5e8b429)补上:阈值内记下最后一个与按下点不同的坐标,越过阈值时先把它
+                    // 作为一次移动补发(slop_prefix,插在本次移动之前)。切水果 -[TouchTrailLayer ccTouchMoved:...]@0x143e20 只拿下发的
+                    // 采样点逐个 checkLists:touchPos:,从水果边缘起刀、阈值内就划出水果时,水果里的那个点以前被吞掉,这一刀落空。
                     let slop = mouse_drag_slop();
                     if let Some(drag) = self.mouse_drag.as_mut() {
                         if !drag.broke {
                             let (dx, dy) = (coords.0 - drag.down.0, coords.1 - drag.down.1);
                             if (dx * dx + dy * dy).sqrt() < slop {
+                                if coords != drag.down {
+                                    drag.last = Some(coords);
+                                }
                                 continue;
                             }
                             drag.broke = true;
+                            if let Some(last) = drag.last.take() {
+                                slop_prefix.insert(FingerId::Mouse, last);
+                            }
                             log_dbg!(
                                 "[鼠标起拖] 越过 {}pt 阈值,开始下发移动:按下点 {:?} → {:?}",
                                 slop,
